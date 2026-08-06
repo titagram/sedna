@@ -136,7 +136,13 @@ class IngestionReport(BaseModel):
 
 
 class CanonicalKnowledgeRepository:
-    """Persist canonical JSON through a retained, resolved root descriptor."""
+    """Persist canonical JSON through a retained, resolved root descriptor.
+
+    Write methods return the nominal canonical ``Path`` beneath the original resolved
+    root pathname. IO remains bound to the retained directory when that pathname is
+    renamed or replaced, so a returned path is a location hint rather than an identity
+    handle in that exceptional case.
+    """
 
     _DIRECTORIES = frozenset({"manifests", "quarantine", "ingestion_reports"})
 
@@ -189,15 +195,15 @@ class CanonicalKnowledgeRepository:
                 os.close(root_fd)
 
     def write_manifest(self, manifest: DocumentManifest) -> Path:
-        """Atomically persist one source manifest."""
+        """Persist one source manifest and return its nominal canonical path."""
         return self._write_model("manifests", manifest.source_id, manifest)
 
     def write_quarantine(self, record: QuarantineRecord) -> Path:
-        """Atomically persist one quarantine explanation."""
+        """Persist one quarantine explanation and return its nominal canonical path."""
         return self._write_model("quarantine", record.source_id, record)
 
     def write_ingestion_report(self, report: IngestionReport) -> Path:
-        """Atomically persist one deterministic run report."""
+        """Persist one deterministic report and return its nominal canonical path."""
         return self._write_model("ingestion_reports", report.run_id, report)
 
     def load_manifest(self, source_id: str) -> DocumentManifest:
@@ -233,11 +239,13 @@ class CanonicalKnowledgeRepository:
                     file_fd = -1
                     payload = json.load(stream)
                 manifest = DocumentManifest.model_validate(payload)
+            except (OSError, UnicodeError, ValueError) as exc:
+                raise ValueError(
+                    f"invalid manifest for source_id {source_id!r}: {target}; {exc}"
+                ) from exc
             finally:
                 if file_fd >= 0:
                     os.close(file_fd)
-        except (OSError, UnicodeError, ValueError) as exc:
-            raise ValueError(f"invalid manifest for source_id {source_id!r}: {target}") from exc
         finally:
             os.close(directory_fd)
 
@@ -376,7 +384,12 @@ class CanonicalKnowledgeRepository:
 
     @staticmethod
     def _file_read_flags() -> int:
-        return os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        return (
+            os.O_RDONLY
+            | os.O_NONBLOCK
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+        )
 
     @staticmethod
     def _file_create_flags() -> int:
@@ -395,7 +408,7 @@ class CanonicalKnowledgeRepository:
 
     @staticmethod
     def _require_safe_primitives() -> None:
-        required_constants = ("O_DIRECTORY", "O_NOFOLLOW")
+        required_constants = ("O_DIRECTORY", "O_NONBLOCK", "O_NOFOLLOW")
         if any(not hasattr(os, name) for name in required_constants):
             raise RuntimeError("platform lacks safe descriptor-relative filesystem support")
         if any(

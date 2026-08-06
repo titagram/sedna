@@ -375,11 +375,35 @@ def test_repository_fails_closed_without_descriptor_relative_support(
         CanonicalKnowledgeRepository(tmp_path / "knowledge")
 
 
-def test_load_manifest_fails_clearly_when_missing_or_invalid(tmp_path: Path) -> None:
+@pytest.mark.parametrize("manifest_directory_exists", (False, True))
+def test_load_manifest_consistently_reports_missing_file(
+    tmp_path: Path,
+    manifest_directory_exists: bool,
+) -> None:
     repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    if manifest_directory_exists:
+        (repository.root / "manifests").mkdir()
 
     with pytest.raises(FileNotFoundError, match="source-missing"):
         repository.load_manifest("source-missing")
+
+
+def test_manifest_read_flags_are_nonblocking() -> None:
+    assert CanonicalKnowledgeRepository._file_read_flags() & os.O_NONBLOCK
+
+
+def test_load_manifest_rejects_fifo_promptly_as_non_regular(tmp_path: Path) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    manifests = repository.root / "manifests"
+    manifests.mkdir()
+    os.mkfifo(manifests / "source-fifo.json")
+
+    with pytest.raises(ValueError, match="invalid manifest.*not a regular file"):
+        repository.load_manifest("source-fifo")
+
+
+def test_load_manifest_fails_clearly_when_invalid(tmp_path: Path) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
 
     invalid = repository.root / "manifests" / "source-invalid.json"
     invalid.parent.mkdir()
