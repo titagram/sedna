@@ -3,6 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
+import sedna.knowledge.parsing.models as parsing_models
 from sedna.knowledge.parsing import (
     BlockKind,
     LogicalSegment,
@@ -159,6 +160,25 @@ def test_logical_segment_requires_unique_increasing_block_indices(block_indices)
         )
 
 
+def test_logical_segment_rejects_huge_index_gap_without_materializing_range(monkeypatch):
+    range_calls = []
+
+    def observe_range_materialization(*args):
+        range_calls.append(args)
+        return ()
+
+    monkeypatch.setattr(parsing_models, "range", observe_range_materialization, raising=False)
+
+    with pytest.raises(ValidationError):
+        LogicalSegment(
+            block_indices=(0, 1_000_000_000),
+            text="Observe HTTP.",
+            start_line=1,
+            end_line=1,
+        )
+    assert range_calls == []
+
+
 def test_logical_segment_rejects_reversed_line_range():
     with pytest.raises(ValidationError):
         LogicalSegment(
@@ -283,3 +303,56 @@ def test_prepared_source_rejects_segment_asset_not_owned_by_document():
 
     with pytest.raises(ValidationError):
         PreparedSource(manifest=manifest(), document=document, segments=(segment,))
+
+
+def test_prepared_source_rejects_owned_asset_outside_segment_span():
+    block = ParsedBlock(
+        kind=BlockKind.PARAGRAPH,
+        text="Observe HTTP.",
+        start_line=1,
+        end_line=1,
+    )
+    distant_asset = ParsedAsset(target="later.png", start_line=100, end_line=100)
+    document = ParsedDocument(
+        source_id="source-test",
+        path="sample.md",
+        blocks=(block,),
+        assets=(distant_asset,),
+    )
+    segment = LogicalSegment(
+        block_indices=(0,),
+        text="Observe HTTP.",
+        start_line=1,
+        end_line=1,
+        assets=(distant_asset,),
+    )
+
+    with pytest.raises(ValidationError):
+        PreparedSource(manifest=manifest(), document=document, segments=(segment,))
+
+
+def test_prepared_source_accepts_owned_asset_overlapping_segment_span():
+    block = ParsedBlock(
+        kind=BlockKind.IMAGE,
+        text="HTTP response",
+        start_line=2,
+        end_line=3,
+    )
+    overlapping_asset = ParsedAsset(target="response.png", start_line=3, end_line=4)
+    document = ParsedDocument(
+        source_id="source-test",
+        path="sample.md",
+        blocks=(block,),
+        assets=(overlapping_asset,),
+    )
+    segment = LogicalSegment(
+        block_indices=(0,),
+        text="HTTP response",
+        start_line=2,
+        end_line=3,
+        assets=(overlapping_asset,),
+    )
+
+    prepared = PreparedSource(manifest=manifest(), document=document, segments=(segment,))
+
+    assert prepared.segments[0].assets == (overlapping_asset,)

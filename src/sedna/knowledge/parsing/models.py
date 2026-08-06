@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from enum import StrEnum
+from itertools import pairwise
 from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, GetCoreSchemaHandler, model_validator
@@ -157,8 +158,7 @@ class LogicalSegment(BaseModel):
         """Require ordered lines and unique, increasing source block indices."""
         if self.end_line < self.start_line:
             raise ValueError("end_line must not precede start_line")
-        expected_indices = tuple(range(self.block_indices[0], self.block_indices[-1] + 1))
-        if self.block_indices != expected_indices:
+        if any(current != previous + 1 for previous, current in pairwise(self.block_indices)):
             raise ValueError("block_indices must be unique, increasing, and contiguous")
         return self
 
@@ -195,6 +195,9 @@ class PreparedSource(BaseModel):
             ):
                 raise ValueError("segment line range must exactly span its referenced blocks")
 
-            if any(asset not in self.document.assets for asset in segment.assets):
-                raise ValueError("segment assets must belong to the parsed document")
+            for asset in segment.assets:
+                if asset not in self.document.assets:
+                    raise ValueError("segment assets must belong to the parsed document")
+                if asset.end_line < segment.start_line or asset.start_line > segment.end_line:
+                    raise ValueError("segment asset line range must overlap the segment span")
         return self
