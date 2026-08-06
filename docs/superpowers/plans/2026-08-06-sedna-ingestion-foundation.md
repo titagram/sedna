@@ -17,7 +17,7 @@
 - Empty, flag-only, and external-link-only documents produce manifests but no decision-ready segments.
 - Final flags must never appear in prepared searchable text, canonical strategic artifacts, or retrieval indexes.
 - Processing is incremental by source hash plus schema, parser, and extractor versions.
-- `/Users/gabriele/Dev/sedna` is not an autonomous Git repository and the user declined initialization; omit commit actions and use test/review checkpoints instead.
+- Execute every task on branch `codex/ingestion-foundation` in the isolated worktree, commit each reviewed task locally, and never push without explicit user instruction.
 
 ## Scope Boundary
 
