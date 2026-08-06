@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -120,7 +121,14 @@ def test_atomic_replace_failure_preserves_old_target_and_cleans_temp(
     target = repository.write_manifest(complete_manifest(title="First"))
     old_bytes = target.read_bytes()
 
-    def fail_replace(source: Path, destination: Path) -> None:
+    def fail_replace(
+        source: Path,
+        destination: Path,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        del src_dir_fd, dst_dir_fd
         raise OSError(f"cannot replace {source} with {destination}")
 
     monkeypatch.setattr(repository_module.os, "replace", fail_replace)
@@ -179,6 +187,194 @@ def test_repository_rejects_symlinked_directory_escape(tmp_path: Path) -> None:
     assert not list(outside.iterdir())
 
 
+def test_parent_symlink_swap_during_write_cannot_redirect_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    repository.write_manifest(complete_manifest(title="Before"))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    original_directory = repository.root / "manifests-original"
+    real_open = os.open
+    swapped = False
+
+    def racing_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if not swapped and os.fspath(path).startswith(".source-123.json."):
+            (repository.root / "manifests").rename(original_directory)
+            (repository.root / "manifests").symlink_to(
+                outside, target_is_directory=True
+            )
+            swapped = True
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(repository_module.os, "open", racing_open)
+    repository.write_manifest(complete_manifest(title="After"))
+
+    assert swapped
+    assert not list(outside.iterdir())
+    payload = json.loads((original_directory / "source-123.json").read_text())
+    assert payload["title"] == "After"
+
+
+def test_target_symlink_swap_during_replace_cannot_modify_outside_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    repository.write_manifest(complete_manifest(title="Before"))
+    outside_file = tmp_path / "outside.json"
+    outside_file.write_text("outside sentinel", encoding="utf-8")
+    real_replace = os.replace
+
+    def racing_replace(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        assert src_dir_fd is not None
+        assert dst_dir_fd is not None
+        os.unlink(destination, dir_fd=dst_dir_fd)
+        os.symlink(outside_file, destination, dir_fd=dst_dir_fd)
+        real_replace(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(repository_module.os, "replace", racing_replace)
+    repository.write_manifest(complete_manifest(title="After"))
+
+    assert outside_file.read_text(encoding="utf-8") == "outside sentinel"
+    assert repository.load_manifest("source-123").title == "After"
+
+
+def test_root_path_replacement_does_not_redirect_open_repository(
+    tmp_path: Path,
+) -> None:
+    root_path = tmp_path / "knowledge"
+    repository = CanonicalKnowledgeRepository(root_path)
+    retained_root = tmp_path / "retained-root"
+    root_path.rename(retained_root)
+    root_path.mkdir()
+
+    repository.write_manifest(complete_manifest())
+
+    assert (retained_root / "manifests" / "source-123.json").is_file()
+    assert not list(root_path.rglob("*.json"))
+
+
+def test_parent_symlink_swap_during_load_cannot_redirect_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    repository.write_manifest(complete_manifest(title="Trusted"))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "source-123.json").write_text(
+        repository_module.json.dumps(
+            complete_manifest(title="Untrusted").model_dump(mode="json")
+        ),
+        encoding="utf-8",
+    )
+    original_directory = repository.root / "manifests-original"
+    real_open = os.open
+    swapped = False
+
+    def racing_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if not swapped and os.fspath(path) == "source-123.json":
+            (repository.root / "manifests").rename(original_directory)
+            (repository.root / "manifests").symlink_to(
+                outside, target_is_directory=True
+            )
+            swapped = True
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(repository_module.os, "open", racing_open)
+    loaded = repository.load_manifest("source-123")
+
+    assert swapped
+    assert loaded.title == "Trusted"
+
+
+def test_target_symlink_swap_during_load_is_rejected_without_reading_outside(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    repository.write_manifest(complete_manifest(title="Trusted"))
+    outside_file = tmp_path / "outside.json"
+    outside_file.write_text(
+        json.dumps(complete_manifest(title="Untrusted").model_dump(mode="json")),
+        encoding="utf-8",
+    )
+    real_open = os.open
+    swapped = False
+
+    def racing_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if not swapped and os.fspath(path) == "source-123.json":
+            assert dir_fd is not None
+            os.unlink(path, dir_fd=dir_fd)
+            os.symlink(outside_file, path, dir_fd=dir_fd)
+            swapped = True
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(repository_module.os, "open", racing_open)
+
+    with pytest.raises(ValueError, match="invalid manifest.*source-123"):
+        repository.load_manifest("source-123")
+
+    assert swapped
+
+
+def test_repository_context_manager_closes_descriptor_and_close_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    with CanonicalKnowledgeRepository(tmp_path / "knowledge") as repository:
+        repository.write_manifest(complete_manifest())
+
+    repository.close()
+    with pytest.raises(RuntimeError, match="repository is closed"):
+        repository.load_manifest("source-123")
+    with pytest.raises(RuntimeError, match="repository is closed"):
+        repository.write_manifest(complete_manifest())
+
+
+def test_repository_fails_closed_without_descriptor_relative_support(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(repository_module.os, "supports_dir_fd", frozenset())
+
+    with pytest.raises(RuntimeError, match="safe descriptor-relative"):
+        CanonicalKnowledgeRepository(tmp_path / "knowledge")
+
+
 def test_load_manifest_fails_clearly_when_missing_or_invalid(tmp_path: Path) -> None:
     repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
 
@@ -190,6 +386,16 @@ def test_load_manifest_fails_clearly_when_missing_or_invalid(tmp_path: Path) -> 
     invalid.write_text('{"source_id": "source-invalid"}\n', encoding="utf-8")
     with pytest.raises(ValueError, match="invalid manifest.*source-invalid"):
         repository.load_manifest("source-invalid")
+
+
+def test_load_manifest_rejects_source_id_mismatch(tmp_path: Path) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    target = repository.write_manifest(complete_manifest("source-other"))
+    requested_target = target.with_name("source-requested.json")
+    target.rename(requested_target)
+
+    with pytest.raises(ValueError, match="invalid manifest.*source-requested"):
+        repository.load_manifest("source-requested")
 
 
 def test_quarantine_contract_is_strict_and_requires_explanation() -> None:
