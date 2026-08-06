@@ -206,6 +206,27 @@ class CanonicalKnowledgeRepository:
         """Persist one deterministic report and return its nominal canonical path."""
         return self._write_model("ingestion_reports", report.run_id, report)
 
+    def quarantine_exists(self, source_id: str) -> bool:
+        """Return whether a regular quarantine record exists for ``source_id``."""
+        return self._record_exists("quarantine", source_id)
+
+    def delete_quarantine(self, source_id: str) -> bool:
+        """Delete one stale quarantine record, returning whether it existed."""
+        _, filename = self._target("quarantine", source_id)
+        try:
+            directory_fd = self._open_child_directory("quarantine", create=False)
+        except FileNotFoundError:
+            return False
+        try:
+            try:
+                os.unlink(filename, dir_fd=directory_fd)
+            except FileNotFoundError:
+                return False
+            os.fsync(directory_fd)
+            return True
+        finally:
+            os.close(directory_fd)
+
     def load_manifest(self, source_id: str) -> DocumentManifest:
         """Load and validate one manifest, with path-specific errors."""
         target, filename = self._target("manifests", source_id)
@@ -274,6 +295,36 @@ class CanonicalKnowledgeRepository:
         finally:
             os.close(directory_fd)
         return target
+
+    def _record_exists(self, directory: str, record_id: str) -> bool:
+        self._target(directory, record_id)
+        try:
+            directory_fd = self._open_child_directory(directory, create=False)
+        except FileNotFoundError:
+            return False
+        try:
+            try:
+                file_fd = os.open(
+                    f"{record_id}.json",
+                    self._file_read_flags(),
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                return False
+            except OSError as exc:
+                raise ValueError(
+                    f"invalid {directory} record for source_id {record_id!r}"
+                ) from exc
+            try:
+                if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                    raise ValueError(
+                        f"invalid {directory} record for source_id {record_id!r}"
+                    )
+                return True
+            finally:
+                os.close(file_fd)
+        finally:
+            os.close(directory_fd)
 
     def _target(self, directory: str, record_id: str) -> tuple[Path, str]:
         self._ensure_open()

@@ -113,6 +113,20 @@ def test_json_is_sorted_indented_and_uses_json_mode(tmp_path: Path) -> None:
     assert json.loads(text)["reason_codes"] == ["unsupported_parser"]
 
 
+def test_delete_quarantine_removes_only_requested_record_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    first = repository.write_quarantine(complete_quarantine("source-first"))
+    second = repository.write_quarantine(complete_quarantine("source-second"))
+
+    assert repository.delete_quarantine("source-first") is True
+    assert repository.delete_quarantine("source-first") is False
+
+    assert not first.exists()
+    assert second.exists()
+
+
 def test_atomic_replace_failure_preserves_old_target_and_cleans_temp(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
