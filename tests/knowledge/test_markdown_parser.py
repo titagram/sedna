@@ -526,3 +526,87 @@ def test_parse_markdown_deduplicates_relationships_but_preserves_asset_occurrenc
     assert parsed.relationships == ("https://example.test",)
     assert [asset.target for asset in parsed.assets] == ["same.png", "same.png"]
     assert [(asset.start_line, asset.end_line) for asset in parsed.assets] == [(1, 1), (3, 3)]
+
+
+def test_parse_markdown_emits_nested_heading_and_code_after_list_item_direct_text():
+    parsed = parse_markdown(
+        "source-test",
+        "sample.md",
+        "- Context\n\n  ## Nested heading\n\n      nested command\n",
+    )
+
+    assert [block.kind for block in parsed.blocks] == [
+        BlockKind.UNORDERED_LIST_ITEM,
+        BlockKind.HEADING,
+        BlockKind.CODE,
+    ]
+    assert [(block.text, block.start_line, block.end_line) for block in parsed.blocks] == [
+        ("Context", 1, 5),
+        ("Nested heading", 3, 3),
+        ("nested command", 5, 5),
+    ]
+    assert parsed.blocks[1].level == 2
+    assert parsed.blocks[2].language is None
+
+
+def test_parse_markdown_emits_nested_blockquote_structures_without_text_duplication():
+    parsed = parse_markdown(
+        "source-test",
+        "sample.md",
+        "> Observation\n>\n> ### Evidence\n>\n> ```shell session=proof\n> id\n> ```\n",
+    )
+
+    assert [block.kind for block in parsed.blocks] == [
+        BlockKind.BLOCKQUOTE,
+        BlockKind.HEADING,
+        BlockKind.CODE,
+    ]
+    assert [block.text for block in parsed.blocks] == ["Observation", "Evidence", "id"]
+    assert parsed.blocks[1].level == 3
+    assert (parsed.blocks[2].start_line, parsed.blocks[2].end_line) == (5, 7)
+    assert parsed.blocks[2].language == "shell"
+    assert parsed.blocks[2].metadata["info"] == "shell session=proof"
+
+
+def test_parse_markdown_classifies_linked_and_formatted_image_only_paragraphs_as_images():
+    parsed = parse_markdown(
+        "source-test",
+        "sample.md",
+        "[![linked](linked.png)](https://example.test/full)\n\n"
+        "**![formatted](formatted.png)**\n",
+    )
+
+    assert [block.kind for block in parsed.blocks] == [BlockKind.IMAGE, BlockKind.IMAGE]
+    assert [block.text for block in parsed.blocks] == ["linked", "formatted"]
+    assert parsed.blocks[0].metadata["url"] == "https://example.test/full"
+    assert parsed.blocks[0].metadata["asset_target"] == "linked.png"
+    assert parsed.relationships == ("https://example.test/full",)
+    assert [asset.target for asset in parsed.assets] == ["linked.png", "formatted.png"]
+
+
+def test_parse_markdown_extracts_html_anchor_relationships_and_preserves_raw_html():
+    markdown = (
+        '<div><a href="https://one.test">One</a><img src="proof.png" alt="Proof">'
+        '<a href="https://two.test">Two</a></div>\n\n'
+        'Inspect <a href="https://three.test">three</a> beside '
+        '<img src="inline.png" alt="Inline">.\n'
+    )
+    parsed = parse_markdown("source-test", "sample.md", markdown)
+
+    assert [block.kind for block in parsed.blocks] == [BlockKind.HTML, BlockKind.PARAGRAPH]
+    assert parsed.blocks[0].text == (
+        '<div><a href="https://one.test">One</a><img src="proof.png" alt="Proof">'
+        '<a href="https://two.test">Two</a></div>'
+    )
+    assert parsed.blocks[1].text == (
+        'Inspect <a href="https://three.test">three</a> beside '
+        '<img src="inline.png" alt="Inline">.'
+    )
+    assert parsed.blocks[0].metadata["urls"] == '["https://one.test","https://two.test"]'
+    assert parsed.blocks[1].metadata["url"] == "https://three.test"
+    assert parsed.relationships == (
+        "https://one.test",
+        "https://two.test",
+        "https://three.test",
+    )
+    assert [asset.target for asset in parsed.assets] == ["proof.png", "inline.png"]

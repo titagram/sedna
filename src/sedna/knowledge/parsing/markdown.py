@@ -38,13 +38,15 @@ class _ImageHTMLParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.images: list[dict[str, str]] = []
+        self.links: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.casefold() != "img":
-            return
         attributes = {name.casefold(): value or "" for name, value in attrs}
-        if attributes.get("src"):
+        normalized_tag = tag.casefold()
+        if normalized_tag == "img" and attributes.get("src"):
             self.images.append(attributes)
+        elif normalized_tag == "a" and attributes.get("href"):
+            self.links.append(attributes["href"])
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self.handle_starttag(tag, attrs)
@@ -58,12 +60,35 @@ def parse_markdown(source_id: str, path: str, markdown: str) -> ParsedDocument:
     Cleanup is deliberately absent here: parser profiles own that later step.
     """
     tokens = MarkdownIt("commonmark").enable("table").parse(markdown)
-    parsed_blocks: list[_BlockPayload] = []
-    index = 0
+    parsed_blocks = _parse_scope(tokens, 0, len(tokens), level=0)
 
-    while index < len(tokens):
+    relationships = _unique_in_order(
+        link for parsed in parsed_blocks for link in parsed.links
+    )
+    return ParsedDocument(
+        source_id=source_id,
+        path=path,
+        blocks=tuple(parsed.block for parsed in parsed_blocks),
+        assets=tuple(asset for parsed in parsed_blocks for asset in parsed.assets),
+        relationships=relationships,
+    )
+
+
+def _parse_scope(
+    tokens: list[Token],
+    start: int,
+    end: int,
+    *,
+    level: int,
+    suppress_paragraphs: bool = False,
+) -> list[_BlockPayload]:
+    """Flatten one token scope while retaining nested structural children."""
+    parsed_blocks: list[_BlockPayload] = []
+    index = start
+
+    while index < end:
         token = tokens[index]
-        if token.level != 0:
+        if token.level != level:
             index += 1
             continue
 
@@ -75,7 +100,10 @@ def parse_markdown(source_id: str, path: str, markdown: str) -> ParsedDocument:
 
         if token.type == "paragraph_open":
             close_index = _matching_close(tokens, index)
-            parsed_blocks.append(_paragraph_block(token, tokens[index + 1 : close_index]))
+            if not suppress_paragraphs:
+                parsed_blocks.append(
+                    _paragraph_block(token, tokens[index + 1 : close_index])
+                )
             index = close_index + 1
             continue
 
@@ -98,11 +126,26 @@ def parse_markdown(source_id: str, path: str, markdown: str) -> ParsedDocument:
 
         if token.type == "blockquote_open":
             close_index = _matching_close(tokens, index)
+            child_level = token.level + 1
             parsed_blocks.append(
-                _container_block(
+                _make_block(
                     BlockKind.BLOCKQUOTE,
                     token,
-                    tokens[index + 1 : close_index],
+                    _direct_paragraph_payload(
+                        tokens,
+                        index + 1,
+                        close_index,
+                        level=child_level,
+                    ),
+                )
+            )
+            parsed_blocks.extend(
+                _parse_scope(
+                    tokens,
+                    index + 1,
+                    close_index,
+                    level=child_level,
+                    suppress_paragraphs=True,
                 )
             )
             index = close_index + 1
@@ -130,16 +173,7 @@ def parse_markdown(source_id: str, path: str, markdown: str) -> ParsedDocument:
 
         index += 1
 
-    relationships = _unique_in_order(
-        link for parsed in parsed_blocks for link in parsed.links
-    )
-    return ParsedDocument(
-        source_id=source_id,
-        path=path,
-        blocks=tuple(parsed.block for parsed in parsed_blocks),
-        assets=tuple(asset for parsed in parsed_blocks for asset in parsed.assets),
-        relationships=relationships,
-    )
+    return parsed_blocks
 
 
 def _heading_block(open_token: Token, inner_tokens: list[Token]) -> _BlockPayload:
@@ -156,12 +190,7 @@ def _paragraph_block(open_token: Token, inner_tokens: list[Token]) -> _BlockPayl
         if token.type == "inline"
         for child in (token.children or ())
     )
-    image_only = bool(payload.assets) and all(
-        child.type == "image"
-        or (child.type == "text" and not child.content.strip())
-        or child.type in {"softbreak", "hardbreak"}
-        for child in children
-    )
+    image_only = bool(payload.assets) and _contains_only_wrapped_images(children)
     kind = BlockKind.IMAGE if image_only else BlockKind.PARAGRAPH
     return _make_block(kind, open_token, payload)
 
@@ -211,54 +240,74 @@ def _table_block(open_token: Token, inner_tokens: list[Token]) -> _BlockPayload:
 
 def _list_blocks(tokens: list[Token], start: int, end: int) -> list[_BlockPayload]:
     blocks: list[_BlockPayload] = []
-    list_kinds: list[BlockKind] = []
-    index = start
+    list_token = tokens[start]
+    item_kind = (
+        BlockKind.UNORDERED_LIST_ITEM
+        if list_token.type == "bullet_list_open"
+        else BlockKind.ORDERED_LIST_ITEM
+    )
+    item_level = list_token.level + 1
+    index = start + 1
 
-    while index <= end:
+    while index < end:
         token = tokens[index]
-        if token.type == "bullet_list_open":
-            list_kinds.append(BlockKind.UNORDERED_LIST_ITEM)
-        elif token.type == "ordered_list_open":
-            list_kinds.append(BlockKind.ORDERED_LIST_ITEM)
-        elif token.type in {"bullet_list_close", "ordered_list_close"}:
-            list_kinds.pop()
-        elif token.type == "list_item_open":
+        if token.type == "list_item_open" and token.level == item_level:
             close_index = _matching_close(tokens, index)
-            payload = _direct_list_item_payload(tokens, index + 1, close_index)
-            blocks.append(_make_block(list_kinds[-1], token, payload))
+            child_level = token.level + 1
+            payload = _direct_paragraph_payload(
+                tokens,
+                index + 1,
+                close_index,
+                level=child_level,
+            )
+            blocks.append(_make_block(item_kind, token, payload))
+            blocks.extend(
+                _parse_scope(
+                    tokens,
+                    index + 1,
+                    close_index,
+                    level=child_level,
+                    suppress_paragraphs=True,
+                )
+            )
+            index = close_index + 1
+            continue
         index += 1
 
     return blocks
 
 
-def _direct_list_item_payload(tokens: list[Token], start: int, end: int) -> _InlinePayload:
-    relevant: list[Token] = []
-    nested_item_depth = 0
-    for token in tokens[start:end]:
-        if token.type == "list_item_open":
-            nested_item_depth += 1
+def _direct_paragraph_payload(
+    tokens: list[Token],
+    start: int,
+    end: int,
+    *,
+    level: int,
+) -> _InlinePayload:
+    payloads: list[_InlinePayload] = []
+    index = start
+    while index < end:
+        token = tokens[index]
+        if token.type == "paragraph_open" and token.level == level:
+            close_index = _matching_close(tokens, index)
+            payloads.append(_tokens_payload(tokens[index + 1 : close_index]))
+            index = close_index + 1
             continue
-        if token.type == "list_item_close":
-            nested_item_depth -= 1
-            continue
-        if nested_item_depth == 0:
-            relevant.append(token)
-
-    return _tokens_payload(relevant)
+        index += 1
+    return _combine_payloads(payloads)
 
 
-def _container_block(
-    kind: BlockKind,
-    open_token: Token,
-    inner_tokens: list[Token],
-) -> _BlockPayload:
-    return _make_block(kind, open_token, _tokens_payload(inner_tokens))
+def _combine_payloads(payloads: list[_InlinePayload]) -> _InlinePayload:
+    return _InlinePayload(
+        "\n".join(payload.text for payload in payloads if payload.text),
+        tuple(link for payload in payloads for link in payload.links),
+        tuple(asset for payload in payloads for asset in payload.assets),
+    )
 
 
 def _html_block(token: Token) -> _BlockPayload:
     span = _source_span(token)
-    assets = _html_assets(token.content, span)
-    payload = _InlinePayload(token.content.removesuffix("\n"), assets=assets)
+    payload = _raw_html_payload(token.content.removesuffix("\n"), span)
     return _make_block(BlockKind.HTML, token, payload)
 
 
@@ -296,10 +345,7 @@ def _tokens_payload(tokens: list[Token]) -> _InlinePayload:
             payload = _InlinePayload(token.content.removesuffix("\n"))
         elif token.type == "html_block":
             token_span = _source_span(token)
-            payload = _InlinePayload(
-                token.content.removesuffix("\n"),
-                assets=_html_assets(token.content, token_span),
-            )
+            payload = _raw_html_payload(token.content.removesuffix("\n"), token_span)
         else:
             continue
         if payload.text:
@@ -339,12 +385,10 @@ def _inline_payload(children: list[Token], span: tuple[int, int]) -> _InlinePayl
                 )
             text_parts.append(alt_text)
         elif child.type == "html_inline":
-            html_assets = _html_assets(child.content, span)
-            assets.extend(html_assets)
-            if html_assets:
-                text_parts.extend(asset.alt_text or "" for asset in html_assets)
-            else:
-                text_parts.append(child.content)
+            html_payload = _raw_html_payload(child.content, span)
+            text_parts.append(html_payload.text)
+            links.extend(html_payload.links)
+            assets.extend(html_payload.assets)
 
     return _InlinePayload("".join(text_parts), tuple(links), tuple(assets))
 
@@ -357,11 +401,25 @@ def _inline_visible_text(children: list[Token]) -> str:
     )
 
 
-def _html_assets(html: str, span: tuple[int, int]) -> tuple[ParsedAsset, ...]:
+def _contains_only_wrapped_images(children: tuple[Token, ...]) -> bool:
+    for child in children:
+        if child.type == "image":
+            continue
+        if child.type == "text" and not child.content.strip():
+            continue
+        if child.type in {"softbreak", "hardbreak"}:
+            continue
+        if child.nesting != 0 and not child.block:
+            continue
+        return False
+    return True
+
+
+def _raw_html_payload(html: str, span: tuple[int, int]) -> _InlinePayload:
     parser = _ImageHTMLParser()
     parser.feed(html)
     parser.close()
-    return tuple(
+    assets = tuple(
         ParsedAsset(
             target=attributes["src"],
             alt_text=attributes.get("alt") or None,
@@ -372,6 +430,7 @@ def _html_assets(html: str, span: tuple[int, int]) -> tuple[ParsedAsset, ...]:
         )
         for attributes in parser.images
     )
+    return _InlinePayload(html, tuple(parser.links), assets)
 
 
 def _target_metadata(
