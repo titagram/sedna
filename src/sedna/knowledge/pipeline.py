@@ -536,7 +536,6 @@ class IngestionPipeline:
         )
 
     def _validate_incremental_state(self, manifest: DocumentManifest) -> None:
-        should_have_quarantine = manifest.ingestion_status is IngestionStatus.QUARANTINED
         try:
             quarantine = self.repository.load_quarantine(manifest.source_id)
         except FileNotFoundError:
@@ -547,22 +546,14 @@ class IngestionPipeline:
                 "canonical_state_mismatch",
                 "stored quarantine record is invalid",
             ) from exc
-        if (quarantine is not None) != should_have_quarantine:
+        try:
+            self.repository.validate_source_state(manifest, quarantine)
+        except ValueError as exc:
             raise CandidateIngestionError(
                 manifest.source_id,
                 "canonical_state_mismatch",
-                "manifest and quarantine state disagree",
-            )
-        if quarantine is not None and (
-            quarantine.reason_codes != tuple(sorted(manifest.quarantine_reasons))
-            or quarantine.parser_profile != manifest.parser_profile
-            or quarantine.extraction != manifest.extraction
-        ):
-            raise CandidateIngestionError(
-                manifest.source_id,
-                "canonical_state_mismatch",
-                "manifest and quarantine contracts disagree",
-            )
+                "manifest and quarantine disposition contracts disagree",
+            ) from exc
 
     def _persist_unclassified_quarantine(
         self,

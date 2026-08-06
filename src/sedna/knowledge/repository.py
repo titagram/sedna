@@ -266,7 +266,7 @@ class CanonicalKnowledgeRepository:
         quarantine: QuarantineRecord | None,
     ) -> None:
         """Commit one manifest/quarantine state transition with rollback on failure."""
-        self._validate_transition(manifest, quarantine)
+        self.validate_source_state(manifest, quarantine)
         with self._transition_lock:
             old_manifest = self._read_optional_bytes("manifests", manifest.source_id)
             old_quarantine = self._read_optional_bytes("quarantine", manifest.source_id)
@@ -434,15 +434,16 @@ class CanonicalKnowledgeRepository:
             return
         directory_fd = self._open_child_directory(directory, create=True)
         try:
-            self._atomic_write(directory_fd, f"{record_id}.json", payload.decode("utf-8"))
+            self._atomic_write_bytes(directory_fd, f"{record_id}.json", payload)
         finally:
             os.close(directory_fd)
 
     @staticmethod
-    def _validate_transition(
+    def validate_source_state(
         manifest: DocumentManifest,
         quarantine: QuarantineRecord | None,
     ) -> None:
+        """Validate the complete canonical disposition pair for one source."""
         is_quarantined = manifest.ingestion_status.value == "quarantined"
         if is_quarantined != (quarantine is not None):
             raise ValueError("quarantined manifests require exactly one quarantine record")
@@ -511,6 +512,14 @@ class CanonicalKnowledgeRepository:
 
     @staticmethod
     def _atomic_write(directory_fd: int, filename: str, payload: str) -> None:
+        CanonicalKnowledgeRepository._atomic_write_bytes(
+            directory_fd,
+            filename,
+            payload.encode("utf-8"),
+        )
+
+    @staticmethod
+    def _atomic_write_bytes(directory_fd: int, filename: str, payload: bytes) -> None:
         temporary_name: str | None = None
         try:
             for _ in range(32):
@@ -532,9 +541,7 @@ class CanonicalKnowledgeRepository:
             try:
                 with os.fdopen(
                     temporary_fd,
-                    mode="w",
-                    encoding="utf-8",
-                    newline="",
+                    mode="wb",
                 ) as stream:
                     temporary_fd = -1
                     stream.write(payload)

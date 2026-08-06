@@ -222,6 +222,36 @@ def test_quarantined_transition_rolls_back_if_manifest_write_fails(
     assert repository.quarantine_exists("source-123") is False
 
 
+def test_transition_rollback_restores_non_utf8_bytes_and_original_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    old_manifest = complete_manifest().model_copy(
+        update={
+            "ingestion_status": IngestionStatus.QUARANTINED,
+            "quarantine_reasons": ("ambiguous",),
+        }
+    )
+    repository.write_manifest(old_manifest)
+    quarantine_path = repository.write_quarantine(complete_quarantine())
+    corrupt_bytes = b"\xff\xfe\x00corrupt quarantine bytes"
+    quarantine_path.write_bytes(corrupt_bytes)
+    new_manifest = complete_manifest()
+
+    def fail_manifest(manifest: DocumentManifest) -> Path:
+        del manifest
+        raise OSError("original injected failure")
+
+    monkeypatch.setattr(repository, "write_manifest", fail_manifest)
+
+    with pytest.raises(OSError, match="original injected failure"):
+        repository.transition_source(new_manifest, None)
+
+    assert repository.load_manifest("source-123") == old_manifest
+    assert quarantine_path.read_bytes() == corrupt_bytes
+
+
 def test_atomic_replace_failure_preserves_old_target_and_cleans_temp(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

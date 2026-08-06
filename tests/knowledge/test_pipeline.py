@@ -13,6 +13,7 @@ import pytest
 import sedna.knowledge.pipeline as pipeline_module
 from sedna.knowledge import IngestionPipeline as PublicIngestionPipeline
 from sedna.knowledge.inventory import SourceCandidate, discover_sources, stable_source_id
+from sedna.knowledge.parsing import LogicalSegment
 from sedna.knowledge.pipeline import (
     CandidateIngestionError,
     IngestionPipeline,
@@ -217,6 +218,36 @@ def test_profile_and_segment_value_errors_are_explicit_implementation_failures(
     with pytest.raises(CandidateIngestionError) as segment_error:
         pipeline.prepare(candidate)
     assert segment_error.value.reason_code == "segmenter_failure"
+
+
+def test_prepared_boundary_rejects_unsanitized_segmenter_output_before_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline, candidate = _fixture_pipeline(tmp_path, "machine-walkthrough.md")
+
+    def leaking_segmenter(document: object) -> tuple[LogicalSegment, ...]:
+        del document
+        return (
+            LogicalSegment.model_construct(
+                block_indices=(0,),
+                text="HTB{LEAK}",
+                start_line=1,
+                end_line=1,
+                heading_path=("HTB{HEADING}",),
+                assets=(),
+            ),
+        )
+
+    monkeypatch.setattr(pipeline_module, "segment_document", leaking_segmenter)
+
+    with pytest.raises(CandidateIngestionError) as error:
+        pipeline.prepare(candidate)
+
+    assert error.value.reason_code == "prepared_source_invariant"
+    assert pipeline.last_outcome == "failed"
+    with pytest.raises(FileNotFoundError):
+        pipeline.repository.load_manifest(candidate.source_id)
 
 
 def test_manifest_title_is_sanitized_while_parsed_document_keeps_raw_text(
@@ -497,6 +528,28 @@ def test_unchanged_quarantine_requires_a_strict_matching_record(
         payload = json.loads(quarantine_path.read_text(encoding="utf-8"))
         payload["extraction"]["extractor_version"] = "old"
         quarantine_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CandidateIngestionError) as error:
+        pipeline.prepare(candidate)
+
+    assert error.value.reason_code == "canonical_state_mismatch"
+    assert pipeline.last_outcome == "failed"
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    ("machine-walkthrough.md", "challenge-flag-only.md"),
+)
+def test_unchanged_nonquarantined_manifest_rejects_quarantine_reasons(
+    tmp_path: Path,
+    fixture: str,
+) -> None:
+    pipeline, candidate = _fixture_pipeline(tmp_path, fixture)
+    pipeline.prepare(candidate)
+    manifest_path = pipeline.repository.root / "manifests" / f"{candidate.source_id}.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["quarantine_reasons"] = ["stale_reason"]
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(CandidateIngestionError) as error:
         pipeline.prepare(candidate)

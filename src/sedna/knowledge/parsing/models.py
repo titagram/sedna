@@ -10,7 +10,12 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, GetCoreSchemaHandler, model_validator
 from pydantic_core import CoreSchema, core_schema
 
-from sedna.knowledge.parsing.sanitize import sanitize_asset_target
+from sedna.knowledge.parsing.sanitize import (
+    _contextual_hex_flag_values,
+    _sanitize_searchable_text,
+    sanitize_asset_target,
+    sanitize_searchable_text,
+)
 from sedna.knowledge.schema import DocumentManifest
 
 NonEmptyString = Annotated[str, Field(min_length=1)]
@@ -181,6 +186,14 @@ class LogicalSegment(BaseModel):
             raise ValueError("end_line must not precede start_line")
         if any(current != previous + 1 for previous, current in pairwise(self.block_indices)):
             raise ValueError("block_indices must be unique, increasing, and contiguous")
+        if sanitize_searchable_text(self.text, self.heading_path) != self.text:
+            raise ValueError("logical segment text must be retrieval-safe")
+        for index, component in enumerate(self.heading_path):
+            if (
+                sanitize_searchable_text(component, self.heading_path[: index + 1])
+                != component
+            ):
+                raise ValueError("logical segment heading path must be retrieval-safe")
         return self
 
 
@@ -201,6 +214,13 @@ class PreparedSource(BaseModel):
         if self.manifest.path != self.document.path:
             raise ValueError("manifest and document path must match")
 
+        block_contexts = _document_block_contexts(self.document)
+        known_hex_flags = frozenset(
+            value
+            for block, heading_path in block_contexts
+            for value in _contextual_hex_flag_values(block.text, heading_path)
+        )
+
         for segment in self.segments:
             if segment.block_indices[-1] >= len(self.document.blocks):
                 raise ValueError("segment block index is outside the parsed document")
@@ -216,6 +236,24 @@ class PreparedSource(BaseModel):
             ):
                 raise ValueError("segment line range must exactly span its referenced blocks")
 
+            referenced_contexts = tuple(
+                block_contexts[index] for index in segment.block_indices
+            )
+            expected_text = "\n\n".join(
+                _sanitize_searchable_text(block.text, heading_path, known_hex_flags)
+                for block, heading_path in referenced_contexts
+            )
+            if segment.text != expected_text:
+                raise ValueError("segment text must exactly match retrieval-safe source blocks")
+            expected_heading_path = _safe_heading_path(
+                referenced_contexts[0][1],
+                known_hex_flags,
+            )
+            if segment.heading_path != expected_heading_path:
+                raise ValueError(
+                    "segment heading path must exactly match retrieval-safe source scope"
+                )
+
             for asset in segment.assets:
                 if asset.asset_index >= len(self.document.assets):
                     raise ValueError("segment asset index is outside the parsed document")
@@ -230,3 +268,34 @@ class PreparedSource(BaseModel):
                 if asset.end_line < segment.start_line or asset.start_line > segment.end_line:
                     raise ValueError("segment asset line range must overlap the segment span")
         return self
+
+
+def _document_block_contexts(
+    document: ParsedDocument,
+) -> tuple[tuple[ParsedBlock, tuple[str, ...]], ...]:
+    heading_stack: list[tuple[int, str]] = []
+    contexts: list[tuple[ParsedBlock, tuple[str, ...]]] = []
+    for block in document.blocks:
+        if block.kind is BlockKind.HEADING:
+            assert block.level is not None
+            while heading_stack and heading_stack[-1][0] >= block.level:
+                heading_stack.pop()
+            heading_stack.append((block.level, block.text))
+        contexts.append((block, tuple(text for _, text in heading_stack)))
+    return tuple(contexts)
+
+
+def _safe_heading_path(
+    heading_path: tuple[str, ...],
+    known_hex_flags: frozenset[str],
+) -> tuple[str, ...]:
+    safe: list[str] = []
+    for index, component in enumerate(heading_path):
+        sanitized = _sanitize_searchable_text(
+            component,
+            heading_path[: index + 1],
+            known_hex_flags,
+        ).strip()
+        if sanitized:
+            safe.append(sanitized)
+    return tuple(safe)

@@ -177,6 +177,17 @@ def test_segment_asset_is_a_retrieval_safe_view_with_no_raw_metadata():
         )
 
 
+def test_logical_segment_rejects_unsanitized_text_and_heading_recursively():
+    with pytest.raises(ValidationError, match="retrieval-safe"):
+        LogicalSegment(
+            block_indices=(0,),
+            text="HTB{LEAK}",
+            start_line=1,
+            end_line=1,
+            heading_path=("HTB{HEADING}",),
+        )
+
+
 @pytest.mark.parametrize("block_indices", [(1, 0), (0, 0), (0, 2)])
 def test_logical_segment_requires_unique_increasing_block_indices(block_indices):
     with pytest.raises(ValidationError):
