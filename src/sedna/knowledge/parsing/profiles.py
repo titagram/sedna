@@ -111,6 +111,8 @@ _VOID_HTML_TAGS = frozenset(
         "wbr",
     }
 )
+_GITHUB_PROFILE_MARKER_KEY = "profile_cleanup"
+_GITHUB_PROFILE_MARKER_VALUE = "github_centered_unwrapped_v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +121,13 @@ class _RelationshipEvent:
     column: int
     sequence: int
     target: str
+
+
+@dataclass(frozen=True, slots=True)
+class _TextReplacement:
+    start: int
+    end: int
+    text: str
 
 
 class _PresentationHTMLParser(HTMLParser):
@@ -285,38 +294,50 @@ def _remove_note_metadata(
     block: ParsedBlock,
     starting_sequence: int,
 ) -> tuple[tuple[ParsedBlock, ...], tuple[_RelationshipEvent, ...]]:
-    lines = block.text.splitlines()
+    raw_lines = block.text.splitlines(keepends=True)
+    lines = tuple(_remove_line_ending(raw_line) for raw_line in raw_lines)
     if not any(_NOTE_METADATA_RE.fullmatch(line.strip()) for line in lines):
         return (block,), ()
 
     kept_blocks: list[ParsedBlock] = []
-    relationship_events = list(_url_relationship_events(block, starting_sequence))
-    sequence = starting_sequence + len(relationship_events)
+    relationship_events: list[_RelationshipEvent] = []
+    sequence = starting_sequence
+    text_offset = 0
 
-    for offset, line in enumerate(lines):
-        source_line = min(block.start_line + offset, block.end_line)
+    for line_offset, (raw_line, line) in enumerate(zip(raw_lines, lines, strict=True)):
+        source_line = min(block.start_line + line_offset, block.end_line)
+        line_block = _slice_block(
+            block,
+            text=line,
+            text_start=text_offset,
+            text_end=text_offset + len(line),
+            source_line=source_line,
+        )
+        text_offset += len(raw_line)
         match = _NOTE_METADATA_RE.fullmatch(line.strip())
         if match is None:
             if line.strip():
-                kept_blocks.append(
-                    _copy_block(
-                        block,
-                        text=line,
-                        start_line=source_line,
-                        end_line=source_line,
-                    )
-                )
+                kept_blocks.append(line_block)
             continue
 
         label = re.sub(r"\s+", " ", match.group("label")).casefold()
         if label == "tags":
             continue
-        for event in _wiki_events_from_text(
-            match.group("value"),
-            source_line,
-            sequence,
-        ):
-            relationship_events.append(event)
+
+        line_events = [
+            *_url_relationship_events(line_block, sequence),
+            *_wiki_relationship_events(line_block, sequence),
+        ]
+        line_events.sort(key=lambda event: (event.column, event.sequence))
+        for event in line_events:
+            relationship_events.append(
+                _RelationshipEvent(
+                    line=event.line,
+                    column=event.column,
+                    sequence=sequence,
+                    target=event.target,
+                )
+            )
             sequence += 1
 
     return tuple(kept_blocks), tuple(relationship_events)
@@ -326,8 +347,15 @@ def _convert_obsidian_embeds(
     block: ParsedBlock,
 ) -> tuple[ParsedBlock, tuple[ParsedAsset, ...]]:
     assets: list[ParsedAsset] = []
+    replacements: list[_TextReplacement] = []
+    inline_code_spans = _inline_code_spans(block)
 
-    def replace_embed(match: re.Match[str]) -> str:
+    for match in _OBSIDIAN_EMBED_RE.finditer(block.text):
+        if any(
+            start <= match.start() and match.end() <= end
+            for start, end in inline_code_spans
+        ):
+            continue
         target = match.group("target").strip()
         alias = (match.group("alias") or "").strip() or None
         source_line = block.start_line + block.text[: match.start()].count("\n")
@@ -340,17 +368,24 @@ def _convert_obsidian_embeds(
                 metadata={"source": "obsidian_embed"},
             )
         )
-        return alias or target
+        replacements.append(
+            _TextReplacement(match.start(), match.end(), alias or target)
+        )
 
-    rewritten_text = _OBSIDIAN_EMBED_RE.sub(replace_embed, block.text)
     if not assets:
         return block, ()
 
+    rewritten_text = _apply_text_replacements(block.text, replacements)
     embed_only = _OBSIDIAN_EMBED_RE.fullmatch(block.text.strip()) is not None
     kind = BlockKind.IMAGE if embed_only else block.kind
-    metadata = _metadata_with_asset_targets(block, assets)
+    rewritten_block = _copy_block(
+        block,
+        text=rewritten_text,
+        metadata=_metadata_after_replacements(block, replacements),
+    )
+    metadata = _metadata_with_asset_targets(rewritten_block, assets)
     return (
-        _copy_block(block, kind=kind, text=rewritten_text, metadata=metadata),
+        _copy_block(rewritten_block, kind=kind, metadata=metadata),
         tuple(assets),
     )
 
@@ -360,6 +395,12 @@ def _clean_github_walkthrough(document: ParsedDocument) -> ParsedDocument:
     open_centered_wrappers = 0
 
     for block in document.blocks:
+        if (
+            block.metadata.get(_GITHUB_PROFILE_MARKER_KEY)
+            == _GITHUB_PROFILE_MARKER_VALUE
+        ):
+            blocks.append(block)
+            continue
         if block.kind not in {
             BlockKind.HEADING,
             BlockKind.HTML,
@@ -414,7 +455,9 @@ def _unwrap_centered_block(
     kind = block.kind
     if block.kind is BlockKind.HTML:
         kind = BlockKind.IMAGE if assets and not visible_text else BlockKind.PARAGRAPH
-    return _copy_block(block, kind=kind, text=text)
+    metadata = dict(block.metadata)
+    metadata[_GITHUB_PROFILE_MARKER_KEY] = _GITHUB_PROFILE_MARKER_VALUE
+    return _copy_block(block, kind=kind, text=text, metadata=metadata)
 
 
 def _rebuild_document(
@@ -529,6 +572,134 @@ def _metadata_with_asset_targets(
     return metadata
 
 
+def _slice_block(
+    block: ParsedBlock,
+    *,
+    text: str,
+    text_start: int,
+    text_end: int,
+    source_line: int,
+) -> ParsedBlock:
+    metadata = dict(block.metadata)
+    spans = tuple(
+        (max(start, text_start) - text_start, min(end, text_end) - text_start)
+        for start, end in _inline_code_spans(block)
+        if start < text_end and text_start < end
+    )
+    _set_inline_code_spans(metadata, spans)
+
+    targets = _metadata_values(block, "urls", "url")
+    offsets = _url_offsets(block)
+    selected = tuple(
+        (target, offset - text_start)
+        for target, offset in zip(targets, offsets, strict=False)
+        if text_start <= offset < text_end
+    )
+    _set_url_metadata(metadata, selected)
+    return _copy_block(
+        block,
+        text=text,
+        start_line=source_line,
+        end_line=source_line,
+        metadata=metadata,
+    )
+
+
+def _metadata_after_replacements(
+    block: ParsedBlock,
+    replacements: list[_TextReplacement],
+) -> dict[str, str]:
+    metadata = dict(block.metadata)
+    spans = tuple(
+        (
+            _shift_offset(start, replacements),
+            _shift_offset(end, replacements),
+        )
+        for start, end in _inline_code_spans(block)
+    )
+    _set_inline_code_spans(metadata, spans)
+
+    targets = _metadata_values(block, "urls", "url")
+    offsets = _url_offsets(block)
+    if len(offsets) == len(targets):
+        _set_url_metadata(
+            metadata,
+            tuple(
+                (target, _shift_offset(offset, replacements))
+                for target, offset in zip(targets, offsets, strict=True)
+            ),
+        )
+    return metadata
+
+
+def _set_inline_code_spans(
+    metadata: dict[str, str],
+    spans: tuple[tuple[int, int], ...],
+) -> None:
+    if spans:
+        metadata["inline_code_spans"] = json.dumps(
+            spans,
+            separators=(",", ":"),
+        )
+    else:
+        metadata.pop("inline_code_spans", None)
+
+
+def _set_url_metadata(
+    metadata: dict[str, str],
+    relationships: tuple[tuple[str, int], ...],
+) -> None:
+    metadata.pop("urls", None)
+    metadata.pop("url", None)
+    metadata.pop("url_offsets", None)
+    if not relationships:
+        return
+    targets = tuple(target for target, _ in relationships)
+    offsets = tuple(offset for _, offset in relationships)
+    metadata["urls"] = json.dumps(
+        targets,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    metadata["url_offsets"] = json.dumps(offsets, separators=(",", ":"))
+    if len(targets) == 1:
+        metadata["url"] = targets[0]
+
+
+def _apply_text_replacements(
+    text: str,
+    replacements: list[_TextReplacement],
+) -> str:
+    parts: list[str] = []
+    cursor = 0
+    for replacement in replacements:
+        parts.append(text[cursor : replacement.start])
+        parts.append(replacement.text)
+        cursor = replacement.end
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def _shift_offset(offset: int, replacements: list[_TextReplacement]) -> int:
+    delta = 0
+    for replacement in replacements:
+        if replacement.end <= offset:
+            delta += len(replacement.text) - (replacement.end - replacement.start)
+            continue
+        if replacement.start < offset < replacement.end:
+            return replacement.start + delta
+        break
+    return offset + delta
+
+
+def _remove_line_ending(text: str) -> str:
+    if text.endswith("\r\n"):
+        return text[:-2]
+    if text.endswith(("\n", "\r")):
+        return text[:-1]
+    return text
+
+
 def _copy_block(
     block: ParsedBlock,
     *,
@@ -614,13 +785,17 @@ def _url_relationship_events(
     if not targets:
         return ()
 
-    literal_offsets: list[int | None] = []
-    search_offset = 0
-    for target in targets:
-        offset = block.text.find(target, search_offset)
-        literal_offsets.append(offset if offset >= 0 else None)
-        if offset >= 0:
-            search_offset = offset + len(target)
+    stored_offsets = _url_offsets(block)
+    if len(stored_offsets) == len(targets):
+        literal_offsets: list[int | None] = list(stored_offsets)
+    else:
+        literal_offsets = []
+        search_offset = 0
+        for target in targets:
+            offset = block.text.find(target, search_offset)
+            literal_offsets.append(offset if offset >= 0 else None)
+            if offset >= 0:
+                search_offset = offset + len(target)
 
     events: list[_RelationshipEvent] = []
     for index, (target, offset) in enumerate(zip(targets, literal_offsets, strict=True)):
@@ -636,6 +811,18 @@ def _url_relationship_events(
             _RelationshipEvent(line, column, starting_sequence + index, target)
         )
     return tuple(events)
+
+
+def _url_offsets(block: ParsedBlock) -> tuple[int, ...]:
+    serialized = block.metadata.get("url_offsets")
+    if serialized is None:
+        return ()
+    values = json.loads(serialized)
+    if not isinstance(values, list) or not all(
+        isinstance(value, int) for value in values
+    ):
+        return ()
+    return tuple(values)
 
 
 def _best_effort_url_position(

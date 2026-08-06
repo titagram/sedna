@@ -1,5 +1,6 @@
 """Behavioral tests for source-specific structural cleanup profiles."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -155,6 +156,29 @@ def test_obsidian_profile_excludes_inline_code_wikilink_literals():
     assert cleaned.relationships == ("Actual Note",)
 
 
+def test_obsidian_profile_rebases_inline_code_after_metadata_and_embed_rewrites():
+    source = parse_markdown(
+        "source-note",
+        "combined.md",
+        "Tags: #academy\n"
+        "Related to: [[DNS]]\n"
+        "Keep ![[proof.png|Proof]] then `[[Literal Code]]` and "
+        "open [[Folder/Actual Note|actual]].\n",
+    )
+
+    cleaned = apply_profile(source, "academy_obsidian")
+    body = cleaned.blocks[0]
+    spans = json.loads(body.metadata["inline_code_spans"])
+
+    assert body.text == (
+        "Keep Proof then [[Literal Code]] and open [[Folder/Actual Note|actual]]."
+    )
+    assert body.text[slice(*spans[0])] == "[[Literal Code]]"
+    assert cleaned.relationships == ("DNS", "Folder/Actual Note")
+    assert [asset.target for asset in cleaned.assets] == ["proof.png"]
+    assert apply_profile(cleaned, "academy_obsidian") == cleaned
+
+
 def test_obsidian_profile_preserves_urls_on_removed_metadata_lines_not_tags():
     source = parse_markdown(
         "source-note",
@@ -175,6 +199,32 @@ def test_obsidian_profile_preserves_urls_on_removed_metadata_lines_not_tags():
         "https://html.test",
     )
     assert "Tag Taxonomy" not in cleaned.relationships
+
+
+def test_obsidian_profile_discards_tag_line_urls_but_keeps_other_metadata_urls():
+    source = parse_markdown(
+        "source-note",
+        "metadata-urls.md",
+        "# Note\n\n"
+        "Tags: [taxonomy](https://tags.test) "
+        '<a href="https://tag-html.test">tag</a> [[Tag Note]]\n'
+        "Related to: [vendor](https://vendor.test)\n"
+        'See also: <a href="https://reference.test">reference</a>\n'
+        "Previous: [[Academy/Home]]\n\n"
+        "Body [guide](https://body.test).\n",
+    )
+
+    cleaned = apply_profile(source, "academy_obsidian")
+
+    assert cleaned.relationships == (
+        "https://vendor.test",
+        "https://reference.test",
+        "Academy/Home",
+        "https://body.test",
+    )
+    assert "https://tags.test" not in cleaned.relationships
+    assert "https://tag-html.test" not in cleaned.relationships
+    assert "Tag Note" not in cleaned.relationships
 
 
 def test_github_profile_unwraps_centered_presentation_without_losing_content():
@@ -255,6 +305,25 @@ def test_github_profile_keeps_nested_and_sibling_content_inside_centered_root():
         "Host\ncurl TARGET_IP\nObserved output\nReference"
     )
     assert cleaned.relationships == ("https://reference.test",)
+
+
+def test_github_profile_is_idempotent_when_visible_code_looks_like_centered_html():
+    source = parse_markdown(
+        "source-github",
+        "walkthrough.md",
+        '<div align="center"><code>&lt;div align="center"&gt;'
+        'x&lt;/div&gt;</code><a href="https://reference.test"></a>'
+        '<img src="proof.png" alt="proof"></div>\n',
+    )
+
+    once = apply_profile(source, "github_walkthrough")
+    twice = apply_profile(once, "github_walkthrough")
+
+    assert once.blocks[0].text == '<div align="center">x</div>'
+    assert once.relationships == ("https://reference.test",)
+    assert [asset.target for asset in once.assets] == ["proof.png"]
+    assert twice == once
+    assert twice.model_validate_json(twice.model_dump_json()) == twice
 
 
 @pytest.mark.parametrize(

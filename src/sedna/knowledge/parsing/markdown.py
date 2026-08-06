@@ -24,6 +24,7 @@ class _InlinePayload:
     links: tuple[str, ...] = ()
     assets: tuple[ParsedAsset, ...] = ()
     code_spans: tuple[tuple[int, int], ...] = ()
+    link_offsets: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +224,7 @@ def _table_block(open_token: Token, inner_tokens: list[Token]) -> _BlockPayload:
     links: list[str] = []
     assets: list[ParsedAsset] = []
     code_spans: list[tuple[int, int]] = []
+    link_offsets: list[int] = []
     current_cells: list[_InlinePayload] | None = None
 
     for token in inner_tokens:
@@ -232,6 +234,11 @@ def _table_block(open_token: Token, inner_tokens: list[Token]) -> _BlockPayload:
             row_start = sum(len(row) + 1 for row in rows)
             cell_start = row_start
             for cell in current_cells:
+                links.extend(cell.links)
+                link_offsets.extend(
+                    cell_start + offset for offset in cell.link_offsets
+                )
+                assets.extend(cell.assets)
                 code_spans.extend(
                     (cell_start + start, cell_start + end)
                     for start, end in cell.code_spans
@@ -242,14 +249,13 @@ def _table_block(open_token: Token, inner_tokens: list[Token]) -> _BlockPayload:
         elif token.type == "inline" and current_cells is not None:
             payload = _inline_payload(token.children or (), _source_span(token))
             current_cells.append(payload)
-            links.extend(payload.links)
-            assets.extend(payload.assets)
 
     payload = _InlinePayload(
         "\n".join(rows),
         tuple(links),
         tuple(assets),
         tuple(code_spans),
+        tuple(link_offsets),
     )
     return _make_block(BlockKind.TABLE, open_token, payload)
 
@@ -328,7 +334,12 @@ def _make_block(
     level: int | None = None,
 ) -> _BlockPayload:
     start_line, end_line = _source_span(source_token)
-    metadata = _target_metadata(payload.links, payload.assets, payload.code_spans)
+    metadata = _target_metadata(
+        payload.links,
+        payload.assets,
+        payload.code_spans,
+        payload.link_offsets,
+    )
     return _BlockPayload(
         ParsedBlock(
             kind=kind,
@@ -348,6 +359,7 @@ def _tokens_payload(tokens: list[Token]) -> _InlinePayload:
     links: list[str] = []
     assets: list[ParsedAsset] = []
     code_spans: list[tuple[int, int]] = []
+    link_offsets: list[int] = []
     output_length = 0
     for token in tokens:
         if token.type == "inline":
@@ -359,9 +371,11 @@ def _tokens_payload(tokens: list[Token]) -> _InlinePayload:
             payload = _raw_html_payload(token.content.removesuffix("\n"), token_span)
         else:
             continue
+        payload_start = output_length
         if payload.text:
             if text_parts:
                 output_length += 1
+            payload_start = output_length
             code_spans.extend(
                 (output_length + start, output_length + end)
                 for start, end in payload.code_spans
@@ -369,12 +383,16 @@ def _tokens_payload(tokens: list[Token]) -> _InlinePayload:
             text_parts.append(payload.text)
             output_length += len(payload.text)
         links.extend(payload.links)
+        link_offsets.extend(
+            payload_start + offset for offset in payload.link_offsets
+        )
         assets.extend(payload.assets)
     return _InlinePayload(
         "\n".join(text_parts),
         tuple(links),
         tuple(assets),
         tuple(code_spans),
+        tuple(link_offsets),
     )
 
 
@@ -383,6 +401,7 @@ def _inline_payload(children: list[Token], span: tuple[int, int]) -> _InlinePayl
     links: list[str] = []
     assets: list[ParsedAsset] = []
     code_spans: list[tuple[int, int]] = []
+    link_offsets: list[int] = []
     output_length = 0
 
     for child in children:
@@ -400,6 +419,7 @@ def _inline_payload(children: list[Token], span: tuple[int, int]) -> _InlinePayl
             href = child.attrGet("href")
             if href:
                 links.append(href)
+                link_offsets.append(output_length)
         elif child.type == "image":
             alt_text = _inline_visible_text(child.children or ()) or child.content
             target = child.attrGet("src")
@@ -418,6 +438,9 @@ def _inline_payload(children: list[Token], span: tuple[int, int]) -> _InlinePayl
             output_length += len(alt_text)
         elif child.type == "html_inline":
             html_payload = _raw_html_payload(child.content, span)
+            link_offsets.extend(
+                output_length + offset for offset in html_payload.link_offsets
+            )
             text_parts.append(html_payload.text)
             output_length += len(html_payload.text)
             links.extend(html_payload.links)
@@ -428,6 +451,7 @@ def _inline_payload(children: list[Token], span: tuple[int, int]) -> _InlinePayl
         tuple(links),
         tuple(assets),
         tuple(code_spans),
+        tuple(link_offsets),
     )
 
 
@@ -468,19 +492,36 @@ def _raw_html_payload(html: str, span: tuple[int, int]) -> _InlinePayload:
         )
         for attributes in parser.images
     )
-    return _InlinePayload(html, tuple(parser.links), assets)
+    link_offsets: list[int] = []
+    search_offset = 0
+    for target in parser.links:
+        offset = html.find(target, search_offset)
+        link_offsets.append(max(offset, 0))
+        if offset >= 0:
+            search_offset = offset + len(target)
+    return _InlinePayload(
+        html,
+        tuple(parser.links),
+        assets,
+        link_offsets=tuple(link_offsets),
+    )
 
 
 def _target_metadata(
     links: tuple[str, ...],
     assets: tuple[ParsedAsset, ...],
     code_spans: tuple[tuple[int, int], ...],
+    link_offsets: tuple[int, ...],
 ) -> dict[str, str]:
     metadata: dict[str, str] = {}
     if links:
         metadata["urls"] = _compact_json(links)
         if len(links) == 1:
             metadata["url"] = links[0]
+        metadata["url_offsets"] = json.dumps(
+            link_offsets,
+            separators=(",", ":"),
+        )
     targets = tuple(asset.target for asset in assets)
     if targets:
         metadata["asset_targets"] = _compact_json(targets)
