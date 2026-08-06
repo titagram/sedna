@@ -11,6 +11,7 @@ from sedna.knowledge.parsing import (
     ParsedBlock,
     ParsedDocument,
     PreparedSource,
+    parse_markdown,
 )
 from sedna.knowledge.schema import (
     DocumentManifest,
@@ -356,3 +357,172 @@ def test_prepared_source_accepts_owned_asset_overlapping_segment_span():
     prepared = PreparedSource(manifest=manifest(), document=document, segments=(segment,))
 
     assert prepared.segments[0].assets == (overlapping_asset,)
+
+
+def test_parse_markdown_preserves_structure_and_exact_source_lines():
+    parsed = parse_markdown(
+        "source-test",
+        "sample.md",
+        "# Title\n\nObserve HTTP.\n\n```bash session=scan\nnmap -sV TARGET_IP\n```\n",
+    )
+
+    assert [block.kind for block in parsed.blocks] == [
+        BlockKind.HEADING,
+        BlockKind.PARAGRAPH,
+        BlockKind.CODE,
+    ]
+    assert [(block.start_line, block.end_line) for block in parsed.blocks] == [
+        (1, 1),
+        (3, 3),
+        (5, 7),
+    ]
+    assert parsed.blocks[0].level == 1
+    assert parsed.blocks[2].language == "bash"
+    assert parsed.blocks[2].metadata["info"] == "bash session=scan"
+    assert parsed.blocks[2].text == "nmap -sV TARGET_IP"
+
+
+def test_parse_markdown_supports_setext_headings_and_thematic_breaks():
+    parsed = parse_markdown(
+        "source-test",
+        "sample.md",
+        "Main title\n==========\n\nSub title\n---------\n\n---\n",
+    )
+
+    structure = [
+        (block.kind, block.level, block.start_line, block.end_line)
+        for block in parsed.blocks
+    ]
+    assert structure == [
+        (BlockKind.HEADING, 1, 1, 2),
+        (BlockKind.HEADING, 2, 4, 5),
+        (BlockKind.THEMATIC_BREAK, None, 7, 7),
+    ]
+
+
+def test_parse_markdown_preserves_tables_and_inline_links():
+    parsed = parse_markdown(
+        "source-test",
+        "sample.md",
+        "| Service | Reference |\n| --- | --- |\n| HTTP | [guide](https://example.test/one) |\n"
+        "| SSH | [notes](https://example.test/two) |\n",
+    )
+
+    assert len(parsed.blocks) == 1
+    table = parsed.blocks[0]
+    assert table.kind is BlockKind.TABLE
+    assert (table.start_line, table.end_line) == (1, 4)
+    assert table.text == (
+        "Service | Reference\nHTTP | guide\nSSH | notes"
+    )
+    assert table.metadata["urls"] == (
+        '["https://example.test/one","https://example.test/two"]'
+    )
+    assert parsed.relationships == (
+        "https://example.test/one",
+        "https://example.test/two",
+    )
+
+
+def test_parse_markdown_anchors_table_assets_to_their_row_token_map():
+    parsed = parse_markdown(
+        "source-test",
+        "sample.md",
+        "| Evidence |\n| --- |\n| ![response](response.png) |\n",
+    )
+
+    assert len(parsed.assets) == 1
+    assert (parsed.assets[0].start_line, parsed.assets[0].end_line) == (3, 3)
+
+
+def test_parse_markdown_emits_ordered_and_nested_unordered_list_items():
+    parsed = parse_markdown(
+        "source-test",
+        "sample.md",
+        "1. Enumerate\n2. Validate\n\n- Parent\n  - Child\n",
+    )
+
+    assert [block.kind for block in parsed.blocks] == [
+        BlockKind.ORDERED_LIST_ITEM,
+        BlockKind.ORDERED_LIST_ITEM,
+        BlockKind.UNORDERED_LIST_ITEM,
+        BlockKind.UNORDERED_LIST_ITEM,
+    ]
+    assert [(block.text, block.start_line, block.end_line) for block in parsed.blocks] == [
+        ("Enumerate", 1, 1),
+        ("Validate", 2, 3),
+        ("Parent", 4, 5),
+        ("Child", 5, 5),
+    ]
+
+
+def test_parse_markdown_preserves_blockquotes_and_html_blocks():
+    parsed = parse_markdown(
+        "source-test",
+        "sample.md",
+        "> Observation\n> continued\n\n<div class=\"note\">Keep this wrapper.</div>\n",
+    )
+
+    assert [block.kind for block in parsed.blocks] == [
+        BlockKind.BLOCKQUOTE,
+        BlockKind.HTML,
+    ]
+    assert parsed.blocks[0].text == "Observation\ncontinued"
+    assert (parsed.blocks[0].start_line, parsed.blocks[0].end_line) == (1, 2)
+    assert parsed.blocks[1].text == '<div class="note">Keep this wrapper.</div>'
+
+
+def test_parse_markdown_keeps_multiple_inline_links_and_images_without_losing_alt_text():
+    parsed = parse_markdown(
+        "source-test",
+        "sample.md",
+        "Read [one](https://one.test) and [two](https://two.test), then compare "
+        "![first **view**](one.png \"One\") with ![second](two.png).\n",
+    )
+
+    paragraph = parsed.blocks[0]
+    assert paragraph.kind is BlockKind.PARAGRAPH
+    assert paragraph.text == "Read one and two, then compare first view with second."
+    assert paragraph.metadata["urls"] == '["https://one.test","https://two.test"]'
+    assert paragraph.metadata["asset_targets"] == '["one.png","two.png"]'
+    assert [(asset.target, asset.alt_text, asset.title) for asset in parsed.assets] == [
+        ("one.png", "first view", "One"),
+        ("two.png", "second", None),
+    ]
+    assert all((asset.start_line, asset.end_line) == (1, 1) for asset in parsed.assets)
+
+
+def test_parse_markdown_emits_image_blocks_and_extracts_html_images_in_order():
+    parsed = parse_markdown(
+        "source-test",
+        "sample.md",
+        "![scan](scan.png)\n\n"
+        "<figure>\n<img src=\"before.png\" alt=\"Before\" title=\"Initial\">\n"
+        "<img alt=\"After\" src=\"after.png\">\n</figure>\n",
+    )
+
+    assert [block.kind for block in parsed.blocks] == [BlockKind.IMAGE, BlockKind.HTML]
+    assert parsed.blocks[0].metadata["asset_target"] == "scan.png"
+    assert parsed.blocks[1].metadata["asset_targets"] == '["before.png","after.png"]'
+    asset_details = [
+        (asset.target, asset.alt_text, asset.start_line, asset.end_line)
+        for asset in parsed.assets
+    ]
+    assert asset_details == [
+        ("scan.png", "scan", 1, 1),
+        ("before.png", "Before", 3, 6),
+        ("after.png", "After", 3, 6),
+    ]
+
+
+def test_parse_markdown_deduplicates_relationships_but_preserves_asset_occurrences():
+    parsed = parse_markdown(
+        "source-test",
+        "sample.md",
+        "[same](https://example.test) ![one](same.png)\n\n"
+        "[same again](https://example.test) ![two](same.png)\n",
+    )
+
+    assert parsed.relationships == ("https://example.test",)
+    assert [asset.target for asset in parsed.assets] == ["same.png", "same.png"]
+    assert [(asset.start_line, asset.end_line) for asset in parsed.assets] == [(1, 1), (3, 3)]

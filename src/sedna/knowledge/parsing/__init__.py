@@ -1,5 +1,6 @@
 """Public structural parsing contracts."""
 
+from sedna.knowledge.parsing.markdown import parse_markdown
 from sedna.knowledge.parsing.models import (
     BlockKind,
     LogicalSegment,
@@ -16,4 +17,5 @@ __all__ = [
     "ParsedBlock",
     "ParsedDocument",
     "PreparedSource",
+    "parse_markdown",
 ]
