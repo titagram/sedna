@@ -73,7 +73,17 @@ def _block_views(document: ParsedDocument) -> tuple[_BlockView, ...]:
         _BlockView(
             index=index,
             block=block,
-            heading_path=heading_path,
+            heading_path=tuple(
+                sanitized_component
+                for component in heading_path
+                if (
+                    sanitized_component := _sanitize_searchable_text(
+                        component,
+                        heading_path,
+                        known_hex_flags,
+                    ).strip()
+                )
+            ),
             searchable_text=_sanitize_searchable_text(
                 block.text,
                 heading_path,
@@ -114,19 +124,41 @@ def _atomic_groups(views: tuple[_BlockView, ...]) -> tuple[tuple[_BlockView, ...
         return ()
 
     groups: list[tuple[_BlockView, ...]] = []
-    group_start = 0
-    for position in range(len(views) - 1):
+    position = 0
+    while position < len(views):
+        group_start = position
         current = views[position].block
-        following = views[position + 1].block
-        protected_boundary = (
-            current.kind in {BlockKind.HEADING, BlockKind.CODE}
-            or following.kind is BlockKind.CODE
-        )
-        if not protected_boundary:
-            groups.append(views[group_start : position + 1])
-            group_start = position + 1
-    groups.append(views[group_start:])
+
+        if current.kind is BlockKind.HEADING:
+            position += 1
+            if position < len(views) and views[position].block.kind is not BlockKind.HEADING:
+                if views[position].block.kind is BlockKind.CODE:
+                    position += 1
+                    position = _consume_immediate_result(views, position)
+                else:
+                    position += 1
+                    if position < len(views) and views[position].block.kind is BlockKind.CODE:
+                        position += 1
+                        position = _consume_immediate_result(views, position)
+        elif current.kind is BlockKind.CODE:
+            position += 1
+            position = _consume_immediate_result(views, position)
+        elif position + 1 < len(views) and views[position + 1].block.kind is BlockKind.CODE:
+            position += 2
+            position = _consume_immediate_result(views, position)
+        else:
+            position += 1
+
+        groups.append(views[group_start:position])
     return tuple(groups)
+
+
+def _consume_immediate_result(views: tuple[_BlockView, ...], position: int) -> int:
+    if position >= len(views):
+        return position
+    if views[position].block.kind in {BlockKind.HEADING, BlockKind.CODE}:
+        return position
+    return position + 1
 
 
 def _pack_groups(

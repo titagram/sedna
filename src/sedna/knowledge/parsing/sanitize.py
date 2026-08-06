@@ -6,20 +6,21 @@ import re
 
 EXCLUDED_FLAG = "<EXCLUDED_FLAG>"
 
-_HTB_FLAG_RE = re.compile(r"\bHTB\{[^}\r\n]*\}", re.IGNORECASE)
+_HTB_FLAG_RE = re.compile(r"HTB\{[^}]{0,512}\}", re.IGNORECASE)
 _STANDALONE_32_HEX_RE = re.compile(
     r"(?<![A-Za-z0-9])[0-9A-Fa-f]{32}(?![A-Za-z0-9])"
 )
-_HEX_FLAG_HEADINGS = frozenset(
+_EXACT_HEX_FLAG_HEADINGS = frozenset(
     {
-        "final flag",
         "flag",
         "root",
-        "root flag",
+        "root txt",
         "user",
-        "user flag",
+        "user txt",
     }
 )
+_FLAG_WORDS = frozenset({"flag", "flags"})
+_FLAG_CONTEXT_WORDS = frozenset({"final", "root", "user"})
 
 
 def sanitize_searchable_text(text: str, heading_path: tuple[str, ...]) -> str:
@@ -63,7 +64,15 @@ def _sanitize_searchable_text(
 
 
 def _is_hex_flag_context(heading_path: tuple[str, ...]) -> bool:
-    return any(_normalize_heading(part) in _HEX_FLAG_HEADINGS for part in heading_path)
+    return any(_heading_is_hex_flag_context(part) for part in heading_path)
+
+
+def _heading_is_hex_flag_context(heading: str) -> bool:
+    normalized = _normalize_heading(heading)
+    if normalized in _EXACT_HEX_FLAG_HEADINGS:
+        return True
+    words = frozenset(normalized.split())
+    return bool(words & _FLAG_WORDS) and bool(words & _FLAG_CONTEXT_WORDS)
 
 
 def _normalize_heading(heading: str) -> str:
