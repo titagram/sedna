@@ -186,6 +186,143 @@ def test_metadata_separators_and_user_root_values_do_not_imply_procedure(
     assert "flag_only" in result.reasons
 
 
+def test_atx_user_root_hash_sections_are_flag_only_not_procedural(tmp_path: Path) -> None:
+    path = tmp_path / "flags.md"
+    text = """# Minimal machine record
+
+## User
+
+```
+0123456789abcdef0123456789abcdef
+```
+
+## Root
+
+```
+abcdef0123456789abcdef0123456789
+```
+"""
+    path.write_text(text, encoding="utf-8")
+    candidate = SourceCandidate(
+        source_id="source-atx-flags",
+        path=path,
+        relative_path="Write-ups/Machines/Example/flags.md",
+        suffix=".md",
+        sha256="f" * 64,
+        size_bytes=len(text.encode()),
+        assets=(),
+    )
+
+    result = classify_document(candidate, text)
+
+    assert result.document_type == DocumentType.EXCLUDED
+    assert result.ingestion_status == IngestionStatus.EXCLUDED
+    assert "flag_only" in result.reasons
+
+
+def test_unclosed_fence_at_eof_is_a_procedural_code_block(tmp_path: Path) -> None:
+    path = tmp_path / "unclosed.md"
+    text = """# Example machine
+
+## Enumeration
+
+The service response was recorded for the next investigative step.
+
+```text
+80/tcp open http
+"""
+    path.write_text(text, encoding="utf-8")
+    candidate = SourceCandidate(
+        source_id="source-unclosed-fence",
+        path=path,
+        relative_path="Write-ups/Machines/Example/unclosed.md",
+        suffix=".md",
+        sha256="1" * 64,
+        size_bytes=len(text.encode()),
+        assets=(),
+    )
+
+    result = classify_document(candidate, text)
+
+    assert result.document_type == DocumentType.MACHINE_WALKTHROUGH
+    assert result.ingestion_status == IngestionStatus.ACCEPTED
+    assert "procedural_signals" in result.reasons
+
+
+def test_genuine_challenge_method_is_a_challenge_walkthrough(tmp_path: Path) -> None:
+    path = tmp_path / "challenge.md"
+    text = """# Decoder challenge
+
+## Inspect the encoding
+
+We decoded the outer representation before interpreting its contents.
+
+## Interpret the result
+
+The command returned a structured payload that confirmed the hypothesis.
+"""
+    path.write_text(text, encoding="utf-8")
+    candidate = SourceCandidate(
+        source_id="source-challenge-method",
+        path=path,
+        relative_path="Write-ups/Challanges/Decoder/readme.md",
+        suffix=".md",
+        sha256="2" * 64,
+        size_bytes=len(text.encode()),
+        assets=(),
+    )
+
+    result = classify_document(candidate, text)
+
+    assert result.document_type == DocumentType.CHALLENGE_WALKTHROUGH
+    assert result.knowledge_role == KnowledgeRole.CASE_STUDY
+    assert result.ingestion_status == IngestionStatus.ACCEPTED
+
+
+def test_procedural_walkthrough_with_final_flag_remains_accepted(tmp_path: Path) -> None:
+    path = tmp_path / "walkthrough-with-flag.md"
+    text = """# Example machine
+
+## Enumeration
+
+We ran an initial check and the scan returned an exposed web service.
+
+```text
+80/tcp open http
+```
+
+## Exploitation
+
+The observed response confirmed that the selected path succeeded.
+
+```text
+shell obtained
+```
+
+## Final Flag
+
+```text
+HTB{case_outcome_must_not_override_procedure}
+```
+"""
+    path.write_text(text, encoding="utf-8")
+    candidate = SourceCandidate(
+        source_id="source-walkthrough-with-flag",
+        path=path,
+        relative_path="Write-ups/Machines/Example/walkthrough.md",
+        suffix=".md",
+        sha256="3" * 64,
+        size_bytes=len(text.encode()),
+        assets=(),
+    )
+
+    result = classify_document(candidate, text)
+
+    assert result.document_type == DocumentType.MACHINE_WALKTHROUGH
+    assert result.knowledge_role == KnowledgeRole.CASE_STUDY
+    assert result.ingestion_status == IngestionStatus.ACCEPTED
+
+
 def test_technical_reference_pdf_is_quarantined_until_supported(tmp_path: Path) -> None:
     path = tmp_path / "web-cheatsheet.pdf"
     path.write_bytes(b"%PDF-1.4")

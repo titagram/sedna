@@ -18,7 +18,7 @@ from sedna.knowledge.schema import (
 
 _ATX_HEADING_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
 _SETEXT_HEADING_RE = re.compile(r"(?m)^([^\n]+)\n\s*(?:={4,}|-{4,})\s*$")
-_FENCED_CODE_RE = re.compile(r"(?m)^\s{0,3}(?:```|~~~)")
+_FENCE_LINE_RE = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,})(?P<rest>.*)$")
 _INDENTED_CODE_RE = re.compile(r"(?m)^(?: {4}|\t)\S")
 _URL_RE = re.compile(r"https?://[^\s<>\])]+", re.IGNORECASE)
 _HTB_FLAG_RE = re.compile(r"HTB\{[^}\r\n]+\}", re.IGNORECASE)
@@ -27,7 +27,8 @@ _FLAG_HEADING_RE = re.compile(
 )
 _HEX_32_RE = re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])", re.IGNORECASE)
 _USER_ROOT_FLAG_RE = re.compile(
-    r"(?ims)^\s*(?:user|root)(?:\s+flag)?\s*:?\s*$\n(?P<body>.{0,160})"
+    r"(?ims)^\s{0,3}(?:#{1,6}\s*)?(?:user|root)(?:\s+flag)?\s*:?\s*#*\s*$"
+    r"\n(?P<body>.{0,160})"
 )
 _TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
 _ACTION_LANGUAGE_RE = re.compile(
@@ -238,10 +239,8 @@ def _collect_signals(text: str) -> _DocumentSignals:
             *_SETEXT_HEADING_RE.findall(visible_text),
         )
     )
-    substantive_headings = tuple(
-        heading for heading in headings if not _NON_PROCEDURAL_HEADING_RE.search(heading)
-    )
-    code_block_count = len(_FENCED_CODE_RE.findall(visible_text)) // 2
+    substantive_headings = tuple(heading for heading in headings if _is_substantive(heading))
+    code_block_count = _count_fenced_code_blocks(visible_text)
     if not code_block_count and _INDENTED_CODE_RE.search(visible_text):
         code_block_count = 1
 
@@ -279,6 +278,33 @@ def _contains_final_flag(text: str) -> bool:
     return any(_HEX_32_RE.search(match.group("body")) for match in flag_sections)
 
 
+def _count_fenced_code_blocks(text: str) -> int:
+    """Count CommonMark fences, including a final fence left open through EOF."""
+    open_character: str | None = None
+    open_length = 0
+    block_count = 0
+
+    for line in text.splitlines():
+        match = _FENCE_LINE_RE.match(line)
+        if match is None:
+            continue
+
+        fence = match.group("fence")
+        rest = match.group("rest")
+        character = fence[0]
+        if open_character is None:
+            if character == "`" and "`" in rest:
+                continue
+            open_character = character
+            open_length = len(fence)
+            block_count += 1
+        elif character == open_character and len(fence) >= open_length and not rest.strip():
+            open_character = None
+            open_length = 0
+
+    return block_count
+
+
 def _url_is_external_walkthrough(text: str, url: str) -> bool:
     lowered_url = url.casefold()
     if "app.hackthebox.com/challenges" in lowered_url:
@@ -290,6 +316,11 @@ def _url_is_external_walkthrough(text: str, url: str) -> bool:
 
 def _clean_heading(heading: str) -> str:
     return re.sub(r"<[^>]+>", " ", heading).strip()
+
+
+def _is_substantive(heading: str) -> bool:
+    normalized = re.sub(r"\s+", " ", heading).strip().casefold()
+    return normalized not in {"user", "root"} and not _NON_PROCEDURAL_HEADING_RE.search(heading)
 
 
 def _is_narrative_line(line: str) -> bool:
