@@ -45,22 +45,91 @@ _OBSIDIAN_EMBED_RE = re.compile(
 _CLOSING_PRESENTATION_WRAPPER_RE = re.compile(
     r"\s*</(?:div|p)>\s*", re.IGNORECASE
 )
+_RELATIONSHIP_BLOCK_KINDS = frozenset(
+    {
+        BlockKind.BLOCKQUOTE,
+        BlockKind.HEADING,
+        BlockKind.ORDERED_LIST_ITEM,
+        BlockKind.PARAGRAPH,
+        BlockKind.TABLE,
+        BlockKind.UNORDERED_LIST_ITEM,
+    }
+)
+_BLOCK_BOUNDARY_TAGS = frozenset(
+    {
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "dd",
+        "div",
+        "dl",
+        "dt",
+        "fieldset",
+        "figcaption",
+        "figure",
+        "footer",
+        "form",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "li",
+        "main",
+        "nav",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "tr",
+        "ul",
+    }
+)
+_VOID_HTML_TAGS = frozenset(
+    {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "source",
+        "track",
+        "wbr",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
 class _RelationshipEvent:
     line: int
+    column: int
     sequence: int
     target: str
 
 
 class _PresentationHTMLParser(HTMLParser):
-    """Identify centered wrappers and collect their human-visible text."""
+    """Identify a centered root wrapper and render its visible structure."""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.centered = False
-        self.centered_balance = 0
+        self.root_seen = False
+        self.root_centered = False
+        self.root_valid = True
+        self.root_centered_balance = 0
         self.text_parts: list[str] = []
         self.asset_labels: list[str] = []
         self._open_tags: list[tuple[str, bool]] = []
@@ -68,13 +137,26 @@ class _PresentationHTMLParser(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         normalized_tag = tag.casefold()
         is_centered = normalized_tag in {"div", "p"} and _has_center_alignment(attrs)
-        self._open_tags.append((normalized_tag, is_centered))
+        is_root = not self._open_tags and not self.root_seen
+        if not self._open_tags:
+            if self.root_seen:
+                self.root_valid = False
+            else:
+                self.root_seen = True
+                self.root_centered = is_centered
+
         attributes = {name.casefold(): (value or "") for name, value in attrs}
         if normalized_tag == "img" and attributes.get("src"):
             self.asset_labels.append(attributes.get("alt") or attributes["src"])
-        if is_centered:
-            self.centered = True
-            self.centered_balance += 1
+        if normalized_tag == "br" or (
+            normalized_tag in _BLOCK_BOUNDARY_TAGS and not is_root
+        ):
+            self._append_boundary()
+
+        if normalized_tag not in _VOID_HTML_TAGS:
+            self._open_tags.append((normalized_tag, is_root))
+            if is_root and is_centered:
+                self.root_centered_balance += 1
 
     def handle_startendtag(
         self,
@@ -87,20 +169,36 @@ class _PresentationHTMLParser(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         normalized_tag = tag.casefold()
         for index in range(len(self._open_tags) - 1, -1, -1):
-            open_tag, was_centered = self._open_tags[index]
+            open_tag, was_root = self._open_tags[index]
             if open_tag != normalized_tag:
                 continue
             del self._open_tags[index:]
-            if was_centered:
-                self.centered_balance -= 1
+            if normalized_tag in _BLOCK_BOUNDARY_TAGS and not was_root:
+                self._append_boundary()
+            if was_root and self.root_centered:
+                self.root_centered_balance -= 1
             return
 
     def handle_data(self, data: str) -> None:
+        if not self._open_tags and data.strip():
+            self.root_valid = False
         self.text_parts.append(data)
 
     @property
+    def is_centered_root(self) -> bool:
+        return self.root_seen and self.root_centered and self.root_valid
+
+    @property
     def visible_text(self) -> str:
-        return re.sub(r"\s+", " ", "".join(self.text_parts)).strip()
+        lines = (
+            re.sub(r"[\t\f\v ]+", " ", line).strip()
+            for line in "".join(self.text_parts).splitlines()
+        )
+        return "\n".join(line for line in lines if line)
+
+    def _append_boundary(self) -> None:
+        if self.text_parts and not self.text_parts[-1].endswith("\n"):
+            self.text_parts.append("\n")
 
 
 def apply_profile(document: ParsedDocument, profile: str) -> ParsedDocument:
@@ -165,8 +263,14 @@ def _clean_academy_obsidian(document: ParsedDocument) -> ParsedDocument:
             changed = changed or bool(assets)
             blocks.append(rewritten)
             new_assets.extend(assets)
+            wiki_events = _wiki_relationship_events(rewritten, sequence)
+            relationship_events.extend(wiki_events)
+            sequence += len(wiki_events)
 
-    if not changed:
+    missing_relationship = any(
+        event.target not in document.relationships for event in relationship_events
+    )
+    if not changed and not missing_relationship:
         return document
 
     return _rebuild_document(
@@ -186,8 +290,8 @@ def _remove_note_metadata(
         return (block,), ()
 
     kept_blocks: list[ParsedBlock] = []
-    relationship_events: list[_RelationshipEvent] = []
-    sequence = starting_sequence
+    relationship_events = list(_url_relationship_events(block, starting_sequence))
+    sequence = starting_sequence + len(relationship_events)
 
     for offset, line in enumerate(lines):
         source_line = min(block.start_line + offset, block.end_line)
@@ -207,10 +311,12 @@ def _remove_note_metadata(
         label = re.sub(r"\s+", " ", match.group("label")).casefold()
         if label == "tags":
             continue
-        for target in _wiki_targets(match.group("value")):
-            relationship_events.append(
-                _RelationshipEvent(source_line, sequence, target)
-            )
+        for event in _wiki_events_from_text(
+            match.group("value"),
+            source_line,
+            sequence,
+        ):
+            relationship_events.append(event)
             sequence += 1
 
     return tuple(kept_blocks), tuple(relationship_events)
@@ -262,8 +368,8 @@ def _clean_github_walkthrough(document: ParsedDocument) -> ParsedDocument:
             blocks.append(block)
             continue
         parser = _parse_presentation_html(block.text)
-        if parser.centered:
-            open_centered_wrappers += parser.centered_balance
+        if parser.is_centered_root:
+            open_centered_wrappers += parser.root_centered_balance
             rewritten = _unwrap_centered_block(
                 block,
                 parser.visible_text,
@@ -336,11 +442,11 @@ def _relationships_in_source_order(
     events = list(extras)
     sequence = max((event.sequence for event in events), default=-1) + 1
     for block in blocks:
-        for target in _metadata_values(block, "urls", "url"):
-            events.append(_RelationshipEvent(block.start_line, sequence, target))
-            sequence += 1
+        block_events = _url_relationship_events(block, sequence)
+        events.extend(block_events)
+        sequence += len(block_events)
 
-    events.sort(key=lambda event: (event.line, event.sequence))
+    events.sort(key=lambda event: (event.line, event.column, event.sequence))
     return _unique_in_order(event.target for event in events)
 
 
@@ -443,12 +549,128 @@ def _copy_block(
     )
 
 
-def _wiki_targets(text: str) -> tuple[str, ...]:
-    return tuple(
-        target
-        for match in _WIKI_LINK_RE.finditer(text)
-        if (target := match.group("target").strip())
+def _wiki_relationship_events(
+    block: ParsedBlock,
+    starting_sequence: int,
+) -> tuple[_RelationshipEvent, ...]:
+    if block.kind not in _RELATIONSHIP_BLOCK_KINDS:
+        return ()
+    return _wiki_events_from_text(
+        block.text,
+        block.start_line,
+        starting_sequence,
+        excluded_spans=_inline_code_spans(block),
     )
+
+
+def _wiki_events_from_text(
+    text: str,
+    start_line: int,
+    starting_sequence: int,
+    *,
+    excluded_spans: tuple[tuple[int, int], ...] = (),
+) -> tuple[_RelationshipEvent, ...]:
+    events: list[_RelationshipEvent] = []
+    sequence = starting_sequence
+    for match in _WIKI_LINK_RE.finditer(text):
+        if any(
+            start <= match.start() and match.end() <= end
+            for start, end in excluded_spans
+        ):
+            continue
+        raw_target = match.group("target")
+        target = raw_target.strip()
+        if not target or target != raw_target:
+            continue
+        line, column = _text_position(text, match.start(), start_line)
+        events.append(_RelationshipEvent(line, column, sequence, target))
+        sequence += 1
+    return tuple(events)
+
+
+def _inline_code_spans(block: ParsedBlock) -> tuple[tuple[int, int], ...]:
+    serialized = block.metadata.get("inline_code_spans")
+    if serialized is None:
+        return ()
+    values = json.loads(serialized)
+    if not isinstance(values, list):
+        return ()
+    spans: list[tuple[int, int]] = []
+    for value in values:
+        if (
+            isinstance(value, list)
+            and len(value) == 2
+            and all(isinstance(item, int) for item in value)
+        ):
+            spans.append((value[0], value[1]))
+    return tuple(spans)
+
+
+def _url_relationship_events(
+    block: ParsedBlock,
+    starting_sequence: int,
+) -> tuple[_RelationshipEvent, ...]:
+    targets = _metadata_values(block, "urls", "url")
+    if not targets:
+        return ()
+
+    literal_offsets: list[int | None] = []
+    search_offset = 0
+    for target in targets:
+        offset = block.text.find(target, search_offset)
+        literal_offsets.append(offset if offset >= 0 else None)
+        if offset >= 0:
+            search_offset = offset + len(target)
+
+    events: list[_RelationshipEvent] = []
+    for index, (target, offset) in enumerate(zip(targets, literal_offsets, strict=True)):
+        if offset is not None:
+            line, column = _text_position(block.text, offset, block.start_line)
+        else:
+            line, column = _best_effort_url_position(
+                block,
+                index,
+                literal_offsets,
+            )
+        events.append(
+            _RelationshipEvent(line, column, starting_sequence + index, target)
+        )
+    return tuple(events)
+
+
+def _best_effort_url_position(
+    block: ParsedBlock,
+    index: int,
+    literal_offsets: list[int | None],
+) -> tuple[int, int]:
+    next_offset = next(
+        (offset for offset in literal_offsets[index + 1 :] if offset is not None),
+        None,
+    )
+    if next_offset is not None:
+        line, column = _text_position(block.text, next_offset, block.start_line)
+        return line, column - 1
+
+    previous_offset = next(
+        (
+            offset
+            for offset in reversed(literal_offsets[:index])
+            if offset is not None
+        ),
+        None,
+    )
+    if previous_offset is not None:
+        line, column = _text_position(block.text, previous_offset, block.start_line)
+        return line, column + 1
+    return block.end_line, len(block.text) + index
+
+
+def _text_position(text: str, offset: int, start_line: int) -> tuple[int, int]:
+    prefix = text[:offset]
+    line = start_line + prefix.count("\n")
+    last_newline = prefix.rfind("\n")
+    column = offset if last_newline < 0 else offset - last_newline - 1
+    return line, column
 
 
 def _has_center_alignment(attrs: list[tuple[str, str | None]]) -> bool:

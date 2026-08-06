@@ -117,6 +117,66 @@ def test_obsidian_profile_keeps_non_metadata_prose_in_same_paragraph():
     assert (cleaned.blocks[0].start_line, cleaned.blocks[0].end_line) == (3, 3)
 
 
+def test_obsidian_profile_collects_body_wikilinks_in_order_but_not_code():
+    source = parse_markdown(
+        "source-note",
+        "graph.md",
+        "# Graph\n\n"
+        "[[Folder/First Note|First alias]] then [[Second]] then "
+        "[[Folder/First Note|Repeated alias]].\n\n"
+        "Read [reference](https://reference.test).\n\n"
+        "```bash\n"
+        'if [[ -f "$candidate" ]]; then\n'
+        "  echo [[Not an Obsidian relationship]]\n"
+        "fi\n"
+        "```\n\n"
+        "Continue with [[Third|third alias]].\n",
+    )
+
+    cleaned = apply_profile(source, "academy_obsidian")
+
+    assert cleaned.relationships == (
+        "Folder/First Note",
+        "Second",
+        "https://reference.test",
+        "Third",
+    )
+
+
+def test_obsidian_profile_excludes_inline_code_wikilink_literals():
+    source = parse_markdown(
+        "source-note",
+        "inline-code.md",
+        "Treat `[[Literal Syntax]]` as code, then open [[Actual Note]].\n",
+    )
+
+    cleaned = apply_profile(source, "academy_obsidian")
+
+    assert cleaned.relationships == ("Actual Note",)
+
+
+def test_obsidian_profile_preserves_urls_on_removed_metadata_lines_not_tags():
+    source = parse_markdown(
+        "source-note",
+        "metadata.md",
+        "# Note\n\n"
+        "Tags: [[Tag Taxonomy]] #academy\n"
+        "Related to: [[DNS|DNS notes]] and [vendor](https://vendor.test)\n"
+        'See also: <a href="https://html.test">HTML reference</a>\n'
+        "Previous:\n\n"
+        "Retained body.\n",
+    )
+
+    cleaned = apply_profile(source, "academy_obsidian")
+
+    assert cleaned.relationships == (
+        "DNS",
+        "https://vendor.test",
+        "https://html.test",
+    )
+    assert "Tag Taxonomy" not in cleaned.relationships
+
+
 def test_github_profile_unwraps_centered_presentation_without_losing_content():
     cleaned = apply_profile(parse_fixture("github-walkthrough.md"), "github_walkthrough")
 
@@ -155,6 +215,46 @@ def test_github_profile_does_not_rewrite_centered_html_inside_procedural_code():
     )
 
     assert apply_profile(source, "github_walkthrough") == source
+
+
+def test_github_profile_preserves_breaks_inside_centered_root_wrapper():
+    source = parse_markdown(
+        "source-github",
+        "walkthrough.md",
+        '<div align="center">Host<br>10.10.10.10</div>\n',
+    )
+
+    cleaned = apply_profile(source, "github_walkthrough")
+
+    assert cleaned.blocks[0].text == "Host\n10.10.10.10"
+
+
+def test_github_profile_ignores_centered_descendant_of_technical_outer_wrapper():
+    source = parse_markdown(
+        "source-github",
+        "walkthrough.md",
+        '<div class="technical"><div align="center">Title</div>'
+        '<code>curl TARGET_IP</code></div>\n',
+    )
+
+    assert apply_profile(source, "github_walkthrough") == source
+
+
+def test_github_profile_keeps_nested_and_sibling_content_inside_centered_root():
+    source = parse_markdown(
+        "source-github",
+        "walkthrough.md",
+        '<div align="center"><span>Host</span><br>'
+        '<code>curl TARGET_IP</code><p>Observed output</p>'
+        '<a href="https://reference.test">Reference</a></div>\n',
+    )
+
+    cleaned = apply_profile(source, "github_walkthrough")
+
+    assert cleaned.blocks[0].text == (
+        "Host\ncurl TARGET_IP\nObserved output\nReference"
+    )
+    assert cleaned.relationships == ("https://reference.test",)
 
 
 @pytest.mark.parametrize(

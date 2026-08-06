@@ -23,6 +23,7 @@ class _InlinePayload:
     text: str
     links: tuple[str, ...] = ()
     assets: tuple[ParsedAsset, ...] = ()
+    code_spans: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,21 +222,35 @@ def _table_block(open_token: Token, inner_tokens: list[Token]) -> _BlockPayload:
     rows: list[str] = []
     links: list[str] = []
     assets: list[ParsedAsset] = []
-    current_cells: list[str] | None = None
+    code_spans: list[tuple[int, int]] = []
+    current_cells: list[_InlinePayload] | None = None
 
     for token in inner_tokens:
         if token.type == "tr_open":
             current_cells = []
         elif token.type == "tr_close" and current_cells is not None:
-            rows.append(" | ".join(current_cells))
+            row_start = sum(len(row) + 1 for row in rows)
+            cell_start = row_start
+            for cell in current_cells:
+                code_spans.extend(
+                    (cell_start + start, cell_start + end)
+                    for start, end in cell.code_spans
+                )
+                cell_start += len(cell.text) + 3
+            rows.append(" | ".join(cell.text for cell in current_cells))
             current_cells = None
         elif token.type == "inline" and current_cells is not None:
             payload = _inline_payload(token.children or (), _source_span(token))
-            current_cells.append(payload.text)
+            current_cells.append(payload)
             links.extend(payload.links)
             assets.extend(payload.assets)
 
-    payload = _InlinePayload("\n".join(rows), tuple(links), tuple(assets))
+    payload = _InlinePayload(
+        "\n".join(rows),
+        tuple(links),
+        tuple(assets),
+        tuple(code_spans),
+    )
     return _make_block(BlockKind.TABLE, open_token, payload)
 
 
@@ -313,7 +328,7 @@ def _make_block(
     level: int | None = None,
 ) -> _BlockPayload:
     start_line, end_line = _source_span(source_token)
-    metadata = _target_metadata(payload.links, payload.assets)
+    metadata = _target_metadata(payload.links, payload.assets, payload.code_spans)
     return _BlockPayload(
         ParsedBlock(
             kind=kind,
@@ -332,6 +347,8 @@ def _tokens_payload(tokens: list[Token]) -> _InlinePayload:
     text_parts: list[str] = []
     links: list[str] = []
     assets: list[ParsedAsset] = []
+    code_spans: list[tuple[int, int]] = []
+    output_length = 0
     for token in tokens:
         if token.type == "inline":
             payload = _inline_payload(token.children or (), _source_span(token))
@@ -343,22 +360,42 @@ def _tokens_payload(tokens: list[Token]) -> _InlinePayload:
         else:
             continue
         if payload.text:
+            if text_parts:
+                output_length += 1
+            code_spans.extend(
+                (output_length + start, output_length + end)
+                for start, end in payload.code_spans
+            )
             text_parts.append(payload.text)
+            output_length += len(payload.text)
         links.extend(payload.links)
         assets.extend(payload.assets)
-    return _InlinePayload("\n".join(text_parts), tuple(links), tuple(assets))
+    return _InlinePayload(
+        "\n".join(text_parts),
+        tuple(links),
+        tuple(assets),
+        tuple(code_spans),
+    )
 
 
 def _inline_payload(children: list[Token], span: tuple[int, int]) -> _InlinePayload:
     text_parts: list[str] = []
     links: list[str] = []
     assets: list[ParsedAsset] = []
+    code_spans: list[tuple[int, int]] = []
+    output_length = 0
 
     for child in children:
-        if child.type in {"text", "code_inline"}:
+        if child.type == "text":
             text_parts.append(child.content)
+            output_length += len(child.content)
+        elif child.type == "code_inline":
+            code_spans.append((output_length, output_length + len(child.content)))
+            text_parts.append(child.content)
+            output_length += len(child.content)
         elif child.type in {"softbreak", "hardbreak"}:
             text_parts.append("\n")
+            output_length += 1
         elif child.type == "link_open":
             href = child.attrGet("href")
             if href:
@@ -378,13 +415,20 @@ def _inline_payload(children: list[Token], span: tuple[int, int]) -> _InlinePayl
                     )
                 )
             text_parts.append(alt_text)
+            output_length += len(alt_text)
         elif child.type == "html_inline":
             html_payload = _raw_html_payload(child.content, span)
             text_parts.append(html_payload.text)
+            output_length += len(html_payload.text)
             links.extend(html_payload.links)
             assets.extend(html_payload.assets)
 
-    return _InlinePayload("".join(text_parts), tuple(links), tuple(assets))
+    return _InlinePayload(
+        "".join(text_parts),
+        tuple(links),
+        tuple(assets),
+        tuple(code_spans),
+    )
 
 
 def _inline_visible_text(children: list[Token]) -> str:
@@ -430,6 +474,7 @@ def _raw_html_payload(html: str, span: tuple[int, int]) -> _InlinePayload:
 def _target_metadata(
     links: tuple[str, ...],
     assets: tuple[ParsedAsset, ...],
+    code_spans: tuple[tuple[int, int], ...],
 ) -> dict[str, str]:
     metadata: dict[str, str] = {}
     if links:
@@ -441,6 +486,11 @@ def _target_metadata(
         metadata["asset_targets"] = _compact_json(targets)
         if len(targets) == 1:
             metadata["asset_target"] = targets[0]
+    if code_spans:
+        metadata["inline_code_spans"] = json.dumps(
+            code_spans,
+            separators=(",", ":"),
+        )
     return metadata
 
 
