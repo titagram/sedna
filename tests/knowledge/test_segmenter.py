@@ -244,8 +244,10 @@ def test_segment_assets_are_exactly_the_assets_overlapping_its_span():
 
     first, second = segment_document(document)
 
-    assert first.assets == document.assets
+    assert first.assets[0].asset_index == 0
     assert first.assets[0].target == "images/banner.png"
+    assert first.assets[0].start_line == document.assets[0].start_line
+    assert first.assets[0].end_line == document.assets[0].end_line
     assert second.assets == ()
     assert first.start_line == min(
         document.blocks[index].start_line for index in first.block_indices

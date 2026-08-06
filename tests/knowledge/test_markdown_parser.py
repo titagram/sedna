@@ -13,6 +13,7 @@ from sedna.knowledge.parsing import (
     ParsedBlock,
     ParsedDocument,
     PreparedSource,
+    SegmentAsset,
     parse_markdown,
 )
 from sedna.knowledge.schema import (
@@ -133,9 +134,9 @@ def test_parsed_models_reject_reversed_line_ranges():
 
 
 def test_logical_segment_tracks_blocks_heading_path_and_assets():
-    asset = ParsedAsset(
+    asset = SegmentAsset(
+        asset_index=0,
         target="screenshot.png",
-        alt_text="HTTP response",
         start_line=4,
         end_line=4,
     )
@@ -150,6 +151,30 @@ def test_logical_segment_tracks_blocks_heading_path_and_assets():
 
     assert segment.block_indices == (0, 1)
     assert segment.assets == (asset,)
+
+
+def test_segment_asset_is_a_retrieval_safe_view_with_no_raw_metadata():
+    safe = SegmentAsset(
+        asset_index=0,
+        target="<EXCLUDED_FLAG>.png",
+        start_line=4,
+        end_line=4,
+    )
+
+    assert set(SegmentAsset.model_fields) == {
+        "asset_index",
+        "target",
+        "start_line",
+        "end_line",
+    }
+    assert safe.target == "<EXCLUDED_FLAG>.png"
+    with pytest.raises(ValidationError, match="flag marker"):
+        SegmentAsset(
+            asset_index=0,
+            target="HTB{secret}.png",
+            start_line=4,
+            end_line=4,
+        )
 
 
 @pytest.mark.parametrize("block_indices", [(1, 0), (0, 0), (0, 2)])
@@ -289,7 +314,6 @@ def test_prepared_source_rejects_segment_asset_not_owned_by_document():
         end_line=1,
     )
     registered = ParsedAsset(target="registered.png", start_line=1, end_line=1)
-    foreign = ParsedAsset(target="foreign.png", start_line=1, end_line=1)
     document = ParsedDocument(
         source_id="source-test",
         path="sample.md",
@@ -301,7 +325,14 @@ def test_prepared_source_rejects_segment_asset_not_owned_by_document():
         text="HTTP response",
         start_line=1,
         end_line=1,
-        assets=(foreign,),
+        assets=(
+            SegmentAsset(
+                asset_index=0,
+                target="foreign.png",
+                start_line=1,
+                end_line=1,
+            ),
+        ),
     )
 
     with pytest.raises(ValidationError):
@@ -327,7 +358,14 @@ def test_prepared_source_rejects_owned_asset_outside_segment_span():
         text="Observe HTTP.",
         start_line=1,
         end_line=1,
-        assets=(distant_asset,),
+        assets=(
+            SegmentAsset(
+                asset_index=0,
+                target="later.png",
+                start_line=100,
+                end_line=100,
+            ),
+        ),
     )
 
     with pytest.raises(ValidationError):
@@ -353,12 +391,19 @@ def test_prepared_source_accepts_owned_asset_overlapping_segment_span():
         text="HTTP response",
         start_line=2,
         end_line=3,
-        assets=(overlapping_asset,),
+        assets=(
+            SegmentAsset(
+                asset_index=0,
+                target="response.png",
+                start_line=3,
+                end_line=4,
+            ),
+        ),
     )
 
     prepared = PreparedSource(manifest=manifest(), document=document, segments=(segment,))
 
-    assert prepared.segments[0].assets == (overlapping_asset,)
+    assert prepared.segments[0].assets[0].target == overlapping_asset.target
 
 
 def test_parse_markdown_preserves_structure_and_exact_source_lines():

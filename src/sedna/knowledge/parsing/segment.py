@@ -10,10 +10,12 @@ from sedna.knowledge.parsing.models import (
     LogicalSegment,
     ParsedBlock,
     ParsedDocument,
+    SegmentAsset,
 )
 from sedna.knowledge.parsing.sanitize import (
     _contextual_hex_flag_values,
     _sanitize_searchable_text,
+    sanitize_asset_target,
 )
 
 _COMMON_COMMAND_NAMES = frozenset(
@@ -288,8 +290,13 @@ def _build_segment(
     start_line = min(view.block.start_line for view in views)
     end_line = max(view.block.end_line for view in views)
     assets = tuple(
-        asset
-        for asset in document.assets
+        SegmentAsset(
+            asset_index=asset_index,
+            target=sanitize_asset_target(asset.target),
+            start_line=asset.start_line,
+            end_line=asset.end_line,
+        )
+        for asset_index, asset in enumerate(document.assets)
         if asset.end_line >= start_line and asset.start_line <= end_line
     )
     return LogicalSegment(

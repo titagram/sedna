@@ -8,6 +8,8 @@ EXCLUDED_FLAG = "<EXCLUDED_FLAG>"
 
 _HTB_FLAG_RE = re.compile(r"HTB\{[^}]*\}", re.IGNORECASE)
 _HTB_OPEN_MARKER_RE = re.compile(r"HTB\{", re.IGNORECASE)
+_HTB_ENCODED_FLAG_RE = re.compile(r"HTB%7B(?:(?!%7D).)*%7D", re.IGNORECASE)
+_HTB_ENCODED_OPEN_MARKER_RE = re.compile(r"HTB%7B", re.IGNORECASE)
 _STANDALONE_32_HEX_RE = re.compile(
     r"(?<![A-Za-z0-9])[0-9A-Fa-f]{32}(?![A-Za-z0-9])"
 )
@@ -34,6 +36,19 @@ def sanitize_searchable_text(text: str, heading_path: tuple[str, ...]) -> str:
     source document remain untouched.
     """
     return _sanitize_searchable_text(text, heading_path, frozenset())
+
+
+def sanitize_asset_target(target: str) -> str:
+    """Return a retrieval-safe asset locator while raw metadata stays parsed-only.
+
+    Asset locators are not strategic evidence and opaque 32-hex path components have
+    no retrieval value, so this boundary redacts them conservatively in every context.
+    """
+    sanitized = _HTB_ENCODED_FLAG_RE.sub(EXCLUDED_FLAG, target)
+    sanitized = _HTB_ENCODED_OPEN_MARKER_RE.sub(EXCLUDED_FLAG, sanitized)
+    sanitized = _HTB_FLAG_RE.sub(EXCLUDED_FLAG, sanitized)
+    sanitized = _HTB_OPEN_MARKER_RE.sub(EXCLUDED_FLAG, sanitized)
+    return _STANDALONE_32_HEX_RE.sub(EXCLUDED_FLAG, sanitized)
 
 
 def _contextual_hex_flag_values(

@@ -127,6 +127,101 @@ def test_delete_quarantine_removes_only_requested_record_and_is_idempotent(
     assert second.exists()
 
 
+def test_load_quarantine_rejects_corrupt_and_mismatched_identity(tmp_path: Path) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    target = repository.write_quarantine(complete_quarantine())
+    assert repository.load_quarantine("source-123") == complete_quarantine()
+
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    payload["quarantine_id"] = "quarantine-source-other"
+    target.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid quarantine.*source-123"):
+        repository.load_quarantine("source-123")
+
+    target.write_text("{corrupt", encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid quarantine.*source-123"):
+        repository.load_quarantine("source-123")
+
+
+@pytest.mark.parametrize("next_status", (IngestionStatus.ACCEPTED, IngestionStatus.EXCLUDED))
+def test_manifest_only_transition_rolls_back_if_manifest_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    next_status: IngestionStatus,
+) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    old_manifest = complete_manifest().model_copy(
+        update={
+            "ingestion_status": IngestionStatus.QUARANTINED,
+            "quarantine_reasons": ("ambiguous",),
+        }
+    )
+    old_quarantine = complete_quarantine().model_copy(
+        update={"reason_codes": ("ambiguous",)}
+    )
+    repository.write_manifest(old_manifest)
+    repository.write_quarantine(old_quarantine)
+    new_manifest = complete_manifest().model_copy(
+        update={"ingestion_status": next_status, "quarantine_reasons": ()}
+    )
+    real_write_manifest = repository.write_manifest
+    failures = 0
+
+    def fail_once(manifest: DocumentManifest) -> Path:
+        nonlocal failures
+        failures += 1
+        if failures == 1:
+            raise OSError("injected manifest failure")
+        return real_write_manifest(manifest)
+
+    monkeypatch.setattr(repository, "write_manifest", fail_once)
+
+    with pytest.raises(OSError, match="injected manifest failure"):
+        repository.transition_source(new_manifest, None)
+
+    assert repository.load_manifest("source-123") == old_manifest
+    assert repository.load_quarantine("source-123") == old_quarantine
+
+
+def test_quarantined_transition_rolls_back_if_manifest_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    old_manifest = complete_manifest()
+    repository.write_manifest(old_manifest)
+    new_manifest = old_manifest.model_copy(
+        update={
+            "ingestion_status": IngestionStatus.QUARANTINED,
+            "quarantine_reasons": ("ambiguous",),
+        }
+    )
+    new_quarantine = complete_quarantine().model_copy(
+        update={
+            "reason_codes": ("ambiguous",),
+            "parser_profile": new_manifest.parser_profile,
+        }
+    )
+    real_write_manifest = repository.write_manifest
+    failures = 0
+
+    def fail_once(manifest: DocumentManifest) -> Path:
+        nonlocal failures
+        failures += 1
+        if failures == 1:
+            raise OSError("injected manifest failure")
+        return real_write_manifest(manifest)
+
+    monkeypatch.setattr(repository, "write_manifest", fail_once)
+
+    with pytest.raises(OSError, match="injected manifest failure"):
+        repository.transition_source(new_manifest, new_quarantine)
+
+    assert repository.load_manifest("source-123") == old_manifest
+    assert repository.quarantine_exists("source-123") is False
+
+
 def test_atomic_replace_failure_preserves_old_target_and_cleans_temp(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

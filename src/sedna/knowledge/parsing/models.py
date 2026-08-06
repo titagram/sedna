@@ -10,6 +10,7 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, GetCoreSchemaHandler, model_validator
 from pydantic_core import CoreSchema, core_schema
 
+from sedna.knowledge.parsing.sanitize import sanitize_asset_target
 from sedna.knowledge.schema import DocumentManifest
 
 NonEmptyString = Annotated[str, Field(min_length=1)]
@@ -141,6 +142,26 @@ class ParsedDocument(BaseModel):
     relationships: tuple[NonEmptyString, ...] = ()
 
 
+class SegmentAsset(BaseModel):
+    """A retrieval-safe pointer to raw asset provenance in ``ParsedDocument``."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    asset_index: int = Field(ge=0)
+    target: NonEmptyString
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def validate_safe_reference(self) -> SegmentAsset:
+        """Reject reversed spans and any locator that still carries flag material."""
+        if self.end_line < self.start_line:
+            raise ValueError("end_line must not precede start_line")
+        if sanitize_asset_target(self.target) != self.target:
+            raise ValueError("segment asset target contains a final flag marker")
+        return self
+
+
 class LogicalSegment(BaseModel):
     """Searchable text grouped over one or more source blocks."""
 
@@ -151,7 +172,7 @@ class LogicalSegment(BaseModel):
     start_line: int = Field(ge=1)
     end_line: int = Field(ge=1)
     heading_path: tuple[NonEmptyString, ...] = ()
-    assets: tuple[ParsedAsset, ...] = ()
+    assets: tuple[SegmentAsset, ...] = ()
 
     @model_validator(mode="after")
     def validate_source_span(self) -> LogicalSegment:
@@ -196,8 +217,16 @@ class PreparedSource(BaseModel):
                 raise ValueError("segment line range must exactly span its referenced blocks")
 
             for asset in segment.assets:
-                if asset not in self.document.assets:
-                    raise ValueError("segment assets must belong to the parsed document")
+                if asset.asset_index >= len(self.document.assets):
+                    raise ValueError("segment asset index is outside the parsed document")
+                raw_asset = self.document.assets[asset.asset_index]
+                if (asset.start_line, asset.end_line) != (
+                    raw_asset.start_line,
+                    raw_asset.end_line,
+                ):
+                    raise ValueError("segment asset span must match its raw parsed asset")
+                if asset.target != sanitize_asset_target(raw_asset.target):
+                    raise ValueError("segment asset target must be the retrieval-safe raw target")
                 if asset.end_line < segment.start_line or asset.start_line > segment.end_line:
                     raise ValueError("segment asset line range must overlap the segment span")
         return self

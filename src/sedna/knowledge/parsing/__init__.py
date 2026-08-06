@@ -8,6 +8,7 @@ from sedna.knowledge.parsing.models import (
     ParsedBlock,
     ParsedDocument,
     PreparedSource,
+    SegmentAsset,
 )
 
 __all__ = [
@@ -17,5 +18,6 @@ __all__ = [
     "ParsedBlock",
     "ParsedDocument",
     "PreparedSource",
+    "SegmentAsset",
     "parse_markdown",
 ]

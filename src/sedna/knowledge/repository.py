@@ -148,6 +148,7 @@ class CanonicalKnowledgeRepository:
 
     def __init__(self, root: Path) -> None:
         self._descriptor_lock = threading.Lock()
+        self._transition_lock = threading.Lock()
         self._root_fd: int | None = None
         self._require_safe_primitives()
         requested_root = Path(root)
@@ -212,20 +213,73 @@ class CanonicalKnowledgeRepository:
 
     def delete_quarantine(self, source_id: str) -> bool:
         """Delete one stale quarantine record, returning whether it existed."""
-        _, filename = self._target("quarantine", source_id)
+        return self._delete_record("quarantine", source_id)
+
+    def load_quarantine(self, source_id: str) -> QuarantineRecord:
+        """Load and strictly validate one quarantine record and its identities."""
+        target, filename = self._target("quarantine", source_id)
         try:
             directory_fd = self._open_child_directory("quarantine", create=False)
-        except FileNotFoundError:
-            return False
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"quarantine not found for source_id {source_id!r}: {target}"
+            ) from exc
         try:
             try:
-                os.unlink(filename, dir_fd=directory_fd)
-            except FileNotFoundError:
-                return False
-            os.fsync(directory_fd)
-            return True
+                file_fd = os.open(filename, self._file_read_flags(), dir_fd=directory_fd)
+            except FileNotFoundError as exc:
+                raise FileNotFoundError(
+                    f"quarantine not found for source_id {source_id!r}: {target}"
+                ) from exc
+            except OSError as exc:
+                raise ValueError(
+                    f"invalid quarantine for source_id {source_id!r}: {target}"
+                ) from exc
+            try:
+                if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                    raise ValueError("quarantine target is not a regular file")
+                with os.fdopen(file_fd, mode="r", encoding="utf-8") as stream:
+                    file_fd = -1
+                    payload = json.load(stream)
+                record = QuarantineRecord.model_validate(payload)
+            except (OSError, UnicodeError, ValueError) as exc:
+                raise ValueError(
+                    f"invalid quarantine for source_id {source_id!r}: {target}; {exc}"
+                ) from exc
+            finally:
+                if file_fd >= 0:
+                    os.close(file_fd)
         finally:
             os.close(directory_fd)
+
+        expected_quarantine_id = f"quarantine-{source_id}"
+        if record.source_id != source_id or record.quarantine_id != expected_quarantine_id:
+            raise ValueError(
+                f"invalid quarantine for source_id {source_id!r}: {target}; "
+                "record identity does not match requested source"
+            )
+        return record
+
+    def transition_source(
+        self,
+        manifest: DocumentManifest,
+        quarantine: QuarantineRecord | None,
+    ) -> None:
+        """Commit one manifest/quarantine state transition with rollback on failure."""
+        self._validate_transition(manifest, quarantine)
+        with self._transition_lock:
+            old_manifest = self._read_optional_bytes("manifests", manifest.source_id)
+            old_quarantine = self._read_optional_bytes("quarantine", manifest.source_id)
+            try:
+                if quarantine is None:
+                    self.delete_quarantine(manifest.source_id)
+                else:
+                    self.write_quarantine(quarantine)
+                self.write_manifest(manifest)
+            except Exception:
+                self._restore_snapshot("manifests", manifest.source_id, old_manifest)
+                self._restore_snapshot("quarantine", manifest.source_id, old_quarantine)
+                raise
 
     def load_manifest(self, source_id: str) -> DocumentManifest:
         """Load and validate one manifest, with path-specific errors."""
@@ -325,6 +379,85 @@ class CanonicalKnowledgeRepository:
                 os.close(file_fd)
         finally:
             os.close(directory_fd)
+
+    def _delete_record(self, directory: str, record_id: str) -> bool:
+        _, filename = self._target(directory, record_id)
+        try:
+            directory_fd = self._open_child_directory(directory, create=False)
+        except FileNotFoundError:
+            return False
+        try:
+            try:
+                os.unlink(filename, dir_fd=directory_fd)
+            except FileNotFoundError:
+                return False
+            os.fsync(directory_fd)
+            return True
+        finally:
+            os.close(directory_fd)
+
+    def _read_optional_bytes(self, directory: str, record_id: str) -> bytes | None:
+        self._target(directory, record_id)
+        try:
+            directory_fd = self._open_child_directory(directory, create=False)
+        except FileNotFoundError:
+            return None
+        try:
+            try:
+                file_fd = os.open(
+                    f"{record_id}.json",
+                    self._file_read_flags(),
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                return None
+            try:
+                if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                    raise ValueError(f"{directory} target is not a regular file")
+                with os.fdopen(file_fd, mode="rb") as stream:
+                    file_fd = -1
+                    return stream.read()
+            finally:
+                if file_fd >= 0:
+                    os.close(file_fd)
+        finally:
+            os.close(directory_fd)
+
+    def _restore_snapshot(
+        self,
+        directory: str,
+        record_id: str,
+        payload: bytes | None,
+    ) -> None:
+        if payload is None:
+            self._delete_record(directory, record_id)
+            return
+        directory_fd = self._open_child_directory(directory, create=True)
+        try:
+            self._atomic_write(directory_fd, f"{record_id}.json", payload.decode("utf-8"))
+        finally:
+            os.close(directory_fd)
+
+    @staticmethod
+    def _validate_transition(
+        manifest: DocumentManifest,
+        quarantine: QuarantineRecord | None,
+    ) -> None:
+        is_quarantined = manifest.ingestion_status.value == "quarantined"
+        if is_quarantined != (quarantine is not None):
+            raise ValueError("quarantined manifests require exactly one quarantine record")
+        if quarantine is None:
+            if manifest.quarantine_reasons:
+                raise ValueError("non-quarantined manifest cannot contain quarantine reasons")
+            return
+        if (
+            quarantine.source_id != manifest.source_id
+            or quarantine.quarantine_id != f"quarantine-{manifest.source_id}"
+            or quarantine.parser_profile != manifest.parser_profile
+            or quarantine.extraction != manifest.extraction
+            or quarantine.reason_codes != tuple(sorted(manifest.quarantine_reasons))
+        ):
+            raise ValueError("manifest and quarantine record contracts do not match")
 
     def _target(self, directory: str, record_id: str) -> tuple[Path, str]:
         self._ensure_open()

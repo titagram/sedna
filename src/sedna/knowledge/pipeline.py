@@ -27,11 +27,11 @@ from sedna.knowledge.schema import (
     SourceQuality,
 )
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"
 PARSER_ID = "markdown-it-commonmark"
 PARSER_VERSION = "1"
 EXTRACTOR_ID = "deterministic-foundation"
-EXTRACTOR_VERSION = "1"
+EXTRACTOR_VERSION = "2"
 DEFAULT_LANGUAGE = "en"
 
 _ATX_TITLE_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
@@ -49,6 +49,10 @@ class CandidateIngestionError(ValueError):
         self.reason_code = reason_code
 
 
+class SourceStructureError(ValueError):
+    """A dedicated, source-caused structural parsing failure."""
+
+
 def foundation_metadata() -> ExtractionMetadata:
     """Return the exact deterministic foundation versions used by this process."""
     return ExtractionMetadata(
@@ -63,7 +67,7 @@ def foundation_metadata() -> ExtractionMetadata:
 class IngestionPipeline:
     """Prepare one inventoried source without ever writing beneath ``source_root``.
 
-    Source-specific structural ``ValueError`` failures are reviewable quarantines.
+    Source-specific ``SourceStructureError`` failures are reviewable quarantines.
     Unexpected parser/profile failures are explicit ``CandidateIngestionError``
     failures so implementation defects are never disguised as bad input.
     """
@@ -141,6 +145,7 @@ class IngestionPipeline:
 
     def _prepare(self, candidate: SourceCandidate) -> PreparedSource | None:
         source_bytes = self._verified_candidate_bytes(candidate)
+        self._verify_current_asset_path_set(candidate)
         asset_refs = self._verified_asset_refs(candidate)
         existing = self._load_existing_manifest(candidate.source_id)
         if existing is not None and self._is_unchanged(existing, candidate, asset_refs):
@@ -179,8 +184,7 @@ class IngestionPipeline:
                 asset_refs,
                 title=preliminary_title,
             )
-            self.repository.delete_quarantine(candidate.source_id)
-            self.repository.write_manifest(manifest)
+            self.repository.transition_source(manifest, None)
             self.last_outcome = "excluded"
             return None
 
@@ -196,9 +200,7 @@ class IngestionPipeline:
 
         try:
             parsed = parse_markdown(candidate.source_id, candidate.relative_path, text)
-            profiled = apply_profile(parsed, classification.parser_profile)
-            segments = segment_document(profiled)
-        except ValueError:
+        except SourceStructureError:
             return self._persist_quarantine(
                 candidate,
                 classification,
@@ -212,6 +214,24 @@ class IngestionPipeline:
                 candidate.source_id,
                 "parser_failure",
                 "structural parser failed unexpectedly",
+            ) from exc
+
+        try:
+            profiled = apply_profile(parsed, classification.parser_profile)
+        except Exception as exc:
+            raise CandidateIngestionError(
+                candidate.source_id,
+                "profile_failure",
+                "source profile failed unexpectedly",
+            ) from exc
+
+        try:
+            segments = segment_document(profiled)
+        except Exception as exc:
+            raise CandidateIngestionError(
+                candidate.source_id,
+                "segmenter_failure",
+                "logical segmenter failed unexpectedly",
             ) from exc
 
         title = self._title_from_document(profiled, candidate.relative_path)
@@ -240,8 +260,7 @@ class IngestionPipeline:
                 "prepared source violated the canonical consistency contract",
             ) from exc
 
-        self.repository.delete_quarantine(candidate.source_id)
-        self.repository.write_manifest(manifest)
+        self.repository.transition_source(manifest, None)
         self.last_outcome = "accepted"
         return prepared
 
@@ -315,10 +334,118 @@ class IngestionPipeline:
             refs.append(AssetRef(path=relative_path, sha256=digest))
         return tuple(sorted(refs, key=lambda item: item.path))
 
+    def _verify_current_asset_path_set(self, candidate: SourceCandidate) -> None:
+        expected = frozenset(asset.relative_path for asset in candidate.assets)
+        current = self._current_associated_asset_paths(candidate)
+        if current != expected:
+            raise CandidateIngestionError(
+                candidate.source_id,
+                "stale_asset_inventory",
+                "associated asset path set changed since inventory",
+            )
+
+    def _current_associated_asset_paths(self, candidate: SourceCandidate) -> frozenset[str]:
+        source_path = PurePosixPath(candidate.relative_path)
+        root_fd = self._duplicate_source_root()
+        directory_fds = [root_fd]
+        current_fd = root_fd
+        try:
+            for part in source_path.parent.parts:
+                try:
+                    current_fd = os.open(
+                        part,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_NOFOLLOW
+                        | getattr(os, "O_CLOEXEC", 0),
+                        dir_fd=current_fd,
+                    )
+                except OSError as exc:
+                    raise CandidateIngestionError(
+                        candidate.source_id,
+                        "unsafe_source_path",
+                        "source directory is not safely readable beneath source root",
+                    ) from exc
+                directory_fds.append(current_fd)
+
+            prefix = source_path.parent.as_posix()
+            if prefix == ".":
+                prefix = ""
+            return frozenset(
+                self._walk_asset_paths(
+                    current_fd,
+                    prefix,
+                    candidate.source_id,
+                )
+            )
+        finally:
+            for descriptor in reversed(directory_fds):
+                os.close(descriptor)
+
+    def _walk_asset_paths(
+        self,
+        directory_fd: int,
+        prefix: str,
+        source_id: str,
+    ) -> tuple[str, ...]:
+        paths: list[str] = []
+        try:
+            entries = tuple(sorted(os.scandir(directory_fd), key=lambda entry: entry.name))
+        except OSError as exc:
+            raise CandidateIngestionError(
+                source_id,
+                "unsafe_asset_inventory",
+                "associated asset directory changed during verification",
+            ) from exc
+        for entry in entries:
+            relative_path = f"{prefix}/{entry.name}" if prefix else entry.name
+            try:
+                status = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise CandidateIngestionError(
+                    source_id,
+                    "unsafe_asset_inventory",
+                    "associated asset changed during verification",
+                ) from exc
+            if stat.S_ISDIR(status.st_mode):
+                try:
+                    child_fd = os.open(
+                        entry.name,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_NOFOLLOW
+                        | getattr(os, "O_CLOEXEC", 0),
+                        dir_fd=directory_fd,
+                    )
+                except OSError as exc:
+                    raise CandidateIngestionError(
+                        source_id,
+                        "unsafe_asset_inventory",
+                        "associated asset directory is not safely readable",
+                    ) from exc
+                try:
+                    paths.extend(self._walk_asset_paths(child_fd, relative_path, source_id))
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(status.st_mode):
+                if entry.name == ".DS_Store":
+                    continue
+                if PurePosixPath(relative_path).suffix.casefold() in {".md", ".pdf"}:
+                    continue
+                paths.append(relative_path)
+            else:
+                raise CandidateIngestionError(
+                    source_id,
+                    "unsafe_asset_inventory",
+                    "associated asset inventory contains a non-regular entry",
+                )
+        return tuple(paths)
+
     def _read_relative_file(self, relative_path: str, source_id: str) -> bytes:
         parts = PurePosixPath(relative_path).parts
-        parent_fds: list[int] = []
-        current_fd = self._ensure_open()
+        root_fd = self._duplicate_source_root()
+        parent_fds: list[int] = [root_fd]
+        current_fd = root_fd
         try:
             for part in parts[:-1]:
                 try:
@@ -409,13 +536,32 @@ class IngestionPipeline:
         )
 
     def _validate_incremental_state(self, manifest: DocumentManifest) -> None:
-        has_quarantine = self.repository.quarantine_exists(manifest.source_id)
         should_have_quarantine = manifest.ingestion_status is IngestionStatus.QUARANTINED
-        if has_quarantine != should_have_quarantine:
+        try:
+            quarantine = self.repository.load_quarantine(manifest.source_id)
+        except FileNotFoundError:
+            quarantine = None
+        except ValueError as exc:
+            raise CandidateIngestionError(
+                manifest.source_id,
+                "canonical_state_mismatch",
+                "stored quarantine record is invalid",
+            ) from exc
+        if (quarantine is not None) != should_have_quarantine:
             raise CandidateIngestionError(
                 manifest.source_id,
                 "canonical_state_mismatch",
                 "manifest and quarantine state disagree",
+            )
+        if quarantine is not None and (
+            quarantine.reason_codes != tuple(sorted(manifest.quarantine_reasons))
+            or quarantine.parser_profile != manifest.parser_profile
+            or quarantine.extraction != manifest.extraction
+        ):
+            raise CandidateIngestionError(
+                manifest.source_id,
+                "canonical_state_mismatch",
+                "manifest and quarantine contracts disagree",
             )
 
     def _persist_unclassified_quarantine(
@@ -483,8 +629,7 @@ class IngestionPipeline:
             parser_profile=manifest.parser_profile,
             extraction=self.extraction,
         )
-        self.repository.write_quarantine(record)
-        self.repository.write_manifest(manifest)
+        self.repository.transition_source(manifest, record)
 
     def _manifest(
         self,
@@ -538,13 +683,21 @@ class IngestionPipeline:
         return sanitized or "Untitled source"
 
     def _ensure_open(self) -> int:
-        if self._source_fd is None:
-            raise RuntimeError("pipeline is closed")
-        return self._source_fd
+        with self._descriptor_lock:
+            if self._source_fd is None:
+                raise RuntimeError("pipeline is closed")
+            return self._source_fd
+
+    def _duplicate_source_root(self) -> int:
+        with self._descriptor_lock:
+            if self._source_fd is None:
+                raise RuntimeError("pipeline is closed")
+            return os.dup(self._source_fd)
 
 
 __all__ = [
     "CandidateIngestionError",
     "IngestionPipeline",
+    "SourceStructureError",
     "foundation_metadata",
 ]

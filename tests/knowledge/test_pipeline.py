@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -12,7 +13,11 @@ import pytest
 import sedna.knowledge.pipeline as pipeline_module
 from sedna.knowledge import IngestionPipeline as PublicIngestionPipeline
 from sedna.knowledge.inventory import SourceCandidate, discover_sources, stable_source_id
-from sedna.knowledge.pipeline import CandidateIngestionError, IngestionPipeline
+from sedna.knowledge.pipeline import (
+    CandidateIngestionError,
+    IngestionPipeline,
+    SourceStructureError,
+)
 from sedna.knowledge.schema import DocumentType, IngestionStatus
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -160,14 +165,14 @@ def test_invalid_utf8_markdown_is_quarantined(tmp_path: Path) -> None:
     assert record["reason_codes"] == ["invalid_encoding"]
 
 
-def test_parse_value_error_is_quarantined_but_unexpected_failure_is_explicit(
+def test_source_structure_error_is_quarantined_but_value_error_is_explicit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pipeline, candidate = _fixture_pipeline(tmp_path, "machine-walkthrough.md")
 
     def invalid_markdown(*args: object, **kwargs: object) -> object:
         del args, kwargs
-        raise ValueError("source-specific parse failure")
+        raise SourceStructureError("source-specific parse failure")
 
     monkeypatch.setattr(pipeline_module, "parse_markdown", invalid_markdown)
     assert pipeline.prepare(candidate) is None
@@ -179,13 +184,39 @@ def test_parse_value_error_is_quarantined_but_unexpected_failure_is_explicit(
 
     def broken_parser(*args: object, **kwargs: object) -> object:
         del args, kwargs
-        raise RuntimeError("implementation bug")
+        raise ValueError("implementation bug")
 
     monkeypatch.setattr(pipeline_module, "parse_markdown", broken_parser)
     with pytest.raises(CandidateIngestionError, match="structural parser failed") as error:
         pipeline.prepare(candidate)
     assert error.value.reason_code == "parser_failure"
     assert pipeline.last_outcome == "failed"
+
+
+def test_profile_and_segment_value_errors_are_explicit_implementation_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline, candidate = _fixture_pipeline(tmp_path, "machine-walkthrough.md")
+
+    def broken_profile(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise ValueError("profile bug")
+
+    monkeypatch.setattr(pipeline_module, "apply_profile", broken_profile)
+    with pytest.raises(CandidateIngestionError) as profile_error:
+        pipeline.prepare(candidate)
+    assert profile_error.value.reason_code == "profile_failure"
+
+    monkeypatch.undo()
+
+    def broken_segmenter(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise ValueError("segmenter bug")
+
+    monkeypatch.setattr(pipeline_module, "segment_document", broken_segmenter)
+    with pytest.raises(CandidateIngestionError) as segment_error:
+        pipeline.prepare(candidate)
+    assert segment_error.value.reason_code == "segmenter_failure"
 
 
 def test_manifest_title_is_sanitized_while_parsed_document_keeps_raw_text(
@@ -237,6 +268,54 @@ def test_manifest_contains_stable_inventory_asset_refs(tmp_path: Path) -> None:
             hashlib.sha256(b"image bytes").hexdigest(),
         )
     ]
+
+
+def test_segment_assets_are_retrieval_safe_while_parsed_assets_remain_raw(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "raw_src"
+    text = b"""# Example machine
+
+## Enumeration
+
+We ran a scan and recorded the result.
+
+![HTB{alt_secret}](HTB{target_secret}.png \"HTB{title_secret}\")
+
+```text
+nmap target
+```
+
+## Result
+
+The scan showed HTTP was reachable.
+"""
+    candidate = _write_candidate(
+        source_root,
+        "Write-ups/Machines/AssetLeak/walkthrough.md",
+        text,
+    )
+    pipeline = IngestionPipeline(source_root, tmp_path / "knowledge")
+
+    prepared = pipeline.prepare(candidate)
+
+    assert prepared is not None
+    raw_asset = prepared.document.assets[0]
+    assert "HTB%7B" in raw_asset.target
+    assert "HTB{" in (raw_asset.alt_text or "")
+    assert "HTB{" in (raw_asset.title or "")
+    safe_assets = tuple(asset for segment in prepared.segments for asset in segment.assets)
+    assert safe_assets
+    serialized = json.dumps(
+        [asset.model_dump(mode="json") for asset in safe_assets],
+        sort_keys=True,
+    )
+    assert "HTB{" not in serialized
+    assert "HTB%7B" not in serialized
+    assert all(
+        set(type(asset).model_fields) == {"asset_index", "target", "start_line", "end_line"}
+        for asset in safe_assets
+    )
 
 
 def test_corrupt_existing_manifest_fails_without_overwriting_it(tmp_path: Path) -> None:
@@ -375,6 +454,57 @@ def test_reprocessing_an_old_quarantine_removes_stale_record(tmp_path: Path) -> 
     assert not quarantine_path.exists()
 
 
+def test_new_associated_asset_makes_original_candidate_stale_before_skip(
+    tmp_path: Path,
+) -> None:
+    pipeline, candidate = _fixture_pipeline(tmp_path, "machine-walkthrough.md")
+    assert pipeline.prepare(candidate) is not None
+    new_asset = candidate.path.parent / "new.png"
+    new_asset.write_bytes(b"new asset")
+
+    with pytest.raises(CandidateIngestionError) as error:
+        pipeline.prepare(candidate)
+
+    assert error.value.source_id == candidate.source_id
+    assert error.value.reason_code == "stale_asset_inventory"
+    assert pipeline.last_outcome == "failed"
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ("invalid_json", "reason_codes", "parser_profile", "extraction"),
+)
+def test_unchanged_quarantine_requires_a_strict_matching_record(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    source_root = tmp_path / "raw_src"
+    candidate = _write_candidate(source_root, "Imported/source.md", b"ambiguous prose")
+    pipeline = IngestionPipeline(source_root, tmp_path / "knowledge")
+    assert pipeline.prepare(candidate) is None
+    quarantine_path = pipeline.repository.root / "quarantine" / f"{candidate.source_id}.json"
+    if corruption == "invalid_json":
+        quarantine_path.write_text("{corrupt", encoding="utf-8")
+    elif corruption == "reason_codes":
+        payload = json.loads(quarantine_path.read_text(encoding="utf-8"))
+        payload["reason_codes"] = ["wrong_reason"]
+        quarantine_path.write_text(json.dumps(payload), encoding="utf-8")
+    elif corruption == "parser_profile":
+        payload = json.loads(quarantine_path.read_text(encoding="utf-8"))
+        payload["parser_profile"] = "wrong_profile"
+        quarantine_path.write_text(json.dumps(payload), encoding="utf-8")
+    else:
+        payload = json.loads(quarantine_path.read_text(encoding="utf-8"))
+        payload["extraction"]["extractor_version"] = "old"
+        quarantine_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CandidateIngestionError) as error:
+        pipeline.prepare(candidate)
+
+    assert error.value.reason_code == "canonical_state_mismatch"
+    assert pipeline.last_outcome == "failed"
+
+
 def test_stale_asset_candidate_is_rejected_before_manifest_skip(tmp_path: Path) -> None:
     pipeline, _ = _fixture_pipeline(tmp_path, "machine-walkthrough.md")
     asset = pipeline.source_root / "Write-ups/Machines/Example/image.png"
@@ -388,3 +518,47 @@ def test_stale_asset_candidate_is_rejected_before_manifest_skip(tmp_path: Path) 
 
     assert error.value.source_id == candidate.source_id
     assert error.value.reason_code == "stale_asset"
+
+
+def test_close_racing_with_source_open_cannot_invalidate_inflight_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline, candidate = _fixture_pipeline(tmp_path, "machine-walkthrough.md")
+    real_open = pipeline_module.os.open
+    child_open_started = threading.Event()
+    allow_child_open = threading.Event()
+    source_fd = pipeline._source_fd
+
+    def blocking_open(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if path == "Write-ups" and dir_fd is not None:
+            child_open_started.set()
+            assert allow_child_open.wait(timeout=5)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(pipeline_module.os, "open", blocking_open)
+    result: list[bytes | BaseException] = []
+
+    def reader() -> None:
+        try:
+            result.append(
+                pipeline._read_relative_file(candidate.relative_path, candidate.source_id)
+            )
+        except BaseException as error:
+            result.append(error)
+
+    thread = threading.Thread(target=reader)
+    thread.start()
+    assert child_open_started.wait(timeout=5)
+    pipeline.close()
+    assert source_fd is not None
+    allow_child_open.set()
+    thread.join(timeout=5)
+
+    assert result == [candidate.path.read_bytes()]
