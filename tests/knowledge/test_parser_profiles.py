@@ -20,6 +20,21 @@ def joined_text(document) -> str:
     return "\n".join(block.text for block in document.blocks)
 
 
+def assert_text_coordinate_metadata_is_valid(document) -> None:
+    for block in document.blocks:
+        for key, serialized in block.metadata.items():
+            if key.endswith("_offsets"):
+                assert all(
+                    0 <= offset <= len(block.text)
+                    for offset in json.loads(serialized)
+                )
+            elif key.endswith("_spans"):
+                assert all(
+                    0 <= start <= end <= len(block.text)
+                    for start, end in json.loads(serialized)
+                )
+
+
 def test_htb_scrape_removes_interface_regions_but_keeps_article_content():
     cleaned = apply_profile(parse_fixture("htb-scrape.md"), "htb_scrape")
     text = joined_text(cleaned)
@@ -245,6 +260,12 @@ def test_github_profile_unwraps_centered_presentation_without_losing_content():
     assert "Use the observed Samba version" in joined_text(cleaned)
     assert cleaned.relationships == ("https://example.test/machine",)
     assert [asset.target for asset in cleaned.assets] == ["avatar.png", "scan.png"]
+    assert all(
+        not key.endswith(("_offsets", "_spans"))
+        for block in cleaned.blocks[:3]
+        for key in block.metadata
+    )
+    assert_text_coordinate_metadata_is_valid(cleaned)
 
 
 def test_github_profile_preserves_non_centered_html_verbatim():
@@ -324,6 +345,58 @@ def test_github_profile_is_idempotent_when_visible_code_looks_like_centered_html
     assert [asset.target for asset in once.assets] == ["proof.png"]
     assert twice == once
     assert twice.model_validate_json(twice.model_dump_json()) == twice
+
+
+def test_github_profile_drops_stale_coordinates_but_keeps_targets_and_order():
+    source = parse_markdown(
+        "source-github",
+        "walkthrough.md",
+        "[ordinary](https://ordinary.test)\n\n"
+        '<div align="center">Title\n'
+        '<a href="https://example.test/search?a=1&amp;b=2">named</a>\n'
+        '<a href="https://example.test/&#x64;up">numeric</a>\n'
+        '<a href="https://example.test/search?a=1&amp;b=2">duplicate</a>\n'
+        "</div>\n",
+    )
+    centered = source.blocks[1]
+
+    assert "url_offsets" in centered.metadata
+
+    once = apply_profile(source, "github_walkthrough")
+    rewritten = once.blocks[1]
+
+    assert once.relationships == (
+        "https://ordinary.test",
+        "https://example.test/search?a=1&b=2",
+        "https://example.test/dup",
+    )
+    assert json.loads(rewritten.metadata["urls"]) == [
+        "https://example.test/search?a=1&b=2",
+        "https://example.test/dup",
+        "https://example.test/search?a=1&b=2",
+    ]
+    assert "url" not in rewritten.metadata
+    assert rewritten.metadata["profile_cleanup"] == "github_centered_unwrapped_v1"
+    assert "url_offsets" not in rewritten.metadata
+    assert_text_coordinate_metadata_is_valid(once)
+    assert apply_profile(once, "github_walkthrough") == once
+    assert once.model_validate_json(once.model_dump_json()) == once
+
+
+def test_github_profile_drops_inline_code_spans_from_rewritten_centered_heading():
+    source = parse_markdown(
+        "source-github",
+        "walkthrough.md",
+        '# <div align="center">Title `[[literal]]`</div>\n',
+    )
+
+    assert "inline_code_spans" in source.blocks[0].metadata
+
+    cleaned = apply_profile(source, "github_walkthrough")
+
+    assert cleaned.blocks[0].text == "Title [[literal]]"
+    assert "inline_code_spans" not in cleaned.blocks[0].metadata
+    assert_text_coordinate_metadata_is_valid(cleaned)
 
 
 @pytest.mark.parametrize(

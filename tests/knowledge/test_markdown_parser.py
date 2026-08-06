@@ -1,5 +1,7 @@
 """Tests for immutable structural parsing contracts."""
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -610,6 +612,37 @@ def test_parse_markdown_extracts_html_anchor_relationships_and_preserves_raw_htm
         "https://three.test",
     )
     assert [asset.target for asset in parsed.assets] == ["proof.png", "inline.png"]
+
+
+def test_parse_markdown_records_each_raw_html_anchor_start_offset_with_entities():
+    html = (
+        "<div>\n"
+        '<a href="https://example.test/search?a=1&amp;b=2">named</a>\n'
+        '<a href="https://example.test/&#x64;up">numeric</a>\n'
+        '<a href="https://example.test/search?a=1&amp;b=2">duplicate</a>\n'
+        "</div>"
+    )
+    parsed = parse_markdown(
+        "source-test",
+        "sample.md",
+        "[ordinary](https://ordinary.test)\n\n" + html + "\n",
+    )
+    html_block = parsed.blocks[1]
+    offsets = json.loads(html_block.metadata["url_offsets"])
+
+    assert parsed.relationships == (
+        "https://ordinary.test",
+        "https://example.test/search?a=1&b=2",
+        "https://example.test/dup",
+    )
+    assert json.loads(html_block.metadata["urls"]) == [
+        "https://example.test/search?a=1&b=2",
+        "https://example.test/dup",
+        "https://example.test/search?a=1&b=2",
+    ]
+    assert offsets == sorted(offsets)
+    assert len(set(offsets)) == 3
+    assert all(offset >= 0 and html[offset:].startswith("<a ") for offset in offsets)
 
 
 def test_parse_markdown_preserves_list_item_child_interleaving_and_relationship_order():

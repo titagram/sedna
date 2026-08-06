@@ -37,10 +37,16 @@ class _BlockPayload:
 class _ImageHTMLParser(HTMLParser):
     """Collect image attributes without interpreting the surrounding HTML."""
 
-    def __init__(self) -> None:
+    def __init__(self, html: str) -> None:
         super().__init__(convert_charrefs=True)
         self.images: list[dict[str, str]] = []
         self.links: list[str] = []
+        self.link_offsets: list[int] = []
+        self._html_length = len(html)
+        self._line_starts = [0]
+        self._line_starts.extend(
+            index + 1 for index, character in enumerate(html) if character == "\n"
+        )
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = {name.casefold(): value or "" for name, value in attrs}
@@ -49,9 +55,19 @@ class _ImageHTMLParser(HTMLParser):
             self.images.append(attributes)
         elif normalized_tag == "a" and attributes.get("href"):
             self.links.append(attributes["href"])
+            self.link_offsets.append(self._absolute_offset(*self.getpos()))
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self.handle_starttag(tag, attrs)
+
+    def _absolute_offset(self, line: int, column: int) -> int:
+        line_index = line - 1
+        if not 0 <= line_index < len(self._line_starts):
+            raise ValueError("HTML parser returned an invalid source line")
+        offset = self._line_starts[line_index] + column
+        if not 0 <= offset <= self._html_length:
+            raise ValueError("HTML parser returned an invalid source offset")
+        return offset
 
 
 def parse_markdown(source_id: str, path: str, markdown: str) -> ParsedDocument:
@@ -478,7 +494,7 @@ def _contains_only_wrapped_images(children: tuple[Token, ...]) -> bool:
 
 
 def _raw_html_payload(html: str, span: tuple[int, int]) -> _InlinePayload:
-    parser = _ImageHTMLParser()
+    parser = _ImageHTMLParser(html)
     parser.feed(html)
     parser.close()
     assets = tuple(
@@ -492,18 +508,11 @@ def _raw_html_payload(html: str, span: tuple[int, int]) -> _InlinePayload:
         )
         for attributes in parser.images
     )
-    link_offsets: list[int] = []
-    search_offset = 0
-    for target in parser.links:
-        offset = html.find(target, search_offset)
-        link_offsets.append(max(offset, 0))
-        if offset >= 0:
-            search_offset = offset + len(target)
     return _InlinePayload(
         html,
         tuple(parser.links),
         assets,
-        link_offsets=tuple(link_offsets),
+        link_offsets=tuple(parser.link_offsets),
     )
 
 
