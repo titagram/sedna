@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from sedna.knowledge.parsing import BlockKind, parse_markdown
+from sedna.knowledge.parsing import (
+    BlockKind,
+    ParsedBlock,
+    ParsedDocument,
+    parse_markdown,
+)
 from sedna.knowledge.parsing.profiles import apply_profile
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -397,6 +402,46 @@ def test_github_profile_drops_inline_code_spans_from_rewritten_centered_heading(
     assert cleaned.blocks[0].text == "Title [[literal]]"
     assert "inline_code_spans" not in cleaned.blocks[0].metadata
     assert_text_coordinate_metadata_is_valid(cleaned)
+
+
+def test_github_profile_drops_only_parser_owned_positional_metadata():
+    parsed = parse_markdown(
+        "source-github",
+        "walkthrough.md",
+        '# <div align="center">Title `code` '
+        '<a href="https://reference.test">reference</a></div>\n',
+    )
+    original = parsed.blocks[0]
+    enriched = ParsedBlock(
+        kind=original.kind,
+        text=original.text,
+        start_line=original.start_line,
+        end_line=original.end_line,
+        level=original.level,
+        language=original.language,
+        metadata={
+            **dict(original.metadata),
+            "retry_offsets": "application-value",
+            "scope_ranges": "scope-value",
+            "screen_positions": "screen-value",
+        },
+    )
+    source = ParsedDocument(
+        source_id=parsed.source_id,
+        path=parsed.path,
+        blocks=(enriched,),
+        assets=parsed.assets,
+        relationships=parsed.relationships,
+    )
+
+    cleaned = apply_profile(source, "github_walkthrough")
+    metadata = cleaned.blocks[0].metadata
+
+    assert "url_offsets" not in metadata
+    assert "inline_code_spans" not in metadata
+    assert metadata["retry_offsets"] == "application-value"
+    assert metadata["scope_ranges"] == "scope-value"
+    assert metadata["screen_positions"] == "screen-value"
 
 
 @pytest.mark.parametrize(

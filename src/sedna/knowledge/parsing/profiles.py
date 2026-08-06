@@ -113,7 +113,9 @@ _VOID_HTML_TAGS = frozenset(
 )
 _GITHUB_PROFILE_MARKER_KEY = "profile_cleanup"
 _GITHUB_PROFILE_MARKER_VALUE = "github_centered_unwrapped_v1"
-_TEXT_COORDINATE_KEY_SUFFIXES = ("_offsets", "_positions", "_ranges", "_spans")
+_PARSER_POSITIONAL_METADATA_KEYS = frozenset(
+    {"url_offsets", "inline_code_spans"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -459,7 +461,7 @@ def _unwrap_centered_block(
     metadata = {
         key: value
         for key, value in block.metadata.items()
-        if not key.endswith(_TEXT_COORDINATE_KEY_SUFFIXES)
+        if key not in _PARSER_POSITIONAL_METADATA_KEYS
     }
     metadata[_GITHUB_PROFILE_MARKER_KEY] = _GITHUB_PROFILE_MARKER_VALUE
     return _copy_block(block, kind=kind, text=text, metadata=metadata)
