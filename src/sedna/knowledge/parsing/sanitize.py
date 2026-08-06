@@ -6,7 +6,8 @@ import re
 
 EXCLUDED_FLAG = "<EXCLUDED_FLAG>"
 
-_HTB_FLAG_RE = re.compile(r"HTB\{[^}]{0,512}\}", re.IGNORECASE)
+_HTB_FLAG_RE = re.compile(r"HTB\{[^}]*\}", re.IGNORECASE)
+_HTB_OPEN_MARKER_RE = re.compile(r"HTB\{", re.IGNORECASE)
 _STANDALONE_32_HEX_RE = re.compile(
     r"(?<![A-Za-z0-9])[0-9A-Fa-f]{32}(?![A-Za-z0-9])"
 )
@@ -20,7 +21,8 @@ _EXACT_HEX_FLAG_HEADINGS = frozenset(
     }
 )
 _FLAG_WORDS = frozenset({"flag", "flags"})
-_FLAG_CONTEXT_WORDS = frozenset({"final", "root", "user"})
+_DIRECT_FLAG_CONTEXTS = frozenset({"final", "root", "user"})
+_CAPTURE_VERBS = frozenset({"read", "retrieve", "submit"})
 
 
 def sanitize_searchable_text(text: str, heading_path: tuple[str, ...]) -> str:
@@ -49,6 +51,7 @@ def _sanitize_searchable_text(
     known_hex_flags: frozenset[str],
 ) -> str:
     sanitized = _HTB_FLAG_RE.sub(EXCLUDED_FLAG, text)
+    sanitized = _HTB_OPEN_MARKER_RE.sub(EXCLUDED_FLAG, sanitized)
     if _is_hex_flag_context(heading_path):
         sanitized = _STANDALONE_32_HEX_RE.sub(EXCLUDED_FLAG, sanitized)
     elif known_hex_flags:
@@ -71,8 +74,30 @@ def _heading_is_hex_flag_context(heading: str) -> bool:
     normalized = _normalize_heading(heading)
     if normalized in _EXACT_HEX_FLAG_HEADINGS:
         return True
-    words = frozenset(normalized.split())
-    return bool(words & _FLAG_WORDS) and bool(words & _FLAG_CONTEXT_WORDS)
+    words = tuple(normalized.split())
+    if any(
+        word in _DIRECT_FLAG_CONTEXTS
+        and index + 1 < len(words)
+        and words[index + 1] in _FLAG_WORDS
+        for index, word in enumerate(words)
+    ):
+        return True
+    if not any(word in _DIRECT_FLAG_CONTEXTS for word in words):
+        return False
+    return any(_is_capture_flag_phrase(words, index) for index in range(len(words)))
+
+
+def _is_capture_flag_phrase(words: tuple[str, ...], index: int) -> bool:
+    if words[index] not in _CAPTURE_VERBS or index + 1 >= len(words):
+        return False
+    following = words[index + 1]
+    if following in _FLAG_WORDS:
+        return True
+    return (
+        following == "the"
+        and index + 2 < len(words)
+        and words[index + 2] in _FLAG_WORDS
+    )
 
 
 def _normalize_heading(heading: str) -> str:

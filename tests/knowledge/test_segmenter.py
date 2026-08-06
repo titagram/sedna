@@ -33,6 +33,112 @@ def test_segment_keeps_action_code_and_immediate_result_together():
     )
 
 
+def test_action_command_fence_output_fence_and_conclusion_are_one_local_unit():
+    document = parsed(
+        "# Trace\n"
+        "Run a trace to inspect the process.\n\n"
+        "```sh\nstrace -h\n```\n\n"
+        "```text\nusage: strace [options] PROG\n```\n\n"
+        "The usage output confirms that the tool works.\n"
+    )
+
+    segments = segment_document(document, maximum_segment_chars=10)
+
+    assert len(segments) == 1
+    assert segments[0].block_indices == tuple(range(len(document.blocks)))
+    assert "Run a trace" in segments[0].text
+    assert "strace -h" in segments[0].text
+    assert "usage: strace" in segments[0].text
+    assert "confirms that the tool works" in segments[0].text
+
+
+def test_linux_fundamentals_strace_indented_command_and_fenced_output_stay_together():
+    document = parsed(
+        "\tstrace -h\n\n"
+        "```text\n"
+        "usage: strace [-CdffhiqrtttTvVwxxy] [-I n] [-e expr]...\n"
+        "```\n\n"
+        "The help output is available.\n"
+    )
+
+    segments = segment_document(document, maximum_segment_chars=20)
+
+    pair_segment = next(segment for segment in segments if "strace -h" in segment.text)
+    assert "usage: strace" in pair_segment.text
+    assert "The help output" in pair_segment.text
+
+
+def test_eight_consecutive_code_blocks_split_into_bounded_pairs_without_duplication():
+    document = parsed(
+        "\n\n".join(f"```text\nblock-{index}\n```" for index in range(8))
+    )
+
+    segments = segment_document(document, maximum_segment_chars=20)
+
+    assert len(segments) == 4
+    assert all(len(segment.text) <= 20 for segment in segments)
+    assert all(len(segment.block_indices) == 2 for segment in segments)
+    flattened = tuple(index for segment in segments for index in segment.block_indices)
+    assert flattened == tuple(range(8))
+    assert len(flattened) == len(set(flattened))
+
+
+def test_openadmin_command_blocks_prefer_their_own_immediate_outputs():
+    document = parsed(
+        "Expected behavior:\n\n"
+        "```text\nFROM: if authenticated\nTO: stop after redirect\n```\n\n"
+        "```text\ncurl -vvv 127.0.0.1:52846/main.php\n```\n\n"
+        "```text\n* Trying 127.0.0.1...\n< HTTP/1.1 302 Found\n```\n\n"
+        "```text\ncurl -v 127.0.0.1:52846/main.php\n```\n\n"
+        "```text\n* Trying 127.0.0.1...\n* Closing connection\n```\n\n"
+        "Drop into SSH command mode.\n"
+    )
+
+    segments = segment_document(document, maximum_segment_chars=10)
+
+    verbose = next(segment for segment in segments if "curl -vvv" in segment.text)
+    second = next(
+        segment
+        for segment in segments
+        if "curl -v " in segment.text and "curl -vvv" not in segment.text
+    )
+    assert "302 Found" in verbose.text
+    assert "curl -v " not in verbose.text
+    assert "Closing connection" in second.text
+    assert "Drop into SSH" in second.text
+    flattened = tuple(index for segment in segments for index in segment.block_indices)
+    assert flattened == tuple(range(len(document.blocks)))
+    assert len(flattened) == len(set(flattened))
+
+
+@pytest.mark.parametrize(
+    ("command", "output"),
+    [
+        (
+            "sudo nmap 10.129.2.28 -p 80 -sV --script vuln",
+            "Nmap scan report for 10.129.2.28\n80/tcp open http",
+        ),
+        (
+            "iptables -L",
+            "iptables v1.6.1: can't initialize iptables table `filter'",
+        ),
+    ],
+)
+def test_command_named_output_headers_do_not_steal_the_pair(
+    command: str,
+    output: str,
+):
+    document = parsed(
+        f"```text\n{command}\n```\n\n```text\n{output}\n```\n"
+    )
+
+    segments = segment_document(document, maximum_segment_chars=1)
+
+    assert len(segments) == 1
+    assert command in segments[0].text
+    assert output in segments[0].text
+
+
 def test_repeated_code_result_pairs_form_bounded_non_overlapping_units():
     body = "# Procedure\n" + "\n\n".join(
         f"```sh\nrun-{index}\n```\n\nResult {index}." for index in range(8)
@@ -168,19 +274,29 @@ def test_segment_redacts_htb_flags_from_prose_code_and_heading():
     assert segment.text.count("<EXCLUDED_FLAG>") == 4
 
 
-def test_htb_flags_support_embedded_prefixes_and_bounded_multiline_values():
+def test_htb_flags_support_embedded_prefixes_and_complete_multiline_values():
     multiline = "prefixHTB{first line\nsecond line} suffix"
-    malformed = "HTB{" + "x" * 513 + "}"
+    long_complete = "HTB{" + "x" * 10_000 + "}"
 
     sanitized = sanitize_searchable_text(
-        f"{multiline}\nHTB{{first}}tail}} and hTb{{second}}\n{malformed}",
+        f"{multiline}\nHTB{{first}}tail}} and hTb{{second}}\n{long_complete}",
         (),
     )
 
     assert sanitized.startswith("prefix<EXCLUDED_FLAG> suffix")
     assert "<EXCLUDED_FLAG>tail}" in sanitized
-    assert sanitized.count("<EXCLUDED_FLAG>") == 3
-    assert malformed in sanitized
+    assert sanitized.count("<EXCLUDED_FLAG>") == 4
+    assert "htb{" not in sanitized.casefold()
+
+
+def test_unclosed_htb_marker_cannot_survive_sanitization():
+    sanitized = sanitize_searchable_text(
+        "before embeddedHTB{unclosed payload\nafter",
+        (),
+    )
+
+    assert sanitized == "before embedded<EXCLUDED_FLAG>unclosed payload\nafter"
+    assert "htb{" not in sanitized.casefold()
 
 
 def test_multiline_htb_flag_inside_code_is_removed_from_segment_text():
@@ -257,6 +373,20 @@ def test_real_lame_and_permx_descriptive_flag_headings_are_contextual(
     heading: str,
     token: str,
 ):
+    assert sanitize_searchable_text(token, (heading,)) == "<EXCLUDED_FLAG>"
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "Read the flag from root's home directory",
+        "Retrieve the flag assigned to the final account",
+        "Submit the flag stored for user access",
+    ],
+)
+def test_explicit_capture_intent_recognizes_separated_flag_context(heading: str):
+    token = "abcdef0123456789abcdef0123456789"
+
     assert sanitize_searchable_text(token, (heading,)) == "<EXCLUDED_FLAG>"
 
 
@@ -342,6 +472,15 @@ def test_32_hex_hashes_survive_unrelated_technical_contexts():
     )
 
 
+def test_unrelated_avatar_identifier_remains_searchable():
+    avatar = (
+        "https://labs.hackthebox.com/storage/avatars/"
+        "3ec233f1bf70b096a66f8a452e7cd52f.png"
+    )
+
+    assert sanitize_searchable_text(avatar, ("PermX",)) == avatar
+
+
 @pytest.mark.parametrize(
     "heading",
     [
@@ -350,6 +489,14 @@ def test_32_hex_hashes_survive_unrelated_technical_contexts():
         "Command-line flags",
         "Feature flags",
         "Root cause analysis",
+        "Command-line flags for root user",
+        "TCP flags for root traffic",
+        "Feature flags for user accounts",
+        "Compiler flags for root user",
+        "Tool flags for final output",
+        "Read command-line flags for root user",
+        "Retrieve compiler flags for user builds",
+        "Submit tool flags for root process",
     ],
 )
 def test_technical_flag_headings_do_not_create_hex_flag_context(heading: str):
@@ -397,7 +544,7 @@ def test_logical_heading_paths_are_sanitized_but_raw_headings_are_unchanged():
         f"Parent <EXCLUDED_FLAG> {parent_hex}",
     )
     assert segments[1].heading_path == (
-        "Parent <EXCLUDED_FLAG> <EXCLUDED_FLAG>",
+        f"Parent <EXCLUDED_FLAG> {parent_hex}",
         "Root Flag <EXCLUDED_FLAG>",
     )
     assert all(
@@ -408,6 +555,22 @@ def test_logical_heading_paths_are_sanitized_but_raw_headings_are_unchanged():
     assert document.model_dump(mode="json") == original
     assert document.blocks[0].text == f"Parent {htb_token} {parent_hex}"
     assert document.blocks[2].text == f"Root Flag {hex_token}"
+
+
+def test_document_known_flag_redacts_identical_parent_value_without_child_context():
+    token = "abcdef0123456789abcdef0123456789"
+    document = parsed(
+        f"# Technical digest {token}\nparent body\n\n"
+        f"### Root Flag {token}\nchild body\n"
+    )
+
+    segments = segment_document(document, maximum_segment_chars=1)
+
+    assert segments[0].heading_path == ("Technical digest <EXCLUDED_FLAG>",)
+    assert segments[1].heading_path == (
+        "Technical digest <EXCLUDED_FLAG>",
+        "Root Flag <EXCLUDED_FLAG>",
+    )
 
 
 def test_empty_heading_affects_structure_without_empty_path_component():

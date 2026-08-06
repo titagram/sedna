@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from sedna.knowledge.parsing.models import (
@@ -13,6 +14,66 @@ from sedna.knowledge.parsing.models import (
 from sedna.knowledge.parsing.sanitize import (
     _contextual_hex_flag_values,
     _sanitize_searchable_text,
+)
+
+_COMMON_COMMAND_NAMES = frozenset(
+    {
+        "apt",
+        "apt-get",
+        "awk",
+        "bash",
+        "cat",
+        "chmod",
+        "chown",
+        "cp",
+        "curl",
+        "docker",
+        "echo",
+        "env",
+        "find",
+        "git",
+        "grep",
+        "ip",
+        "iptables",
+        "ls",
+        "mkdir",
+        "mount",
+        "mv",
+        "nc",
+        "netcat",
+        "nmap",
+        "ping",
+        "pip",
+        "pip3",
+        "powershell",
+        "python",
+        "python3",
+        "rm",
+        "rpcclient",
+        "run",
+        "script",
+        "set",
+        "show",
+        "smbclient",
+        "snmpwalk",
+        "ssh",
+        "strace",
+        "sudo",
+        "tar",
+        "tree",
+        "unzip",
+        "use",
+        "wget",
+        "whoami",
+    }
+)
+_PROMPT_COMMAND_RE = re.compile(r"(?:[$#>]\s+)(?P<command>[^\r\n]+)$")
+_KNOWN_OUTPUT_PREFIX_RE = re.compile(
+    r"(?:find:|iptables\s+v\d|nmap\s+scan\s+report\b)",
+    re.IGNORECASE,
+)
+_COMMAND_NAME_RE = re.compile(
+    r"(?:(?:\./|/)?[A-Za-z0-9_.-]+/)*(?P<name>[A-Za-z][A-Za-z0-9_-]*)(?=$|\s)"
 )
 
 
@@ -32,9 +93,9 @@ def segment_document(
 
     A heading owns blocks through the next heading at the same or a higher level.
     Oversized sections split only between atomic block groups. A heading and its
-    first block stay together, as do an action immediately before a code block,
-    that code block, and its immediate result or explanation. A single atomic
-    group may therefore exceed the configured target.
+    first block stay together, as do an action immediately before a command code
+    block, at most one following result code block, and an immediate conclusion.
+    A single local group may therefore exceed the configured target.
     """
     if maximum_segment_chars < 1:
         raise ValueError("maximum_segment_chars must be positive")
@@ -73,17 +134,7 @@ def _block_views(document: ParsedDocument) -> tuple[_BlockView, ...]:
         _BlockView(
             index=index,
             block=block,
-            heading_path=tuple(
-                sanitized_component
-                for component in heading_path
-                if (
-                    sanitized_component := _sanitize_searchable_text(
-                        component,
-                        heading_path,
-                        known_hex_flags,
-                    ).strip()
-                )
-            ),
+            heading_path=_sanitize_heading_path(heading_path, known_hex_flags),
             searchable_text=_sanitize_searchable_text(
                 block.text,
                 heading_path,
@@ -92,6 +143,22 @@ def _block_views(document: ParsedDocument) -> tuple[_BlockView, ...]:
         )
         for index, block, heading_path in contextual_blocks
     )
+
+
+def _sanitize_heading_path(
+    heading_path: tuple[str, ...],
+    known_hex_flags: frozenset[str],
+) -> tuple[str, ...]:
+    sanitized_path: list[str] = []
+    for index, component in enumerate(heading_path):
+        sanitized_component = _sanitize_searchable_text(
+            component,
+            heading_path[: index + 1],
+            known_hex_flags,
+        ).strip()
+        if sanitized_component:
+            sanitized_path.append(sanitized_component)
+    return tuple(sanitized_path)
 
 
 def _section_ranges(views: tuple[_BlockView, ...]) -> tuple[range, ...]:
@@ -134,18 +201,18 @@ def _atomic_groups(views: tuple[_BlockView, ...]) -> tuple[tuple[_BlockView, ...
             if position < len(views) and views[position].block.kind is not BlockKind.HEADING:
                 if views[position].block.kind is BlockKind.CODE:
                     position += 1
-                    position = _consume_immediate_result(views, position)
+                    position = _consume_code_result(views, position)
                 else:
                     position += 1
                     if position < len(views) and views[position].block.kind is BlockKind.CODE:
                         position += 1
-                        position = _consume_immediate_result(views, position)
+                        position = _consume_code_result(views, position)
         elif current.kind is BlockKind.CODE:
             position += 1
-            position = _consume_immediate_result(views, position)
+            position = _consume_code_result(views, position)
         elif position + 1 < len(views) and views[position + 1].block.kind is BlockKind.CODE:
             position += 2
-            position = _consume_immediate_result(views, position)
+            position = _consume_code_result(views, position)
         else:
             position += 1
 
@@ -153,12 +220,38 @@ def _atomic_groups(views: tuple[_BlockView, ...]) -> tuple[tuple[_BlockView, ...
     return tuple(groups)
 
 
-def _consume_immediate_result(views: tuple[_BlockView, ...], position: int) -> int:
-    if position >= len(views):
-        return position
-    if views[position].block.kind in {BlockKind.HEADING, BlockKind.CODE}:
-        return position
-    return position + 1
+def _consume_code_result(views: tuple[_BlockView, ...], position: int) -> int:
+    if (
+        position < len(views)
+        and views[position].block.kind is BlockKind.CODE
+        and not _looks_like_command_code(views[position].block)
+    ):
+        position += 1
+    if (
+        position < len(views)
+        and views[position].block.kind not in {BlockKind.HEADING, BlockKind.CODE}
+    ):
+        position += 1
+    return position
+
+
+def _looks_like_command_code(block: ParsedBlock) -> bool:
+    first_line = next(
+        (line.strip() for line in block.text.splitlines() if line.strip()),
+        "",
+    )
+    if not first_line:
+        return False
+    if _KNOWN_OUTPUT_PREFIX_RE.match(first_line):
+        return False
+    prompt_match = _PROMPT_COMMAND_RE.search(first_line)
+    if prompt_match is not None:
+        first_line = prompt_match.group("command").strip()
+    name_match = _COMMAND_NAME_RE.match(first_line.casefold())
+    return (
+        name_match is not None
+        and name_match.group("name") in _COMMON_COMMAND_NAMES
+    )
 
 
 def _pack_groups(
