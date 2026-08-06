@@ -1,0 +1,9 @@
+manifest_version: 1
+name: sedna
+version: "0.1.0"
+kind: standalone
+description: "Minimal HTB/CTF evidence store and safe Nmap wrappers."
+author: Gabriele
+provides_tools:
+  - sedna_nmap_tcp_discovery
+  - sedna_nmap_service_scan
