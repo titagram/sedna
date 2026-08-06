@@ -2,15 +2,68 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from enum import StrEnum
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, GetCoreSchemaHandler, model_validator
+from pydantic_core import CoreSchema, core_schema
 
 from sedna.knowledge.schema import DocumentManifest
 
 NonEmptyString = Annotated[str, Field(min_length=1)]
 BlockIndex = Annotated[int, Field(ge=0)]
+
+
+class FrozenMetadata(Mapping[str, str]):
+    """A JSON-serializable immutable string mapping accepted from ordinary dicts."""
+
+    __slots__ = ("_items",)
+
+    def __init__(self, values: Mapping[str, str] | None = None) -> None:
+        object.__setattr__(self, "_items", tuple((values or {}).items()))
+
+    def __getitem__(self, key: str) -> str:
+        for item_key, value in self._items:
+            if item_key == key:
+                return value
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return (key for key, _ in self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise TypeError(f"{type(self).__name__} is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise TypeError(f"{type(self).__name__} is immutable")
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({dict(self)!r})"
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls,
+        source_type: object,
+        handler: GetCoreSchemaHandler,
+    ) -> CoreSchema:
+        """Validate natural dict input and serialize back to a JSON object."""
+        del source_type, handler
+        dictionary_schema = core_schema.dict_schema(
+            keys_schema=core_schema.str_schema(),
+            values_schema=core_schema.str_schema(),
+        )
+        return core_schema.no_info_after_validator_function(
+            cls,
+            dictionary_schema,
+            serialization=core_schema.plain_serializer_function_ser_schema(
+                dict,
+                return_schema=dictionary_schema,
+            ),
+        )
 
 
 class BlockKind(StrEnum):
@@ -39,7 +92,7 @@ class ParsedBlock(BaseModel):
     end_line: int = Field(ge=1)
     level: int | None = Field(default=None, ge=1, le=6)
     language: str | None = None
-    metadata: dict[str, str] = Field(default_factory=dict)
+    metadata: FrozenMetadata = Field(default_factory=FrozenMetadata)
 
     @model_validator(mode="after")
     def validate_structure(self) -> ParsedBlock:
@@ -50,6 +103,8 @@ class ParsedBlock(BaseModel):
             raise ValueError("heading blocks require a level")
         if self.kind is not BlockKind.HEADING and self.level is not None:
             raise ValueError("only heading blocks may define a level")
+        if self.kind is not BlockKind.CODE and self.language is not None:
+            raise ValueError("only code blocks may define a language")
         return self
 
 
@@ -63,7 +118,7 @@ class ParsedAsset(BaseModel):
     end_line: int = Field(ge=1)
     alt_text: str | None = None
     title: str | None = None
-    metadata: dict[str, str] = Field(default_factory=dict)
+    metadata: FrozenMetadata = Field(default_factory=FrozenMetadata)
 
     @model_validator(mode="after")
     def validate_line_range(self) -> ParsedAsset:
@@ -102,8 +157,9 @@ class LogicalSegment(BaseModel):
         """Require ordered lines and unique, increasing source block indices."""
         if self.end_line < self.start_line:
             raise ValueError("end_line must not precede start_line")
-        if tuple(sorted(set(self.block_indices))) != self.block_indices:
-            raise ValueError("block_indices must be unique and increasing")
+        expected_indices = tuple(range(self.block_indices[0], self.block_indices[-1] + 1))
+        if self.block_indices != expected_indices:
+            raise ValueError("block_indices must be unique, increasing, and contiguous")
         return self
 
 
@@ -117,10 +173,28 @@ class PreparedSource(BaseModel):
     segments: tuple[LogicalSegment, ...]
 
     @model_validator(mode="after")
-    def validate_source_identity(self) -> PreparedSource:
-        """Prevent a manifest from being paired with a different parsed source."""
+    def validate_source_consistency(self) -> PreparedSource:
+        """Keep every segment anchored exactly to blocks and assets in its document."""
         if self.manifest.source_id != self.document.source_id:
             raise ValueError("manifest and document source_id must match")
         if self.manifest.path != self.document.path:
             raise ValueError("manifest and document path must match")
+
+        for segment in self.segments:
+            if segment.block_indices[-1] >= len(self.document.blocks):
+                raise ValueError("segment block index is outside the parsed document")
+
+            referenced_blocks = tuple(
+                self.document.blocks[index] for index in segment.block_indices
+            )
+            expected_start_line = min(block.start_line for block in referenced_blocks)
+            expected_end_line = max(block.end_line for block in referenced_blocks)
+            if (segment.start_line, segment.end_line) != (
+                expected_start_line,
+                expected_end_line,
+            ):
+                raise ValueError("segment line range must exactly span its referenced blocks")
+
+            if any(asset not in self.document.assets for asset in segment.assets):
+                raise ValueError("segment assets must belong to the parsed document")
         return self
