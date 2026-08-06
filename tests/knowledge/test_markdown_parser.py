@@ -610,3 +610,62 @@ def test_parse_markdown_extracts_html_anchor_relationships_and_preserves_raw_htm
         "https://three.test",
     )
     assert [asset.target for asset in parsed.assets] == ["proof.png", "inline.png"]
+
+
+def test_parse_markdown_preserves_list_item_child_interleaving_and_relationship_order():
+    parsed = parse_markdown(
+        "source-test",
+        "sample.md",
+        "- [before](https://before.test)\n\n"
+        "      nested command\n\n"
+        "  ## [middle](https://middle.test)\n\n"
+        "  [after](https://after.test)\n",
+    )
+
+    assert [block.kind for block in parsed.blocks] == [
+        BlockKind.UNORDERED_LIST_ITEM,
+        BlockKind.CODE,
+        BlockKind.HEADING,
+        BlockKind.PARAGRAPH,
+    ]
+    assert [block.text for block in parsed.blocks] == [
+        "before",
+        "nested command",
+        "middle",
+        "after",
+    ]
+    assert parsed.blocks[2].level == 2
+    assert parsed.relationships == (
+        "https://before.test",
+        "https://middle.test",
+        "https://after.test",
+    )
+
+
+def test_parse_markdown_preserves_blockquote_child_interleaving_and_relationship_order():
+    parsed = parse_markdown(
+        "source-test",
+        "sample.md",
+        "> [before](https://before.test)\n>\n"
+        "> > [middle](https://middle.test)\n>\n"
+        ">     nested command\n>\n"
+        "> [after](https://after.test)\n",
+    )
+
+    assert [block.kind for block in parsed.blocks] == [
+        BlockKind.BLOCKQUOTE,
+        BlockKind.BLOCKQUOTE,
+        BlockKind.CODE,
+        BlockKind.PARAGRAPH,
+    ]
+    assert [block.text for block in parsed.blocks] == [
+        "before",
+        "middle",
+        "nested command",
+        "after",
+    ]
+    assert parsed.relationships == (
+        "https://before.test",
+        "https://middle.test",
+        "https://after.test",
+    )

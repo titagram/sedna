@@ -80,7 +80,7 @@ def _parse_scope(
     end: int,
     *,
     level: int,
-    suppress_paragraphs: bool = False,
+    skip_paragraph_index: int | None = None,
 ) -> list[_BlockPayload]:
     """Flatten one token scope while retaining nested structural children."""
     parsed_blocks: list[_BlockPayload] = []
@@ -100,7 +100,7 @@ def _parse_scope(
 
         if token.type == "paragraph_open":
             close_index = _matching_close(tokens, index)
-            if not suppress_paragraphs:
+            if index != skip_paragraph_index:
                 parsed_blocks.append(
                     _paragraph_block(token, tokens[index + 1 : close_index])
                 )
@@ -127,16 +127,17 @@ def _parse_scope(
         if token.type == "blockquote_open":
             close_index = _matching_close(tokens, index)
             child_level = token.level + 1
+            leading_payload, leading_paragraph_index = _leading_paragraph_payload(
+                tokens,
+                index + 1,
+                close_index,
+                level=child_level,
+            )
             parsed_blocks.append(
                 _make_block(
                     BlockKind.BLOCKQUOTE,
                     token,
-                    _direct_paragraph_payload(
-                        tokens,
-                        index + 1,
-                        close_index,
-                        level=child_level,
-                    ),
+                    leading_payload,
                 )
             )
             parsed_blocks.extend(
@@ -145,7 +146,7 @@ def _parse_scope(
                     index + 1,
                     close_index,
                     level=child_level,
-                    suppress_paragraphs=True,
+                    skip_paragraph_index=leading_paragraph_index,
                 )
             )
             index = close_index + 1
@@ -254,7 +255,7 @@ def _list_blocks(tokens: list[Token], start: int, end: int) -> list[_BlockPayloa
         if token.type == "list_item_open" and token.level == item_level:
             close_index = _matching_close(tokens, index)
             child_level = token.level + 1
-            payload = _direct_paragraph_payload(
+            payload, leading_paragraph_index = _leading_paragraph_payload(
                 tokens,
                 index + 1,
                 close_index,
@@ -267,7 +268,7 @@ def _list_blocks(tokens: list[Token], start: int, end: int) -> list[_BlockPayloa
                     index + 1,
                     close_index,
                     level=child_level,
-                    suppress_paragraphs=True,
+                    skip_paragraph_index=leading_paragraph_index,
                 )
             )
             index = close_index + 1
@@ -277,32 +278,25 @@ def _list_blocks(tokens: list[Token], start: int, end: int) -> list[_BlockPayloa
     return blocks
 
 
-def _direct_paragraph_payload(
+def _leading_paragraph_payload(
     tokens: list[Token],
     start: int,
     end: int,
     *,
     level: int,
-) -> _InlinePayload:
-    payloads: list[_InlinePayload] = []
+) -> tuple[_InlinePayload, int | None]:
+    """Return only the first paragraph when it leads a container's direct children."""
     index = start
     while index < end:
         token = tokens[index]
-        if token.type == "paragraph_open" and token.level == level:
-            close_index = _matching_close(tokens, index)
-            payloads.append(_tokens_payload(tokens[index + 1 : close_index]))
-            index = close_index + 1
+        if token.level != level:
+            index += 1
             continue
-        index += 1
-    return _combine_payloads(payloads)
-
-
-def _combine_payloads(payloads: list[_InlinePayload]) -> _InlinePayload:
-    return _InlinePayload(
-        "\n".join(payload.text for payload in payloads if payload.text),
-        tuple(link for payload in payloads for link in payload.links),
-        tuple(asset for payload in payloads for asset in payload.assets),
-    )
+        if token.type == "paragraph_open":
+            close_index = _matching_close(tokens, index)
+            return _tokens_payload(tokens[index + 1 : close_index]), index
+        return _InlinePayload(""), None
+    return _InlinePayload(""), None
 
 
 def _html_block(token: Token) -> _BlockPayload:
