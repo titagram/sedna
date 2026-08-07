@@ -1,0 +1,141 @@
+[
+  {
+    "artifacts": [
+      {
+        "draft_type": "reference",
+        "local_id": "credential-evidence-role",
+        "artifact_type": "evidence_interpretation",
+        "knowledge_role": "reference",
+        "subject": "Case-local credential evidence",
+        "statement": "A source-authored credential example is historical case evidence, not a credential for another target.",
+        "applicable_situations": [
+          "A case source records an authentication attempt"
+        ],
+        "prerequisites": [],
+        "action_intent": "Interpret the authentication outcome without reusing the recorded literal.",
+        "expected_information_gain": "Clarify whether the authentication hypothesis gained or lost support.",
+        "expected_evidence": [
+          "An authentication acceptance or rejection outcome"
+        ],
+        "evidence_interpretation": "The literal's role and observed outcome matter; its truth outside the case is unknown.",
+        "success_implications": [],
+        "failure_implications": [
+          "Lower the case-local authentication hypothesis"
+        ],
+        "stop_implications": [],
+        "exceptions": [],
+        "warnings": [
+          "Never promote the source-authored literal to a current-target credential"
+        ],
+        "capability_refs": [],
+        "observed_at": null,
+        "origin": "explicit",
+        "applicability": {
+          "typed_context": {},
+          "facets": []
+        },
+        "citations": [
+          {
+            "segment_indexes": [
+              0
+            ]
+          }
+        ]
+      },
+      {
+        "draft_type": "case",
+        "local_id": "authentication-recovery-case",
+        "artifact_type": "case",
+        "knowledge_role": "case_study",
+        "title": "Authentication rejection and strategy revision",
+        "starting_access": "Network access",
+        "steps": [
+          {
+            "artifact_type": "case_step",
+            "local_id": "record-rejection",
+            "ordinal": 1,
+            "state_before": {
+              "access": "Network access",
+              "environment": [],
+              "privileges": []
+            },
+            "observations": [
+              "The source-authored credential example was rejected and no session was created"
+            ],
+            "hypotheses": [
+              {
+                "statement": "The recorded credential role did not provide access in this case",
+                "origin": "explicit"
+              }
+            ],
+            "selected_action": {
+              "intent": "Preserve the rejection as negative evidence and investigate a different hypothesis.",
+              "capability_ref": null
+            },
+            "expected_information_gain": "Avoid repeating an authentication path that added no evidence.",
+            "evidence": [
+              {
+                "summary": "Authentication was rejected.",
+                "origin": "explicit",
+                "category": "negative authentication evidence"
+              }
+            ],
+            "state_after": {
+              "access": "Network access",
+              "environment": [],
+              "privileges": []
+            },
+            "negative_evidence": [
+              "No authenticated session was created"
+            ],
+            "transfer_conditions": [
+              "Treat only the rejection pattern as transferable evidence"
+            ],
+            "case_specific_details": [
+              "The exact source-authored credential literal is intentionally excluded"
+            ],
+            "requires_validation": true,
+            "origin": "explicit",
+            "applicability": {
+              "typed_context": {},
+              "facets": []
+            },
+            "citations": [
+              {
+                "segment_indexes": [
+                  1
+                ]
+              }
+            ]
+          }
+        ],
+        "outcome": "The failed authentication path was preserved as negative evidence.",
+        "source_quality": "complete",
+        "difficulty": null,
+        "transferable_properties": [
+          "Preserve failed attempts that explain a strategy change"
+        ],
+        "non_transferable_properties": [
+          "The exact source-authored credential literal"
+        ],
+        "origin": "explicit",
+        "applicability": {
+          "typed_context": {},
+          "facets": []
+        },
+        "citations": [
+          {
+            "segment_indexes": [
+              1
+            ]
+          }
+        ]
+      }
+    ],
+    "ignored_segment_indexes": []
+  },
+  {
+    "accepted": true,
+    "findings": []
+  }
+]

@@ -1,0 +1,124 @@
+[
+  {
+    "artifacts": [
+      {
+        "draft_type": "reference",
+        "local_id": "architecture-strategy",
+        "artifact_type": "methodology",
+        "knowledge_role": "reference",
+        "subject": "Architecture-dependent strategy selection",
+        "statement": "Confirm the relevant execution architecture before selecting an architecture-dependent strategy.",
+        "applicable_situations": [
+          "A strategy depends on the execution architecture"
+        ],
+        "prerequisites": [
+          "Observed execution architecture"
+        ],
+        "action_intent": "Confirm architecture before selecting the strategy.",
+        "expected_information_gain": "Exclude strategies incompatible with the observed architecture.",
+        "expected_evidence": [
+          "An architecture observation"
+        ],
+        "evidence_interpretation": "Architecture is a required applicability condition.",
+        "success_implications": [],
+        "failure_implications": [],
+        "stop_implications": [],
+        "exceptions": [],
+        "warnings": [],
+        "capability_refs": [],
+        "observed_at": null,
+        "origin": "explicit",
+        "applicability": {
+          "typed_context": {},
+          "facets": []
+        },
+        "citations": [
+          {
+            "segment_indexes": [
+              0
+            ]
+          }
+        ]
+      }
+    ],
+    "ignored_segment_indexes": [
+      1
+    ]
+  },
+  {
+    "accepted": false,
+    "findings": [
+      {
+        "code": "context_omission",
+        "severity": "material",
+        "artifact_local_id": "architecture-strategy",
+        "message": "Required applicability context is omitted.",
+        "segment_indexes": [
+          1
+        ]
+      }
+    ]
+  },
+  {
+    "artifacts": [
+      {
+        "draft_type": "reference",
+        "local_id": "architecture-strategy",
+        "artifact_type": "methodology",
+        "knowledge_role": "reference",
+        "subject": "Architecture-dependent strategy selection",
+        "statement": "Confirm the relevant execution architecture before selecting an architecture-dependent strategy.",
+        "applicable_situations": [
+          "A strategy depends on the execution architecture"
+        ],
+        "prerequisites": [
+          "Observed execution architecture"
+        ],
+        "action_intent": "Confirm architecture before selecting the strategy.",
+        "expected_information_gain": "Exclude strategies incompatible with the observed architecture.",
+        "expected_evidence": [
+          "An architecture observation"
+        ],
+        "evidence_interpretation": "Architecture is a required applicability condition.",
+        "success_implications": [],
+        "failure_implications": [],
+        "stop_implications": [],
+        "exceptions": [],
+        "warnings": [],
+        "capability_refs": [],
+        "observed_at": null,
+        "origin": "explicit",
+        "applicability": {
+          "typed_context": {
+            "cpu_architecture": {
+              "value": "x86_64",
+              "relation": "required",
+              "origin": "explicit",
+              "confidence": 1.0,
+              "citations": [
+                {
+                  "segment_indexes": [
+                    1
+                  ]
+                }
+              ]
+            }
+          },
+          "facets": []
+        },
+        "citations": [
+          {
+            "segment_indexes": [
+              0
+            ]
+          }
+        ]
+      }
+    ],
+    "ignored_segment_indexes": []
+  },
+  {
+    "accepted": true,
+    "findings": []
+  }
+]

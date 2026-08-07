@@ -42,6 +42,7 @@ from sedna.knowledge.schema import (
     VerificationFinding,
     verification_from_legacy_review,
 )
+from sedna.knowledge.semantic import SemanticCompiler, SemanticIngestionService
 
 __all__ = [
     "ArtifactType",
@@ -76,7 +77,9 @@ __all__ = [
     "SourceRef",
     "ServiceContext",
     "SemanticCallMetadata",
+    "SemanticCompiler",
     "SemanticCompilationManifest",
+    "SemanticIngestionService",
     "SemanticKnowledgeBundle",
     "SemanticQuarantineRecord",
     "SemanticVerificationRecord",

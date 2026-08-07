@@ -36,17 +36,32 @@ indexed directly. Only sanitized logical-segment fields are prepared for search,
 and final flags such as `HTB{...}` or contextual user/root flag values are excluded
 from those fields.
 
-This foundation stops at `PreparedSource`. Semantic extraction into references,
-case studies, case steps, and draft decision rules is a follow-on phase, as are
-normalization and retrieval indexing. Sedna will own strategic intent and
-evidence transitions; detailed tool operation remains the responsibility of
-Hades capabilities. The implementation has no intentional deviations from this
-foundation boundary. In particular, PDF contents remain quarantined until a
-deterministic PDF parser is added rather than being partially or silently
-extracted.
+The deterministic foundation stops at `PreparedSource`. The M2 semantic compiler
+can then process one supplied prepared source through a caller-provided Hades LLM
+facade:
 
-The approved architecture for the next phase is documented in the
-[semantic ingestion and retrieval design](docs/superpowers/specs/2026-08-07-sedna-semantic-ingestion-retrieval-design.md).
+```text
+PreparedSource -> host LLM extractor -> critic -> bounded repair
+               -> canonical SemanticKnowledgeBundle
+```
+
+`SemanticIngestionService.compile_and_store()` checks canonical currentness
+before invoking the model, returns the stored typed bundle and verification as
+`unchanged` when all source and compiler versions match, and otherwise compiles
+once. Verified bundles and explainable quarantines are persisted atomically;
+transport or validation failures remain local to that run. Semantic artifacts
+retain exact segment provenance, applicability conditions, and graded epistemic
+metadata while keeping strategic intent separate from detailed Hades tool
+operation.
+
+M2 accepts a single `PreparedSource`; it does not traverse a folder, register a
+Hades tool, expose a user-facing “learn folder” workflow, or provide retrieval or
+indexing. Those composition and retrieval surfaces remain later milestones.
+PDF contents also remain quarantined until a deterministic PDF parser is added
+rather than being partially or silently extracted.
+
+The approved architecture for semantic compilation and later retrieval is
+documented in the [semantic ingestion and retrieval design](docs/superpowers/specs/2026-08-07-sedna-semantic-ingestion-retrieval-design.md).
 It defines the host-LLM extractor and critic, applicability facets, automatic
 verification, canonical JSON/JSONL storage, SQLite FTS5 retrieval, the future
 document-learning skill, and the evaluation gate for any later vector database.

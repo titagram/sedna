@@ -1,0 +1,74 @@
+[
+  {
+    "artifacts": [
+      {
+        "draft_type": "reference",
+        "local_id": "evidence-led-methodology",
+        "artifact_type": "methodology",
+        "knowledge_role": "reference",
+        "subject": "Evidence-led hypothesis testing",
+        "statement": "Choose the smallest discriminating observation that can support or weaken a stated hypothesis.",
+        "applicable_situations": [
+          "Several explanations fit the current evidence"
+        ],
+        "prerequisites": [
+          "A recorded observation",
+          "A falsifiable hypothesis"
+        ],
+        "action_intent": "Gather the lowest-cost evidence that distinguishes the leading explanations.",
+        "expected_information_gain": "Reduce uncertainty between competing explanations.",
+        "expected_evidence": [
+          "An observation that supports or weakens the hypothesis"
+        ],
+        "evidence_interpretation": "A failed observation can weaken a branch without proving that the underlying service is absent.",
+        "success_implications": [
+          "Promote the explanation supported by the new evidence"
+        ],
+        "failure_implications": [
+          "Revisit assumptions that could explain the negative result"
+        ],
+        "stop_implications": [
+          "Stop repeating an action when it adds no evidence"
+        ],
+        "exceptions": [],
+        "warnings": [
+          "Do not treat one source as authoritative"
+        ],
+        "capability_refs": [],
+        "observed_at": null,
+        "origin": "explicit",
+        "applicability": {
+          "typed_context": {
+            "os_family": {
+              "value": "unknown",
+              "relation": "unknown",
+              "origin": "inferred",
+              "confidence": 0.4,
+              "citations": [
+                {
+                  "segment_indexes": [
+                    0
+                  ]
+                }
+              ]
+            }
+          },
+          "facets": []
+        },
+        "citations": [
+          {
+            "segment_indexes": [
+              0,
+              1
+            ]
+          }
+        ]
+      }
+    ],
+    "ignored_segment_indexes": []
+  },
+  {
+    "accepted": true,
+    "findings": []
+  }
+]

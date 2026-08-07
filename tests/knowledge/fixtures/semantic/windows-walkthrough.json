@@ -1,0 +1,166 @@
+[
+  {
+    "artifacts": [
+      {
+        "draft_type": "case",
+        "local_id": "windows-routing-case",
+        "artifact_type": "case",
+        "knowledge_role": "case_study",
+        "title": "Windows service routing validation",
+        "starting_access": "Network access to the service",
+        "steps": [
+          {
+            "artifact_type": "case_step",
+            "local_id": "validate-routing",
+            "ordinal": 1,
+            "state_before": {
+              "access": "Network access",
+              "environment": [
+                "Windows server"
+              ],
+              "privileges": []
+            },
+            "observations": [
+              "The source identified a Windows server and host-based routing behavior"
+            ],
+            "hypotheses": [
+              {
+                "statement": "Routing context explains the generic response",
+                "origin": "explicit"
+              }
+            ],
+            "selected_action": {
+              "intent": "Validate routing behavior before choosing a follow-up action.",
+              "capability_ref": "hades.http.inspect"
+            },
+            "expected_information_gain": "Distinguish a routing issue from an unresponsive application.",
+            "evidence": [
+              {
+                "summary": "The response changed when the observed routing context was supplied.",
+                "origin": "explicit",
+                "category": "routing"
+              }
+            ],
+            "state_after": {
+              "access": "Network access",
+              "environment": [
+                "Windows server with confirmed host-based routing"
+              ],
+              "privileges": []
+            },
+            "negative_evidence": [],
+            "transfer_conditions": [
+              "The target is a Windows service with comparable routing behavior"
+            ],
+            "case_specific_details": [],
+            "requires_validation": true,
+            "origin": "explicit",
+            "applicability": {
+              "typed_context": {
+                "os_family": {
+                  "value": "windows",
+                  "relation": "observed",
+                  "origin": "explicit",
+                  "confidence": 1.0,
+                  "citations": [
+                    {
+                      "segment_indexes": [
+                        0
+                      ]
+                    }
+                  ]
+                }
+              },
+              "facets": [
+                {
+                  "namespace": "platform",
+                  "key": "os_family",
+                  "assertion": {
+                    "value": "linux",
+                    "relation": "incompatible",
+                    "origin": "explicit",
+                    "confidence": 1.0,
+                    "citations": [
+                      {
+                        "segment_indexes": [
+                          1
+                        ]
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            "citations": [
+              {
+                "segment_indexes": [
+                  0,
+                  1
+                ]
+              }
+            ]
+          }
+        ],
+        "outcome": "Routing behavior was confirmed without generalizing the case to Linux.",
+        "source_quality": "complete",
+        "difficulty": null,
+        "transferable_properties": [
+          "Validate routing prerequisites before choosing a follow-up action"
+        ],
+        "non_transferable_properties": [
+          "The Windows-specific service behavior"
+        ],
+        "origin": "explicit",
+        "applicability": {
+          "typed_context": {
+            "os_family": {
+              "value": "windows",
+              "relation": "observed",
+              "origin": "explicit",
+              "confidence": 1.0,
+              "citations": [
+                {
+                  "segment_indexes": [
+                    0
+                  ]
+                }
+              ]
+            }
+          },
+          "facets": [
+            {
+              "namespace": "platform",
+              "key": "os_family",
+              "assertion": {
+                "value": "linux",
+                "relation": "incompatible",
+                "origin": "explicit",
+                "confidence": 1.0,
+                "citations": [
+                  {
+                    "segment_indexes": [
+                      1
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "citations": [
+          {
+            "segment_indexes": [
+              0,
+              1
+            ]
+          }
+        ]
+      }
+    ],
+    "ignored_segment_indexes": []
+  },
+  {
+    "accepted": true,
+    "findings": []
+  }
+]
