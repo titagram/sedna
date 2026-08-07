@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import PurePosixPath
 
+from markdown_it import MarkdownIt
+from markdown_it.token import Token
 from pydantic import BaseModel, ConfigDict, Field
 
 from sedna.knowledge.inventory import SourceCandidate
@@ -18,18 +21,8 @@ from sedna.knowledge.schema import (
 
 _ATX_HEADING_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
 _SETEXT_HEADING_RE = re.compile(r"(?m)^([^\n]+)\n\s*(?:={4,}|-{4,})\s*$")
-_FENCE_LINE_RE = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,})(?P<rest>.*)$")
-_INDENTED_CODE_RE = re.compile(r"(?m)^(?: {4}|\t)\S")
 _URL_RE = re.compile(r"https?://[^\s<>\])]+", re.IGNORECASE)
-_MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[[^\]\n]+\]\([^\)\n]+\)")
 _WIKI_LINK_RE = re.compile(r"(?<!!)\[\[[^\]\n]+\]\]")
-_REFERENCE_DEFINITION_RE = re.compile(r"(?m)^[ ]{0,3}\[(?P<label>[^\]\n]+)\]:[ \t]*\S.*$")
-_REFERENCE_LINK_RE = re.compile(r"(?<!!)\[(?P<label>[^\]\n]+)\]\[(?P<identifier>[^\]\n]*)\]")
-_SHORTCUT_REFERENCE_RE = re.compile(r"(?<!!)\[(?P<label>[^\]\n]+)\](?![\[(])")
-_HTML_ANCHOR_RE = re.compile(
-    r"<a\b(?=[^>]*\bhref\s*=)[^>]*>.*?</a\s*>",
-    re.IGNORECASE | re.DOTALL,
-)
 _HTB_FLAG_RE = re.compile(r"HTB\{[^}\r\n]+\}", re.IGNORECASE)
 _FLAG_HEADING_RE = re.compile(r"(?ims)^\s{0,3}#{1,6}[^\n]*\bflag\b[^\n]*\n(?P<body>.{0,500})")
 _HEX_32_RE = re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])", re.IGNORECASE)
@@ -37,7 +30,6 @@ _USER_ROOT_FLAG_RE = re.compile(
     r"(?ims)^\s{0,3}(?:#{1,6}\s*)?(?:user|root)(?:\s+flag)?\s*:?\s*#*\s*$"
     r"\n(?P<body>.{0,160})"
 )
-_TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
 _ACTION_LANGUAGE_RE = re.compile(
     r"\b(?:we|i)\s+(?:ran|run|used|started|added|enumerated|scanned|inspected|"
     r"tested|tried|executed|uploaded|connected|requested|checked|decoded|"
@@ -96,6 +88,77 @@ class _DocumentSignals:
     walkthrough_urls: tuple[str, ...]
     local_substance: bool
     reference_link_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ContentSignals:
+    local_text: str
+    narrative_line_count: int
+    code_block_count: int
+    table_line_count: int
+    table_has_local_content: bool
+    reference_link_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _InlineSignals:
+    local_text: str
+    reference_link_count: int
+
+
+class _HTMLContentParser(HTMLParser):
+    """Collect visible non-anchor text and bounded link/image signals."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.local_parts: list[str] = []
+        self.reference_link_count = 0
+        self._linked_anchor_stack: list[bool] = []
+        self._linked_anchor_depth = 0
+
+    @property
+    def suppresses_text(self) -> bool:
+        return self._linked_anchor_depth > 0
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        normalized_tag = tag.casefold()
+        attributes = {name.casefold(): value or "" for name, value in attrs}
+        if normalized_tag == "a":
+            linked = bool(attributes.get("href"))
+            self._linked_anchor_stack.append(linked)
+            if linked:
+                self.reference_link_count += 1
+                self._linked_anchor_depth += 1
+        elif normalized_tag == "img" and _is_external_target(attributes.get("src", "")):
+            self.reference_link_count += 1
+
+    def handle_startendtag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        self.handle_starttag(tag, attrs)
+        if tag.casefold() == "a":
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() != "a" or not self._linked_anchor_stack:
+            return
+        if self._linked_anchor_stack.pop():
+            self._linked_anchor_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self.suppresses_text:
+            self.local_parts.append(data)
+
+    def drain_local_text(self) -> str:
+        text = "".join(self.local_parts)
+        self.local_parts.clear()
+        return text
 
 
 def classify_document(candidate: SourceCandidate, text: str | None) -> ClassificationResult:
@@ -260,8 +323,7 @@ def _classify_pdf(candidate: SourceCandidate) -> ClassificationResult:
 
 def _collect_signals(text: str) -> _DocumentSignals:
     visible_text = _HTML_COMMENT_RE.sub("", text)
-    reference_ids = _reference_definition_ids(visible_text)
-    local_signal_text = _strip_reference_links(visible_text, reference_ids)
+    content = _markdown_content_signals(visible_text)
     headings = tuple(
         _clean_heading(heading)
         for heading in (
@@ -270,45 +332,162 @@ def _collect_signals(text: str) -> _DocumentSignals:
         )
     )
     substantive_headings = tuple(heading for heading in headings if _is_substantive(heading))
-    code_block_count = _count_fenced_code_blocks(visible_text)
-    if not code_block_count and _INDENTED_CODE_RE.search(visible_text):
-        code_block_count = 1
 
-    action_language = bool(_ACTION_LANGUAGE_RE.search(local_signal_text))
-    result_language = bool(_RESULT_LANGUAGE_RE.search(local_signal_text))
-    procedural = (len(substantive_headings) >= 2 and code_block_count >= 1) or (
+    action_language = bool(_ACTION_LANGUAGE_RE.search(content.local_text))
+    result_language = bool(_RESULT_LANGUAGE_RE.search(content.local_text))
+    procedural = (len(substantive_headings) >= 2 and content.code_block_count >= 1) or (
         action_language and result_language
     )
 
     urls = tuple(url.rstrip(".,;:'\"") for url in _URL_RE.findall(visible_text))
     walkthrough_urls = tuple(url for url in urls if _url_is_external_walkthrough(visible_text, url))
-    lines = visible_text.splitlines()
-    table_line_count = sum(bool(_TABLE_ROW_RE.match(line)) for line in lines)
-    table_has_local_content = _table_has_local_content(lines, reference_ids)
-    narrative_line_count = sum(_is_narrative_line(line, reference_ids) for line in lines)
-    reference_link_count = (
-        len(urls)
-        + len(_MARKDOWN_LINK_RE.findall(visible_text))
-        + len(_WIKI_LINK_RE.findall(visible_text))
-        + len(_REFERENCE_DEFINITION_RE.findall(visible_text))
-        + len(_HTML_ANCHOR_RE.findall(visible_text))
+    local_substance = bool(
+        content.code_block_count or content.table_has_local_content or content.narrative_line_count
     )
-    local_substance = bool(code_block_count or table_has_local_content or narrative_line_count)
 
     return _DocumentSignals(
         headings=headings,
         substantive_heading_count=len(substantive_headings),
-        code_block_count=code_block_count,
-        word_count=len(re.findall(r"\b[\w'-]+\b", local_signal_text)),
-        table_line_count=table_line_count,
-        table_has_local_content=table_has_local_content,
-        narrative_line_count=narrative_line_count,
+        code_block_count=content.code_block_count,
+        word_count=len(re.findall(r"\b[\w'-]+\b", content.local_text)),
+        table_line_count=content.table_line_count,
+        table_has_local_content=content.table_has_local_content,
+        narrative_line_count=content.narrative_line_count,
         has_flag=_contains_final_flag(text),
         procedural=procedural,
         walkthrough_urls=walkthrough_urls,
         local_substance=local_substance,
+        reference_link_count=content.reference_link_count,
+    )
+
+
+def _markdown_content_signals(text: str) -> _ContentSignals:
+    tokens = MarkdownIt("commonmark").enable("table").parse(text)
+    stack: list[str] = []
+    local_parts: list[str] = []
+    narrative_line_count = 0
+    code_block_count = 0
+    table_row_count = 0
+    table_count = 0
+    table_has_local_content = False
+    reference_link_count = 0
+
+    for token in tokens:
+        if token.nesting == 1:
+            if token.type == "tr_open":
+                table_row_count += 1
+            elif token.type == "table_open":
+                table_count += 1
+            stack.append(token.type)
+            continue
+        if token.nesting == -1:
+            if stack:
+                stack.pop()
+            continue
+
+        if token.type == "inline":
+            inline = _inline_content_signals(tuple(token.children or ()))
+            local_parts.append(inline.local_text)
+            reference_link_count += inline.reference_link_count
+            if "tbody_open" in stack and _contains_word(inline.local_text):
+                table_has_local_content = True
+            elif "table_open" not in stack and "heading_open" not in stack:
+                narrative_line_count += sum(
+                    _is_local_narrative_line(line) for line in inline.local_text.splitlines()
+                )
+        elif token.type in {"fence", "code_block"} and token.content.strip():
+            code_block_count += 1
+            local_parts.append(token.content)
+        elif token.type == "html_block":
+            html = _html_content_signals(token.content)
+            local_parts.append(html.local_text)
+            reference_link_count += html.reference_link_count
+            narrative_line_count += sum(
+                _is_local_narrative_line(line) for line in html.local_text.splitlines()
+            )
+
+    return _ContentSignals(
+        local_text="\n".join(local_parts),
+        narrative_line_count=narrative_line_count,
+        code_block_count=code_block_count,
+        table_line_count=table_row_count + table_count,
+        table_has_local_content=table_has_local_content,
         reference_link_count=reference_link_count,
     )
+
+
+def _inline_content_signals(children: tuple[Token, ...]) -> _InlineSignals:
+    local_parts: list[str] = []
+    reference_link_count = 0
+    markdown_link_depth = 0
+    html_parser = _HTMLContentParser()
+
+    for child in children:
+        if child.type == "link_open":
+            reference_link_count += 1
+            markdown_link_depth += 1
+            continue
+        if child.type == "link_close":
+            markdown_link_depth = max(0, markdown_link_depth - 1)
+            continue
+        if child.type == "image":
+            if _is_external_target(child.attrGet("src") or ""):
+                reference_link_count += 1
+            continue
+        if child.type == "html_inline":
+            html_parser.feed(child.content)
+            html_text, text_links = _strip_text_references(html_parser.drain_local_text())
+            reference_link_count += text_links
+            if markdown_link_depth == 0:
+                local_parts.append(html_text)
+            continue
+        if child.type in {"softbreak", "hardbreak"}:
+            if markdown_link_depth == 0 and not html_parser.suppresses_text:
+                local_parts.append("\n")
+            continue
+        if child.type == "code_inline":
+            if markdown_link_depth == 0 and not html_parser.suppresses_text:
+                local_parts.append(child.content)
+            continue
+        if child.type == "text" and markdown_link_depth == 0 and not html_parser.suppresses_text:
+            local_text, text_links = _strip_text_references(child.content)
+            local_parts.append(local_text)
+            reference_link_count += text_links
+
+    html_parser.close()
+    trailing_text, text_links = _strip_text_references(html_parser.drain_local_text())
+    local_parts.append(trailing_text)
+    reference_link_count += text_links + html_parser.reference_link_count
+    return _InlineSignals(
+        local_text="".join(local_parts),
+        reference_link_count=reference_link_count,
+    )
+
+
+def _html_content_signals(html: str) -> _InlineSignals:
+    parser = _HTMLContentParser()
+    parser.feed(html)
+    parser.close()
+    local_text, text_links = _strip_text_references(parser.drain_local_text())
+    return _InlineSignals(
+        local_text=local_text,
+        reference_link_count=parser.reference_link_count + text_links,
+    )
+
+
+def _strip_text_references(text: str) -> tuple[str, int]:
+    wiki_link_count = len(_WIKI_LINK_RE.findall(text))
+    local_text = _WIKI_LINK_RE.sub("", text)
+    urls = _URL_RE.findall(local_text)
+    return _URL_RE.sub("", local_text), wiki_link_count + len(urls)
+
+
+def _is_external_target(target: str) -> bool:
+    return target.casefold().startswith(("http://", "https://"))
+
+
+def _contains_word(text: str) -> bool:
+    return bool(re.search(r"\w", text))
 
 
 def _contains_final_flag(text: str) -> bool:
@@ -316,44 +495,6 @@ def _contains_final_flag(text: str) -> bool:
         return True
     flag_sections = (*_FLAG_HEADING_RE.finditer(text), *_USER_ROOT_FLAG_RE.finditer(text))
     return any(_HEX_32_RE.search(match.group("body")) for match in flag_sections)
-
-
-def _count_fenced_code_blocks(text: str) -> int:
-    """Count nonempty CommonMark fences, including one left open through EOF."""
-    open_character: str | None = None
-    open_length = 0
-    has_payload = False
-    block_count = 0
-
-    for line in text.splitlines():
-        match = _FENCE_LINE_RE.match(line)
-        if open_character is not None and match is None:
-            has_payload = has_payload or bool(line.strip())
-            continue
-        if match is None:
-            continue
-
-        fence = match.group("fence")
-        rest = match.group("rest")
-        character = fence[0]
-        if open_character is None:
-            if character == "`" and "`" in rest:
-                continue
-            open_character = character
-            open_length = len(fence)
-            has_payload = False
-        elif character == open_character and len(fence) >= open_length and not rest.strip():
-            block_count += int(has_payload)
-            open_character = None
-            open_length = 0
-            has_payload = False
-        else:
-            has_payload = has_payload or bool(line.strip())
-
-    if open_character is not None:
-        block_count += int(has_payload)
-
-    return block_count
 
 
 def _url_is_external_walkthrough(text: str, url: str) -> bool:
@@ -369,90 +510,20 @@ def _clean_heading(heading: str) -> str:
     return re.sub(r"<[^>]+>", " ", heading).strip()
 
 
-def _reference_definition_ids(text: str) -> frozenset[str]:
-    return frozenset(
-        _normalize_reference_id(match.group("label"))
-        for match in _REFERENCE_DEFINITION_RE.finditer(text)
-    )
-
-
-def _normalize_reference_id(identifier: str) -> str:
-    return re.sub(r"\s+", " ", identifier).strip().casefold()
-
-
-def _strip_reference_links(
-    text: str,
-    reference_ids: frozenset[str] = frozenset(),
-) -> str:
-    def strip_full_reference(match: re.Match[str]) -> str:
-        identifier = match.group("identifier") or match.group("label")
-        if _normalize_reference_id(identifier) in reference_ids:
-            return ""
-        return match.group(0)
-
-    def strip_shortcut_reference(match: re.Match[str]) -> str:
-        if _normalize_reference_id(match.group("label")) in reference_ids:
-            return ""
-        return match.group(0)
-
-    local_text = _REFERENCE_DEFINITION_RE.sub("", text)
-    local_text = _MARKDOWN_LINK_RE.sub("", local_text)
-    local_text = _WIKI_LINK_RE.sub("", local_text)
-    local_text = _REFERENCE_LINK_RE.sub(strip_full_reference, local_text)
-    local_text = _SHORTCUT_REFERENCE_RE.sub(strip_shortcut_reference, local_text)
-    local_text = _HTML_ANCHOR_RE.sub("", local_text)
-    return _URL_RE.sub("", local_text)
-
-
 def _is_substantive(heading: str) -> bool:
     normalized = re.sub(r"\s+", " ", heading).strip().casefold()
     return normalized not in {"user", "root"} and not _NON_PROCEDURAL_HEADING_RE.search(heading)
 
 
-def _is_narrative_line(
-    line: str,
-    reference_ids: frozenset[str] = frozenset(),
-) -> bool:
+def _is_local_narrative_line(line: str) -> bool:
     stripped = line.strip()
-    if not stripped or _TABLE_ROW_RE.match(stripped):
+    if not stripped:
         return False
-    if stripped.casefold().startswith(
-        ("#", "```", "~~~", "![", "tags:", "related to:", "see also:", "previous:", "next:")
-    ):
+    if stripped.casefold().startswith(("tags:", "related to:", "see also:", "previous:", "next:")):
         return False
     if re.fullmatch(r"[-=* _]{3,}", stripped):
         return False
-    local_text = _strip_reference_links(stripped, reference_ids)
-    return len(re.findall(r"\b[\w'-]+\b", local_text)) >= 5
-
-
-def _table_has_local_content(
-    lines: list[str],
-    reference_ids: frozenset[str],
-) -> bool:
-    inside_body = False
-    for line in lines:
-        if not _TABLE_ROW_RE.match(line):
-            inside_body = False
-            continue
-        if _is_table_delimiter(line):
-            inside_body = True
-            continue
-        if not inside_body:
-            continue
-        local_row = _strip_reference_links(line, reference_ids)
-        if any(re.search(r"[\w]", cell) for cell in _table_cells(local_row)):
-            return True
-    return False
-
-
-def _is_table_delimiter(line: str) -> bool:
-    cells = _table_cells(line)
-    return bool(cells) and all(re.fullmatch(r":?-+:?", cell.strip()) for cell in cells)
-
-
-def _table_cells(line: str) -> tuple[str, ...]:
-    return tuple(cell.strip(" `*_~") for cell in line.strip().strip("|").split("|"))
+    return len(re.findall(r"\b[\w'-]+\b", stripped)) >= 5
 
 
 def _is_table_dominant(signals: _DocumentSignals) -> bool:

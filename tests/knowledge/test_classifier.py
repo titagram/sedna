@@ -208,6 +208,10 @@ def test_academy_external_link_label_alone_is_not_local_substance(
             "[guide]: https://example.com/course\n"
         ),
         (
+            "[Complete course with an escaped \\] label][guide]\n\n"
+            "[guide]: https://example.com/course\n"
+        ),
+        (
             "[Complete course covering network enumeration concepts][]\n\n"
             "[Complete course covering network enumeration concepts]: "
             "https://example.com/course\n"
@@ -218,7 +222,7 @@ def test_academy_external_link_label_alone_is_not_local_substance(
             "https://example.com/course\n"
         ),
         (
-            '<a href="https://example.com/course">'
+            '<a title="1 > 0" href="https://example.com/course">'
             "Complete course covering network enumeration concepts"
             "</a>\n"
         ),
@@ -256,7 +260,7 @@ def test_academy_table_with_only_external_link_body_is_not_a_cheatsheet(
 
 | Resource | Details |
 | --- | --- |
-|  | [Complete external command catalog](https://example.com/catalog) |
+|  | ![External catalog](https://example.com/catalog.png) |
 """
     path.write_text(text, encoding="utf-8")
     candidate = SourceCandidate(
@@ -285,7 +289,8 @@ def test_academy_table_with_only_external_link_body_is_not_a_cheatsheet(
             "[guide]: https://example.com/syntax\n"
         ),
         (
-            'Read the <a href="https://example.com/syntax">official syntax</a>, '
+            'Read the <a title="1 > 0" href="https://example.com/syntax">'
+            "official syntax</a>, "
             "then compare its examples against the response observed locally.\n"
         ),
     ],
