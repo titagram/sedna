@@ -238,13 +238,15 @@ def test_prompt_boundary_redacts_credentials_but_preserves_benign_technical_pros
         "token: identifier password=<password> api key: example "
         "password=<hunter2> token=<livecredential> "
         '{"authorization":"Basic quotedhunter2"} authorization Basic barehunter2 '
-        "password admin passwd root token abc12 secret test Bearer abc123 Bearer root "
+        "password admin passwd root token abc12 secret test password swordfish "
+        "Bearer abc123 Bearer root "
         "Bearer authentication uses access tokens. Token bucket algorithms, password hashing, "
         "password policy, token validation, API key rotation, api key storage, "
         "secret management, and secret handling are useful technical concepts. "
         "Password strength and password complexity matter. Token introspection and "
         "token expiration are protocol concepts. API key permissions and secret scanning "
-        "are operational controls."
+        "are operational controls. Password: must contain twelve characters. "
+        "API key: rotate it regularly. secret: stored in a vault."
     )
     blocks = tuple(
         block.model_copy(update={"text": credential_text}) if index == 1 else block
@@ -301,6 +303,7 @@ def test_prompt_boundary_redacts_credentials_but_preserves_benign_technical_pros
             "admin",
             "root",
             "abc12",
+            "swordfish",
             "Bearer abc123",
             "Bearer root",
             "sk_live_abcdefghijkl",
@@ -323,6 +326,9 @@ def test_prompt_boundary_redacts_credentials_but_preserves_benign_technical_pros
     assert "token expiration" in host_input
     assert "API key permissions" in host_input
     assert "secret scanning" in host_input
+    assert "Password: must contain twelve characters" in host_input
+    assert "API key: rotate it regularly" in host_input
+    assert "secret: stored in a vault" in host_input
     assert "token: identifier" in host_input
     assert "password=<password>" in host_input
     assert "api key: example" in host_input

@@ -73,7 +73,6 @@ _BENIGN_BEARER_FOLLOWERS = frozenset(
     {"authentication", "authorization", "credentials", "header", "scheme", "token", "tokens"}
 )
 _EXPLICIT_CREDENTIAL_PLACEHOLDERS = frozenset({"example", "identifier", "placeholder", "value"})
-_HIGH_RISK_DEFAULT_CREDENTIALS = frozenset({"admin", "root", "test"})
 _EXPLICIT_ANGLE_PLACEHOLDERS = frozenset(
     {
         "access_token",
@@ -86,6 +85,45 @@ _EXPLICIT_ANGLE_PLACEHOLDERS = frozenset(
         "token",
         "value",
     }
+)
+_BENIGN_CREDENTIAL_CONCEPTS: Mapping[str, frozenset[str]] = {
+    "password": frozenset(
+        {
+            "authentication",
+            "complexity",
+            "hashing",
+            "policy",
+            "reset",
+            "storage",
+            "strength",
+        }
+    ),
+    "passwd": frozenset({"database", "file"}),
+    "token": frozenset(
+        {
+            "bucket",
+            "exchange",
+            "expiration",
+            "format",
+            "identifier",
+            "introspection",
+            "validation",
+        }
+    ),
+    "access token": frozenset({"expiration", "validation"}),
+    "auth token": frozenset({"format", "validation"}),
+    "id token": frozenset({"claims", "validation"}),
+    "refresh token": frozenset({"rotation", "validation"}),
+    "api key": frozenset({"management", "permissions", "rotation", "storage"}),
+    "secret": frozenset({"handling", "management", "rotation", "scanning", "storage"}),
+    "client secret": frozenset({"rotation", "storage"}),
+    "consumer secret": frozenset({"rotation", "storage"}),
+}
+_BENIGN_COLON_ADVICE_RE = re.compile(
+    r"(?:must|should)\s+(?:be|contain|have|include)\b|"
+    r"(?:rotate|replace|revoke)\s+(?:it|them)\b|"
+    r"(?:kept|managed|protected|rotated|stored)\s+(?:at|by|in)\b",
+    re.IGNORECASE,
 )
 
 
@@ -125,7 +163,10 @@ def _redact_bearer_candidate(match: re.Match[str]) -> str:
 
 def _redact_credential_word_candidate(match: re.Match[str]) -> str:
     value = match.group("value")
-    if _is_explicit_credential_placeholder(value) or not _is_likely_credential_value(value):
+    label = _normalize_credential_label(match.group("label"))
+    if _is_explicit_credential_placeholder(value) or value.casefold() in (
+        _BENIGN_CREDENTIAL_CONCEPTS.get(label, frozenset())
+    ):
         return match.group(0)
     return f"{match.group('label')} {EXCLUDED_CREDENTIAL}"
 
@@ -145,7 +186,11 @@ def _redact_authorization_credential(match: re.Match[str]) -> str:
 
 
 def _redact_assignment_credential(match: re.Match[str]) -> str:
-    if _is_explicit_credential_placeholder(match.group("value")):
+    if _is_explicit_credential_placeholder(match.group("value")) or (
+        not match.group("quote")
+        and ":" in match.group("separator")
+        and _BENIGN_COLON_ADVICE_RE.match(match.string[match.start("value") :])
+    ):
         return match.group(0)
     quote = match.group("quote")
     return f"{quote}{match.group('label')}{quote}{match.group('separator')}{EXCLUDED_CREDENTIAL}"
@@ -162,14 +207,8 @@ def _is_explicit_credential_placeholder(value: str) -> bool:
     )
 
 
-def _is_likely_credential_value(value: str) -> bool:
-    """Require evidence beyond an ambiguous whitespace-separated noun phrase."""
-    normalized = value.casefold()
-    return (
-        normalized in _HIGH_RISK_DEFAULT_CREDENTIALS
-        or any(character.isdigit() for character in value)
-        or any(not character.isalpha() for character in value)
-    )
+def _normalize_credential_label(label: str) -> str:
+    return re.sub(r"[\s_-]+", " ", label.casefold()).strip()
 
 
 def _require_prompt_safe_text(value: str) -> str:
