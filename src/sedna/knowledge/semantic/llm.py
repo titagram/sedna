@@ -37,32 +37,55 @@ SemanticLlmReasonCode = Literal[
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 EXCLUDED_CREDENTIAL = "<EXCLUDED_CREDENTIAL>"
-_CREDENTIAL_LABEL = (
-    r"(?:password|passwd|(?:(?:access|auth|id|refresh)[\s_-]?)?token|"
-    r"api[\s_-]?key|(?:(?:client|consumer)[\s_-]?)?secret)"
+_MAX_CREDENTIAL_CLAUSES = 256
+_PROVIDER_CREDENTIAL_SUFFIX = (
+    r"(?:secret_access_key|access_key_id|application_credentials|session_token|"
+    r"client_secret|consumer_secret|refresh_token|access_token|auth_token|id_token|"
+    r"private_key|secret_key|access_key|api_key|credentials?|password|passwd|token)"
 )
-_CREDENTIAL_ASSIGNMENT_RE = re.compile(
-    rf"(?P<quote>[\"']?)\b(?P<label>{_CREDENTIAL_LABEL})(?P=quote)"
-    r"(?P<separator>\s*[:=]\s*)"
-    r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;}\]]+)",
+_PROVIDER_CREDENTIAL_LABEL = rf"(?:[A-Za-z][A-Za-z0-9]*_)+{_PROVIDER_CREDENTIAL_SUFFIX}"
+_CREDENTIAL_LABEL = (
+    rf"(?:{_PROVIDER_CREDENTIAL_LABEL}|authorization|credentials?|password|passwd|"
+    r"api[ \t_-]+key|(?:secret|private)[ \t_-]+key|"
+    r"(?:access|auth|id|refresh)[ \t_-]+token|token|"
+    r"(?:client|consumer)[ \t_-]+secret|secret)"
+)
+_UNQUOTED_CLAUSE_VALUE = (
+    rf"[^.!?,;}}\]\r\n]+?(?=(?:[.!?,;}}\]\r\n]|"
+    rf"[ \t]+(?:and|or)[ \t]+[\"']?(?:{_CREDENTIAL_LABEL})"
+    r"(?:[\"']?)(?![A-Za-z0-9])|$))"
+)
+_COMPLETE_CLAUSE_VALUE = rf"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|{_UNQUOTED_CLAUSE_VALUE})"
+_SAFE_ASSIGNMENT_PLACEHOLDER = (
+    r"(?:example|identifier|placeholder|value|"
+    r"<(?:access_token|api_key|credential|password|passwd|refresh_token|secret|token|value)>)"
+)
+_ASSIGNMENT_VALUE = (
+    rf"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|"
+    rf"{_SAFE_ASSIGNMENT_PLACEHOLDER}(?=$|[.!?,;}}\]\r\n])|"
+    r"(?:(?:bearer|basic)[ \t]+\S+)|\S+)"
+)
+_ASSIGNMENT_PLACEHOLDER_FORM = (
+    rf"(?:\"{_SAFE_ASSIGNMENT_PLACEHOLDER}\"|'"
+    rf"{_SAFE_ASSIGNMENT_PLACEHOLDER}'|{_SAFE_ASSIGNMENT_PLACEHOLDER})"
+)
+_CREDENTIAL_CLAUSE_RE = re.compile(
+    rf"(?P<label_quote>[\"']?)\b(?P<label>{_CREDENTIAL_LABEL})"
+    r"(?P=label_quote)(?![A-Za-z0-9])"
+    rf"(?:(?P<equals>\s*=\s*)(?P<equals_value>{_ASSIGNMENT_VALUE})|"
+    rf"(?P<colon>[ \t]*:[ \t]*)(?P<colon_value>{_COMPLETE_CLAUSE_VALUE})|"
+    rf"(?P<copula>[ \t]+(?:is|was|equals?)[ \t]+)"
+    rf"(?P<copula_value>{_COMPLETE_CLAUSE_VALUE})|"
+    rf"(?P<spacing>[ \t]+)(?P<spacing_value>{_COMPLETE_CLAUSE_VALUE}))",
     re.IGNORECASE,
 )
-_AUTHORIZATION_CREDENTIAL_RE = re.compile(
-    r"(?P<key_quote>[\"']?)\bauthorization(?P=key_quote)"
-    r"(?P<separator>\s*[:=]\s*|\s+)"
-    r"(?P<value_quote>[\"']?)"
-    r"(?P<scheme>bearer\s+|basic\s+)?"
-    r"(?P<value>[^\"'\s,;}\]]+)"
-    r"(?P=value_quote)",
+_ASSIGNMENT_PLACEHOLDER_TAIL_RE = re.compile(
+    rf"[\"']?\b(?:{_CREDENTIAL_LABEL})[\"']?\s*=\s*"
+    rf"{_ASSIGNMENT_PLACEHOLDER_FORM}\s+\S",
     re.IGNORECASE,
 )
 _BEARER_CANDIDATE_RE = re.compile(
     r"\bbearer\s+(?P<value>[A-Za-z0-9._~+/\-]+)",
-    re.IGNORECASE,
-)
-_CREDENTIAL_WORD_CANDIDATE_RE = re.compile(
-    rf"\b(?P<label>{_CREDENTIAL_LABEL})\s+"
-    r"(?P<value>[A-Za-z0-9._~+/\-]+)",
     re.IGNORECASE,
 )
 _COMMON_SK_TOKEN_RE = re.compile(
@@ -86,44 +109,78 @@ _EXPLICIT_ANGLE_PLACEHOLDERS = frozenset(
         "value",
     }
 )
-_BENIGN_CREDENTIAL_CONCEPTS: Mapping[str, frozenset[str]] = {
-    "password": frozenset(
-        {
-            "authentication",
-            "complexity",
-            "hashing",
-            "policy",
-            "reset",
-            "storage",
-            "strength",
-        }
-    ),
-    "passwd": frozenset({"database", "file"}),
-    "token": frozenset(
-        {
-            "bucket",
-            "exchange",
-            "expiration",
-            "format",
-            "identifier",
-            "introspection",
-            "validation",
-        }
-    ),
-    "access token": frozenset({"expiration", "validation"}),
-    "auth token": frozenset({"format", "validation"}),
-    "id token": frozenset({"claims", "validation"}),
-    "refresh token": frozenset({"rotation", "validation"}),
-    "api key": frozenset({"management", "permissions", "rotation", "storage"}),
-    "secret": frozenset({"handling", "management", "rotation", "scanning", "storage"}),
-    "client secret": frozenset({"rotation", "storage"}),
-    "consumer secret": frozenset({"rotation", "storage"}),
-}
-_BENIGN_COLON_ADVICE_RE = re.compile(
-    r"(?:must|should)\s+(?:be|contain|have|include)\b|"
-    r"(?:rotate|replace|revoke)\s+(?:it|them)\b|"
-    r"(?:kept|managed|protected|rotated|stored)\s+(?:at|by|in)\b",
+_BENIGN_TECHNICAL_CONTEXTS = frozenset(
+    {
+        "authentication",
+        "authorization",
+        "bucket",
+        "claims",
+        "complexity",
+        "credentials",
+        "database",
+        "endpoint",
+        "exchange",
+        "expiration",
+        "file",
+        "format",
+        "handling",
+        "hashing",
+        "header",
+        "introspection",
+        "management",
+        "manager",
+        "permissions",
+        "policy",
+        "reset",
+        "revocation",
+        "rotation",
+        "scanning",
+        "scheme",
+        "sharing",
+        "storage",
+        "strength",
+        "token",
+        "tokens",
+        "validation",
+    }
+)
+_BENIGN_TECHNICAL_CONTEXT_RE = re.compile(
+    rf"(?:{'|'.join(sorted(_BENIGN_TECHNICAL_CONTEXTS))})"
+    r"(?:[ \t]+(?:algorithms?|discovery|matters?|selection))?"
+    r"(?:[ \t]+uses?[ \t]+(?:access[ \t]+)?tokens?)?"
+    r"(?:[ \t]+(?:is|are)[ \t]+(?:useful[ \t]+)?"
+    r"(?:(?:operational|protocol|security|technical)[ \t]+)?"
+    r"(?:concepts?|controls?))?",
     re.IGNORECASE,
+)
+_POLICY_QUANTITY = (
+    r"(?:(?:at[ \t]+(?:least|most)|exactly)[ \t]+)?"
+    r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+    r"[ \t]+(?:characters?|digits?|letters?|symbols?|words?)"
+)
+_POLICY_CADENCE = r"(?:automatically|periodically|regularly|securely)"
+_POLICY_STORAGE_LOCATION = (
+    r"(?:(?:a|an|the)[ \t]+)?(?:hardware[ \t]+security[ \t]+module|keychain|"
+    r"keystore|secret[ \t]+manager|vault)"
+)
+_BENIGN_POLICY_CONTEXT_RE = re.compile(
+    rf"(?:(?:must|should)[ \t]+(?:contain|have|include)[ \t]+{_POLICY_QUANTITY}|"
+    rf"(?:must|should)[ \t]+be[ \t]+(?:{_POLICY_QUANTITY}|"
+    r"(?:complex|confidential|long|private|random|strong|unique)|"
+    rf"(?:rotated|replaced|revoked)[ \t]+{_POLICY_CADENCE}|"
+    rf"(?:kept|protected|stored)[ \t]+(?:at|in)[ \t]+{_POLICY_STORAGE_LOCATION})|"
+    r"(?:can|may|must|should)[ \t]+remain[ \t]+(?:confidential|private|secret)|"
+    rf"(?:rotate|replace|revoke)[ \t]+(?:it|them)[ \t]+{_POLICY_CADENCE}|"
+    rf"(?:kept|protected|stored)[ \t]+(?:at|in)[ \t]+{_POLICY_STORAGE_LOCATION}|"
+    r"(?:deprecated|disabled|enabled|optional|required|recommended))",
+    re.IGNORECASE,
+)
+_CLAUSE_SEPARATOR_GROUPS = ("equals", "colon", "copula", "spacing")
+_CLAUSE_VALUE_GROUPS = (
+    "equals_value",
+    "colon_value",
+    "copula_value",
+    "spacing_value",
 )
 
 
@@ -138,20 +195,20 @@ def _sanitize_prompt_text(text: str) -> str:
 
 
 def _sanitize_credentials_once(text: str) -> str:
-    sanitized = _AUTHORIZATION_CREDENTIAL_RE.sub(
-        _redact_authorization_credential,
+    if _ASSIGNMENT_PLACEHOLDER_TAIL_RE.search(text):
+        return EXCLUDED_CREDENTIAL
+    sanitized, clause_count = _CREDENTIAL_CLAUSE_RE.subn(
+        _redact_credential_clause,
         text,
     )
-    sanitized = _CREDENTIAL_ASSIGNMENT_RE.sub(
-        _redact_assignment_credential,
+    sanitized, bearer_count = _BEARER_CANDIDATE_RE.subn(
+        _redact_bearer_candidate,
         sanitized,
     )
-    sanitized = _BEARER_CANDIDATE_RE.sub(_redact_bearer_candidate, sanitized)
-    sanitized = _CREDENTIAL_WORD_CANDIDATE_RE.sub(
-        _redact_credential_word_candidate,
-        sanitized,
-    )
-    return _COMMON_SK_TOKEN_RE.sub(EXCLUDED_CREDENTIAL, sanitized)
+    sanitized, sk_count = _COMMON_SK_TOKEN_RE.subn(EXCLUDED_CREDENTIAL, sanitized)
+    if clause_count + bearer_count + sk_count > _MAX_CREDENTIAL_CLAUSES:
+        return EXCLUDED_CREDENTIAL
+    return sanitized
 
 
 def _redact_bearer_candidate(match: re.Match[str]) -> str:
@@ -161,43 +218,58 @@ def _redact_bearer_candidate(match: re.Match[str]) -> str:
     return f"Bearer {EXCLUDED_CREDENTIAL}"
 
 
-def _redact_credential_word_candidate(match: re.Match[str]) -> str:
-    value = match.group("value")
-    label = _normalize_credential_label(match.group("label"))
-    if _is_explicit_credential_placeholder(value) or value.casefold() in (
-        _BENIGN_CREDENTIAL_CONCEPTS.get(label, frozenset())
-    ):
+def _redact_credential_clause(match: re.Match[str]) -> str:
+    if _is_benign_credential_clause(match):
         return match.group(0)
-    return f"{match.group('label')} {EXCLUDED_CREDENTIAL}"
-
-
-def _redact_authorization_credential(match: re.Match[str]) -> str:
-    if _is_explicit_credential_placeholder(match.group("value")) or (
-        match.group("scheme") is None
-        and match.group("value").casefold() in _BENIGN_BEARER_FOLLOWERS
-    ):
-        return match.group(0)
-    key_quote = match.group("key_quote")
-    value_quote = match.group("value_quote")
+    label_quote = match.group("label_quote")
+    separator = _matched_group(match, _CLAUSE_SEPARATOR_GROUPS)
     return (
-        f"{key_quote}Authorization{key_quote}{match.group('separator')}"
-        f"{value_quote}{match.group('scheme') or ''}{EXCLUDED_CREDENTIAL}{value_quote}"
+        f"{label_quote}{match.group('label')}{label_quote}{separator}"
+        f"{_redacted_clause_value(match)}"
     )
 
 
-def _redact_assignment_credential(match: re.Match[str]) -> str:
-    if _is_explicit_credential_placeholder(match.group("value")) or (
-        not match.group("quote")
-        and ":" in match.group("separator")
-        and _BENIGN_COLON_ADVICE_RE.match(match.string[match.start("value") :])
-    ):
-        return match.group(0)
-    quote = match.group("quote")
-    return f"{quote}{match.group('label')}{quote}{match.group('separator')}{EXCLUDED_CREDENTIAL}"
+def _is_benign_credential_clause(match: re.Match[str]) -> bool:
+    value = _matched_group(match, _CLAUSE_VALUE_GROUPS)
+    if _is_explicit_credential_placeholder(value):
+        return True
+    if value.startswith(('"', "'")):
+        return False
+
+    if match.group("equals") is not None:
+        return False
+    if match.group("colon") is not None or match.group("copula") is not None:
+        return bool(_BENIGN_POLICY_CONTEXT_RE.fullmatch(value.strip()))
+    return bool(
+        _BENIGN_TECHNICAL_CONTEXT_RE.fullmatch(value.strip())
+        or _BENIGN_POLICY_CONTEXT_RE.fullmatch(value.strip())
+    )
+
+
+def _redacted_clause_value(match: re.Match[str]) -> str:
+    value = _matched_group(match, _CLAUSE_VALUE_GROUPS)
+    quote = value[0] if value.startswith(('"', "'")) else ""
+    unquoted = value[1:-1] if quote else value
+    scheme = re.match(r"(?P<scheme>bearer|basic)(?P<spacing>[ \t]+)", unquoted, re.IGNORECASE)
+    if _normalize_credential_label(match.group("label")) == "authorization" and scheme:
+        replacement = f"{scheme.group('scheme')}{scheme.group('spacing')}{EXCLUDED_CREDENTIAL}"
+    else:
+        replacement = EXCLUDED_CREDENTIAL
+    return f"{quote}{replacement}{quote}"
+
+
+def _matched_group(match: re.Match[str], names: tuple[str, ...]) -> str:
+    for name in names:
+        value = match.group(name)
+        if value is not None:
+            return value
+    raise AssertionError("credential clause regex matched without a required group")
 
 
 def _is_explicit_credential_placeholder(value: str) -> bool:
-    normalized = value.strip("\"'").casefold()
+    normalized = value.strip().strip("\"'").casefold()
+    if normalized.rstrip(".!?") == EXCLUDED_CREDENTIAL.casefold():
+        return True
     if normalized in _EXPLICIT_CREDENTIAL_PLACEHOLDERS:
         return True
     return (

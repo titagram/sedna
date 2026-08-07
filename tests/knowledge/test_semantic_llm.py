@@ -234,11 +234,26 @@ def test_prompt_boundary_redacts_credentials_but_preserves_benign_technical_pros
         '"secret":"json-private-value"} '
         "access_token=access-secret-123 refresh-token:refresh-secret-456 "
         "client_secret=client-secret-123 consumer-secret:consumer-secret-456 "
-        "sk_live_abcdefghijkl sk_test_mnopqrstuvwxyz "
-        "token: identifier password=<password> api key: example "
+        "sk_live_abcdefghijkl sk_test_mnopqrstuvwxyz. "
+        "token: identifier. password=<password>. api key: example. "
         "password=<hunter2> token=<livecredential> "
         '{"authorization":"Basic quotedhunter2"} authorization Basic barehunter2 '
         "password admin passwd root token abc12 secret test password swordfish "
+        "password is alphabeticpass credential=blueberry "
+        "AWS_SECRET_ACCESS_KEY=abcdEFGH1234 private_key=privatealphabetic "
+        "secret key=orchard AWS_ACCESS_KEY_ID=AKIAREVIEW123 "
+        "AWS_SESSION_TOKEN=sessionsecret123 OPENAI_API_KEY=openaiAlphabetic "
+        "ANTHROPIC_API_KEY=anthropicAlphabetic GITHUB_TOKEN=ghp_reviewsecret "
+        "DATABASE_PASSWORD=dbswordfish AZURE_CLIENT_SECRET=azureAlphabetic "
+        "GOOGLE_APPLICATION_CREDENTIALS=/tmp/private.json "
+        "Password: must be policySwordfish. Password: should be policyHunter2. "
+        "secret: stored in hunter2vault. "
+        "password equals meadow; credential is violet, private key was wintergreen. "
+        "password is value tailhunter2. "
+        "api key: example tailghpsecret. password is correct horse battery staple. "
+        "secret is the orchardword. "
+        "password=!banghunter2 API_KEY=.dotghp secret=?questionorchard "
+        "token=;semicolonabc password=hunter2!Swordfish. password=\nnewlinehunter2. "
         "Bearer abc123 Bearer root "
         "Bearer authentication uses access tokens. Token bucket algorithms, password hashing, "
         "password policy, token validation, API key rotation, api key storage, "
@@ -246,7 +261,10 @@ def test_prompt_boundary_redacts_credentials_but_preserves_benign_technical_pros
         "Password strength and password complexity matter. Token introspection and "
         "token expiration are protocol concepts. API key permissions and secret scanning "
         "are operational controls. Password: must contain twelve characters. "
-        "API key: rotate it regularly. secret: stored in a vault."
+        "API key: rotate it regularly. secret: stored in a vault. Token endpoint discovery, "
+        "password manager selection, API key authentication, secret sharing, and refresh token "
+        "revocation are technical concepts. Password must be at least 12 characters. "
+        "API key should be rotated regularly. Secret should be stored in a vault."
     )
     blocks = tuple(
         block.model_copy(update={"text": credential_text}) if index == 1 else block
@@ -304,6 +322,35 @@ def test_prompt_boundary_redacts_credentials_but_preserves_benign_technical_pros
             "root",
             "abc12",
             "swordfish",
+            "alphabeticpass",
+            "blueberry",
+            "abcdEFGH1234",
+            "privatealphabetic",
+            "orchard",
+            "AKIAREVIEW123",
+            "sessionsecret123",
+            "openaiAlphabetic",
+            "anthropicAlphabetic",
+            "ghp_reviewsecret",
+            "dbswordfish",
+            "azureAlphabetic",
+            "/tmp/private.json",
+            "policySwordfish",
+            "policyHunter2",
+            "hunter2vault",
+            "meadow",
+            "violet",
+            "wintergreen",
+            "tailhunter2",
+            "tailghpsecret",
+            "correct horse battery staple",
+            "orchardword",
+            "banghunter2",
+            "dotghp",
+            "questionorchard",
+            "semicolonabc",
+            "hunter2!Swordfish",
+            "newlinehunter2",
             "Bearer abc123",
             "Bearer root",
             "sk_live_abcdefghijkl",
@@ -329,10 +376,82 @@ def test_prompt_boundary_redacts_credentials_but_preserves_benign_technical_pros
     assert "Password: must contain twelve characters" in host_input
     assert "API key: rotate it regularly" in host_input
     assert "secret: stored in a vault" in host_input
+    assert "Token endpoint discovery" in host_input
+    assert "password manager selection" in host_input
+    assert "API key authentication" in host_input
+    assert "secret sharing" in host_input
+    assert "refresh token revocation" in host_input
+    assert "Password must be at least 12 characters" in host_input
+    assert "API key should be rotated regularly" in host_input
+    assert "Secret should be stored in a vault" in host_input
     assert "token: identifier" in host_input
     assert "password=<password>" in host_input
     assert "api key: example" in host_input
     assert '"target"' not in host_input
+
+
+def test_prompt_boundary_fails_closed_when_credential_clause_budget_is_exceeded():
+    prepared = _prepared_source()
+    blocks = tuple(
+        block.model_copy(update={"text": " ".join(["password manager"] * 257)})
+        if index == 1
+        else block
+        for index, block in enumerate(prepared.document.blocks)
+    )
+    document = prepared.document.model_copy(update={"blocks": blocks})
+    prepared = PreparedSource(
+        manifest=prepared.manifest,
+        document=document,
+        segments=segment_document(document),
+    )
+    host = _RecordingHost(_HostResult(parsed={"artifacts": [], "ignored_segment_indexes": []}))
+
+    HadesLlmAdapter(host).complete(
+        SemanticDraftBundle,
+        instructions=EXTRACTOR_PROMPT,
+        payload=build_safe_source_payload(prepared),
+        purpose="sedna.semantic.extract",
+    )
+
+    host_input = str(host.calls[0]["input"])
+    assert "<EXCLUDED_CREDENTIAL>" in host_input
+    assert "password manager" not in host_input
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("password=<password> tailplaceholderhunter2", "tailplaceholderhunter2"),
+        ('password="<password>" hunter2', "hunter2"),
+        ("password='<password>'\thunter2", "hunter2"),
+        ("password=<password>\nhunter2", "hunter2"),
+        ("password=value\r\nhunter2", "hunter2"),
+    ],
+)
+def test_prompt_boundary_fails_closed_for_assignment_placeholder_with_value_tail(text, secret):
+    prepared = _prepared_source()
+    blocks = tuple(
+        block.model_copy(update={"text": text}) if index == 1 else block
+        for index, block in enumerate(prepared.document.blocks)
+    )
+    document = prepared.document.model_copy(update={"blocks": blocks})
+    prepared = PreparedSource(
+        manifest=prepared.manifest,
+        document=document,
+        segments=segment_document(document),
+    )
+    host = _RecordingHost(_HostResult(parsed={"artifacts": [], "ignored_segment_indexes": []}))
+
+    HadesLlmAdapter(host).complete(
+        SemanticDraftBundle,
+        instructions=EXTRACTOR_PROMPT,
+        payload=build_safe_source_payload(prepared),
+        purpose="sedna.semantic.extract",
+    )
+
+    host_input = str(host.calls[0]["input"])
+    assert "<EXCLUDED_CREDENTIAL>" in host_input
+    assert secret not in host_input
 
 
 def test_critic_envelope_rejects_credentials_nested_in_valid_drafts_before_host_call():
