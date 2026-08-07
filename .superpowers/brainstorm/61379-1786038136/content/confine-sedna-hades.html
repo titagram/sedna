@@ -1,0 +1,69 @@
+<h2>Sezione 1 — Confine tra Sedna e Hades</h2>
+<p class="subtitle">Sedna decide il senso strategico dell'azione; Hades conosce l'esecuzione concreta dello strumento.</p>
+
+<div class="mockup">
+  <div class="mockup-header">Ciclo decisionale proposto</div>
+  <div class="mockup-body">
+    <div style="display:grid;grid-template-columns:1fr auto 1.25fr auto 1fr;gap:14px;align-items:center;text-align:center">
+      <div style="padding:18px;border:1px solid #475569;border-radius:10px">
+        <strong>Stato dell'agente</strong><br>
+        <small>servizi, accesso, osservazioni, azioni già provate</small>
+      </div>
+      <div style="font-size:24px">→</div>
+      <div style="padding:18px;border:2px solid #8b5cf6;border-radius:10px;background:rgba(139,92,246,.10)">
+        <strong>Sedna — strategia</strong><br>
+        <small>ipotesi, priorità, action intent, evidenza attesa, stop condition</small>
+      </div>
+      <div style="font-size:24px">→</div>
+      <div style="padding:18px;border:2px solid #22c55e;border-radius:10px;background:rgba(34,197,94,.08)">
+        <strong>Hades — skill</strong><br>
+        <small>strumento, sintassi, parametri, esecuzione e parsing tecnico</small>
+      </div>
+    </div>
+    <div style="text-align:center;margin-top:18px;color:#94a3b8">output tecnico → evidenza normalizzata → aggiornamento dello stato → nuova decisione</div>
+  </div>
+</div>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">Asse 1 — Tipo di documento</div>
+    <div class="mockup-body">
+      <pre>lesson
+machine_walkthrough
+challenge_walkthrough
+cheatsheet_reference
+external_stub
+excluded</pre>
+      <p><small>Descrive provenienza, qualità attesa e parser da usare.</small></p>
+    </div>
+  </div>
+  <div class="mockup">
+    <div class="mockup-header">Asse 2 — Artefatto strategico</div>
+    <div class="mockup-body">
+      <pre>concept
+decision_rule
+case
+case_step
+negative_evidence
+anti_pattern</pre>
+      <p><small>Nessun <code>tool_recipe</code>: Sedna conserva solo un <code>capability_ref</code> verso la skill Hades.</small></p>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Esempio</h3>
+  <p><strong>Sedna:</strong> “Dominio base noto + HTTP + vhost non verificati → considera <code>discover_virtual_hosts</code>; cerca risposte differenti; interrompi se emergono wildcard o rate limiting.”</p>
+  <p><strong>Hades:</strong> la skill associata decide se usare FFUF o Gobuster, costruisce il comando, calibra i filtri e interpreta l'output.</p>
+</div>
+
+<div class="options">
+  <div class="option" data-choice="boundary-approved" onclick="toggleSelect(this)">
+    <div class="letter">✓</div>
+    <div class="content"><h3>Confine corretto</h3><p>Procediamo a definire lo schema dei record strategici.</p></div>
+  </div>
+  <div class="option" data-choice="boundary-revise" onclick="toggleSelect(this)">
+    <div class="letter">↺</div>
+    <div class="content"><h3>Da rivedere</h3><p>Indicami in chat quali responsabilità devono spostarsi tra Sedna e Hades.</p></div>
+  </div>
+</div>

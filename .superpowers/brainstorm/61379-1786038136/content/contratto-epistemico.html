@@ -1,0 +1,79 @@
+<h2>Sezione 2 — Contratto epistemico</h2>
+<p class="subtitle">Sedna deve distinguere ciò che spiega il dominio da ciò che racconta un percorso riuscito una volta.</p>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">Riferimenti tecnici e lezioni</div>
+    <div class="mockup-body">
+      <h3>Funzione: orientare</h3>
+      <ul>
+        <li>concetti e terminologia;</li>
+        <li>precondizioni e vincoli;</li>
+        <li>metodologie e controlli disponibili;</li>
+        <li>evidenze da osservare;</li>
+        <li>versione, data e provenienza.</li>
+      </ul>
+      <p><strong>Peso:</strong> riferimento primario, ma non “verità eterna”: può essere obsoleto o dipendente dalla versione.</p>
+    </div>
+  </div>
+  <div class="mockup">
+    <div class="mockup-header">Walkthrough e case study</div>
+    <div class="mockup-body">
+      <h3>Funzione: ispirare</h3>
+      <ul>
+        <li>sequenze realmente osservate;</li>
+        <li>analogie con lo stato corrente;</li>
+        <li>successi, fallimenti e deviazioni;</li>
+        <li>idee da validare, mai da ripetere alla cieca;</li>
+        <li>dettagli specifici marcati come non trasferibili.</li>
+      </ul>
+      <p><strong>Peso:</strong> esempio storico; ogni passaggio richiede verifica delle precondizioni nel target corrente.</p>
+    </div>
+  </div>
+</div>
+
+<div class="mockup">
+  <div class="mockup-header">Pacchetto restituito da Sedna al planner</div>
+  <div class="mockup-body">
+    <div style="display:grid;grid-template-columns:1fr auto 1fr auto 1.2fr;gap:14px;align-items:center;text-align:center">
+      <div style="padding:16px;border:1px solid #475569;border-radius:10px">
+        <strong>1. Reference anchor</strong><br><small>Cosa è noto e quali controlli hanno senso</small>
+      </div>
+      <div style="font-size:22px">+</div>
+      <div style="padding:16px;border:1px solid #475569;border-radius:10px">
+        <strong>2. Analogical cases</strong><br><small>2–3 casi simili e almeno un fallimento, se disponibile</small>
+      </div>
+      <div style="font-size:22px">→</div>
+      <div style="padding:16px;border:2px solid #8b5cf6;border-radius:10px;background:rgba(139,92,246,.10)">
+        <strong>3. Candidate hypotheses</strong><br><small>ipotesi recuperate + almeno una alternativa generata dal planner</small>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Regole anti-overfitting incorporate nel dato</h3>
+  <pre>knowledge_role: reference | case_study | negative_case
+generalizability: none | low | medium | high
+transfer_conditions: [...]      # quando l'analogia è valida
+case_specific_details: [...]     # IP, flag, password, path accidentali
+requires_validation: true
+source_version / observed_at
+supporting_sources / contradicting_sources</pre>
+</div>
+
+<div class="section">
+  <h3>Comportamento richiesto all'agente</h3>
+  <p>Il retriever non restituisce “fai X”. Restituisce: “X ha senso se valgono A e B; nel caso C ha prodotto D; cerca E; se osservi F abbandona l'ipotesi”. Il planner può proporre alternative non presenti nei walkthrough, purché motivate dallo stato e compatibili con il riferimento tecnico.</p>
+</div>
+
+<div class="options">
+  <div class="option" data-choice="epistemic-approved" onclick="toggleSelect(this)">
+    <div class="letter">✓</div>
+    <div class="content"><h3>Contratto corretto</h3><p>Procediamo con lo schema concreto di documenti, casi e passaggi.</p></div>
+  </div>
+  <div class="option" data-choice="epistemic-revise" onclick="toggleSelect(this)">
+    <div class="letter">↺</div>
+    <div class="content"><h3>Da correggere</h3><p>Scrivimi in chat quale ruolo o peso deve cambiare.</p></div>
+  </div>
+</div>

@@ -1,0 +1,52 @@
+<h2>Come classificare il corpus di Sedna?</h2>
+<p class="subtitle">La scelta determina cosa il retriever considera una regola, un esempio storico o semplice materiale di riferimento.</p>
+
+<div class="options">
+  <div class="option" data-choice="source-first" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Solo per tipo di sorgente</h3>
+      <pre>Corpus
+├── Lezioni Academy
+├── Walkthrough macchine
+├── Walkthrough challenge
+├── Cheatsheet
+└── Stub / materiale escluso</pre>
+      <p>Semplice da ingerire, ma una categoria descrive il documento e non il ruolo della conoscenza estratta.</p>
+    </div>
+  </div>
+
+  <div class="option" data-choice="phase-first" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Solo per fase operativa</h3>
+      <pre>Knowledge
+├── Recon
+├── Enumeration
+├── Exploitation
+├── Post-exploitation
+└── Privilege escalation</pre>
+      <p>Ottimo per cercare azioni, ma appiattisce la differenza tra regola autorevole, caso singolo e opinione dell'autore.</p>
+    </div>
+  </div>
+
+  <div class="option" data-choice="two-axis" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Due assi separati — raccomandato</h3>
+      <pre>1. Documento                 2. Artefatti estratti
+├── lesson                  ├── concept
+├── machine_walkthrough     ├── procedure
+├── challenge_walkthrough   ├── case_step
+├── cheatsheet              ├── decision_rule
+├── external_stub           ├── tool_recipe
+└── excluded                └── negative_evidence</pre>
+      <p>Ogni artefatto mantiene sorgente, fase, evidenza e affidabilità. Il retriever può chiedere una regola e casi analoghi senza confonderli.</p>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Perché il doppio asse riduce l'overfitting</h3>
+  <p>“In BoardLight <code>admin:admin</code> ha funzionato” rimane un <strong>case_step</strong> specifico. “Verificare poche credenziali predefinite documentate quando il prodotto è confermato” può diventare una <strong>decision_rule</strong>, ma solo dopo validazione e supporto di più fonti.</p>
+</div>

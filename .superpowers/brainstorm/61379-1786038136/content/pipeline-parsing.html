@@ -1,0 +1,73 @@
+<h2>Sezione 3 — Pipeline di parsing e strutturazione</h2>
+<p class="subtitle">Un solo inventario, parser strutturali diversi per famiglia, due percorsi semantici e una validazione comune.</p>
+
+<div class="mockup">
+  <div class="mockup-header">Flusso incrementale</div>
+  <div class="mockup-body">
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;text-align:center">
+      <div style="padding:14px;border:1px solid #475569;border-radius:10px"><strong>1. Inventario</strong><br><small>hash, formato, asset, path, stato</small></div>
+      <div style="padding:14px;border:1px solid #475569;border-radius:10px"><strong>2. Classificazione</strong><br><small>lesson, walkthrough, cheatsheet, stub, excluded</small></div>
+      <div style="padding:14px;border:1px solid #475569;border-radius:10px"><strong>3. Parsing strutturale</strong><br><small>heading, paragrafi, liste, tabelle, code block, immagini</small></div>
+      <div style="padding:14px;border:1px solid #475569;border-radius:10px"><strong>4. Segmentazione logica</strong><br><small>unità coerenti, non finestre di token</small></div>
+    </div>
+    <div style="text-align:center;font-size:22px;margin:10px">↓</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+      <div style="padding:16px;border:2px solid #3b82f6;border-radius:10px;background:rgba(59,130,246,.08)">
+        <strong>Percorso reference</strong><br>
+        <small>concept → metodologia → precondizioni → evidenza attesa → avvertenze → capability ref</small>
+      </div>
+      <div style="padding:16px;border:2px solid #f59e0b;border-radius:10px;background:rgba(245,158,11,.08)">
+        <strong>Percorso case study</strong><br>
+        <small>stato → osservazione → ipotesi → azione → output/evidenza → nuovo stato</small>
+      </div>
+    </div>
+    <div style="text-align:center;font-size:22px;margin:10px">↓</div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;text-align:center">
+      <div style="padding:14px;border:1px solid #475569;border-radius:10px"><strong>5. Normalizzazione</strong><br><small>placeholder, phase, access, servizi, capability</small></div>
+      <div style="padding:14px;border:1px solid #475569;border-radius:10px"><strong>6. Validazione</strong><br><small>schema, provenance, inferenze, flag, contraddizioni</small></div>
+      <div style="padding:14px;border:1px solid #475569;border-radius:10px"><strong>7. Emissione</strong><br><small>JSON/JSONL, YAML revisionato, indice ricostruibile</small></div>
+    </div>
+  </div>
+</div>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">Parser per famiglia</div>
+    <div class="mockup-body">
+      <ul>
+        <li><strong>HTB scrape:</strong> rimuove sidebar, domande, footer e modali.</li>
+        <li><strong>Obsidian/Academy:</strong> conserva wiki-link, tabelle e asset locali.</li>
+        <li><strong>GitHub walkthrough:</strong> conserva ordine, code block, output e screenshot.</li>
+        <li><strong>Stub/flag-only:</strong> classifica e non estrae conoscenza decisionale.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="mockup">
+    <div class="mockup-header">Controlli anti-allucinazione</div>
+    <div class="mockup-body">
+      <ul>
+        <li>ogni campo estratto ha source span o è marcato <code>inferred</code>;</li>
+        <li>flag, IP e callback non entrano nell'indice strategico;</li>
+        <li>un case study non genera automaticamente una regola;</li>
+        <li>record incompleti finiscono in quarantena con motivo;</li>
+        <li>regole promosse solo dopo revisione o più fonti concordanti.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Incrementalità</h3>
+  <p>Il manifest conserva hash della sorgente, versione dello schema, parser e modello di estrazione. Un nuovo writeup o una modifica rielabora soltanto il documento interessato e gli eventuali draft di regole che lo citano.</p>
+</div>
+
+<div class="options">
+  <div class="option" data-choice="pipeline-approved" onclick="toggleSelect(this)">
+    <div class="letter">✓</div>
+    <div class="content"><h3>Pipeline corretta</h3><p>Procediamo allo schema preciso dei record e alla strategia d'indicizzazione.</p></div>
+  </div>
+  <div class="option" data-choice="pipeline-revise" onclick="toggleSelect(this)">
+    <div class="letter">↺</div>
+    <div class="content"><h3>Da modificare</h3><p>Indicami in chat quale passaggio non convince.</p></div>
+  </div>
+</div>
