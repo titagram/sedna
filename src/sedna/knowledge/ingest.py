@@ -22,7 +22,12 @@ def ingest_markdown(
     source_root: str | Path | None = None,
     maximum_chunk_chars: int = 3_500,
 ) -> list[KnowledgeChunk]:
-    """Extract the article body, split it by paragraphs, and upsert stable chunks."""
+    """Create legacy retrieval chunks from one Markdown article.
+
+    Deprecated: this compatibility helper preserves the original SQLite-backed
+    ``KnowledgeChunk`` workflow during migration. It is not used by the strategic
+    ingestion pipeline; new integrations should start with ``IngestionPipeline``.
+    """
     if maximum_chunk_chars < 1:
         raise ValueError("maximum_chunk_chars must be positive")
 

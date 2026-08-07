@@ -1,8 +1,29 @@
 from __future__ import annotations
 
-from sedna.knowledge.ingest import ingest_markdown
+from sedna.knowledge import (
+    DecisionRule,
+    DocumentManifest,
+    IngestionPipeline,
+    KnowledgeCase,
+    ReferenceArtifact,
+    ingest_markdown,
+)
 from sedna.models import KnowledgeChunk, Phase
 from sedna.store import SednaStore
+
+
+def test_legacy_ingest_markdown_remains_available_during_migration(tmp_path):
+    assert callable(ingest_markdown)
+    assert callable(IngestionPipeline)
+    assert all(
+        callable(schema_type)
+        for schema_type in (
+            DocumentManifest,
+            ReferenceArtifact,
+            KnowledgeCase,
+            DecisionRule,
+        )
+    )
 
 
 def test_ingestion_extracts_article_chunks_and_is_idempotent(tmp_path):
