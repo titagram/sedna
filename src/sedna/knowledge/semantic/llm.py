@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -38,50 +39,42 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 
 EXCLUDED_CREDENTIAL = "<EXCLUDED_CREDENTIAL>"
 _MAX_CREDENTIAL_CLAUSES = 256
+_MAX_SPLIT_COMMENT_RECORDS = 16
+_LABEL_JOIN = r"(?:[^\S\r\n_-]|[_-])*"
 _PROVIDER_CREDENTIAL_SUFFIX = (
-    r"(?:secret_access_key|access_key_id|application_credentials|session_token|"
-    r"client_secret|consumer_secret|refresh_token|access_token|auth_token|id_token|"
-    r"private_key|secret_key|access_key|api_key|credentials?|password|passwd|token)"
+    rf"(?:secret{_LABEL_JOIN}access{_LABEL_JOIN}key|"
+    rf"access{_LABEL_JOIN}key{_LABEL_JOIN}id|"
+    rf"application{_LABEL_JOIN}credentials|session{_LABEL_JOIN}token|"
+    rf"client{_LABEL_JOIN}secret|consumer{_LABEL_JOIN}secret|"
+    rf"refresh{_LABEL_JOIN}token|access{_LABEL_JOIN}token|"
+    rf"auth{_LABEL_JOIN}token|id{_LABEL_JOIN}token|"
+    rf"private{_LABEL_JOIN}key|secret{_LABEL_JOIN}key|"
+    rf"access{_LABEL_JOIN}key|api{_LABEL_JOIN}key|"
+    r"credentials?|password|passwd|token)"
 )
-_PROVIDER_CREDENTIAL_LABEL = rf"(?:[A-Za-z][A-Za-z0-9]*_)+{_PROVIDER_CREDENTIAL_SUFFIX}"
+_PROVIDER_CREDENTIAL_LABEL = (
+    rf"_*(?:[A-Za-z0-9]+_+)*{_PROVIDER_CREDENTIAL_SUFFIX}"
+    r"(?:_+[A-Za-z0-9]+)*"
+)
 _CREDENTIAL_LABEL = (
     rf"(?:{_PROVIDER_CREDENTIAL_LABEL}|authorization|credentials?|password|passwd|"
-    r"api[ \t_-]+key|(?:secret|private)[ \t_-]+key|"
-    r"(?:access|auth|id|refresh)[ \t_-]+token|token|"
-    r"(?:client|consumer)[ \t_-]+secret|secret)"
+    rf"api{_LABEL_JOIN}key|(?:access|secret|private){_LABEL_JOIN}key|"
+    rf"(?:access|auth|id|refresh){_LABEL_JOIN}token|token|"
+    rf"(?:client|consumer){_LABEL_JOIN}secret|secret)"
 )
-_UNQUOTED_CLAUSE_VALUE = (
-    rf"[^.!?,;}}\]\r\n]+?(?=(?:[.!?,;}}\]\r\n]|"
-    rf"[ \t]+(?:and|or)[ \t]+[\"']?(?:{_CREDENTIAL_LABEL})"
-    r"(?:[\"']?)(?![A-Za-z0-9])|$))"
-)
-_COMPLETE_CLAUSE_VALUE = rf"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|{_UNQUOTED_CLAUSE_VALUE})"
-_SAFE_ASSIGNMENT_PLACEHOLDER = (
-    r"(?:example|identifier|placeholder|value|"
-    r"<(?:access_token|api_key|credential|password|passwd|refresh_token|secret|token|value)>)"
-)
-_ASSIGNMENT_VALUE = (
-    rf"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|"
-    rf"{_SAFE_ASSIGNMENT_PLACEHOLDER}(?=$|[.!?,;}}\]\r\n])|"
-    r"(?:(?:bearer|basic)[ \t]+\S+)|\S+)"
-)
-_ASSIGNMENT_PLACEHOLDER_FORM = (
-    rf"(?:\"{_SAFE_ASSIGNMENT_PLACEHOLDER}\"|'"
-    rf"{_SAFE_ASSIGNMENT_PLACEHOLDER}'|{_SAFE_ASSIGNMENT_PLACEHOLDER})"
-)
-_CREDENTIAL_CLAUSE_RE = re.compile(
+_CREDENTIAL_LABEL_RE = re.compile(
     rf"(?P<label_quote>[\"']?)\b(?P<label>{_CREDENTIAL_LABEL})"
-    r"(?P=label_quote)(?![A-Za-z0-9])"
-    rf"(?:(?P<equals>\s*=\s*)(?P<equals_value>{_ASSIGNMENT_VALUE})|"
-    rf"(?P<colon>[ \t]*:[ \t]*)(?P<colon_value>{_COMPLETE_CLAUSE_VALUE})|"
-    rf"(?P<copula>[ \t]+(?:is|was|equals?)[ \t]+)"
-    rf"(?P<copula_value>{_COMPLETE_CLAUSE_VALUE})|"
-    rf"(?P<spacing>[ \t]+)(?P<spacing_value>{_COMPLETE_CLAUSE_VALUE}))",
+    r"(?P=label_quote)(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
-_ASSIGNMENT_PLACEHOLDER_TAIL_RE = re.compile(
-    rf"[\"']?\b(?:{_CREDENTIAL_LABEL})[\"']?\s*=\s*"
-    rf"{_ASSIGNMENT_PLACEHOLDER_FORM}\s+\S",
+_IDENTIFIER_LABEL_RE = re.compile(
+    r"(?P<label_quote>[\"']?)(?P<label>[A-Za-z_][A-Za-z0-9_-]*)"
+    r"(?P=label_quote)(?![A-Za-z0-9_-])"
+)
+_CREDENTIAL_SYNTAX_RE = re.compile(
+    r"(?:(?P<assignment>[^\S\r\n]*[:=][^\S\r\n]*)|"
+    r"(?P<copula>[^\S\r\n]+(?:is|was|equals?)[^\S\r\n]+)|"
+    r"(?P<spacing>[^\S\r\n]+))",
     re.IGNORECASE,
 )
 _BEARER_CANDIDATE_RE = re.compile(
@@ -129,6 +122,7 @@ _BENIGN_TECHNICAL_CONTEXTS = frozenset(
         "introspection",
         "management",
         "manager",
+        "managers",
         "permissions",
         "policy",
         "reset",
@@ -145,43 +139,84 @@ _BENIGN_TECHNICAL_CONTEXTS = frozenset(
     }
 )
 _BENIGN_TECHNICAL_CONTEXT_RE = re.compile(
-    rf"(?:{'|'.join(sorted(_BENIGN_TECHNICAL_CONTEXTS))})"
-    r"(?:[ \t]+(?:algorithms?|discovery|matters?|selection))?"
-    r"(?:[ \t]+uses?[ \t]+(?:access[ \t]+)?tokens?)?"
-    r"(?:[ \t]+(?:is|are)[ \t]+(?:useful[ \t]+)?"
-    r"(?:(?:operational|protocol|security|technical)[ \t]+)?"
-    r"(?:concepts?|controls?))?",
+    rf"(?P<head>{'|'.join(sorted(_BENIGN_TECHNICAL_CONTEXTS))})\b(?P<tail>.*)",
     re.IGNORECASE,
 )
-_POLICY_QUANTITY = (
+_MODAL_GUIDANCE_RE = re.compile(
+    r"(?P<modal>can|may|must|shall|should)[ \t]+(?P<predicate>.+)",
+    re.IGNORECASE,
+)
+_POLICY_STATE_RE = re.compile(
+    r"(?:deprecated|disabled|enabled|optional|required|recommended)",
+    re.IGNORECASE,
+)
+_POLICY_QUANTITY_RE = re.compile(
     r"(?:(?:at[ \t]+(?:least|most)|exactly)[ \t]+)?"
     r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
-    r"[ \t]+(?:characters?|digits?|letters?|symbols?|words?)"
-)
-_POLICY_CADENCE = r"(?:automatically|periodically|regularly|securely)"
-_POLICY_STORAGE_LOCATION = (
-    r"(?:(?:a|an|the)[ \t]+)?(?:hardware[ \t]+security[ \t]+module|keychain|"
-    r"keystore|secret[ \t]+manager|vault)"
-)
-_BENIGN_POLICY_CONTEXT_RE = re.compile(
-    rf"(?:(?:must|should)[ \t]+(?:contain|have|include)[ \t]+{_POLICY_QUANTITY}|"
-    rf"(?:must|should)[ \t]+be[ \t]+(?:{_POLICY_QUANTITY}|"
-    r"(?:complex|confidential|long|private|random|strong|unique)|"
-    rf"(?:rotated|replaced|revoked)[ \t]+{_POLICY_CADENCE}|"
-    rf"(?:kept|protected|stored)[ \t]+(?:at|in)[ \t]+{_POLICY_STORAGE_LOCATION})|"
-    r"(?:can|may|must|should)[ \t]+remain[ \t]+(?:confidential|private|secret)|"
-    rf"(?:rotate|replace|revoke)[ \t]+(?:it|them)[ \t]+{_POLICY_CADENCE}|"
-    rf"(?:kept|protected|stored)[ \t]+(?:at|in)[ \t]+{_POLICY_STORAGE_LOCATION}|"
-    r"(?:deprecated|disabled|enabled|optional|required|recommended))",
+    r"[ \t]+(?:characters?|digits?|letters?|symbols?|words?)",
     re.IGNORECASE,
 )
-_CLAUSE_SEPARATOR_GROUPS = ("equals", "colon", "copula", "spacing")
-_CLAUSE_VALUE_GROUPS = (
-    "equals_value",
-    "colon_value",
-    "copula_value",
-    "spacing_value",
+_SAFE_POLICY_OBJECT_RE = re.compile(
+    r"(?:it|them|this|these|(?:a|an|the)[ \t]+(?:access[ \t]+key|api[ \t]+key|"
+    r"credential|password|password[ \t]+manager|private[ \t]+key|secret|"
+    r"secret[ \t]+manager|token)s?)\b"
+    r"(?:[ \t]+(?:automatically|periodically|regularly|securely)|"
+    r"[ \t]+(?:after|before|during|when)[ \t]+(?:(?:a|an|the)[ \t]+)?"
+    r"(?:incident|maintenance|rotation|support[ \t]+workflow|use)|"
+    r"[ \t]+(?:into|on)[ \t]+(?:(?:a|an|the)[ \t]+)?"
+    r"(?:documentation|logs?|tickets?)|"
+    r"[ \t]+(?:at|in)[ \t]+(?:(?:a|an|the)[ \t]+)?"
+    r"(?:hardware[ \t]+security[ \t]+module|keychain|keystore|secret[ \t]+manager|vault))?",
+    re.IGNORECASE,
 )
+_SAFE_STORAGE_LOCATION_RE = re.compile(
+    r"(?:(?:a|an|the)[ \t]+)?(?:hardware[ \t]+security[ \t]+module|keychain|"
+    r"keystore|secret[ \t]+manager|vault)",
+    re.IGNORECASE,
+)
+_POLICY_ACTION_RE = re.compile(
+    r"(?P<verb>avoid|contain|disclose|expose|have|include|paste|protect|replace|"
+    r"revoke|rotate|share|store|use|validate)\b[ \t]*(?P<object>.*)",
+    re.IGNORECASE,
+)
+_ENSURE_GUIDANCE_RE = re.compile(
+    r"(?:operators?|systems?|teams?|users?)[ \t]+(?P<action>.+)",
+    re.IGNORECASE,
+)
+_NOMINAL_CONTINUATION_RE = re.compile(
+    r"(?:algorithms?|discovery|matters?|selection|"
+    r"(?:is|are)[ \t]+(?:useful[ \t]+)?"
+    r"(?:(?:operational|protocol|security|technical)[ \t]+)?(?:concepts?|controls?)|"
+    r"uses?[ \t]+(?:access[ \t]+tokens?|credentials?|password[ \t]+manager)|"
+    r"(?:mitigates?|prevents?)[ \t]+(?:(?:offline|online|replay)[ \t]+)?attacks?|"
+    r"(?:can|may|must|shall|should)[ \t]+occur[ \t]+(?:after|before|during)[ \t]+"
+    r"(?:authentication|authorization|rotation|use|validation)|"
+    r"centralizes?[ \t]+(?:access[ \t]+)?(?:control|management)|"
+    r"simplif(?:y|ies)[ \t]+(?:authentication|authorization|management|rotation|storage|"
+    r"validation)|"
+    r"securely[ \t]+stores?(?:[ \t]+(?:access[ \t]+keys?|api[ \t]+keys?|"
+    r"credentials?|passwords?|private[ \t]+keys?|secrets?|tokens?))?|"
+    r"stores?(?:[ \t]+(?:access[ \t]+keys?|api[ \t]+keys?|credentials?|passwords?|"
+    r"private[ \t]+keys?|secrets?|tokens?)(?:[ \t]+securely)?)?|"
+    r"resolution(?:[ \t]+(?:across|for|in|of|within)[ \t]+"
+    r"(?:regions?|services?|systems?|workflows?))?"
+    r"(?:[ \t]+(?:is|are|remains?)[ \t]+"
+    r"(?:deterministic|portable|reliable|stable|useful))?)",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _CredentialRecordAssessment:
+    clauses: int = 0
+    unsafe: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _CredentialLabelMatch:
+    start: int
+    end: int
+    technical_family: str | None = None
 
 
 def _sanitize_prompt_text(text: str) -> str:
@@ -195,75 +230,369 @@ def _sanitize_prompt_text(text: str) -> str:
 
 
 def _sanitize_credentials_once(text: str) -> str:
-    if _ASSIGNMENT_PLACEHOLDER_TAIL_RE.search(text):
+    normalized = unicodedata.normalize("NFKC", text)
+    scan_text = "".join(
+        char
+        for char in normalized
+        if unicodedata.category(char) != "Cf" and not unicodedata.category(char).startswith("M")
+    )
+    records = scan_text.splitlines(keepends=True)
+    if not records:
+        return text
+    if _has_split_credential_assignment(records):
         return EXCLUDED_CREDENTIAL
-    sanitized, clause_count = _CREDENTIAL_CLAUSE_RE.subn(
-        _redact_credential_clause,
-        text,
+
+    clause_count = 0
+    for record in records:
+        content, line_ending = _split_line_ending(record)
+        assessment = _assess_credential_record(
+            content,
+            terminated=bool(line_ending),
+        )
+        clause_count += assessment.clauses
+        if clause_count > _MAX_CREDENTIAL_CLAUSES:
+            return EXCLUDED_CREDENTIAL
+        if assessment.unsafe:
+            return EXCLUDED_CREDENTIAL
+
+    return text
+
+
+def _has_split_credential_assignment(records: Sequence[str]) -> bool:
+    pending_credential_key = False
+    in_block_comment = False
+    comment_records = 0
+    for record in records:
+        content, _ = _split_line_ending(record)
+        candidate = content.strip()
+        if not candidate:
+            continue
+        if pending_credential_key:
+            if in_block_comment:
+                comment_records += 1
+                if comment_records > _MAX_SPLIT_COMMENT_RECORDS:
+                    return True
+                if "*/" not in candidate:
+                    continue
+                candidate = candidate.split("*/", 1)[1].strip()
+                in_block_comment = False
+                if not candidate:
+                    continue
+            while candidate.startswith("/*"):
+                comment_records += 1
+                if comment_records > _MAX_SPLIT_COMMENT_RECORDS:
+                    return True
+                if "*/" not in candidate[2:]:
+                    in_block_comment = True
+                    candidate = ""
+                    break
+                candidate = candidate.split("*/", 1)[1].strip()
+            if not candidate:
+                continue
+            if candidate.startswith((":", "=")):
+                return True
+            if _is_comment_only_record(candidate):
+                comment_records += 1
+                if comment_records > _MAX_SPLIT_COMMENT_RECORDS:
+                    return True
+                continue
+            pending_credential_key = False
+            comment_records = 0
+        pending_credential_key = any(
+            label.end == len(candidate) and not candidate[: label.start].strip(" \t{[,")
+            for label in _find_credential_labels(candidate)
+        )
+    return False
+
+
+def _is_comment_only_record(record: str) -> bool:
+    return record.startswith(("//", "#")) or bool(re.fullmatch(r"/\*.*\*/", record))
+
+
+def _find_credential_labels(record: str) -> list[_CredentialLabelMatch]:
+    candidates = [
+        _CredentialLabelMatch(
+            start=match.start(),
+            end=match.end(),
+            technical_family=_technical_identifier_family(match.group("label")),
+        )
+        for match in _CREDENTIAL_LABEL_RE.finditer(record)
+    ]
+    candidates.extend(
+        _CredentialLabelMatch(
+            start=match.start(),
+            end=match.end(),
+            technical_family=_technical_identifier_family(match.group("label")),
+        )
+        for match in _IDENTIFIER_LABEL_RE.finditer(record)
+        if _is_credential_identifier(match.group("label"))
     )
-    sanitized, bearer_count = _BEARER_CANDIDATE_RE.subn(
-        _redact_bearer_candidate,
-        sanitized,
-    )
-    sanitized, sk_count = _COMMON_SK_TOKEN_RE.subn(EXCLUDED_CREDENTIAL, sanitized)
-    if clause_count + bearer_count + sk_count > _MAX_CREDENTIAL_CLAUSES:
-        return EXCLUDED_CREDENTIAL
-    return sanitized
+    selected: list[_CredentialLabelMatch] = []
+    for candidate in sorted(
+        candidates,
+        key=lambda item: (
+            item.start,
+            -(item.end - item.start),
+            -int(item.technical_family is not None),
+        ),
+    ):
+        if any(candidate.start < item.end and item.start < candidate.end for item in selected):
+            continue
+        selected.append(candidate)
+    return selected
 
 
-def _redact_bearer_candidate(match: re.Match[str]) -> str:
-    value = match.group("value")
-    if value.casefold() in _BENIGN_BEARER_FOLLOWERS:
-        return match.group(0)
-    return f"Bearer {EXCLUDED_CREDENTIAL}"
-
-
-def _redact_credential_clause(match: re.Match[str]) -> str:
-    if _is_benign_credential_clause(match):
-        return match.group(0)
-    label_quote = match.group("label_quote")
-    separator = _matched_group(match, _CLAUSE_SEPARATOR_GROUPS)
-    return (
-        f"{label_quote}{match.group('label')}{label_quote}{separator}"
-        f"{_redacted_clause_value(match)}"
-    )
-
-
-def _is_benign_credential_clause(match: re.Match[str]) -> bool:
-    value = _matched_group(match, _CLAUSE_VALUE_GROUPS)
-    if _is_explicit_credential_placeholder(value):
+def _is_credential_identifier(value: str) -> bool:
+    compact = re.sub(r"[^a-z0-9]", "", value.casefold())
+    components = _canonical_identifier_components(value)
+    if any(label in compact for label in _COMPOUND_CREDENTIAL_LABELS):
         return True
-    if value.startswith(('"', "'")):
-        return False
-
-    if match.group("equals") is not None:
-        return False
-    if match.group("colon") is not None or match.group("copula") is not None:
-        return bool(_BENIGN_POLICY_CONTEXT_RE.fullmatch(value.strip()))
-    return bool(
-        _BENIGN_TECHNICAL_CONTEXT_RE.fullmatch(value.strip())
-        or _BENIGN_POLICY_CONTEXT_RE.fullmatch(value.strip())
+    if any(component in _SINGLE_CREDENTIAL_LABELS for component in components):
+        return True
+    if any(compact.endswith(label) for label in _SINGLE_CREDENTIAL_LABELS):
+        return True
+    qualifier = (
+        r"(?:backup|content|data|live|old|payload|plaintext|prod|production|raw|test|val|value)"
+    )
+    risky_suffix = rf"(?:(?:{qualifier}){{1,3}}\d*|\d+)"
+    return any(
+        re.search(rf"{label}{risky_suffix}$", compact) for label in _SINGLE_CREDENTIAL_LABELS
     )
 
 
-def _redacted_clause_value(match: re.Match[str]) -> str:
-    value = _matched_group(match, _CLAUSE_VALUE_GROUPS)
-    quote = value[0] if value.startswith(('"', "'")) else ""
-    unquoted = value[1:-1] if quote else value
-    scheme = re.match(r"(?P<scheme>bearer|basic)(?P<spacing>[ \t]+)", unquoted, re.IGNORECASE)
-    if _normalize_credential_label(match.group("label")) == "authorization" and scheme:
-        replacement = f"{scheme.group('scheme')}{scheme.group('spacing')}{EXCLUDED_CREDENTIAL}"
-    else:
-        replacement = EXCLUDED_CREDENTIAL
-    return f"{quote}{replacement}{quote}"
+def _canonical_identifier_components(value: str) -> tuple[str, ...]:
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value)
+    separated = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", separated)
+    separated = re.sub(r"(?<=[A-Za-z])(?=[0-9])", "_", separated)
+    return tuple(part for part in re.split(r"[^A-Za-z0-9]+", separated.casefold()) if part)
 
 
-def _matched_group(match: re.Match[str], names: tuple[str, ...]) -> str:
-    for name in names:
-        value = match.group(name)
-        if value is not None:
-            return value
-    raise AssertionError("credential clause regex matched without a required group")
+_COMPOUND_CREDENTIAL_LABELS = (
+    "secretaccesskey",
+    "applicationcredentials",
+    "accesskeyid",
+    "consumersecret",
+    "sessiontoken",
+    "clientsecret",
+    "accesstoken",
+    "privatekey",
+    "accesskey",
+    "authtoken",
+    "secretkey",
+    "refreshtoken",
+    "idtoken",
+    "apikey",
+)
+_SINGLE_CREDENTIAL_LABELS = (
+    "authorization",
+    "credentials",
+    "credential",
+    "password",
+    "passwd",
+    "secret",
+    "token",
+)
+
+
+def _technical_identifier_family(value: str) -> str | None:
+    compact = re.sub(r"[^a-z0-9]", "", value.casefold())
+    if compact.endswith(("passwordhashalgorithm", "passwordhashalgorithmname")):
+        return "hash_algorithm"
+    if compact.endswith("secretscanningenabled"):
+        return "boolean"
+    if compact.endswith(("tokenexpirationseconds", "apikeyrotationdays")):
+        return "duration"
+    return None
+
+
+def _is_safe_technical_config_value(value: str, family: str) -> bool:
+    candidate = value.strip()
+    if " #" in candidate:
+        candidate, comment = candidate.split(" #", 1)
+        if comment.strip().casefold() not in {
+            "default",
+            "enabled",
+            "hash algorithm",
+            "recommended",
+            "rotation interval",
+            "days between rotations",
+            "seconds before expiration",
+        }:
+            return False
+    candidate = candidate.rstrip(".,;}] ")
+    if candidate.casefold() == "null":
+        return True
+    if family == "hash_algorithm":
+        return bool(
+            re.fullmatch(
+                r"[\"']?(?:argon2(?:id)?|bcrypt|pbkdf2|scrypt|sha(?:256|384|512))[\"']?",
+                candidate,
+                flags=re.IGNORECASE,
+            )
+        )
+    if family == "boolean":
+        return candidate.casefold() in {"false", "true"}
+    if family == "duration" and re.fullmatch(r"\d+", candidate):
+        return int(candidate) <= 31_536_000
+    return False
+
+
+def _assess_credential_record(
+    record: str,
+    *,
+    terminated: bool,
+) -> _CredentialRecordAssessment:
+    labels = _find_credential_labels(record)
+    clauses: list[tuple[_CredentialLabelMatch, re.Match[str]]] = []
+    for label in labels:
+        syntax = _CREDENTIAL_SYNTAX_RE.match(record, label.end)
+        if syntax is not None:
+            clauses.append((label, syntax))
+
+    bearer_matches = list(_BEARER_CANDIDATE_RE.finditer(record))
+    sk_matches = list(_COMMON_SK_TOKEN_RE.finditer(record))
+    count = len(clauses) + len(bearer_matches) + len(sk_matches)
+    unsafe = bool(sk_matches) or any(
+        match.group("value").casefold() not in _BENIGN_BEARER_FOLLOWERS for match in bearer_matches
+    )
+    for index, (label, syntax) in enumerate(clauses):
+        value_end = clauses[index + 1][0].start if index + 1 < len(clauses) else len(record)
+        value = record[syntax.end() : value_end]
+        assignment = syntax.group("assignment")
+        if assignment is not None:
+            if label.technical_family and _is_safe_technical_config_value(
+                value, label.technical_family
+            ):
+                continue
+            exact_placeholder = _is_exact_placeholder_record(value)
+            colon_guidance = ":" in assignment and _is_guidance_record(value)
+            ambiguous_placeholder_continuation = (
+                exact_placeholder
+                and terminated
+                and value_end == len(record)
+                and not value.rstrip().endswith((".", "!", "?", ",", ";"))
+            )
+            if ambiguous_placeholder_continuation or (not exact_placeholder and not colon_guidance):
+                unsafe = True
+            continue
+        if syntax.group("copula") is not None:
+            unsafe = unsafe or not _is_guidance_record(value)
+            continue
+        unsafe = unsafe or not (_is_guidance_record(value) or _is_technical_concept_record(value))
+
+    return _CredentialRecordAssessment(
+        clauses=count,
+        unsafe=unsafe,
+    )
+
+
+def _is_exact_placeholder_record(value: str) -> bool:
+    candidate = value.strip().rstrip(".!?;, ")
+    return _is_explicit_credential_placeholder(candidate)
+
+
+def _is_technical_concept_record(value: str) -> bool:
+    candidate = value.strip().lstrip(".,;:!? ")
+    if candidate.rstrip(".,;:!? ").casefold() == "securely":
+        return True
+    match = _BENIGN_TECHNICAL_CONTEXT_RE.fullmatch(candidate)
+    if match is None:
+        return False
+    tail = match.group("tail").strip().strip(".,;:!? ")
+    if tail.casefold() in {"and", "or"}:
+        return True
+    tail = re.sub(r"(?:\s+(?:and|or))$", "", tail, flags=re.IGNORECASE).strip()
+    return not tail or bool(_NOMINAL_CONTINUATION_RE.fullmatch(tail))
+
+
+def _is_guidance_record(value: str) -> bool:
+    candidate = value.strip().lstrip(".,;:!? ").rstrip(".,;:!? ")
+    if not candidate:
+        return False
+    modal = _MODAL_GUIDANCE_RE.fullmatch(candidate)
+    if modal is not None:
+        return _is_safe_policy_predicate(modal.group("predicate"))
+    lowered = candidate.casefold()
+    for prefix in ("do not ", "don't ", "never ", "always "):
+        if lowered.startswith(prefix):
+            return _is_safe_policy_predicate(candidate[len(prefix) :])
+    if lowered.startswith("ensure "):
+        ensured = _ENSURE_GUIDANCE_RE.fullmatch(candidate[len("ensure ") :])
+        if ensured is None:
+            return False
+        action = _POLICY_ACTION_RE.fullmatch(ensured.group("action"))
+        return action is not None and _is_safe_policy_action(action)
+    return _is_safe_policy_predicate(candidate)
+
+
+def _is_safe_policy_predicate(predicate: str) -> bool:
+    candidate = predicate.strip().rstrip(".,;:!? ")
+    lowered = candidate.casefold()
+    for prefix in ("not ", "never ", "always "):
+        if lowered.startswith(prefix):
+            return _is_safe_policy_predicate(candidate[len(prefix) :])
+    if lowered.startswith("be "):
+        state = candidate[3:].strip()
+        if _POLICY_QUANTITY_RE.fullmatch(state):
+            return True
+        first, _, remainder = state.partition(" ")
+        if first.casefold() in {
+            "complex",
+            "confidential",
+            "long",
+            "private",
+            "random",
+            "strong",
+            "unique",
+        }:
+            return not remainder or bool(
+                re.fullmatch(
+                    r"and[ \t]+(?:complex|confidential|long|private|random|strong|unique)",
+                    remainder,
+                    flags=re.IGNORECASE,
+                )
+            )
+        if first.casefold() in {"kept", "managed", "protected", "stored"}:
+            return _is_safe_storage_predicate(remainder)
+        if first.casefold() in {"disclosed", "replaced", "revoked", "rotated", "validated"}:
+            return not remainder or bool(
+                re.fullmatch(
+                    r"(?:automatically|periodically|regularly|securely|"
+                    r"(?:after|before|during|when)[ \t]+(?:(?:a|an|the)[ \t]+)?"
+                    r"(?:incident|maintenance|rotation|support[ \t]+workflows?|use))",
+                    remainder,
+                    flags=re.IGNORECASE,
+                )
+            )
+        return False
+    if lowered.startswith(("kept ", "managed ", "protected ", "stored ")):
+        _, _, remainder = candidate.partition(" ")
+        return _is_safe_storage_predicate(remainder)
+    if _POLICY_STATE_RE.fullmatch(candidate):
+        return True
+    action = _POLICY_ACTION_RE.fullmatch(candidate)
+    return action is not None and _is_safe_policy_action(action)
+
+
+def _is_safe_policy_action(action: re.Match[str]) -> bool:
+    verb = action.group("verb").casefold()
+    object_text = action.group("object").strip()
+    if verb in {"contain", "have", "include"}:
+        return bool(_POLICY_QUANTITY_RE.fullmatch(object_text))
+    if verb == "store":
+        safe_object = _SAFE_POLICY_OBJECT_RE.fullmatch(object_text)
+        return bool(safe_object) or _is_safe_storage_predicate(object_text)
+    return bool(_SAFE_POLICY_OBJECT_RE.fullmatch(object_text))
+
+
+def _is_safe_storage_predicate(predicate: str) -> bool:
+    location = re.sub(r"^(?:at|in)[ \t]+", "", predicate, flags=re.IGNORECASE)
+    return bool(_SAFE_STORAGE_LOCATION_RE.fullmatch(location))
+
+
+def _split_line_ending(record: str) -> tuple[str, str]:
+    content = record.rstrip("\r\n")
+    return content, record[len(content) :]
 
 
 def _is_explicit_credential_placeholder(value: str) -> bool:
@@ -277,10 +606,6 @@ def _is_explicit_credential_placeholder(value: str) -> bool:
         and normalized.endswith(">")
         and (normalized[1:-1] in _EXPLICIT_ANGLE_PLACEHOLDERS)
     )
-
-
-def _normalize_credential_label(label: str) -> str:
-    return re.sub(r"[\s_-]+", " ", label.casefold()).strip()
 
 
 def _require_prompt_safe_text(value: str) -> str:

@@ -223,6 +223,43 @@ def test_safe_payload_removes_credentials_from_asset_locator_urls():
 
 def test_prompt_boundary_redacts_credentials_but_preserves_benign_technical_prose():
     prepared = _prepared_source()
+    benign_text = (
+        "token: identifier. password=<password>. api key: example.\n"
+        "Bearer authentication uses access tokens. Token bucket algorithms, password hashing, "
+        "password policy, token validation, API key rotation, api key storage, "
+        "secret management, and secret handling are useful technical concepts. "
+        "Password strength and password complexity matter. Token introspection and "
+        "token expiration are protocol concepts. API key permissions and secret scanning "
+        "are operational controls. Password: must contain twelve characters. "
+        "API key: rotate it regularly. secret: stored in a vault. Token endpoint discovery, "
+        "password manager selection, API key authentication, secret sharing, and refresh token "
+        "revocation are technical concepts. Password must be at least 12 characters. "
+        "API key should be rotated regularly. Secret should be stored in a vault. "
+        "Password shall never be disclosed during support workflows. "
+        "API key: do not paste it into tickets. Secret: ensure operators rotate it after an "
+        "incident. Token endpoint resolution across regions remains deterministic. "
+        "Password hashing prevents offline attacks. "
+        "Token validation should occur before use. "
+        "API key management centralizes access control. "
+        "Password managers store credentials securely. "
+        "Password hashing mitigates offline attacks. "
+        "Token validation prevents replay attacks. "
+        "API key management simplifies rotation. "
+        "Password managers securely store credentials.\n"
+        'passwordHashAlgorithm = "argon2".\n'
+        "tokenExpirationSeconds = 3600.\n"
+        "secretScanningEnabled = true.\n"
+        "apiKeyRotationDays = 30.\n"
+        "tokenizationEnabled = true.\n"
+        'secretaryName = "Alice".\n'
+        "passwordlessEnabled = true.\n"
+        "passwordHashAlgorithm = argon2.\n"
+        '{"passwordHashAlgorithm":"argon2"}.\n'
+        '{"secretScanningEnabled":true}.\n'
+        "passwordHashAlgorithm: argon2 # recommended\n"
+        'passwordHashAlgorithmName = "argon2".\n'
+        "apiKeyRotationDays: 30 # days between rotations"
+    )
     credential_text = (
         "token%253Dsk-live-secret password&#61;hunter2 "
         "passwd:open-sesame api_key=sk-query-secret secret=private-value "
@@ -235,7 +272,6 @@ def test_prompt_boundary_redacts_credentials_but_preserves_benign_technical_pros
         "access_token=access-secret-123 refresh-token:refresh-secret-456 "
         "client_secret=client-secret-123 consumer-secret:consumer-secret-456 "
         "sk_live_abcdefghijkl sk_test_mnopqrstuvwxyz. "
-        "token: identifier. password=<password>. api key: example. "
         "password=<hunter2> token=<livecredential> "
         '{"authorization":"Basic quotedhunter2"} authorization Basic barehunter2 '
         "password admin passwd root token abc12 secret test password swordfish "
@@ -246,25 +282,41 @@ def test_prompt_boundary_redacts_credentials_but_preserves_benign_technical_pros
         "ANTHROPIC_API_KEY=anthropicAlphabetic GITHUB_TOKEN=ghp_reviewsecret "
         "DATABASE_PASSWORD=dbswordfish AZURE_CLIENT_SECRET=azureAlphabetic "
         "GOOGLE_APPLICATION_CREDENTIALS=/tmp/private.json "
+        "OPENAI_API_KEY_BACKUP=backupsecret DATABASE_PASSWORD_OLD=oldswordfish "
+        "AWS_SECRET_ACCESS_KEY_PROD=prodsecret OPENAI_API_KEY_2=numericsecret "
+        "AWS_SECRET_ACCESS_KEY_2026=yearsecret _OPENAI_API_KEY=leadingsecret "
+        "SERVICE__API_KEY=doublesecret "
         "Password: must be policySwordfish. Password: should be policyHunter2. "
         "secret: stored in hunter2vault. "
+        "Password: should use guidanceSwordfish. Password must include guidanceHunter2. "
+        "secret: stored in the hiddenhuntervault. API key: must equal ghp_guidancesecret. "
+        "API key: should store it in storehunter2. Password: should use it after useswordfish. "
+        "Password must be strong and equal strongorchard. password manager uses managersecret. "
+        "secret stored in the vault hiddenvaultsecret. "
+        "Password: must contain 12 characters including quantityhunter2. "
+        "Secret: ensure prefixhunter2 operators rotate it after an incident. "
+        "Password: must be swordfished. "
         "password equals meadow; credential is violet, private key was wintergreen. "
         "password is value tailhunter2. "
         "api key: example tailghpsecret. password is correct horse battery staple. "
         "secret is the orchardword. "
         "password=!banghunter2 API_KEY=.dotghp secret=?questionorchard "
-        "token=;semicolonabc password=hunter2!Swordfish. password=\nnewlinehunter2. "
-        "Bearer abc123 Bearer root "
-        "Bearer authentication uses access tokens. Token bucket algorithms, password hashing, "
-        "password policy, token validation, API key rotation, api key storage, "
-        "secret management, and secret handling are useful technical concepts. "
-        "Password strength and password complexity matter. Token introspection and "
-        "token expiration are protocol concepts. API key permissions and secret scanning "
-        "are operational controls. Password: must contain twelve characters. "
-        "API key: rotate it regularly. secret: stored in a vault. Token endpoint discovery, "
-        "password manager selection, API key authentication, secret sharing, and refresh token "
-        "revocation are technical concepts. Password must be at least 12 characters. "
-        "API key should be rotated regularly. Secret should be stored in a vault."
+        "token=;semicolonabc password=hunter2!Swordfish access key=genericaccesssecret. "
+        'password="first quoted line\nmultilinequotedsecret"\n'
+        "password: |\n yamlhunter2\n"
+        'password="""\ntriplequotedsecret\n"""\n'
+        "TOKEN=<<EOF\nheredoctoken\nEOF\n"
+        "password: | # comment\n commentyamlsecret\n"
+        "password: |2-\n  indentyamlsecret\n"
+        "TOKEN=<<'EOF'\nquotedheredocsecret\nEOF\n"
+        "password=\npassword: |\n  awaityamlsecret\n"
+        "password: &credential |\n anchorsecret\n"
+        "api_key: !!str >-\n yamlstrsecret\n"
+        'password=r"""\nrawtriplesecret\n"""\n'
+        "TOKEN=<<\\EOF\nescapedheredocsecret\nEOF\n"
+        "password:\n  value: |\n    nestedhunter2\n"
+        "password=\nnewlinehunter2.\n"
+        "Bearer abc123 Bearer root\n"
     )
     blocks = tuple(
         block.model_copy(update={"text": credential_text}) if index == 1 else block
@@ -351,6 +403,39 @@ def test_prompt_boundary_redacts_credentials_but_preserves_benign_technical_pros
             "semicolonabc",
             "hunter2!Swordfish",
             "newlinehunter2",
+            "genericaccesssecret",
+            "multilinequotedsecret",
+            "backupsecret",
+            "oldswordfish",
+            "prodsecret",
+            "numericsecret",
+            "yearsecret",
+            "leadingsecret",
+            "doublesecret",
+            "guidanceSwordfish",
+            "guidanceHunter2",
+            "hiddenhuntervault",
+            "ghp_guidancesecret",
+            "yamlhunter2",
+            "triplequotedsecret",
+            "heredoctoken",
+            "storehunter2",
+            "useswordfish",
+            "strongorchard",
+            "managersecret",
+            "hiddenvaultsecret",
+            "commentyamlsecret",
+            "indentyamlsecret",
+            "quotedheredocsecret",
+            "awaityamlsecret",
+            "quantityhunter2",
+            "prefixhunter2",
+            "swordfished",
+            "anchorsecret",
+            "yamlstrsecret",
+            "rawtriplesecret",
+            "escapedheredocsecret",
+            "nestedhunter2",
             "Bearer abc123",
             "Bearer root",
             "sk_live_abcdefghijkl",
@@ -358,44 +443,92 @@ def test_prompt_boundary_redacts_credentials_but_preserves_benign_technical_pros
             "sk-path-secret",
         )
     )
-    assert "Bearer authentication uses access tokens" in host_input
-    assert "Token bucket algorithms" in host_input
-    assert "password hashing" in host_input
-    assert "password policy" in host_input
-    assert "token validation" in host_input
-    assert "API key rotation" in host_input
-    assert "api key storage" in host_input
-    assert "secret management" in host_input
-    assert "secret handling" in host_input
-    assert "Password strength" in host_input
-    assert "password complexity" in host_input
-    assert "Token introspection" in host_input
-    assert "token expiration" in host_input
-    assert "API key permissions" in host_input
-    assert "secret scanning" in host_input
-    assert "Password: must contain twelve characters" in host_input
-    assert "API key: rotate it regularly" in host_input
-    assert "secret: stored in a vault" in host_input
-    assert "Token endpoint discovery" in host_input
-    assert "password manager selection" in host_input
-    assert "API key authentication" in host_input
-    assert "secret sharing" in host_input
-    assert "refresh token revocation" in host_input
-    assert "Password must be at least 12 characters" in host_input
-    assert "API key should be rotated regularly" in host_input
-    assert "Secret should be stored in a vault" in host_input
-    assert "token: identifier" in host_input
-    assert "password=<password>" in host_input
-    assert "api key: example" in host_input
+    benign_prepared = _prepared_source()
+    benign_blocks = tuple(
+        block.model_copy(update={"text": benign_text}) if index == 1 else block
+        for index, block in enumerate(benign_prepared.document.blocks)
+    )
+    benign_document = benign_prepared.document.model_copy(update={"blocks": benign_blocks})
+    benign_prepared = PreparedSource(
+        manifest=benign_prepared.manifest,
+        document=benign_document,
+        segments=segment_document(benign_document),
+    )
+    benign_host = _RecordingHost(
+        _HostResult(parsed={"artifacts": [], "ignored_segment_indexes": []})
+    )
+    HadesLlmAdapter(benign_host).complete(
+        SemanticDraftBundle,
+        instructions=EXTRACTOR_PROMPT,
+        payload=build_safe_source_payload(benign_prepared),
+        purpose="sedna.semantic.extract",
+    )
+    benign_host_input = str(benign_host.calls[0]["input"])
+
+    assert "Bearer authentication uses access tokens" in benign_host_input
+    assert "Token bucket algorithms" in benign_host_input
+    assert "password hashing" in benign_host_input
+    assert "password policy" in benign_host_input
+    assert "token validation" in benign_host_input
+    assert "API key rotation" in benign_host_input
+    assert "api key storage" in benign_host_input
+    assert "secret management" in benign_host_input
+    assert "secret handling" in benign_host_input
+    assert "Password strength" in benign_host_input
+    assert "password complexity" in benign_host_input
+    assert "Token introspection" in benign_host_input
+    assert "token expiration" in benign_host_input
+    assert "API key permissions" in benign_host_input
+    assert "secret scanning" in benign_host_input
+    assert "Password: must contain twelve characters" in benign_host_input
+    assert "API key: rotate it regularly" in benign_host_input
+    assert "secret: stored in a vault" in benign_host_input
+    assert "Token endpoint discovery" in benign_host_input
+    assert "password manager selection" in benign_host_input
+    assert "API key authentication" in benign_host_input
+    assert "secret sharing" in benign_host_input
+    assert "refresh token revocation" in benign_host_input
+    assert "Password must be at least 12 characters" in benign_host_input
+    assert "API key should be rotated regularly" in benign_host_input
+    assert "Secret should be stored in a vault" in benign_host_input
+    assert "Password shall never be disclosed during support workflows" in benign_host_input
+    assert "API key: do not paste it into tickets" in benign_host_input
+    assert "Secret: ensure operators rotate it after an incident" in benign_host_input
+    assert "Token endpoint resolution across regions remains deterministic" in benign_host_input
+    assert "Password hashing prevents offline attacks" in benign_host_input
+    assert "Token validation should occur before use" in benign_host_input
+    assert "API key management centralizes access control" in benign_host_input
+    assert "Password managers store credentials securely" in benign_host_input
+    assert "Password hashing mitigates offline attacks" in benign_host_input
+    assert "Token validation prevents replay attacks" in benign_host_input
+    assert "API key management simplifies rotation" in benign_host_input
+    assert "Password managers securely store credentials" in benign_host_input
+    assert "passwordHashAlgorithm" in benign_host_input
+    assert "argon2" in benign_host_input
+    assert "tokenExpirationSeconds = 3600" in benign_host_input
+    assert "secretScanningEnabled = true" in benign_host_input
+    assert "apiKeyRotationDays = 30" in benign_host_input
+    assert "tokenizationEnabled = true" in benign_host_input
+    assert "secretaryName" in benign_host_input
+    assert "Alice" in benign_host_input
+    assert "passwordlessEnabled = true" in benign_host_input
+    assert "passwordHashAlgorithm = argon2" in benign_host_input
+    assert "secretScanningEnabled" in benign_host_input
+    assert "passwordHashAlgorithm: argon2 # recommended" in benign_host_input
+    assert "passwordHashAlgorithmName" in benign_host_input
+    assert "apiKeyRotationDays: 30 # days between rotations" in benign_host_input
+    assert "token: identifier" in benign_host_input
+    assert "password=<password>" in benign_host_input
+    assert "api key: example" in benign_host_input
     assert '"target"' not in host_input
 
 
 def test_prompt_boundary_fails_closed_when_credential_clause_budget_is_exceeded():
     prepared = _prepared_source()
+    clauses = "\n".join(["password manager"] * 257)
+    assert len(clauses.splitlines()) == 257
     blocks = tuple(
-        block.model_copy(update={"text": " ".join(["password manager"] * 257)})
-        if index == 1
-        else block
+        block.model_copy(update={"text": clauses}) if index == 1 else block
         for index, block in enumerate(prepared.document.blocks)
     )
     document = prepared.document.model_copy(update={"blocks": blocks})
@@ -426,9 +559,68 @@ def test_prompt_boundary_fails_closed_when_credential_clause_budget_is_exceeded(
         ("password='<password>'\thunter2", "hunter2"),
         ("password=<password>\nhunter2", "hunter2"),
         ("password=value\r\nhunter2", "hunter2"),
+        ("_OPENAI_API_KEY=leadingsecret", "leadingsecret"),
+        ("SERVICE__API_KEY=doublesecret", "doublesecret"),
+        ('{"apiKey":"camelghpsecret"}', "camelghpsecret"),
+        ("accessToken=camelaccessecret", "camelaccessecret"),
+        ("clientSecret=camelclientsecret", "camelclientsecret"),
+        ("OPENAI_APIKEY=compactsecret", "compactsecret"),
+        ("password\u00a0=\u00a0nbsphunter2", "nbsphunter2"),
+        ("password&nbsp;=&nbsp;encodedhunter2", "encodedhunter2"),
+        ('"password"\n:\n"splitjsonhunter2"', "splitjsonhunter2"),
+        ("openaiApiKey=providercamelsecret", "providercamelsecret"),
+        ("AwsSecretAccessKey=pascalawssecret", "pascalawssecret"),
+        ("apiKeyBackup=camelpostfixsecret", "camelpostfixsecret"),
+        ("password&#8203;=&#8203;encodedzerohunter2", "encodedzerohunter2"),
+        ('{"password"\n:\n"bracehunter2"}', "bracehunter2"),
+        (',"password"\n:\n"commajsonhunter2"', "commajsonhunter2"),
+        ("{password\n:\n'json5hunter2'}", "json5hunter2"),
+        ("password policy swordfishing", "swordfishing"),
+        ("OPENAIAPIKEY=uppercompactsecret", "uppercompactsecret"),
+        ("openaiapikey=lowercompactsecret", "lowercompactsecret"),
+        ("apikeybackup=compactpostfixsecret", "compactpostfixsecret"),
+        ("apiKey2=camelnumericsecret", "camelnumericsecret"),
+        ("openaiApiKey2=providernumericsecret", "providernumericsecret"),
+        ("githubaccesstoken=compactaccessecret", "compactaccessecret"),
+        ("password\u0301=combininghunter2", "combininghunter2"),
+        ("password&#769;=encodedcombininghunter2", "encodedcombininghunter2"),
+        ("{password\n// comment\n:\n'commenthunter2'}", "commenthunter2"),
+        ("ｐａｓｓｗｏｒｄ=fullwidthhunter2", "fullwidthhunter2"),
+        (
+            "&#65360;&#65345;&#65363;&#65363;&#65367;&#65359;&#65362;&#65348;="
+            "encodedfullwidthhunter2",
+            "encodedfullwidthhunter2",
+        ),
+        (
+            "{password\n/*\n comment\n*/\n:\n'blockcommenthunter2'}",
+            "blockcommenthunter2",
+        ),
+        (
+            "{password\n/* one */ /* two */ :\n'twocommenthunter2'}",
+            "twocommenthunter2",
+        ),
+        ("passwordvalue=compactpasswordhunter2", "compactpasswordhunter2"),
+        ("githubtokenvalue=singletokenhunter2", "singletokenhunter2"),
+        ("passwordvalue2=qualifiednumericsecret", "qualifiednumericsecret"),
+        ("githubtokenpayloadprod=qualifiedchainsecret", "qualifiedchainsecret"),
+        ("passwordHashAlgorithm = 987654321", "987654321"),
+        ("secretScanningEnabled = 24681012", "24681012"),
+        ('apiKeyRotationDays = "argon2"', "argon2"),
+        ("tokenExpirationSeconds = bcrypt", "bcrypt"),
+        ("Password: must contain 12 characters including quantityhunter2", "quantityhunter2"),
+        (
+            "Secret: ensure prefixhunter2 operators rotate it after an incident",
+            "prefixhunter2",
+        ),
+        ("Password: must be swordfished", "swordfished"),
+        ("password: &credential |\n anchorsecret", "anchorsecret"),
+        ("api_key: !!str >-\n yamlstrsecret", "yamlstrsecret"),
+        ('password=r"""\nrawtriplesecret\n"""', "rawtriplesecret"),
+        ("TOKEN=<<\\EOF\nescapedheredocsecret\nEOF", "escapedheredocsecret"),
+        ("password:\n  value: |\n    nestedhunter2", "nestedhunter2"),
     ],
 )
-def test_prompt_boundary_fails_closed_for_assignment_placeholder_with_value_tail(text, secret):
+def test_prompt_boundary_fails_closed_for_ambiguous_credential_segments(text, secret):
     prepared = _prepared_source()
     blocks = tuple(
         block.model_copy(update={"text": text}) if index == 1 else block
