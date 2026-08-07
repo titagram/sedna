@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from sedna.knowledge.schema.common import Origin, ReviewStatus, SourceQuality, SourceRef
+from sedna.knowledge.schema.common import (
+    ArtifactType,
+    CanonicalArtifactMetadata,
+    KnowledgeRole,
+    Origin,
+    SearchableNonEmptyString,
+    SearchableString,
+    SourceQuality,
+)
 
-NonEmptyString = Annotated[str, Field(min_length=1)]
+NonEmptyString = SearchableNonEmptyString
 
 
 class CaseState(BaseModel):
@@ -26,7 +34,7 @@ class CaseHypothesis(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    statement: str = Field(min_length=1)
+    statement: NonEmptyString
     origin: Origin
 
 
@@ -35,8 +43,8 @@ class CaseAction(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    intent: str = Field(min_length=1)
-    capability_ref: str | None = None
+    intent: NonEmptyString
+    capability_ref: SearchableString | None = None
 
 
 class CaseEvidence(BaseModel):
@@ -49,37 +57,39 @@ class CaseEvidence(BaseModel):
     category: NonEmptyString | None = None
 
 
-class CaseStep(BaseModel):
+class CaseStep(CanonicalArtifactMetadata):
     """One ordered, source-backed transition in a case study."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    artifact_type: Literal[ArtifactType.CASE_STEP]
+    knowledge_role: Literal[KnowledgeRole.CASE_STUDY, KnowledgeRole.NEGATIVE_CASE]
     ordinal: int = Field(ge=1)
     state_before: CaseState
-    observations: tuple[str, ...]
+    observations: tuple[SearchableString, ...]
     hypotheses: tuple[CaseHypothesis, ...]
     selected_action: CaseAction
     evidence: tuple[CaseEvidence, ...]
     state_after: CaseState
-    negative_evidence: tuple[str, ...] = ()
-    transfer_conditions: tuple[str, ...] = ()
-    case_specific_details: tuple[str, ...] = ()
+    negative_evidence: tuple[SearchableString, ...] = ()
+    transfer_conditions: tuple[SearchableString, ...] = ()
+    case_specific_details: tuple[SearchableString, ...] = ()
     requires_validation: bool = True
-    source_refs: tuple[SourceRef, ...] = Field(min_length=1)
 
 
-class KnowledgeCase(BaseModel):
+class KnowledgeCase(CanonicalArtifactMetadata):
     """An ordered case study with transferable and local context kept distinct."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    artifact_type: Literal[ArtifactType.CASE]
+    knowledge_role: Literal[KnowledgeRole.CASE_STUDY, KnowledgeRole.NEGATIVE_CASE]
     case_id: NonEmptyString
     title: NonEmptyString
     starting_access: NonEmptyString
     steps: tuple[CaseStep, ...]
     outcome: NonEmptyString
     source_quality: SourceQuality
-    review_status: ReviewStatus
     platform: NonEmptyString | None = None
     operating_system: NonEmptyString | None = None
     difficulty: NonEmptyString | None = None
@@ -88,7 +98,9 @@ class KnowledgeCase(BaseModel):
 
     @model_validator(mode="after")
     def validate_unique_ordinals(self) -> KnowledgeCase:
-        """Reject duplicate step ordinals so chronology remains unambiguous."""
+        """Keep chronology unique and every nested step in the case's lane."""
         if len({step.ordinal for step in self.steps}) != len(self.steps):
             raise ValueError("case step ordinals must be unique")
+        if any(step.knowledge_role is not self.knowledge_role for step in self.steps):
+            raise ValueError("case step knowledge_role must match its knowledge case")
         return self

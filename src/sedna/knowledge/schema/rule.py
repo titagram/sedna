@@ -1,19 +1,27 @@
 """Immutable contracts for source-backed decision rules."""
 
-from typing import Annotated
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import ConfigDict, Field
 
-from sedna.knowledge.schema.common import ReviewStatus, SourceRef
+from sedna.knowledge.schema.common import (
+    ArtifactType,
+    CanonicalArtifactMetadata,
+    KnowledgeRole,
+    SearchableNonEmptyString,
+    SourceRef,
+)
 
-NonEmptyString = Annotated[str, Field(min_length=1)]
+NonEmptyString = SearchableNonEmptyString
 
 
-class DecisionRule(BaseModel):
+class DecisionRule(CanonicalArtifactMetadata):
     """A source-backed rule connecting observations to an action intent."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    artifact_type: Literal[ArtifactType.DECISION_RULE]
+    knowledge_role: Literal[KnowledgeRole.REFERENCE]
     rule_id: NonEmptyString
     trigger_observations: tuple[NonEmptyString, ...] = Field(min_length=1)
     rationale: NonEmptyString
@@ -27,5 +35,3 @@ class DecisionRule(BaseModel):
     alternative_hypotheses: tuple[NonEmptyString, ...] = ()
     capability_refs: tuple[NonEmptyString, ...] = ()
     contradicting_source_refs: tuple[SourceRef, ...] = ()
-    review_status: ReviewStatus = ReviewStatus.DRAFT
-    source_refs: tuple[SourceRef, ...] = Field(min_length=1)

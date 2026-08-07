@@ -6,6 +6,7 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 from pydantic import ValidationError
@@ -250,6 +251,99 @@ def test_transition_rollback_restores_non_utf8_bytes_and_original_error(
 
     assert repository.load_manifest("source-123") == old_manifest
     assert quarantine_path.read_bytes() == corrupt_bytes
+
+
+def test_source_transition_serializes_across_repository_instances(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "knowledge"
+    first = CanonicalKnowledgeRepository(root)
+    second = CanonicalKnowledgeRepository(root)
+    first.write_manifest(complete_manifest(title="Initial"))
+    quarantined_manifest = complete_manifest(title="Quarantined").model_copy(
+        update={
+            "ingestion_status": IngestionStatus.QUARANTINED,
+            "quarantine_reasons": ("unsupported_parser",),
+            "parser_profile": "none",
+        }
+    )
+    accepted_manifest = complete_manifest(title="Accepted")
+    quarantine = complete_quarantine()
+    first_between_records = Event()
+    release_first = Event()
+    second_called = Event()
+    second_finished = Event()
+    real_first_write_manifest = first.write_manifest
+
+    def pause_first_between_records(manifest: DocumentManifest) -> Path:
+        first_between_records.set()
+        assert release_first.wait(5), "test did not release first transition"
+        return real_first_write_manifest(manifest)
+
+    def run_second() -> None:
+        second_called.set()
+        second.transition_source(accepted_manifest, None)
+        second_finished.set()
+
+    monkeypatch.setattr(first, "write_manifest", pause_first_between_records)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(
+            first.transition_source,
+            quarantined_manifest,
+            quarantine,
+        )
+        assert first_between_records.wait(5)
+        second_future = executor.submit(run_second)
+        assert second_called.wait(5)
+        assert not second_finished.wait(0.2), "second transition entered a half transition"
+        release_first.set()
+        first_future.result(timeout=5)
+        second_future.result(timeout=5)
+
+    assert second.load_manifest("source-123") == accepted_manifest
+    assert second.quarantine_exists("source-123") is False
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="repository requires POSIX locking")
+def test_crashed_half_transition_is_rolled_back_on_repository_reopen(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "knowledge"
+    initial = complete_manifest(title="Initial")
+    repository = CanonicalKnowledgeRepository(root)
+    repository.write_manifest(initial)
+    repository.close()
+    quarantined_manifest = complete_manifest(title="Interrupted").model_copy(
+        update={
+            "ingestion_status": IngestionStatus.QUARANTINED,
+            "quarantine_reasons": ("unsupported_parser",),
+            "parser_profile": "none",
+        }
+    )
+
+    child_pid = os.fork()
+    if child_pid == 0:
+        child_repository = CanonicalKnowledgeRepository(root)
+
+        def crash_before_manifest(manifest: DocumentManifest) -> Path:
+            del manifest
+            os._exit(17)
+
+        child_repository.write_manifest = crash_before_manifest  # type: ignore[method-assign]
+        child_repository.transition_source(quarantined_manifest, complete_quarantine())
+        os._exit(99)
+
+    waited_pid, status = os.waitpid(child_pid, 0)
+    assert waited_pid == child_pid
+    assert os.waitstatus_to_exitcode(status) == 17
+
+    recovered = CanonicalKnowledgeRepository(root)
+
+    assert recovered.load_manifest("source-123") == initial
+    assert recovered.quarantine_exists("source-123") is False
+    assert not list(root.rglob("*.transaction.json"))
 
 
 def test_atomic_replace_failure_preserves_old_target_and_cleans_temp(

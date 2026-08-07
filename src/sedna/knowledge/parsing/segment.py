@@ -87,6 +87,10 @@ class _BlockView:
     searchable_text: str
 
 
+class OversizedStructuralGroupError(ValueError):
+    """A source block group cannot fit without breaking provenance or coherence."""
+
+
 def segment_document(
     document: ParsedDocument,
     maximum_segment_chars: int = 12_000,
@@ -97,7 +101,9 @@ def segment_document(
     Oversized sections split only between atomic block groups. A heading and its
     first block stay together, as do an action immediately before a command code
     block, at most one following result code block, and an immediate conclusion.
-    A single local group may therefore exceed the configured target.
+    An indivisible group that exceeds the configured maximum is rejected with its
+    exact block and line provenance instead of silently exceeding the limit or
+    slicing a source block.
     """
     if maximum_segment_chars < 1:
         raise ValueError("maximum_segment_chars must be positive")
@@ -164,6 +170,32 @@ def _sanitize_heading_path(
 
 
 def _section_ranges(views: tuple[_BlockView, ...]) -> tuple[range, ...]:
+    heading_positions = tuple(
+        (position, view.block.level)
+        for position, view in enumerate(views)
+        if view.block.kind is BlockKind.HEADING
+    )
+    if not heading_positions:
+        return (range(len(views)),) if views else ()
+
+    first_heading_position, first_heading_level = heading_positions[0]
+    assert first_heading_level is not None
+    later_heading_levels = tuple(level for _, level in heading_positions[1:] if level is not None)
+    title_child_levels = tuple(
+        level for level in later_heading_levels if level > first_heading_level
+    )
+    title_is_container = (
+        first_heading_level == 1
+        and bool(title_child_levels)
+        and all(level > first_heading_level for level in later_heading_levels)
+    )
+    if title_is_container:
+        return _title_container_section_ranges(
+            views,
+            first_heading_position,
+            min(title_child_levels),
+        )
+
     sections: list[range] = []
     section_start = 0
     section_level: int | None = None
@@ -185,6 +217,30 @@ def _section_ranges(views: tuple[_BlockView, ...]) -> tuple[range, ...]:
 
     if section_start < len(views):
         sections.append(range(section_start, len(views)))
+    return tuple(sections)
+
+
+def _title_container_section_ranges(
+    views: tuple[_BlockView, ...],
+    title_position: int,
+    child_section_level: int,
+) -> tuple[range, ...]:
+    sections: list[range] = []
+    if title_position:
+        sections.append(range(0, title_position))
+
+    section_start = title_position
+    for position in range(title_position + 1, len(views)):
+        block = views[position].block
+        if (
+            block.kind is BlockKind.HEADING
+            and block.level is not None
+            and block.level <= child_section_level
+        ):
+            sections.append(range(section_start, position))
+            section_start = position
+
+    sections.append(range(section_start, len(views)))
     return tuple(sections)
 
 
@@ -229,10 +285,10 @@ def _consume_code_result(views: tuple[_BlockView, ...], position: int) -> int:
         and not _looks_like_command_code(views[position].block)
     ):
         position += 1
-    if (
-        position < len(views)
-        and views[position].block.kind not in {BlockKind.HEADING, BlockKind.CODE}
-    ):
+    if position < len(views) and views[position].block.kind not in {
+        BlockKind.HEADING,
+        BlockKind.CODE,
+    }:
         position += 1
     return position
 
@@ -250,10 +306,7 @@ def _looks_like_command_code(block: ParsedBlock) -> bool:
     if prompt_match is not None:
         first_line = prompt_match.group("command").strip()
     name_match = _COMMAND_NAME_RE.match(first_line.casefold())
-    return (
-        name_match is not None
-        and name_match.group("name") in _COMMON_COMMAND_NAMES
-    )
+    return name_match is not None and name_match.group("name") in _COMMON_COMMAND_NAMES
 
 
 def _pack_groups(
@@ -264,6 +317,9 @@ def _pack_groups(
     current: tuple[_BlockView, ...] = ()
 
     for group in groups:
+        group_length = _rendered_length(group)
+        if group_length > maximum_segment_chars:
+            raise _oversized_group_error(group, group_length, maximum_segment_chars)
         candidate = (*current, *group)
         if current and _rendered_length(candidate) > maximum_segment_chars:
             packed.append(current)
@@ -274,6 +330,26 @@ def _pack_groups(
     if current:
         packed.append(current)
     return tuple(packed)
+
+
+def _oversized_group_error(
+    group: tuple[_BlockView, ...],
+    rendered_length: int,
+    maximum_segment_chars: int,
+) -> OversizedStructuralGroupError:
+    first = group[0]
+    last = group[-1]
+    block_label = (
+        f"block {first.index}" if len(group) == 1 else f"blocks {first.index}-{last.index}"
+    )
+    start_line = min(view.block.start_line for view in group)
+    end_line = max(view.block.end_line for view in group)
+    return OversizedStructuralGroupError(
+        f"indivisible structural {block_label} at lines {start_line}-{end_line} "
+        f"renders to {rendered_length} characters, exceeding "
+        f"maximum_segment_chars={maximum_segment_chars}; refusing to split "
+        "source blocks or lose exact provenance"
+    )
 
 
 def _rendered_length(views: tuple[_BlockView, ...]) -> int:

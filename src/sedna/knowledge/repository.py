@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import fcntl
 import inspect
 import json
 import os
 import secrets
 import stat
 import threading
-from collections.abc import Iterable
-from contextlib import suppress
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager, suppress
 from pathlib import Path, PurePath
 from typing import Annotated
 
@@ -142,13 +143,19 @@ class CanonicalKnowledgeRepository:
     root pathname. IO remains bound to the retained directory when that pathname is
     renamed or replaced, so a returned path is a location hint rather than an identity
     handle in that exceptional case.
+
+    Source transitions use POSIX ``flock`` locks opened relative to the retained
+    root.  The locks are advisory, but every transition entry point participates;
+    their open-file-description lifetime also releases locks after process death.
+    Construction fails closed on platforms without these POSIX semantics.
     """
 
-    _DIRECTORIES = frozenset({"manifests", "quarantine", "ingestion_reports"})
+    _DIRECTORIES = frozenset(
+        {"manifests", "quarantine", "ingestion_reports", "transactions"}
+    )
 
     def __init__(self, root: Path) -> None:
         self._descriptor_lock = threading.Lock()
-        self._transition_lock = threading.Lock()
         self._root_fd: int | None = None
         self._require_safe_primitives()
         requested_root = Path(root)
@@ -171,6 +178,11 @@ class CanonicalKnowledgeRepository:
             os.close(root_fd)
             raise
         self._root_fd = root_fd
+        try:
+            self._recover_pending_transactions()
+        except BaseException:
+            self.close()
+            raise
 
     def __enter__(self) -> CanonicalKnowledgeRepository:
         self._ensure_open()
@@ -265,21 +277,41 @@ class CanonicalKnowledgeRepository:
         manifest: DocumentManifest,
         quarantine: QuarantineRecord | None,
     ) -> None:
-        """Commit one manifest/quarantine state transition with rollback on failure."""
+        """Durably commit one source disposition or recover its previous bytes."""
         self.validate_source_state(manifest, quarantine)
-        with self._transition_lock:
+        with self._source_transition_lock(manifest.source_id):
+            self._recover_source(manifest.source_id)
             old_manifest = self._read_optional_bytes("manifests", manifest.source_id)
             old_quarantine = self._read_optional_bytes("quarantine", manifest.source_id)
+            self._write_transition_journal(
+                manifest.source_id,
+                old_manifest,
+                old_quarantine,
+            )
             try:
                 if quarantine is None:
                     self.delete_quarantine(manifest.source_id)
                 else:
                     self.write_quarantine(quarantine)
                 self.write_manifest(manifest)
-            except Exception:
-                self._restore_snapshot("manifests", manifest.source_id, old_manifest)
-                self._restore_snapshot("quarantine", manifest.source_id, old_quarantine)
+            except BaseException as original_error:
+                rollback_errors = self._restore_source_snapshots(
+                    manifest.source_id,
+                    old_manifest,
+                    old_quarantine,
+                )
+                if not rollback_errors:
+                    try:
+                        self._delete_transition_journal(manifest.source_id)
+                    except BaseException as rollback_error:
+                        rollback_errors.append(rollback_error)
+                for rollback_error in rollback_errors:
+                    original_error.add_note(
+                        "transition rollback remains recoverable: "
+                        f"{type(rollback_error).__name__}: {rollback_error}"
+                    )
                 raise
+            self._delete_transition_journal(manifest.source_id)
 
     def load_manifest(self, source_id: str) -> DocumentManifest:
         """Load and validate one manifest, with path-specific errors."""
@@ -438,6 +470,188 @@ class CanonicalKnowledgeRepository:
         finally:
             os.close(directory_fd)
 
+    def _restore_source_snapshots(
+        self,
+        source_id: str,
+        manifest: bytes | None,
+        quarantine: bytes | None,
+    ) -> list[BaseException]:
+        errors: list[BaseException] = []
+        for directory, payload in (
+            ("manifests", manifest),
+            ("quarantine", quarantine),
+        ):
+            try:
+                self._restore_snapshot(directory, source_id, payload)
+            except BaseException as exc:
+                errors.append(exc)
+        return errors
+
+    @contextmanager
+    def _source_transition_lock(self, source_id: str) -> Iterator[None]:
+        _validate_stable_id(source_id)
+        directory_fd = self._open_child_directory("transactions", create=True)
+        lock_fd = -1
+        try:
+            lock_fd = os.open(
+                f"{source_id}.lock",
+                self._lock_open_flags(),
+                0o600,
+                dir_fd=directory_fd,
+            )
+            if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+                raise ValueError("source transition lock is not a regular file")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            if lock_fd >= 0:
+                with suppress(OSError):
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            os.close(directory_fd)
+
+    def _recover_pending_transactions(self) -> None:
+        try:
+            directory_fd = self._open_child_directory("transactions", create=False)
+        except FileNotFoundError:
+            return
+        try:
+            names = tuple(sorted(os.listdir(directory_fd)))
+        finally:
+            os.close(directory_fd)
+        suffix = ".transaction.json"
+        for name in names:
+            if not name.endswith(suffix):
+                continue
+            source_id = name[: -len(suffix)]
+            _validate_stable_id(source_id)
+            with self._source_transition_lock(source_id):
+                self._recover_source(source_id)
+
+    def _recover_source(self, source_id: str) -> None:
+        journal = self._read_transition_journal(source_id)
+        if journal is None:
+            return
+        manifest, quarantine = journal
+        errors = self._restore_source_snapshots(source_id, manifest, quarantine)
+        if errors:
+            error = OSError(f"could not recover interrupted transition for {source_id!r}")
+            for recovery_error in errors:
+                error.add_note(
+                    f"{type(recovery_error).__name__}: {recovery_error}"
+                )
+            raise error from errors[0]
+        self._delete_transition_journal(source_id)
+
+    def _write_transition_journal(
+        self,
+        source_id: str,
+        manifest: bytes | None,
+        quarantine: bytes | None,
+    ) -> None:
+        payload = (
+            json.dumps(
+                {
+                    "manifest_hex": None if manifest is None else manifest.hex(),
+                    "quarantine_hex": None if quarantine is None else quarantine.hex(),
+                    "source_id": source_id,
+                    "version": 1,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                indent=2,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("ascii")
+        directory_fd = self._open_child_directory("transactions", create=True)
+        try:
+            self._atomic_write_bytes(
+                directory_fd,
+                f"{source_id}.transaction.json",
+                payload,
+            )
+        finally:
+            os.close(directory_fd)
+
+    def _read_transition_journal(
+        self,
+        source_id: str,
+    ) -> tuple[bytes | None, bytes | None] | None:
+        _validate_stable_id(source_id)
+        try:
+            directory_fd = self._open_child_directory("transactions", create=False)
+        except FileNotFoundError:
+            return None
+        filename = f"{source_id}.transaction.json"
+        try:
+            try:
+                file_fd = os.open(
+                    filename,
+                    self._file_read_flags(),
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                return None
+            try:
+                if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                    raise ValueError("transition journal is not a regular file")
+                with os.fdopen(file_fd, mode="rb") as stream:
+                    file_fd = -1
+                    raw = stream.read()
+            finally:
+                if file_fd >= 0:
+                    os.close(file_fd)
+        finally:
+            os.close(directory_fd)
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or set(payload) != {
+                "manifest_hex",
+                "quarantine_hex",
+                "source_id",
+                "version",
+            }:
+                raise ValueError("unexpected transition journal fields")
+            if (
+                payload["source_id"] != source_id
+                or type(payload["version"]) is not int
+                or payload["version"] != 1
+            ):
+                raise ValueError("transition journal identity or version mismatch")
+            manifest = self._decode_optional_hex(payload["manifest_hex"])
+            quarantine = self._decode_optional_hex(payload["quarantine_hex"])
+        except (TypeError, UnicodeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid interrupted transition journal for {source_id!r}"
+            ) from exc
+        return manifest, quarantine
+
+    @staticmethod
+    def _decode_optional_hex(value: object) -> bytes | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("snapshot must be hexadecimal text or null")
+        return bytes.fromhex(value)
+
+    def _delete_transition_journal(self, source_id: str) -> None:
+        try:
+            directory_fd = self._open_child_directory("transactions", create=False)
+        except FileNotFoundError:
+            return
+        try:
+            try:
+                os.unlink(
+                    f"{source_id}.transaction.json",
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                return
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
     @staticmethod
     def validate_source_state(
         manifest: DocumentManifest,
@@ -592,6 +806,15 @@ class CanonicalKnowledgeRepository:
             | getattr(os, "O_CLOEXEC", 0)
         )
 
+    @staticmethod
+    def _lock_open_flags() -> int:
+        return (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+
     def _ensure_open(self) -> int:
         if self._root_fd is None:
             raise RuntimeError("repository is closed")
@@ -610,6 +833,8 @@ class CanonicalKnowledgeRepository:
         replace_parameters = inspect.signature(os.replace).parameters
         if not {"src_dir_fd", "dst_dir_fd"}.issubset(replace_parameters):
             raise RuntimeError("platform lacks safe descriptor-relative replace support")
+        if not hasattr(fcntl, "flock"):
+            raise RuntimeError("platform lacks POSIX source-transition locking")
 
 
 __all__ = [

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import html
 import re
+from urllib.parse import unquote
 
 EXCLUDED_FLAG = "<EXCLUDED_FLAG>"
 
@@ -44,11 +46,10 @@ def sanitize_asset_target(target: str) -> str:
     Asset locators are not strategic evidence and opaque 32-hex path components have
     no retrieval value, so this boundary redacts them conservatively in every context.
     """
-    sanitized = _HTB_ENCODED_FLAG_RE.sub(EXCLUDED_FLAG, target)
-    sanitized = _HTB_ENCODED_OPEN_MARKER_RE.sub(EXCLUDED_FLAG, sanitized)
-    sanitized = _HTB_FLAG_RE.sub(EXCLUDED_FLAG, sanitized)
-    sanitized = _HTB_OPEN_MARKER_RE.sub(EXCLUDED_FLAG, sanitized)
-    return _STANDALONE_32_HEX_RE.sub(EXCLUDED_FLAG, sanitized)
+    sanitized = _sanitize_asset_target_once(target)
+    decoded = _recursively_decode(target)
+    decoded_sanitized = _sanitize_asset_target_once(decoded)
+    return decoded_sanitized if decoded_sanitized != decoded else sanitized
 
 
 def _contextual_hex_flag_values(
@@ -57,10 +58,28 @@ def _contextual_hex_flag_values(
 ) -> frozenset[str]:
     if not _is_hex_flag_context(heading_path):
         return frozenset()
-    return frozenset(match.group().casefold() for match in _STANDALONE_32_HEX_RE.finditer(text))
+    decoded = _recursively_decode(text)
+    return frozenset(
+        match.group().casefold() for match in _STANDALONE_32_HEX_RE.finditer(decoded)
+    )
 
 
 def _sanitize_searchable_text(
+    text: str,
+    heading_path: tuple[str, ...],
+    known_hex_flags: frozenset[str],
+) -> str:
+    sanitized = _sanitize_searchable_text_once(text, heading_path, known_hex_flags)
+    decoded = _recursively_decode(text)
+    decoded_sanitized = _sanitize_searchable_text_once(
+        decoded,
+        heading_path,
+        known_hex_flags,
+    )
+    return decoded_sanitized if decoded_sanitized != decoded else sanitized
+
+
+def _sanitize_searchable_text_once(
     text: str,
     heading_path: tuple[str, ...],
     known_hex_flags: frozenset[str],
@@ -79,6 +98,23 @@ def _sanitize_searchable_text(
             sanitized,
         )
     return sanitized
+
+
+def _sanitize_asset_target_once(target: str) -> str:
+    sanitized = _HTB_ENCODED_FLAG_RE.sub(EXCLUDED_FLAG, target)
+    sanitized = _HTB_ENCODED_OPEN_MARKER_RE.sub(EXCLUDED_FLAG, sanitized)
+    sanitized = _HTB_FLAG_RE.sub(EXCLUDED_FLAG, sanitized)
+    sanitized = _HTB_OPEN_MARKER_RE.sub(EXCLUDED_FLAG, sanitized)
+    return _STANDALONE_32_HEX_RE.sub(EXCLUDED_FLAG, sanitized)
+
+
+def _recursively_decode(text: str) -> str:
+    decoded = text
+    while True:
+        next_value = html.unescape(unquote(decoded))
+        if next_value == decoded:
+            return decoded
+        decoded = next_value
 
 
 def _is_hex_flag_context(heading_path: tuple[str, ...]) -> bool:

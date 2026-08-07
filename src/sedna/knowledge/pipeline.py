@@ -15,7 +15,10 @@ from sedna.knowledge.inventory import SourceCandidate, stable_source_id
 from sedna.knowledge.parsing import BlockKind, PreparedSource, parse_markdown
 from sedna.knowledge.parsing.profiles import apply_profile
 from sedna.knowledge.parsing.sanitize import EXCLUDED_FLAG, sanitize_searchable_text
-from sedna.knowledge.parsing.segment import segment_document
+from sedna.knowledge.parsing.segment import (
+    OversizedStructuralGroupError,
+    segment_document,
+)
 from sedna.knowledge.repository import CanonicalKnowledgeRepository, QuarantineRecord
 from sedna.knowledge.schema import (
     AssetRef,
@@ -85,10 +88,7 @@ class IngestionPipeline:
         self._descriptor_lock = threading.Lock()
         self._source_fd: int | None = os.open(
             self.source_root,
-            os.O_RDONLY
-            | os.O_DIRECTORY
-            | os.O_NOFOLLOW
-            | getattr(os, "O_CLOEXEC", 0),
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
         )
         try:
             source_status = os.fstat(self._source_fd)
@@ -227,6 +227,15 @@ class IngestionPipeline:
 
         try:
             segments = segment_document(profiled)
+        except OversizedStructuralGroupError as exc:
+            return self._persist_quarantine(
+                candidate,
+                classification,
+                asset_refs,
+                title=self._title_from_document(profiled, candidate.relative_path),
+                reason_code="oversized_indivisible_block",
+                message=str(exc),
+            )
         except Exception as exc:
             raise CandidateIngestionError(
                 candidate.source_id,
@@ -299,9 +308,7 @@ class IngestionPipeline:
             )
         return content
 
-    def _verified_asset_refs(
-        self, candidate: SourceCandidate
-    ) -> tuple[AssetRef, ...]:
+    def _verified_asset_refs(self, candidate: SourceCandidate) -> tuple[AssetRef, ...]:
         refs: list[AssetRef] = []
         seen_paths: set[str] = set()
         for asset in candidate.assets:
@@ -354,10 +361,7 @@ class IngestionPipeline:
                 try:
                     current_fd = os.open(
                         part,
-                        os.O_RDONLY
-                        | os.O_DIRECTORY
-                        | os.O_NOFOLLOW
-                        | getattr(os, "O_CLOEXEC", 0),
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
                         dir_fd=current_fd,
                     )
                 except OSError as exc:
@@ -411,10 +415,7 @@ class IngestionPipeline:
                 try:
                     child_fd = os.open(
                         entry.name,
-                        os.O_RDONLY
-                        | os.O_DIRECTORY
-                        | os.O_NOFOLLOW
-                        | getattr(os, "O_CLOEXEC", 0),
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
                         dir_fd=directory_fd,
                     )
                 except OSError as exc:
@@ -451,10 +452,7 @@ class IngestionPipeline:
                 try:
                     directory_fd = os.open(
                         part,
-                        os.O_RDONLY
-                        | os.O_DIRECTORY
-                        | os.O_NOFOLLOW
-                        | getattr(os, "O_CLOEXEC", 0),
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
                         dir_fd=current_fd,
                     )
                 except OSError as exc:
@@ -468,10 +466,7 @@ class IngestionPipeline:
             try:
                 file_fd = os.open(
                     parts[-1],
-                    os.O_RDONLY
-                    | os.O_NONBLOCK
-                    | os.O_NOFOLLOW
-                    | getattr(os, "O_CLOEXEC", 0),
+                    os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
                     dir_fd=current_fd,
                 )
             except OSError as exc:

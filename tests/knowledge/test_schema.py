@@ -7,6 +7,8 @@ from sedna.knowledge.schema import (
     ArtifactType,
     AssetRef,
     CaseAction,
+    CaseEvidence,
+    CaseHypothesis,
     CaseState,
     CaseStep,
     DecisionRule,
@@ -42,6 +44,69 @@ def walkthrough_ref() -> SourceRef:
         path="raw_src/Write-ups/Machines/Lame/walkthrough.md",
         location=SourceLocation(start_line=10, end_line=18),
     )
+
+
+def canonical_metadata(
+    artifact_type: ArtifactType,
+    knowledge_role: KnowledgeRole,
+) -> dict[str, object]:
+    return {
+        "artifact_type": artifact_type,
+        "knowledge_role": knowledge_role,
+        "origin": Origin.EXPLICIT,
+        "review_status": ReviewStatus.DRAFT,
+        "generalizability": Generalizability.MEDIUM,
+        "source_refs": (walkthrough_ref(),),
+        "extraction": foundation_metadata(),
+    }
+
+
+def reference_payload() -> dict[str, object]:
+    return {
+        "artifact_id": "reference-http",
+        "statement": "Inspect HTTP.",
+        **canonical_metadata(ArtifactType.METHODOLOGY, KnowledgeRole.REFERENCE),
+    }
+
+
+def case_step_payload(
+    knowledge_role: KnowledgeRole = KnowledgeRole.CASE_STUDY,
+) -> dict[str, object]:
+    return {
+        "ordinal": 1,
+        "state_before": CaseState(access="none"),
+        "observations": ("HTTP service exposed",),
+        "hypotheses": (),
+        "selected_action": CaseAction(intent="inspect_http"),
+        "evidence": (),
+        "state_after": CaseState(access="none"),
+        **canonical_metadata(ArtifactType.CASE_STEP, knowledge_role),
+    }
+
+
+def knowledge_case_payload(
+    steps: tuple[CaseStep, ...] = (),
+    knowledge_role: KnowledgeRole = KnowledgeRole.CASE_STUDY,
+) -> dict[str, object]:
+    return {
+        "case_id": "case-http",
+        "title": "HTTP case",
+        "starting_access": "none",
+        "steps": steps,
+        "outcome": "HTTP inspected.",
+        "source_quality": SourceQuality.COMPLETE,
+        **canonical_metadata(ArtifactType.CASE, knowledge_role),
+    }
+
+
+def decision_rule_payload() -> dict[str, object]:
+    return {
+        "rule_id": "rule-http",
+        "trigger_observations": ("HTTP exposed",),
+        "rationale": "Observed services guide investigation.",
+        "action_intent": "inspect_http",
+        **canonical_metadata(ArtifactType.DECISION_RULE, KnowledgeRole.REFERENCE),
+    }
 
 
 def test_source_ref_requires_a_precise_location():
@@ -167,7 +232,13 @@ def test_case_step_requires_at_least_one_source_reference():
             selected_action=CaseAction(intent="inspect_http"),
             evidence=(),
             state_after=CaseState(access="none"),
-            source_refs=(),
+            **{
+                **canonical_metadata(
+                    ArtifactType.CASE_STEP,
+                    KnowledgeRole.CASE_STUDY,
+                ),
+                "source_refs": (),
+            },
         )
 
 
@@ -176,8 +247,13 @@ def test_reference_artifact_and_decision_rule_require_source_references():
         ReferenceArtifact(
             artifact_id="reference-http-inspection",
             statement="Inspect the exposed HTTP service before choosing an exploit.",
-            artifact_type=ArtifactType.METHODOLOGY,
-            source_refs=(),
+            **{
+                **canonical_metadata(
+                    ArtifactType.METHODOLOGY,
+                    KnowledgeRole.REFERENCE,
+                ),
+                "source_refs": (),
+            },
         )
     with pytest.raises(ValidationError):
         DecisionRule(
@@ -185,7 +261,268 @@ def test_reference_artifact_and_decision_rule_require_source_references():
             trigger_observations=("HTTP service exposed",),
             rationale="Observed services guide the next investigation.",
             action_intent="inspect_http",
-            source_refs=(),
+            **{
+                **canonical_metadata(
+                    ArtifactType.DECISION_RULE,
+                    KnowledgeRole.REFERENCE,
+                ),
+                "source_refs": (),
+            },
+        )
+
+
+def test_canonical_artifacts_carry_required_epistemic_and_extraction_metadata():
+    reference = ReferenceArtifact.model_validate(reference_payload())
+    step = CaseStep.model_validate(case_step_payload())
+    case = KnowledgeCase.model_validate(knowledge_case_payload((step,)))
+    rule = DecisionRule.model_validate(decision_rule_payload())
+
+    assert reference.extraction.extractor_version == "1"
+    assert step.generalizability is Generalizability.MEDIUM
+    assert case.origin is Origin.EXPLICIT
+    assert rule.knowledge_role is KnowledgeRole.REFERENCE
+
+
+def test_every_canonical_artifact_metadata_field_is_required():
+    step = CaseStep.model_validate(case_step_payload())
+    artifacts = (
+        ReferenceArtifact.model_validate(reference_payload()),
+        step,
+        KnowledgeCase.model_validate(knowledge_case_payload((step,))),
+        DecisionRule.model_validate(decision_rule_payload()),
+    )
+
+    for artifact in artifacts:
+        for field in (
+            "artifact_type",
+            "knowledge_role",
+            "origin",
+            "review_status",
+            "generalizability",
+            "source_refs",
+            "extraction",
+        ):
+            payload = artifact.model_dump()
+            del payload[field]
+            with pytest.raises(ValidationError) as error:
+                type(artifact).model_validate(payload)
+            assert field in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("model", "payload", "field"),
+    [
+        (
+            ReferenceArtifact,
+            {**reference_payload(), "artifact_type": ArtifactType.CASE},
+            "artifact_type",
+        ),
+        (
+            ReferenceArtifact,
+            {
+                **reference_payload(),
+                "knowledge_role": KnowledgeRole.CASE_STUDY,
+            },
+            "knowledge_role",
+        ),
+        (
+            CaseStep,
+            {**case_step_payload(), "artifact_type": ArtifactType.CASE},
+            "artifact_type",
+        ),
+        (
+            KnowledgeCase,
+            {
+                **knowledge_case_payload(),
+                "knowledge_role": KnowledgeRole.REFERENCE,
+            },
+            "knowledge_role",
+        ),
+        (
+            DecisionRule,
+            {**decision_rule_payload(), "artifact_type": ArtifactType.METHODOLOGY},
+            "artifact_type",
+        ),
+    ],
+)
+def test_canonical_artifact_taxonomies_reject_incompatible_metadata(
+    model: type[ReferenceArtifact | CaseStep | KnowledgeCase | DecisionRule],
+    payload: dict[str, object],
+    field: str,
+):
+    with pytest.raises(ValidationError) as error:
+        model.model_validate(payload)
+
+    assert field in str(error.value)
+
+
+ENCODED_CANONICAL_LEAK = "HTB%2526%2523123%253Bcanonical_leak%2526%2523125%253B"
+
+
+def _searchable_field_cases(
+    model: type[ReferenceArtifact | CaseStep | KnowledgeCase | DecisionRule],
+    payload: dict[str, object],
+    scalar_fields: tuple[str, ...],
+    sequence_fields: tuple[str, ...],
+) -> tuple[
+    tuple[
+        type[ReferenceArtifact | CaseStep | KnowledgeCase | DecisionRule],
+        dict[str, object],
+        str,
+        bool,
+    ],
+    ...,
+]:
+    return tuple(
+        (model, payload, field, field in sequence_fields)
+        for field in (*scalar_fields, *sequence_fields)
+    )
+
+
+@pytest.mark.parametrize(
+    ("model", "base_payload", "field", "is_sequence"),
+    [
+        *_searchable_field_cases(
+            ReferenceArtifact,
+            reference_payload(),
+            ("statement", "action_intent", "observed_at"),
+            (
+                "applicable_situations",
+                "prerequisites",
+                "expected_evidence",
+                "success_implications",
+                "failure_implications",
+                "stop_implications",
+                "exceptions",
+                "warnings",
+                "capability_refs",
+            ),
+        ),
+        *_searchable_field_cases(
+            CaseStep,
+            case_step_payload(),
+            (),
+            (
+                "observations",
+                "negative_evidence",
+                "transfer_conditions",
+                "case_specific_details",
+            ),
+        ),
+        *_searchable_field_cases(
+            KnowledgeCase,
+            knowledge_case_payload(),
+            (
+                "title",
+                "starting_access",
+                "outcome",
+                "platform",
+                "operating_system",
+                "difficulty",
+            ),
+            ("transferable_properties", "non_transferable_properties"),
+        ),
+        *_searchable_field_cases(
+            DecisionRule,
+            decision_rule_payload(),
+            ("rationale", "action_intent"),
+            (
+                "trigger_observations",
+                "prerequisites",
+                "expected_evidence",
+                "success_transitions",
+                "failure_transitions",
+                "stop_conditions",
+                "exceptions",
+                "alternative_hypotheses",
+                "capability_refs",
+            ),
+        ),
+    ],
+)
+def test_every_direct_canonical_searchable_field_rejects_encoded_flags(
+    model: type[ReferenceArtifact | CaseStep | KnowledgeCase | DecisionRule],
+    base_payload: dict[str, object],
+    field: str,
+    is_sequence: bool,
+):
+    payload = {
+        **base_payload,
+        field: (ENCODED_CANONICAL_LEAK,) if is_sequence else ENCODED_CANONICAL_LEAK,
+    }
+
+    with pytest.raises(ValidationError, match="final flag"):
+        model.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("model", "payload"),
+    [
+        (CaseState, {"access": ENCODED_CANONICAL_LEAK}),
+        (CaseState, {"access": "none", "environment": (ENCODED_CANONICAL_LEAK,)}),
+        (CaseState, {"access": "none", "privileges": (ENCODED_CANONICAL_LEAK,)}),
+        (
+            CaseHypothesis,
+            {"statement": ENCODED_CANONICAL_LEAK, "origin": Origin.INFERRED},
+        ),
+        (CaseAction, {"intent": ENCODED_CANONICAL_LEAK}),
+        (
+            CaseAction,
+            {"intent": "inspect_http", "capability_ref": ENCODED_CANONICAL_LEAK},
+        ),
+        (
+            CaseEvidence,
+            {"summary": ENCODED_CANONICAL_LEAK, "origin": Origin.EXPLICIT},
+        ),
+        (
+            CaseEvidence,
+            {
+                "summary": "HTTP exposed",
+                "origin": Origin.EXPLICIT,
+                "category": ENCODED_CANONICAL_LEAK,
+            },
+        ),
+    ],
+)
+def test_nested_case_searchable_fields_reject_encoded_flags(
+    model: type[CaseState | CaseHypothesis | CaseAction | CaseEvidence],
+    payload: dict[str, object],
+):
+    with pytest.raises(ValidationError, match="final flag"):
+        model.model_validate(payload)
+
+
+def test_canonical_models_accept_the_explicit_exclusion_sentinel():
+    reference = ReferenceArtifact(
+        artifact_id="reference-excluded-result",
+        statement="The result is <EXCLUDED_FLAG>.",
+        **canonical_metadata(ArtifactType.METHODOLOGY, KnowledgeRole.REFERENCE),
+    )
+
+    assert reference.statement == "The result is <EXCLUDED_FLAG>."
+
+
+def test_knowledge_case_rejects_steps_from_a_different_epistemic_lane():
+    negative_step = CaseStep(
+        ordinal=1,
+        state_before=CaseState(access="none"),
+        observations=("The attempted path produced no evidence.",),
+        hypotheses=(),
+        selected_action=CaseAction(intent="stop_unproductive_path"),
+        evidence=(),
+        state_after=CaseState(access="none"),
+        **canonical_metadata(ArtifactType.CASE_STEP, KnowledgeRole.NEGATIVE_CASE),
+    )
+
+    with pytest.raises(ValidationError, match="knowledge_role"):
+        KnowledgeCase(
+            case_id="mixed-lane-case",
+            title="Mixed lane",
+            starting_access="none",
+            steps=(negative_step,),
+            outcome="The path was stopped.",
+            source_quality=SourceQuality.COMPLETE,
+            **canonical_metadata(ArtifactType.CASE, KnowledgeRole.CASE_STUDY),
         )
 
 
@@ -198,7 +535,7 @@ def test_knowledge_case_rejects_duplicate_step_ordinals():
         selected_action=CaseAction(intent="inspect_http"),
         evidence=(),
         state_after=CaseState(access="none"),
-        source_refs=(walkthrough_ref(),),
+        **canonical_metadata(ArtifactType.CASE_STEP, KnowledgeRole.CASE_STUDY),
     )
 
     with pytest.raises(ValidationError):
@@ -209,5 +546,5 @@ def test_knowledge_case_rejects_duplicate_step_ordinals():
             steps=(step, step),
             outcome="Initial HTTP investigation completed.",
             source_quality=SourceQuality.COMPLETE,
-            review_status=ReviewStatus.DRAFT,
+            **canonical_metadata(ArtifactType.CASE, KnowledgeRole.CASE_STUDY),
         )

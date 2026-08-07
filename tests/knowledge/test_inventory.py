@@ -2,6 +2,9 @@
 
 from pathlib import Path
 
+import pytest
+
+import sedna.knowledge.inventory as inventory_module
 from sedna.knowledge.inventory import discover_sources, sha256_file, stable_source_id
 
 
@@ -60,3 +63,45 @@ def test_discovery_includes_pdf_and_nested_assets_but_excludes_ds_store(tmp_path
     ]
     assert candidate.assets[0].sha256 == sha256_file(root / "Courses" / "images" / "diagram.png")
 
+
+def test_discovery_ignores_symlinked_file_without_hashing_its_external_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "raw_src"
+    root.mkdir()
+    external = tmp_path / "external.md"
+    external.write_text("external secret", encoding="utf-8")
+    linked_source = root / "linked.md"
+    linked_source.symlink_to(external)
+    real_sha256_file = inventory_module.sha256_file
+
+    def reject_link_hash(path: Path) -> str:
+        if path == linked_source:
+            raise AssertionError("inventory tried to hash a symlink target")
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(inventory_module, "sha256_file", reject_link_hash)
+
+    assert discover_sources(root) == ()
+
+
+def test_discovery_does_not_descend_into_symlinked_external_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "raw_src"
+    root.mkdir()
+    external = tmp_path / "external"
+    write_source(external / "nested" / "outside.md", "external secret")
+    (root / "linked-directory").symlink_to(external, target_is_directory=True)
+    real_sha256_file = inventory_module.sha256_file
+
+    def reject_external_hash(path: Path) -> str:
+        if external in path.parents:
+            raise AssertionError("inventory descended outside the source root")
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(inventory_module, "sha256_file", reject_external_hash)
+
+    assert discover_sources(root) == ()

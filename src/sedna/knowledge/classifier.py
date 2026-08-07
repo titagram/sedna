@@ -21,10 +21,10 @@ _SETEXT_HEADING_RE = re.compile(r"(?m)^([^\n]+)\n\s*(?:={4,}|-{4,})\s*$")
 _FENCE_LINE_RE = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,})(?P<rest>.*)$")
 _INDENTED_CODE_RE = re.compile(r"(?m)^(?: {4}|\t)\S")
 _URL_RE = re.compile(r"https?://[^\s<>\])]+", re.IGNORECASE)
+_MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[[^\]\n]+\]\([^\)\n]+\)")
+_WIKI_LINK_RE = re.compile(r"(?<!!)\[\[[^\]\n]+\]\]")
 _HTB_FLAG_RE = re.compile(r"HTB\{[^}\r\n]+\}", re.IGNORECASE)
-_FLAG_HEADING_RE = re.compile(
-    r"(?ims)^\s{0,3}#{1,6}[^\n]*\bflag\b[^\n]*\n(?P<body>.{0,500})"
-)
+_FLAG_HEADING_RE = re.compile(r"(?ims)^\s{0,3}#{1,6}[^\n]*\bflag\b[^\n]*\n(?P<body>.{0,500})")
 _HEX_32_RE = re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])", re.IGNORECASE)
 _USER_ROOT_FLAG_RE = re.compile(
     r"(?ims)^\s{0,3}(?:#{1,6}\s*)?(?:user|root)(?:\s+flag)?\s*:?\s*#*\s*$"
@@ -53,9 +53,7 @@ _WALKTHROUGH_LANGUAGE_RE = re.compile(
     r"\b(?:walkthrough|write[ -]?up|step[ -]?by[ -]?step|full guide)\b",
     re.IGNORECASE,
 )
-_TECHNICAL_PDF_RE = re.compile(
-    r"\b(?:cheat[ -]?sheet|reference|handbook|manual)\b", re.IGNORECASE
-)
+_TECHNICAL_PDF_RE = re.compile(r"\b(?:cheat[ -]?sheet|reference|handbook|manual)\b", re.IGNORECASE)
 _NON_PROCEDURAL_HEADING_RE = re.compile(
     r"\b(?:flag|challenge overview|overview|objective|metadata|table of contents|"
     r"contents|difficulty|category)\b",
@@ -88,6 +86,8 @@ class _DocumentSignals:
     has_flag: bool
     procedural: bool
     walkthrough_urls: tuple[str, ...]
+    local_substance: bool
+    reference_link_count: int
 
 
 def classify_document(candidate: SourceCandidate, text: str | None) -> ClassificationResult:
@@ -168,6 +168,26 @@ def classify_document(candidate: SourceCandidate, text: str | None) -> Classific
         )
 
     if _is_reference_family_path(normalized_path):
+        if not signals.local_substance:
+            if signals.reference_link_count:
+                return _result(
+                    DocumentType.EXTERNAL_STUB,
+                    KnowledgeRole.REFERENCE,
+                    SourceQuality.MINIMAL,
+                    "none",
+                    IngestionStatus.EXCLUDED,
+                    "no_local_substance",
+                    "link_navigation_only",
+                )
+            return _result(
+                DocumentType.EXCLUDED,
+                KnowledgeRole.REFERENCE,
+                SourceQuality.UNUSABLE,
+                "none",
+                IngestionStatus.EXCLUDED,
+                "no_local_substance",
+            )
+
         parser_profile = (
             "htb_scrape"
             if normalized_path.startswith("01_information-gathering/")
@@ -246,17 +266,21 @@ def _collect_signals(text: str) -> _DocumentSignals:
 
     action_language = bool(_ACTION_LANGUAGE_RE.search(visible_text))
     result_language = bool(_RESULT_LANGUAGE_RE.search(visible_text))
-    procedural = (
-        len(substantive_headings) >= 2 and code_block_count >= 1
-    ) or (action_language and result_language)
+    procedural = (len(substantive_headings) >= 2 and code_block_count >= 1) or (
+        action_language and result_language
+    )
 
     urls = tuple(url.rstrip(".,;:'\"") for url in _URL_RE.findall(visible_text))
-    walkthrough_urls = tuple(
-        url for url in urls if _url_is_external_walkthrough(visible_text, url)
-    )
+    walkthrough_urls = tuple(url for url in urls if _url_is_external_walkthrough(visible_text, url))
     lines = visible_text.splitlines()
     table_line_count = sum(bool(_TABLE_ROW_RE.match(line)) for line in lines)
     narrative_line_count = sum(_is_narrative_line(line) for line in lines)
+    reference_link_count = (
+        len(urls)
+        + len(_MARKDOWN_LINK_RE.findall(visible_text))
+        + len(_WIKI_LINK_RE.findall(visible_text))
+    )
+    local_substance = bool(code_block_count or table_line_count >= 3 or narrative_line_count)
 
     return _DocumentSignals(
         headings=headings,
@@ -268,6 +292,8 @@ def _collect_signals(text: str) -> _DocumentSignals:
         has_flag=_contains_final_flag(text),
         procedural=procedural,
         walkthrough_urls=walkthrough_urls,
+        local_substance=local_substance,
+        reference_link_count=reference_link_count,
     )
 
 
@@ -327,7 +353,9 @@ def _is_narrative_line(line: str) -> bool:
     stripped = line.strip()
     if not stripped or _TABLE_ROW_RE.match(stripped):
         return False
-    if stripped.startswith(("#", "```", "~~~", "![", "Tags:", "Related to:", "See also:")):
+    if stripped.casefold().startswith(
+        ("#", "```", "~~~", "![", "tags:", "related to:", "see also:", "previous:", "next:")
+    ):
         return False
     if re.fullmatch(r"[-=* _]{3,}", stripped):
         return False

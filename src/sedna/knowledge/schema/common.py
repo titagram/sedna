@@ -3,8 +3,25 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
+
+
+def _reject_final_flag_material(value: str) -> str:
+    from sedna.knowledge.parsing.sanitize import sanitize_searchable_text
+
+    if sanitize_searchable_text(value, ()) != value:
+        raise ValueError("searchable text contains raw or encoded final flag material")
+    return value
+
+
+SearchableString = Annotated[str, AfterValidator(_reject_final_flag_material)]
+SearchableNonEmptyString = Annotated[
+    str,
+    Field(min_length=1),
+    AfterValidator(_reject_final_flag_material),
+]
 
 
 class DocumentType(StrEnum):
@@ -126,3 +143,17 @@ class ExtractionMetadata(BaseModel):
     prompt_version: str | None = Field(default=None, min_length=1)
     model_id: str | None = Field(default=None, min_length=1)
     model_version: str | None = Field(default=None, min_length=1)
+
+
+class CanonicalArtifactMetadata(BaseModel):
+    """Epistemic identity and provenance required on every canonical artifact."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    artifact_type: ArtifactType
+    knowledge_role: KnowledgeRole
+    origin: Origin
+    review_status: ReviewStatus
+    generalizability: Generalizability
+    source_refs: tuple[SourceRef, ...] = Field(min_length=1)
+    extraction: ExtractionMetadata

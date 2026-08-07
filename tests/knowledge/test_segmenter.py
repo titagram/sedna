@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from sedna.knowledge.parsing.markdown import parse_markdown
 from sedna.knowledge.parsing.models import BlockKind, ParsedBlock, ParsedDocument
+from sedna.knowledge.parsing.profiles import apply_profile
 from sedna.knowledge.parsing.sanitize import sanitize_searchable_text
 from sedna.knowledge.parsing.segment import segment_document
 
@@ -20,7 +23,7 @@ def test_segment_keeps_action_code_and_immediate_result_together():
         "smbclient -L //TARGET_IP\n"
         "```\n\n"
         "The output reveals a public share worth inspecting.\n\n"
-        + "Independent follow-up. " * 12
+        + "\n\n".join(f"Independent follow-up {index}." for index in range(8))
     )
 
     segments = segment_document(document, maximum_segment_chars=150)
@@ -42,7 +45,7 @@ def test_action_command_fence_output_fence_and_conclusion_are_one_local_unit():
         "The usage output confirms that the tool works.\n"
     )
 
-    segments = segment_document(document, maximum_segment_chars=10)
+    segments = segment_document(document)
 
     assert len(segments) == 1
     assert segments[0].block_indices == tuple(range(len(document.blocks)))
@@ -61,7 +64,7 @@ def test_linux_fundamentals_strace_indented_command_and_fenced_output_stay_toget
         "The help output is available.\n"
     )
 
-    segments = segment_document(document, maximum_segment_chars=20)
+    segments = segment_document(document)
 
     pair_segment = next(segment for segment in segments if "strace -h" in segment.text)
     assert "usage: strace" in pair_segment.text
@@ -69,9 +72,7 @@ def test_linux_fundamentals_strace_indented_command_and_fenced_output_stay_toget
 
 
 def test_eight_consecutive_code_blocks_split_into_bounded_pairs_without_duplication():
-    document = parsed(
-        "\n\n".join(f"```text\nblock-{index}\n```" for index in range(8))
-    )
+    document = parsed("\n\n".join(f"```text\nblock-{index}\n```" for index in range(8)))
 
     segments = segment_document(document, maximum_segment_chars=20)
 
@@ -94,7 +95,7 @@ def test_openadmin_command_blocks_prefer_their_own_immediate_outputs():
         "Drop into SSH command mode.\n"
     )
 
-    segments = segment_document(document, maximum_segment_chars=10)
+    segments = segment_document(document, maximum_segment_chars=110)
 
     verbose = next(segment for segment in segments if "curl -vvv" in segment.text)
     second = next(
@@ -128,11 +129,9 @@ def test_command_named_output_headers_do_not_steal_the_pair(
     command: str,
     output: str,
 ):
-    document = parsed(
-        f"```text\n{command}\n```\n\n```text\n{output}\n```\n"
-    )
+    document = parsed(f"```text\n{command}\n```\n\n```text\n{output}\n```\n")
 
-    segments = segment_document(document, maximum_segment_chars=1)
+    segments = segment_document(document)
 
     assert len(segments) == 1
     assert command in segments[0].text
@@ -169,22 +168,18 @@ def test_long_section_splits_only_between_blocks():
         1,
         2,
     )
-    assert all(
-        any(block.text in segment.text for segment in segments)
-        for block in document.blocks
-    )
+    assert all(any(block.text in segment.text for segment in segments) for block in document.blocks)
 
 
-def test_single_oversized_block_is_kept_whole():
+def test_single_oversized_block_is_rejected_with_exact_provenance():
     source = "one " * 100
     document = parsed(source)
 
-    segments = segment_document(document, maximum_segment_chars=20)
-
-    assert len(segments) == 1
-    assert segments[0].block_indices == (0,)
-    assert segments[0].text == document.blocks[0].text
-    assert len(segments[0].text) > 20
+    with pytest.raises(
+        ValueError,
+        match=r"block 0 at lines 1-1.*399 characters.*maximum_segment_chars=20",
+    ):
+        segment_document(document, maximum_segment_chars=20)
 
 
 def test_heading_stack_handles_level_jumps_and_replacements():
@@ -196,7 +191,7 @@ def test_heading_stack_handles_level_jumps_and_replacements():
         "#### Jump Again\njump body\n"
     )
 
-    segments = segment_document(document, maximum_segment_chars=1)
+    segments = segment_document(document, maximum_segment_chars=29)
 
     assert tuple(segment.heading_path for segment in segments) == (
         ("Machine",),
@@ -224,6 +219,55 @@ def test_equal_or_higher_heading_starts_a_new_section_but_child_is_retained():
     assert segments[2].heading_path == ("Top",)
 
 
+def test_document_title_h1_contains_independent_h2_sections() -> None:
+    document = parsed(
+        "# DNS\n"
+        "A short introduction to name resolution.\n\n"
+        "## Query resolution\n"
+        "Run the resolver and inspect its answer.\n\n"
+        "```sh\n"
+        "dig example.com\n"
+        "```\n\n"
+        "The returned address confirms resolution.\n\n"
+        "### Resolver cache\n"
+        "Cached answers retain their original lifetime.\n\n"
+        "## Record types\n"
+        "Address and mail records answer different questions.\n"
+    )
+
+    segments = segment_document(document)
+
+    assert tuple(segment.heading_path for segment in segments) == (
+        ("DNS",),
+        ("DNS", "Query resolution"),
+        ("DNS", "Record types"),
+    )
+    assert "Resolver cache" in segments[1].text
+    assert "Record types" not in segments[1].text
+    assert tuple(index for segment in segments for index in segment.block_indices) == tuple(
+        range(len(document.blocks))
+    )
+
+
+_REAL_DNS = Path(__file__).parents[2] / "raw_src/01_information-gathering/DNS.md"
+
+
+@pytest.mark.skipif(not _REAL_DNS.is_file(), reason="real source corpus is unavailable")
+def test_real_dns_scrape_uses_child_sections_and_respects_retrieval_limit() -> None:
+    text = _REAL_DNS.read_text(encoding="utf-8")
+    document = parse_markdown("real-dns", "01_information-gathering/DNS.md", text)
+    profiled = apply_profile(document, "htb_scrape")
+
+    segments = segment_document(profiled, maximum_segment_chars=12_000)
+
+    assert len(profiled.blocks) == 115
+    assert len(segments) > 1
+    assert all(len(segment.text) <= 12_000 for segment in segments)
+    assert tuple(index for segment in segments for index in segment.block_indices) == tuple(
+        range(len(profiled.blocks))
+    )
+
+
 def test_preamble_no_heading_and_empty_documents_are_deterministic():
     with_preamble = segment_document(parsed("preamble\n\n# Title\nbody\n"))
     without_heading = segment_document(parsed("first\n\nsecond\n"))
@@ -237,9 +281,7 @@ def test_preamble_no_heading_and_empty_documents_are_deterministic():
 
 def test_segment_assets_are_exactly_the_assets_overlapping_its_span():
     document = parsed(
-        "## Evidence\n"
-        "![service banner](images/banner.png \"Banner\")\n\n"
-        "## Next\nNo image here.\n"
+        '## Evidence\n![service banner](images/banner.png "Banner")\n\n## Next\nNo image here.\n'
     )
 
     first, second = segment_document(document)
@@ -252,9 +294,7 @@ def test_segment_assets_are_exactly_the_assets_overlapping_its_span():
     assert first.start_line == min(
         document.blocks[index].start_line for index in first.block_indices
     )
-    assert first.end_line == max(
-        document.blocks[index].end_line for index in first.block_indices
-    )
+    assert first.end_line == max(document.blocks[index].end_line for index in first.block_indices)
 
 
 @pytest.mark.parametrize("maximum", [0, -1])
@@ -301,6 +341,30 @@ def test_unclosed_htb_marker_cannot_survive_sanitization():
     assert "htb{" not in sanitized.casefold()
 
 
+@pytest.mark.parametrize(
+    "encoded_flag",
+    [
+        "HTB%7Burl_secret%7D",
+        "htb%257bdouble_url_secret%257d",
+        "HTB&#123;html_secret&#125;",
+        "HTB&amp;#123;double_html_secret&amp;#125;",
+        "HTB%26%23123%3Bmixed_secret%26%23125%3B",
+    ],
+)
+def test_recursively_url_or_html_encoded_flags_are_redacted(encoded_flag: str):
+    sanitized = sanitize_searchable_text(f"before {encoded_flag} after", ())
+
+    assert sanitized == "before <EXCLUDED_FLAG> after"
+
+
+def test_recursively_encoded_contextual_hex_flag_is_redacted():
+    encoded_flag = "%2561bcdef0123456789abcdef0123456789"
+
+    sanitized = sanitize_searchable_text(encoded_flag, ("Root Flag",))
+
+    assert sanitized == "<EXCLUDED_FLAG>"
+
+
 def test_multiline_htb_flag_inside_code_is_removed_from_segment_text():
     document = parsed("```text\nlabelHTB{line one\nline two}\n```\n")
 
@@ -319,11 +383,11 @@ def test_nested_flag_heading_is_sanitized_with_its_active_block_path():
         f"The final value is `{token}`.\n"
     )
 
-    segment = segment_document(document)[0]
+    searchable = "\n".join(segment.text for segment in segment_document(document))
 
-    assert "0123456789abcdef0123456789abcdef" in segment.text
-    assert token not in segment.text
-    assert "<EXCLUDED_FLAG>" in segment.text
+    assert "0123456789abcdef0123456789abcdef" in searchable
+    assert token not in searchable
+    assert "<EXCLUDED_FLAG>" in searchable
 
 
 def test_known_contextual_hex_flag_is_excluded_from_every_document_occurrence():
@@ -432,14 +496,10 @@ def test_real_lame_and_permx_flag_line_shapes_do_not_reach_logical_segments(
 
     segments = segment_document(document, maximum_segment_chars=80)
     searchable_values = tuple(
-        value
-        for segment in segments
-        for value in (segment.text, *segment.heading_path)
+        value for segment in segments for value in (segment.text, *segment.heading_path)
     )
 
-    assert all(
-        token not in value for token in known_flags for value in searchable_values
-    )
+    assert all(token not in value for token in known_flags for value in searchable_values)
     assert document.model_dump(mode="json") == original
 
 
@@ -469,16 +529,11 @@ def test_contextual_32_hex_flags_are_redacted_case_and_whitespace_insensitively(
 def test_32_hex_hashes_survive_unrelated_technical_contexts():
     token = "abcdef0123456789abcdef0123456789"
 
-    assert sanitize_searchable_text(f"MD5: {token}", ("Password hashes",)) == (
-        f"MD5: {token}"
-    )
+    assert sanitize_searchable_text(f"MD5: {token}", ("Password hashes",)) == (f"MD5: {token}")
 
 
 def test_unrelated_avatar_identifier_remains_searchable():
-    avatar = (
-        "https://labs.hackthebox.com/storage/avatars/"
-        "3ec233f1bf70b096a66f8a452e7cd52f.png"
-    )
+    avatar = "https://labs.hackthebox.com/storage/avatars/3ec233f1bf70b096a66f8a452e7cd52f.png"
 
     assert sanitize_searchable_text(avatar, ("PermX",)) == avatar
 
@@ -535,16 +590,13 @@ def test_logical_heading_paths_are_sanitized_but_raw_headings_are_unchanged():
     hex_token = "abcdef0123456789abcdef0123456789"
     parent_hex = "0123456789abcdef0123456789abcdef"
     document = parsed(
-        f"# Parent {htb_token} {parent_hex}\nparent body\n\n"
-        f"### Root Flag {hex_token}\nchild body\n"
+        f"# Parent {htb_token} {parent_hex}\nparent body\n\n### Root Flag {hex_token}\nchild body\n"
     )
     original = document.model_dump(mode="json")
 
-    segments = segment_document(document, maximum_segment_chars=1)
+    segments = segment_document(document)
 
-    assert segments[0].heading_path == (
-        f"Parent <EXCLUDED_FLAG> {parent_hex}",
-    )
+    assert segments[0].heading_path == (f"Parent <EXCLUDED_FLAG> {parent_hex}",)
     assert segments[1].heading_path == (
         f"Parent <EXCLUDED_FLAG> {parent_hex}",
         "Root Flag <EXCLUDED_FLAG>",
@@ -562,11 +614,10 @@ def test_logical_heading_paths_are_sanitized_but_raw_headings_are_unchanged():
 def test_document_known_flag_redacts_identical_parent_value_without_child_context():
     token = "abcdef0123456789abcdef0123456789"
     document = parsed(
-        f"# Technical digest {token}\nparent body\n\n"
-        f"### Root Flag {token}\nchild body\n"
+        f"# Technical digest {token}\nparent body\n\n### Root Flag {token}\nchild body\n"
     )
 
-    segments = segment_document(document, maximum_segment_chars=1)
+    segments = segment_document(document)
 
     assert segments[0].heading_path == ("Technical digest <EXCLUDED_FLAG>",)
     assert segments[1].heading_path == (

@@ -135,6 +135,30 @@ def test_prepare_accepted_walkthrough_returns_segments_and_manifest(tmp_path: Pa
     assert pipeline.last_outcome == "accepted"
 
 
+def test_pipeline_redacts_complete_url_encoded_flag_from_searchable_segments(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "raw_src"
+    candidate = _write_candidate(
+        source_root,
+        "Write-ups/Machines/Encoded/walkthrough.md",
+        b"# Encoded walkthrough\n"
+        b"## Enumerate service\n"
+        b"Observe port 80 and inspect the service.\n\n"
+        b"```text\nHTTP service exposed\n```\n\n"
+        b"## Result\n"
+        b"The final value is HTB%7Bpipeline_leak%7D.\n",
+    )
+    pipeline = IngestionPipeline(source_root, tmp_path / "knowledge")
+
+    prepared = pipeline.prepare(candidate)
+
+    assert prepared is not None
+    searchable = "\n".join(segment.text for segment in prepared.segments)
+    assert "pipeline_leak" not in searchable
+    assert searchable.count("<EXCLUDED_FLAG>") == 1
+
+
 def test_pipeline_is_exported_from_public_knowledge_package() -> None:
     assert PublicIngestionPipeline is IngestionPipeline
 
@@ -288,6 +312,30 @@ def test_profile_and_segment_value_errors_are_explicit_implementation_failures(
     with pytest.raises(CandidateIngestionError) as segment_error:
         pipeline.prepare(candidate)
     assert segment_error.value.reason_code == "segmenter_failure"
+
+
+def test_oversized_indivisible_source_block_is_quarantined_with_provenance(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "raw_src"
+    body = "substantive technical explanation " * 500
+    candidate = _write_candidate(
+        source_root,
+        "Write-ups/Academy/Oversized/lesson.md",
+        f"# Oversized lesson\n\n{body}\n".encode(),
+    )
+    pipeline = IngestionPipeline(source_root, tmp_path / "knowledge")
+
+    assert pipeline.prepare(candidate) is None
+
+    manifest = pipeline.repository.load_manifest(candidate.source_id)
+    quarantine = pipeline.repository.load_quarantine(candidate.source_id)
+    assert manifest.ingestion_status == IngestionStatus.QUARANTINED
+    assert manifest.quarantine_reasons == ("oversized_indivisible_block",)
+    assert quarantine.reason_codes == ("oversized_indivisible_block",)
+    assert "blocks 0-1 at lines 1-3" in quarantine.messages[0]
+    assert "maximum_segment_chars=12000" in quarantine.messages[0]
+    assert pipeline.last_outcome == "quarantined"
 
 
 def test_prepared_boundary_rejects_unsanitized_segmenter_output_before_persistence(

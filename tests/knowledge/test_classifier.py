@@ -14,6 +14,7 @@ from sedna.knowledge.schema import (
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
+REAL_CORPUS = Path(__file__).parents[2] / "raw_src"
 FIXTURE_PATHS = {
     "lesson.md": "Write-ups/Academy/Recon/lesson.md",
     "machine-walkthrough.md": "Write-ups/Machines/Example/walkthrough.md",
@@ -105,6 +106,105 @@ def test_table_dominant_academy_source_is_a_cheatsheet(tmp_path: Path) -> None:
     assert result.knowledge_role == KnowledgeRole.REFERENCE
     assert result.quality == SourceQuality.PARTIAL
     assert result.parser_profile == "academy_obsidian"
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "Write-ups/Academy/Exploitation/Using CrackMapExec.md",
+        "01_information-gathering/Academy/Using CrackMapExec.md",
+    ],
+)
+def test_reference_family_navigation_only_note_is_an_external_stub(
+    tmp_path: Path,
+    relative_path: str,
+) -> None:
+    path = tmp_path / "navigation-only.md"
+    text = """# Using CrackMapExec
+
+Tags: #🧑‍🎓
+Related to:
+See also:
+Previous: [[HTB Academy]]
+"""
+    path.write_text(text, encoding="utf-8")
+    candidate = SourceCandidate(
+        source_id="source-navigation-only",
+        path=path,
+        relative_path=relative_path,
+        suffix=".md",
+        sha256="4" * 64,
+        size_bytes=len(text.encode()),
+        assets=(),
+    )
+
+    result = classify_document(candidate, text)
+
+    assert result.document_type == DocumentType.EXTERNAL_STUB
+    assert result.quality == SourceQuality.MINIMAL
+    assert result.parser_profile == "none"
+    assert result.ingestion_status == IngestionStatus.EXCLUDED
+    assert "no_local_substance" in result.reasons
+
+
+@pytest.mark.skipif(not REAL_CORPUS.is_dir(), reason="real source corpus is unavailable")
+def test_real_academy_stubs_are_excluded_without_losing_concise_cheatsheets() -> None:
+    stub_paths = (
+        "Write-ups/Academy/01. Pre-Engagement/"
+        "03a. Introduction to Windows Command Line/"
+        "Introduction to Windows Command Line.md",
+        "Write-ups/Academy/03. Vulnerability Assessment/"
+        "14. Vulnerability Assessment/Vulnerability Assessment.md",
+        "Write-ups/Academy/04. Exploitation/21a. Using CrackMapExec/Using CrackMapExec.md",
+        "Write-ups/Academy/05. Web Exploitation/26a. Blind SQL Injection/Blind SQL Injection.md",
+        "Write-ups/Academy/05. Web Exploitation/"
+        "31g. Attacking Authentication Mechanisms/"
+        "Attacking Authentication Mechanisms.md",
+        "Write-ups/Academy/08. Proof-of-Concept/"
+        "34b. Stack-Based Buffer Overflows on Linux x86/"
+        "Stack-Based Buffer Overflows on Linux x86.md",
+        "Write-ups/Academy/09. Post-Engagement/"
+        "35. Documentation & Reporting/Documentation & Reporting.md",
+        "Write-ups/Academy/09. Post-Engagement/"
+        "36. Attacking Enterprise Networks/Attacking Enterprise Networks.md",
+        "Write-ups/Academy/10. Misc/MacOS Fundamentals/MacOS Fundamentals.md",
+    )
+    cheatsheet_paths = (
+        "Write-ups/Academy/04. Exploitation/"
+        "21d. Active Directory BloodHound/Active Directory BloodHound.md",
+        "Write-ups/Academy/05. Web Exploitation/22. Using Web Proxies/Using Web Proxies.md",
+    )
+
+    stub_results = tuple(_classify_real_source(path) for path in stub_paths)
+    cheatsheet_results = tuple(_classify_real_source(path) for path in cheatsheet_paths)
+
+    assert len(stub_results) == 9
+    assert all(
+        result.document_type == DocumentType.EXTERNAL_STUB
+        and result.ingestion_status == IngestionStatus.EXCLUDED
+        and "no_local_substance" in result.reasons
+        for result in stub_results
+    )
+    assert all(
+        result.document_type == DocumentType.CHEATSHEET_REFERENCE
+        and result.ingestion_status == IngestionStatus.ACCEPTED
+        for result in cheatsheet_results
+    )
+
+
+def _classify_real_source(relative_path: str) -> ClassificationResult:
+    path = REAL_CORPUS / relative_path
+    text = path.read_text(encoding="utf-8")
+    candidate = SourceCandidate(
+        source_id=f"real-{path.stem}",
+        path=path,
+        relative_path=relative_path,
+        suffix=path.suffix,
+        sha256="5" * 64,
+        size_bytes=path.stat().st_size,
+        assets=(),
+    )
+    return classify_document(candidate, text)
 
 
 def test_unknown_nonempty_source_is_quarantined_as_ambiguous(tmp_path: Path) -> None:
