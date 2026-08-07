@@ -21,17 +21,20 @@ content hashes, classification chooses a deterministic parser profile and an
 ingestion outcome, and the structural parser preserves headings, blocks, line
 spans, and provenance. Logical segmentation then creates retrieval-safe units
 while keeping related observations, actions, outputs, and conclusions together.
-`IngestionPipeline` is the entry point for this flow and returns a typed
-`PreparedSource` for accepted documents.
+`IngestionPipeline` is the entry point for this flow. Its `prepare()` method
+returns a typed `PreparedSource` when an accepted document is newly processed or
+reprocessed; an unchanged accepted document returns `None` because its canonical
+state already exists.
 
-Generated JSON manifests are the canonical processing record for every source,
-including accepted, excluded, quarantined, and unchanged outcomes. Quarantine
-records explain ambiguous or unsupported input; the raw files themselves remain
-the canonical source material and are never rewritten. Prepared structural
-documents may retain original source text for provenance review and therefore
-must not be indexed directly. Only sanitized logical-segment fields are prepared
-for search, and final flags such as `HTB{...}` or contextual user/root flag values
-are excluded from those fields.
+Generated JSON manifests retain the canonical disposition for every source:
+accepted, excluded, or quarantined. A separate `IngestionReport` records each
+run's outcomes, including unchanged sources and failures. Quarantine records
+explain ambiguous or unsupported input; the raw files themselves remain the
+canonical source material and are never rewritten. Prepared structural documents
+may retain original source text for provenance review and therefore must not be
+indexed directly. Only sanitized logical-segment fields are prepared for search,
+and final flags such as `HTB{...}` or contextual user/root flag values are excluded
+from those fields.
 
 This foundation stops at `PreparedSource`. Semantic extraction into references,
 case studies, case steps, and draft decision rules is a follow-on phase, as are
