@@ -1,0 +1,91 @@
+cases:
+  - path: lesson-narrative.md
+    document_type: lesson
+    parser_profile: academy_obsidian
+    quality: complete
+    status: accepted
+    minimum_segments: 3
+  - path: lesson-cheatsheet.md
+    document_type: cheatsheet_reference
+    parser_profile: academy_obsidian
+    quality: partial
+    status: accepted
+    minimum_segments: 1
+  - path: htb-scrape.md
+    document_type: lesson
+    parser_profile: htb_scrape
+    quality: complete
+    status: accepted
+    minimum_segments: 2
+  - path: obsidian-with-assets.md
+    document_type: lesson
+    parser_profile: academy_obsidian
+    quality: complete
+    status: accepted
+    minimum_segments: 2
+  - path: machine-complete.md
+    document_type: machine_walkthrough
+    parser_profile: github_walkthrough
+    quality: complete
+    status: accepted
+    minimum_segments: 4
+  - path: machine-failed-attempt.md
+    document_type: machine_walkthrough
+    parser_profile: github_walkthrough
+    quality: complete
+    status: accepted
+    minimum_segments: 3
+  - path: machine-html-wrapper.md
+    document_type: machine_walkthrough
+    parser_profile: github_walkthrough
+    quality: partial
+    status: accepted
+    minimum_segments: 2
+  - path: challenge-complete.md
+    document_type: challenge_walkthrough
+    parser_profile: github_walkthrough
+    quality: complete
+    status: accepted
+    minimum_segments: 3
+  - path: challenge-flag-only.md
+    document_type: excluded
+    parser_profile: none
+    quality: unusable
+    status: excluded
+    minimum_segments: 0
+  - path: machine-external-stub.md
+    document_type: external_stub
+    parser_profile: none
+    quality: minimal
+    status: excluded
+    minimum_segments: 0
+  - path: machine-flags-only.md
+    document_type: excluded
+    parser_profile: none
+    quality: unusable
+    status: excluded
+    minimum_segments: 0
+  - path: empty.md
+    document_type: excluded
+    parser_profile: none
+    quality: unusable
+    status: excluded
+    minimum_segments: 0
+  - path: malformed-ambiguous.md
+    document_type: excluded
+    parser_profile: none
+    quality: minimal
+    status: quarantined
+    minimum_segments: 0
+  - path: setext-lesson.md
+    document_type: lesson
+    parser_profile: htb_scrape
+    quality: partial
+    status: accepted
+    minimum_segments: 2
+  - path: reference-cheatsheet.pdf
+    document_type: cheatsheet_reference
+    parser_profile: none
+    quality: partial
+    status: quarantined
+    minimum_segments: 0

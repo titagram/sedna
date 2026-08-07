@@ -1,0 +1,13 @@
+.DS_Store
+.venv/
+.pytest_cache/
+.ruff_cache/
+.superpowers/
+.worktrees/
+__pycache__/
+*.py[cod]
+raw_src/
+indexes/
+*.db
+*.db-shm
+*.db-wal
