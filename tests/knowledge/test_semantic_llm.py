@@ -258,7 +258,28 @@ def test_prompt_boundary_redacts_credentials_but_preserves_benign_technical_pros
         '{"secretScanningEnabled":true}.\n'
         "passwordHashAlgorithm: argon2 # recommended\n"
         'passwordHashAlgorithmName = "argon2".\n'
-        "apiKeyRotationDays: 30 # days between rotations"
+        "apiKeyRotationDays: 30 # days between rotations\n"
+        "Password must include uppercase letters.\n"
+        "API key should be rotated every 90 days.\n"
+        "Secret should be stored outside source control.\n"
+        "Password: do not reuse it.\n"
+        "token endpoint validates requests.\n"
+        "password manager integration.\n"
+        "secret sharing protocol.\n"
+        "password hashing.\n"
+        "API key authentication.\n"
+        "refresh token revocation.\n"
+        "apiKeynoteEnabled=true.\n"
+        "tokenBucketSize=100.\n"
+        "passwordPolicyEnabled=true.\n"
+        "secretSharingThreshold=3."
+        "\nPassword must include uppercase and lowercase letters."
+        "\nPassword must include digits and symbols."
+        "\nSecret should be stored outside of source control."
+        "\ntoken endpoint validates incoming requests."
+        "\nsecret sharing protocols."
+        "\nAPI key authentication protocols."
+        "\nΗ πολιτική κωδικών πρόσβασης παραμένει τεχνική."
     )
     credential_text = (
         "token%253Dsk-live-secret password&#61;hunter2 "
@@ -517,6 +538,27 @@ def test_prompt_boundary_redacts_credentials_but_preserves_benign_technical_pros
     assert "passwordHashAlgorithm: argon2 # recommended" in benign_host_input
     assert "passwordHashAlgorithmName" in benign_host_input
     assert "apiKeyRotationDays: 30 # days between rotations" in benign_host_input
+    assert "Password must include uppercase letters" in benign_host_input
+    assert "API key should be rotated every 90 days" in benign_host_input
+    assert "Secret should be stored outside source control" in benign_host_input
+    assert "Password: do not reuse it" in benign_host_input
+    assert "token endpoint validates requests" in benign_host_input
+    assert "password manager integration" in benign_host_input
+    assert "secret sharing protocol" in benign_host_input
+    assert "password hashing" in benign_host_input
+    assert "API key authentication" in benign_host_input
+    assert "refresh token revocation" in benign_host_input
+    assert "apiKeynoteEnabled=true" in benign_host_input
+    assert "tokenBucketSize=100" in benign_host_input
+    assert "passwordPolicyEnabled=true" in benign_host_input
+    assert "secretSharingThreshold=3" in benign_host_input
+    assert "Password must include uppercase and lowercase letters" in benign_host_input
+    assert "Password must include digits and symbols" in benign_host_input
+    assert "Secret should be stored outside of source control" in benign_host_input
+    assert "token endpoint validates incoming requests" in benign_host_input
+    assert "secret sharing protocols" in benign_host_input
+    assert "API key authentication protocols" in benign_host_input
+    assert "Η πολιτική κωδικών πρόσβασης παραμένει τεχνική" in benign_host_input
     assert "token: identifier" in benign_host_input
     assert "password=<password>" in benign_host_input
     assert "api key: example" in benign_host_input
@@ -603,6 +645,24 @@ def test_prompt_boundary_fails_closed_when_credential_clause_budget_is_exceeded(
         ("githubtokenvalue=singletokenhunter2", "singletokenhunter2"),
         ("passwordvalue2=qualifiednumericsecret", "qualifiednumericsecret"),
         ("githubtokenpayloadprod=qualifiedchainsecret", "qualifiedchainsecret"),
+        ("pаssword=mixedscripthunter2", "mixedscripthunter2"),
+        ("passwordv2=passwordversionhunter2", "passwordversionhunter2"),
+        ("tokenv2=tokenversionhunter2", "tokenversionhunter2"),
+        (
+            "passwordvaluepayloadprodbackuplivetestv12=longchainhunter2",
+            "longchainhunter2",
+        ),
+        ("password=<password>.\ntailhunter2", "tailhunter2"),
+        ("password=value!\npunctuatedtailhunter2", "punctuatedtailhunter2"),
+        ("paѕѕword=confusablessecret", "confusablessecret"),
+        ("passwordv2backup=versionbackupsecret", "versionbackupsecret"),
+        ("token2prod=numericprodsecret", "numericprodsecret"),
+        ("password=<password>.\ntailhunter2;", "tailhunter2"),
+        ('password=value!\n"commatailsecret",', "commatailsecret"),
+        (
+            "password=<password>.\n# comment\ncommentgapsecret",
+            "commentgapsecret",
+        ),
         ("passwordHashAlgorithm = 987654321", "987654321"),
         ("secretScanningEnabled = 24681012", "24681012"),
         ('apiKeyRotationDays = "argon2"', "argon2"),
