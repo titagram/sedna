@@ -88,3 +88,58 @@ not cause a lint or formatting failure.
 No unresolved implementation concerns. The existing semantic schema stores a critic call in the
 verification record; Task 6's result-level immutable call sequence preserves extractor and repair
 metadata without changing the canonical bundle/audit schema.
+
+---
+
+## Fix Round 1: Preserve Extractor Identity and Validate Before Criticism
+
+### Changes
+
+- Kept original extractor completion metadata separate from repaired drafts. Repaired artifacts now
+  materialize with the original extractor call metadata; the manifest binds extractor model to the
+  first call and critic model to the final critic call.
+- Added result-contract validation for verified/unchanged source identity, verified audit and
+  manifest disposition, bounded repair count, and model-to-call binding.
+- Exposed and reused one segment-accounting validator so incomplete extractor output fails before
+  any critic call.
+- Limited `unsafe_material` quarantine conversion to `ValueError`/`TypeError` from the
+  materializer itself. Unexpected materializer exceptions now emit `materialization_failure`; clock,
+  verification, manifest, and result construction failures emit `internal_failure`.
+
+### RED Evidence
+
+The new regressions initially failed as follows:
+
+```text
+extractor_model_id: repair-model != extractor-model
+incomplete extractor output: transport_failure != invalid_structured_response
+manifest repair_count mismatch: DID NOT RAISE ValidationError
+```
+
+### GREEN Evidence
+
+```text
+.venv/bin/python -m pytest -q \
+  tests/knowledge/test_semantic_compiler.py \
+  tests/knowledge/test_semantic_materialize.py \
+  tests/knowledge/test_semantic_llm.py \
+  tests/knowledge/test_semantic_drafts.py
+89 passed in 0.31s
+
+.venv/bin/python -m pytest -q tests/knowledge
+469 passed in 0.88s
+
+.venv/bin/python -m pytest -q
+489 passed in 0.90s
+```
+
+Ruff format/check on every changed Python file and `git diff --check` passed.
+
+### Self-Review
+
+- Distinct extractor, repair, initial critic, and final critic models are retained in call order;
+  canonical artifact extraction and manifest metadata use the original extractor and final critic
+  respectively.
+- An incomplete draft reaches neither the first critic nor repair.
+- Repair and post-repair critic transport failures retain all prior successful call metadata.
+- A decreasing aware-UTC clock produces an `internal_failure`, never an unsafe-material quarantine.

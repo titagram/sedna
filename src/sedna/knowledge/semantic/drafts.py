@@ -373,15 +373,20 @@ class SemanticCompilationResult(BaseModel):
                 raise ValueError("verified and unchanged results require a bundle and verification")
             if any((self.quarantine, self.failure_code, self.failure_message)):
                 raise ValueError("verified and unchanged results cannot contain other payloads")
-            if (
-                self.disposition == "verified"
-                and self.verification.adjudication != self.disposition
-            ):
-                raise ValueError(
-                    "verified result verification adjudication must agree with disposition"
-                )
             if self.disposition == "verified":
+                if self.verification.adjudication != "verified":
+                    raise ValueError(
+                        "verified result verification adjudication must agree with disposition"
+                    )
                 self._validate_final_critic_call(purposes)
+            else:
+                if purposes:
+                    raise ValueError(
+                        "unchanged results cannot contain a new semantic call sequence"
+                    )
+                if self.verification.adjudication != "verified":
+                    raise ValueError("unchanged results must retain a verified audit")
+            self._validate_normal_bundle()
             return self
 
         if self.disposition == "quarantined":
@@ -411,6 +416,32 @@ class SemanticCompilationResult(BaseModel):
             raise ValueError("terminal semantic results require an extractor and final critic call")
         if self.verification.critic_call != self.calls[-1]:
             raise ValueError("verification critic call must match final call metadata")
+
+    def _validate_normal_bundle(self) -> None:
+        if self.bundle is None or self.verification is None:
+            raise ValueError("normal results require a bundle and verification")
+        manifest = self.bundle.compilation_manifest
+        if (
+            self.bundle.source_id != self.verification.source_id
+            or self.bundle.source_sha256 != self.verification.source_sha256
+            or manifest.source_id != self.bundle.source_id
+            or manifest.source_sha256 != self.bundle.source_sha256
+        ):
+            raise ValueError("bundle and verification source identity must match")
+        if self.disposition == "unchanged":
+            if manifest.disposition != "verified":
+                raise ValueError("unchanged results must retain a verified compilation manifest")
+            return
+        if manifest.disposition != "verified":
+            raise ValueError("verified result manifest disposition must be verified")
+        expected_repair_count = 0 if len(self.calls) == 2 else 1
+        if manifest.repair_count != expected_repair_count:
+            raise ValueError("manifest repair_count must match the semantic call path")
+        if (
+            manifest.extractor_model_id != self.calls[0].model
+            or manifest.critic_model_id != self.calls[-1].model
+        ):
+            raise ValueError("manifest model IDs must match extractor and final critic calls")
 
 
 def _validate_deterministic_indexes(indexes: tuple[int, ...]) -> None:

@@ -246,7 +246,7 @@ def test_compiler_range_validation_covers_ignored_and_cited_indexes():
 
 @pytest.mark.parametrize("disposition", ("verified", "unchanged"))
 def test_verified_and_unchanged_results_require_a_bundle_and_verification(disposition: str):
-    record = verification(disposition)
+    record = verification("verified")
     result = SemanticCompilationResult(
         disposition=disposition,
         bundle=bundle(),
@@ -321,4 +321,72 @@ def test_failure_codes_are_closed_and_do_not_reuse_critic_finding_codes():
             disposition="failed",
             failure_code="unsafe_material",
             failure_message="The artifact contains unsafe material.",
+        )
+
+
+@pytest.mark.parametrize(
+    ("repair_count", "calls"),
+    [
+        (1, "two"),
+        (0, "four"),
+    ],
+)
+def test_verified_result_rejects_call_path_and_manifest_repair_count_disagreement(
+    repair_count: int, calls: str
+):
+    record = verification("verified")
+    bundle_value = bundle().model_copy(
+        update={
+            "compilation_manifest": bundle().compilation_manifest.model_copy(
+                update={"repair_count": repair_count}
+            )
+        }
+    )
+    call_metadata = semantic_calls(record.critic_call)
+    if calls == "four":
+        call_metadata = (
+            call_metadata[0],
+            SemanticCallMetadata(
+                purpose="sedna.semantic.critic",
+                provider="host",
+                model="initial-critic",
+                agent_id="agent-7",
+                input_tokens=100,
+                output_tokens=50,
+            ),
+            SemanticCallMetadata(
+                purpose="sedna.semantic.repair",
+                provider="host",
+                model="repair-model",
+                agent_id="agent-7",
+                input_tokens=100,
+                output_tokens=50,
+            ),
+            record.critic_call,
+        )
+    with pytest.raises(ValidationError, match="repair_count"):
+        SemanticCompilationResult(
+            disposition="verified",
+            bundle=bundle_value,
+            verification=record,
+            calls=call_metadata,
+        )
+
+
+def test_verified_result_rejects_manifest_models_that_do_not_bind_to_call_metadata():
+    record = verification("verified")
+    bundle_value = bundle().model_copy(
+        update={
+            "compilation_manifest": bundle().compilation_manifest.model_copy(
+                update={"extractor_model_id": "wrong-extractor"}
+            )
+        }
+    )
+
+    with pytest.raises(ValidationError, match="model IDs"):
+        SemanticCompilationResult(
+            disposition="verified",
+            bundle=bundle_value,
+            verification=record,
+            calls=semantic_calls(record.critic_call),
         )

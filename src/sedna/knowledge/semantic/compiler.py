@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 
 from sedna.knowledge.parsing import PreparedSource
@@ -37,7 +37,11 @@ from sedna.knowledge.semantic.llm import (
     StructuredResult,
     build_safe_source_payload,
 )
-from sedna.knowledge.semantic.materialize import CanonicalArtifact, materialize_bundle
+from sedna.knowledge.semantic.materialize import (
+    CanonicalArtifact,
+    materialize_bundle,
+    validate_segment_accounting,
+)
 from sedna.knowledge.semantic.prompts import (
     CRITIC_PROMPT,
     CRITIC_PROMPT_VERSION,
@@ -64,8 +68,11 @@ class SemanticCompiler:
 
     def compile(self, prepared: PreparedSource) -> SemanticCompilationResult:
         """Return a verified bundle, explainable quarantine, or response-free failure."""
-        started_at = self._now()
         calls: list[SemanticCallMetadata] = []
+        try:
+            started_at = self._now()
+        except Exception:
+            return self._failed("internal_failure", calls)
         try:
             prepared = self._validated_prepared(prepared)
             source = build_safe_source_payload(prepared)
@@ -76,6 +83,7 @@ class SemanticCompiler:
             extracted = self._extract(source)
             calls.append(self._call_metadata(extracted, "sedna.semantic.extract"))
             extracted.parsed.validate_against_segment_count(len(source.segments))
+            validate_segment_accounting(prepared, extracted.parsed)
 
             initial_critic = self._critic(source, extracted.parsed)
             calls.append(self._call_metadata(initial_critic, "sedna.semantic.critic"))
@@ -84,6 +92,7 @@ class SemanticCompiler:
                 return self._verified(
                     prepared,
                     extracted,
+                    extracted.parsed,
                     initial_critic,
                     repair_count=0,
                     started_at=started_at,
@@ -93,6 +102,7 @@ class SemanticCompiler:
             repaired = self._repair(source, extracted.parsed, initial_critic.parsed)
             calls.append(self._call_metadata(repaired, "sedna.semantic.repair"))
             repaired.parsed.validate_against_segment_count(len(source.segments))
+            validate_segment_accounting(prepared, repaired.parsed)
             final_critic = self._critic(source, repaired.parsed)
             calls.append(self._call_metadata(final_critic, "sedna.semantic.critic"))
             final_critic.parsed.validate_against_segment_count(len(source.segments))
@@ -105,7 +115,8 @@ class SemanticCompiler:
                 )
             return self._verified(
                 prepared,
-                repaired,
+                extracted,
+                repaired.parsed,
                 final_critic,
                 repair_count=1,
                 started_at=started_at,
@@ -155,6 +166,7 @@ class SemanticCompiler:
         self,
         prepared: PreparedSource,
         extraction: StructuredResult[SemanticDraftBundle],
+        final_drafts: SemanticDraftBundle,
         critic: StructuredResult[CriticVerdict],
         *,
         repair_count: int,
@@ -164,10 +176,15 @@ class SemanticCompiler:
         try:
             artifacts = materialize_bundle(
                 prepared,
-                extraction.parsed,
+                final_drafts,
                 self._call_metadata(extraction, "sedna.semantic.extract"),
                 VerificationStatus.VERIFIED,
             )
+        except (TypeError, ValueError):
+            return self._canonical_material_quarantine(prepared, critic, calls)
+        except Exception:
+            return self._failed("materialization_failure", calls)
+        try:
             verification = self._verification(prepared, critic, "verified")
             bundle = self._bundle(
                 prepared,
@@ -177,8 +194,8 @@ class SemanticCompiler:
                 repair_count=repair_count,
                 started_at=started_at,
             )
-        except (TypeError, ValueError):
-            return self._canonical_material_quarantine(prepared, critic, calls)
+        except Exception:
+            return self._failed("internal_failure", calls)
         return SemanticCompilationResult(
             disposition="verified",
             bundle=bundle,
@@ -196,19 +213,22 @@ class SemanticCompiler:
     ) -> SemanticCompilationResult:
         del repair_count  # The audit schema records the adjudication, not a repair transcript.
         verdict = critic.parsed
-        return SemanticCompilationResult(
-            disposition="quarantined",
-            verification=self._verification(prepared, critic, "quarantined"),
-            quarantine=SemanticQuarantineRecord(
-                source_id=prepared.manifest.source_id,
-                source_sha256=prepared.manifest.sha256,
-                reason_codes=tuple(finding.code for finding in verdict.findings),
-                messages=tuple(finding.message for finding in verdict.findings),
-                segment_indexes=self._finding_indexes(verdict.findings),
-                recorded_at=self._now(),
-            ),
-            calls=calls,
-        )
+        try:
+            return SemanticCompilationResult(
+                disposition="quarantined",
+                verification=self._verification(prepared, critic, "quarantined"),
+                quarantine=SemanticQuarantineRecord(
+                    source_id=prepared.manifest.source_id,
+                    source_sha256=prepared.manifest.sha256,
+                    reason_codes=tuple(finding.code for finding in verdict.findings),
+                    messages=tuple(finding.message for finding in verdict.findings),
+                    segment_indexes=self._finding_indexes(verdict.findings),
+                    recorded_at=self._now(),
+                ),
+                calls=calls,
+            )
+        except Exception:
+            return self._failed("internal_failure", calls)
 
     def _canonical_material_quarantine(
         self,
@@ -216,30 +236,33 @@ class SemanticCompiler:
         critic: StructuredResult[CriticVerdict],
         calls: tuple[SemanticCallMetadata, ...],
     ) -> SemanticCompilationResult:
-        finding = VerificationFinding(
-            code="unsafe_material",
-            severity="material",
-            message=CANONICAL_FINDING_MESSAGES["unsafe_material"],
-        )
-        return SemanticCompilationResult(
-            disposition="quarantined",
-            verification=SemanticVerificationRecord(
-                source_id=prepared.manifest.source_id,
-                source_sha256=prepared.manifest.sha256,
-                critic_call=self._call_metadata(critic, "sedna.semantic.critic"),
-                findings=(*critic.parsed.findings, finding),
-                adjudication="quarantined",
-                recorded_at=self._now(),
-            ),
-            quarantine=SemanticQuarantineRecord(
-                source_id=prepared.manifest.source_id,
-                source_sha256=prepared.manifest.sha256,
-                reason_codes=("unsafe_material",),
-                messages=(CANONICAL_FINDING_MESSAGES["unsafe_material"],),
-                recorded_at=self._now(),
-            ),
-            calls=calls,
-        )
+        try:
+            finding = VerificationFinding(
+                code="unsafe_material",
+                severity="material",
+                message=CANONICAL_FINDING_MESSAGES["unsafe_material"],
+            )
+            return SemanticCompilationResult(
+                disposition="quarantined",
+                verification=SemanticVerificationRecord(
+                    source_id=prepared.manifest.source_id,
+                    source_sha256=prepared.manifest.sha256,
+                    critic_call=self._call_metadata(critic, "sedna.semantic.critic"),
+                    findings=(*critic.parsed.findings, finding),
+                    adjudication="quarantined",
+                    recorded_at=self._now(),
+                ),
+                quarantine=SemanticQuarantineRecord(
+                    source_id=prepared.manifest.source_id,
+                    source_sha256=prepared.manifest.sha256,
+                    reason_codes=("unsafe_material",),
+                    messages=(CANONICAL_FINDING_MESSAGES["unsafe_material"],),
+                    recorded_at=self._now(),
+                ),
+                calls=calls,
+            )
+        except Exception:
+            return self._failed("internal_failure", calls)
 
     def _verification(
         self,
@@ -344,7 +367,7 @@ class SemanticCompiler:
     def _failed(
         self,
         failure_code: CompilationFailureCode,
-        calls: list[SemanticCallMetadata],
+        calls: Sequence[SemanticCallMetadata],
     ) -> SemanticCompilationResult:
         return SemanticCompilationResult(
             disposition="failed",

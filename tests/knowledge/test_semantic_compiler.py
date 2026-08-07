@@ -236,6 +236,31 @@ def test_one_material_finding_triggers_exactly_one_repair_then_accepts():
     assert repair_payload["critic"]["findings"][0]["code"] == "context_omission"
 
 
+def test_repaired_bundle_keeps_original_extractor_metadata_and_final_critic_model():
+    compiler, _ = _compiler(
+        [
+            _HostResult(_draft().model_dump(mode="json"), model="extractor-model"),
+            _HostResult({"accepted": False, "findings": [_finding()]}, model="initial-critic"),
+            _HostResult(_draft(architecture=True).model_dump(mode="json"), model="repair-model"),
+            _HostResult({"accepted": True}, model="final-critic"),
+        ]
+    )
+
+    result = compiler.compile(_prepared_source())
+
+    assert result.disposition == "verified"
+    assert result.bundle is not None
+    assert result.bundle.compilation_manifest.extractor_model_id == "extractor-model"
+    assert result.bundle.compilation_manifest.critic_model_id == "final-critic"
+    assert result.bundle.references[0].extraction.model_id == "extractor-model"
+    assert [call.model for call in result.calls] == [
+        "extractor-model",
+        "initial-critic",
+        "repair-model",
+        "final-critic",
+    ]
+
+
 def test_material_finding_after_repair_is_quarantined_without_artifacts():
     compiler, host = _compiler(
         [
@@ -284,6 +309,18 @@ def test_architecture_omission_repair_emits_a_cited_context_assertion():
     ]
 
 
+def test_incomplete_extractor_segment_accounting_fails_before_critic():
+    incomplete = _draft().model_copy(update={"ignored_segment_indexes": ()})
+    compiler, host = _compiler([_HostResult(incomplete.model_dump(mode="json"))])
+
+    result = compiler.compile(_prepared_source())
+
+    assert result.disposition == "failed"
+    assert result.failure_code == "invalid_structured_response"
+    assert [call.purpose for call in result.calls] == ["sedna.semantic.extract"]
+    assert _purposes(host) == ["sedna.semantic.extract"]
+
+
 @pytest.mark.parametrize(
     ("response", "failure_code"),
     [
@@ -322,6 +359,48 @@ def test_critic_failure_retains_successful_extractor_call_metadata():
     assert _purposes(host) == ["sedna.semantic.extract", "sedna.semantic.critic"]
 
 
+@pytest.mark.parametrize(
+    ("results", "expected_purposes"),
+    [
+        (
+            [
+                _HostResult(_draft().model_dump(mode="json")),
+                _HostResult({"accepted": False, "findings": [_finding()]}),
+                RuntimeError("repair secret"),
+            ],
+            ["sedna.semantic.extract", "sedna.semantic.critic"],
+        ),
+        (
+            [
+                _HostResult(_draft().model_dump(mode="json")),
+                _HostResult({"accepted": False, "findings": [_finding()]}),
+                _HostResult(_draft(architecture=True).model_dump(mode="json")),
+                RuntimeError("post-critic secret"),
+            ],
+            [
+                "sedna.semantic.extract",
+                "sedna.semantic.critic",
+                "sedna.semantic.repair",
+            ],
+        ),
+    ],
+)
+def test_repair_stage_failures_retain_all_successful_call_metadata(
+    results: list[object], expected_purposes: list[str]
+):
+    compiler, host = _compiler(results)
+
+    result = compiler.compile(_prepared_source())
+
+    assert result.disposition == "failed"
+    assert result.failure_code == "transport_failure"
+    assert [call.purpose for call in result.calls] == expected_purposes
+    assert _purposes(host) == [
+        *expected_purposes,
+        "sedna.semantic.repair" if len(expected_purposes) == 2 else "sedna.semantic.critic",
+    ]
+
+
 def test_unsafe_canonical_material_is_quarantined(monkeypatch: pytest.MonkeyPatch):
     import sedna.knowledge.semantic.compiler as compiler_module
 
@@ -340,3 +419,48 @@ def test_unsafe_canonical_material_is_quarantined(monkeypatch: pytest.MonkeyPatc
     assert result.quarantine is not None
     assert result.quarantine.reason_codes == ("unsafe_material",)
     assert _purposes(host) == ["sedna.semantic.extract", "sedna.semantic.critic"]
+
+
+def test_unexpected_materializer_failure_is_a_typed_failure(monkeypatch: pytest.MonkeyPatch):
+    import sedna.knowledge.semantic.compiler as compiler_module
+
+    compiler, host = _compiler(
+        [_HostResult(_draft().model_dump(mode="json")), _HostResult({"accepted": True})]
+    )
+
+    def fail_materialization(*args: object, **kwargs: object) -> tuple[object, ...]:
+        raise RuntimeError("materializer implementation failure")
+
+    monkeypatch.setattr(compiler_module, "materialize_bundle", fail_materialization)
+    result = compiler.compile(_prepared_source())
+
+    assert result.disposition == "failed"
+    assert result.failure_code == "materialization_failure"
+    assert result.quarantine is None
+    assert _purposes(host) == ["sedna.semantic.extract", "sedna.semantic.critic"]
+
+
+def test_decreasing_clock_produces_internal_failure_not_unsafe_quarantine():
+    instants = iter(
+        [
+            datetime(2026, 8, 7, 12, 0, tzinfo=UTC),
+            datetime(2026, 8, 7, 11, 0, tzinfo=UTC),
+            datetime(2026, 8, 7, 11, 0, tzinfo=UTC),
+            datetime(2026, 8, 7, 11, 0, tzinfo=UTC),
+            datetime(2026, 8, 7, 11, 0, tzinfo=UTC),
+        ]
+    )
+    host = _ScriptedHost(
+        [_HostResult(_draft().model_dump(mode="json")), _HostResult({"accepted": True})]
+    )
+    compiler = SemanticCompiler(HadesLlmAdapter(host), clock=lambda: next(instants))
+
+    result = compiler.compile(_prepared_source())
+
+    assert result.disposition == "failed"
+    assert result.failure_code == "internal_failure"
+    assert result.quarantine is None
+    assert [call.purpose for call in result.calls] == [
+        "sedna.semantic.extract",
+        "sedna.semantic.critic",
+    ]

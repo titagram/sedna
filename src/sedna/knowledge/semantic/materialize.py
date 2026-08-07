@@ -62,7 +62,7 @@ def materialize_bundle(
     verification_status = VerificationStatus(verification_status)
 
     drafts.validate_against_segment_count(len(prepared.segments))
-    _require_segment_accounting(prepared, drafts)
+    validate_segment_accounting(prepared, drafts)
 
     extraction = _extraction_metadata(prepared, call_metadata)
     artifacts = tuple(
@@ -354,7 +354,8 @@ def _resolve_citations(
     return _sorted_source_refs(tuple(refs))
 
 
-def _require_segment_accounting(prepared: PreparedSource, drafts: SemanticDraftBundle) -> None:
+def validate_segment_accounting(prepared: PreparedSource, drafts: SemanticDraftBundle) -> None:
+    """Require every prepared segment to have draft evidence or an explicit omission."""
     cited_indexes = set(_all_cited_indexes(drafts))
     ignored_indexes = set(drafts.ignored_segment_indexes)
     missing = set(range(len(prepared.segments))) - cited_indexes - ignored_indexes
