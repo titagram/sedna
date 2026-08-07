@@ -228,7 +228,7 @@ class CanonicalArtifactMetadata(BaseModel):
             ObservedOutcome,
         )
 
-        payload["applicability"] = ApplicabilityContext()
+        payload.setdefault("applicability", ApplicabilityContext())
         payload["assessment"] = EpistemicAssessment(
             source_reliability=0.5,
             extraction_confidence=0.5,

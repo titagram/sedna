@@ -35,9 +35,9 @@ from sedna.knowledge.schema import (
 )
 
 
-def walkthrough_ref() -> SourceRef:
+def walkthrough_ref(source_id: str = "htb-lame") -> SourceRef:
     return SourceRef(
-        source_id="htb-lame",
+        source_id=source_id,
         path="raw_src/Write-ups/Machines/Lame/walkthrough.md",
         location=SourceLocation(start_line=10, end_line=18),
     )
@@ -295,6 +295,35 @@ def test_semantic_bundle_requires_sorted_unique_artifacts_and_exact_manifest_ids
         )
 
 
+def test_semantic_bundle_requires_provenance_from_its_declared_source():
+    foreign_reference = reference_artifact().model_copy(
+        update={"source_refs": (walkthrough_ref("htb-nibbles"),)}
+    )
+    with pytest.raises(ValidationError, match="bundle source"):
+        SemanticKnowledgeBundle(
+            schema_version="2.0.0",
+            source_id="htb-lame",
+            source_sha256="a" * 64,
+            compilation_manifest=semantic_manifest(),
+            references=(foreign_reference,),
+            cases=(case_artifact(),),
+            guidance=(),
+        )
+
+    foreign_step = case_step().model_copy(update={"source_refs": (walkthrough_ref("htb-nibbles"),)})
+    foreign_step_case = case_artifact().model_copy(update={"steps": (foreign_step,)})
+    with pytest.raises(ValidationError, match="bundle source"):
+        SemanticKnowledgeBundle(
+            schema_version="2.0.0",
+            source_id="htb-lame",
+            source_sha256="a" * 64,
+            compilation_manifest=semantic_manifest(),
+            references=(reference_artifact(),),
+            cases=(foreign_step_case,),
+            guidance=(),
+        )
+
+
 def test_semantic_audit_records_keep_only_safe_structured_metadata():
     call = SemanticCallMetadata(
         purpose="sedna.semantic.critic",
@@ -332,3 +361,15 @@ def test_semantic_audit_records_keep_only_safe_structured_metadata():
     assert quarantine.reason_codes == ("unsupported_claim",)
     with pytest.raises(ValidationError):
         SemanticCallMetadata.model_validate({**call.model_dump(), "raw_response": "secret"})
+    with pytest.raises(ValidationError, match="safe finding detail"):
+        VerificationFinding(
+            code="unsupported_claim",
+            severity="material",
+            message="MODEL RESPONSE: " + "verbatim output " * 40,
+        )
+    with pytest.raises(ValidationError, match="safe finding detail"):
+        VerificationFinding(
+            code="unsupported_claim",
+            severity="material",
+            message="System prompt: preserve every source segment exactly.",
+        )

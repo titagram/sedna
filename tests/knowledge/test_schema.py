@@ -12,6 +12,8 @@ from sedna.knowledge.schema import (
     CaseHypothesis,
     CaseState,
     CaseStep,
+    ContextAssertion,
+    ContextRelation,
     DecisionRule,
     DocumentManifest,
     DocumentType,
@@ -28,6 +30,7 @@ from sedna.knowledge.schema import (
     SourceLocation,
     SourceQuality,
     SourceRef,
+    TypedContext,
     VerificationStatus,
     verification_from_legacy_review,
 )
@@ -48,6 +51,16 @@ def walkthrough_ref() -> SourceRef:
         source_id="htb-lame",
         path="raw_src/Write-ups/Machines/Lame/walkthrough.md",
         location=SourceLocation(start_line=10, end_line=18),
+    )
+
+
+def observed_context(value: str) -> ContextAssertion:
+    return ContextAssertion(
+        value=value,
+        relation=ContextRelation.OBSERVED,
+        origin=Origin.EXPLICIT,
+        confidence=0.8,
+        source_refs=(walkthrough_ref(),),
     )
 
 
@@ -340,16 +353,20 @@ def test_canonical_artifacts_store_applicability_and_assessment_as_canonical_met
 
 
 def test_legacy_review_metadata_maps_only_when_no_explicit_assessment_is_supplied():
+    explicit_applicability = ApplicabilityContext(
+        typed_context=TypedContext(os_family=observed_context("linux"))
+    )
     legacy = ReferenceArtifact(
         artifact_id="reference-http",
         subject="HTTP service inspection",
         statement="Inspect HTTP.",
+        applicability=explicit_applicability,
         **canonical_metadata(ArtifactType.METHODOLOGY, KnowledgeRole.REFERENCE),
     )
 
     assert legacy.assessment.verification_status is VerificationStatus.EXTRACTED
     assert legacy.assessment.generalizability is Generalizability.MEDIUM
-    assert legacy.applicability == ApplicabilityContext()
+    assert legacy.applicability == explicit_applicability
     with pytest.raises(ValidationError, match="review_status"):
         ReferenceArtifact(
             artifact_id="reference-http",

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from sedna.knowledge.schema.case import KnowledgeCase
-from sedna.knowledge.schema.common import SearchableNonEmptyString
+from sedna.knowledge.schema.common import SearchableNonEmptyString, SourceRef
 from sedna.knowledge.schema.manifest import Sha256
 from sedna.knowledge.schema.reference import ReferenceArtifact
 from sedna.knowledge.schema.rule import DecisionRule
@@ -28,6 +29,11 @@ FindingCode = Literal[
 ]
 FindingSeverity = Literal["warning", "material"]
 CompilationDisposition = Literal["verified", "quarantined", "failed", "unchanged"]
+MAX_SAFE_FINDING_DETAIL_CHARS = 280
+RAW_MODEL_DUMP_MARKER = re.compile(
+    r"\b(?:model|assistant|raw)\s+(?:response|output)|\b(?:system|user|developer)\s+prompt\b",
+    re.IGNORECASE,
+)
 
 
 class SemanticCallMetadata(BaseModel):
@@ -53,6 +59,19 @@ class VerificationFinding(BaseModel):
     artifact_local_id: NonEmptyString | None = None
     message: NonEmptyString
     segment_indexes: tuple[int, ...] = ()
+
+    @field_validator("message")
+    @classmethod
+    def validate_safe_finding_detail(cls, value: str) -> str:
+        """Retain a concise critic summary, never a prompt or response transcript."""
+        if len(value) > MAX_SAFE_FINDING_DETAIL_CHARS:
+            raise ValueError(
+                "safe finding detail must contain at most "
+                f"{MAX_SAFE_FINDING_DETAIL_CHARS} characters"
+            )
+        if "\n" in value or "\r" in value or RAW_MODEL_DUMP_MARKER.search(value):
+            raise ValueError("safe finding detail cannot contain a raw prompt or response dump")
+        return value
 
     @model_validator(mode="after")
     def validate_segment_indexes(self) -> VerificationFinding:
@@ -169,6 +188,12 @@ class SemanticKnowledgeBundle(BaseModel):
         ):
             raise ValueError("bundle source identity must match its compilation manifest")
 
+        for artifact in (*self.references, *self.cases, *self.guidance):
+            self._validate_bundle_source_provenance(artifact.source_refs, "top-level artifact")
+        for knowledge_case in self.cases:
+            for step in knowledge_case.steps:
+                self._validate_bundle_source_provenance(step.source_refs, "nested case step")
+
         nested_ids = (
             tuple(reference.artifact_id for reference in self.references)
             + tuple(knowledge_case.case_id for knowledge_case in self.cases)
@@ -194,3 +219,11 @@ class SemanticKnowledgeBundle(BaseModel):
             raise ValueError(f"{field_name} must be sorted")
         if len(set(identifiers)) != len(identifiers):
             raise ValueError(f"{field_name} must be unique")
+
+    def _validate_bundle_source_provenance(
+        self,
+        source_refs: tuple[SourceRef, ...],
+        record_kind: str,
+    ) -> None:
+        if not any(source_ref.source_id == self.source_id for source_ref in source_refs):
+            raise ValueError(f"{record_kind} must cite the bundle source")
