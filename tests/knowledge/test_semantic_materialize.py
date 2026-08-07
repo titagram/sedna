@@ -30,10 +30,10 @@ from sedna.knowledge.semantic import (
 from sedna.knowledge.semantic.materialize import materialize_bundle
 
 
-def _prepared_source() -> PreparedSource:
+def _prepared_source(*, path: str = "raw_src/material.md") -> PreparedSource:
     document = parse_markdown(
         "material-source",
-        "raw_src/material.md",
+        path,
         """# Discovery
 
 The service exposes HTTP on port 80.
@@ -45,7 +45,7 @@ Inspect the HTTP response before selecting an action.
     )
     manifest = DocumentManifest(
         source_id="material-source",
-        path="raw_src/material.md",
+        path=path,
         sha256="a" * 64,
         title="Materialization notes",
         language="en",
@@ -113,6 +113,28 @@ def test_materialize_resolves_exact_segment_provenance_and_host_metadata():
     assert artifact.extraction.parser_id == "markdown-it"
     assert artifact.extraction.extractor_id == "sedna-semantic-extractor"
     assert artifact.extraction.model_id == "host-model"
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    (
+        "raw_src/HTB{path_final}.md",
+        "raw_src/HTB%2526%2523123%253Bpath_final%2526%2523125%253B.md",
+        "raw_src/Root flag abcdef0123456789abcdef0123456789.md",
+        "raw_src/User flag 0123456789abcdef0123456789abcdef.md",
+    ),
+)
+def test_materialize_rejects_final_flag_material_from_foundation_paths(unsafe_path: str):
+    """Would fail if a valid raw provenance path leaked into a canonical SourceRef."""
+    prepared = _prepared_source(path=unsafe_path)
+
+    with pytest.raises(ValueError, match="final flag"):
+        materialize_bundle(
+            prepared,
+            _bundle(_reference(), ignored=(1,)),
+            _call_metadata(),
+            VerificationStatus.VERIFIED,
+        )
 
 
 def test_materialize_rejects_out_of_range_or_unaccounted_for_segments():

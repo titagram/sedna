@@ -5,12 +5,16 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from sedna.knowledge.parsing import PreparedSource
+from sedna.knowledge.parsing.models import validate_prepared_source
 from sedna.knowledge.semantic.compiler import (
     SEMANTIC_COMPILER_VERSION,
     SEMANTIC_SCHEMA_VERSION,
     SemanticCompiler,
 )
-from sedna.knowledge.semantic.drafts import SemanticCompilationResult
+from sedna.knowledge.semantic.drafts import (
+    CANONICAL_COMPILATION_FAILURE_MESSAGES,
+    SemanticCompilationResult,
+)
 from sedna.knowledge.semantic.prompts import (
     CRITIC_PROMPT_VERSION,
     EXTRACTOR_PROMPT_VERSION,
@@ -34,6 +38,14 @@ class SemanticIngestionService:
 
     def compile_and_store(self, prepared: PreparedSource) -> SemanticCompilationResult:
         """Return current canonical semantics or compile and persist one stale source."""
+        try:
+            prepared = validate_prepared_source(prepared)
+        except (TypeError, ValueError):
+            return SemanticCompilationResult(
+                disposition="failed",
+                failure_code="invalid_input",
+                failure_message=CANONICAL_COMPILATION_FAILURE_MESSAGES["invalid_input"],
+            )
         source_id = prepared.manifest.source_id
         with self._repository.semantic_compilation_guard(source_id):
             current = self._repository.load_current_semantic_result(

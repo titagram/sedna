@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 
 from sedna.knowledge.parsing import PreparedSource
+from sedna.knowledge.parsing.models import validate_prepared_source
 from sedna.knowledge.schema import (
     DecisionRule,
     KnowledgeCase,
@@ -365,9 +366,7 @@ class SemanticCompiler:
 
     @staticmethod
     def _validated_prepared(prepared: PreparedSource) -> PreparedSource:
-        if not isinstance(prepared, PreparedSource):
-            raise TypeError("prepared must be a PreparedSource")
-        return PreparedSource.model_validate(prepared.model_dump(mode="json", warnings="error"))
+        return validate_prepared_source(prepared)
 
     def _failed(
         self,

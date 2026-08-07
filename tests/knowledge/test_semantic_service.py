@@ -410,6 +410,55 @@ def test_current_second_pass_loads_typed_unchanged_result_without_an_llm_call(
         assert _purposes(host) == ["sedna.semantic.extract", "sedna.semantic.critic"]
 
 
+@pytest.mark.parametrize("corrupt_field", ("document", "segments"))
+def test_service_deeply_rejects_constructed_prepared_source_before_lock_or_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corrupt_field: str,
+) -> None:
+    """Would fail if a valid-looking manifest let corrupt nested input return unchanged."""
+    with _prepared_case(tmp_path, "reference") as (pipeline, prepared, _, _):
+        service, host = _service(
+            pipeline.repository,
+            _load_responses(SOURCE_CASES["reference"].fixture_name),
+        )
+        assert service.compile_and_store(prepared).disposition == "verified"
+        corruption = {
+            "document": {"document": "corrupt", "segments": ()},
+            "segments": {"document": prepared.document, "segments": ("corrupt",)},
+        }[corrupt_field]
+        constructed = PreparedSource.model_construct(
+            manifest=prepared.manifest,
+            **corruption,
+        )
+        guard_calls = 0
+        load_calls = 0
+        real_guard = pipeline.repository.semantic_compilation_guard
+        real_load = pipeline.repository.load_current_semantic_result
+
+        @contextmanager
+        def recording_guard(source_id: str) -> Iterator[None]:
+            nonlocal guard_calls
+            guard_calls += 1
+            with real_guard(source_id):
+                yield
+
+        def recording_load(*args: object, **kwargs: object) -> object:
+            nonlocal load_calls
+            load_calls += 1
+            return real_load(*args, **kwargs)
+
+        monkeypatch.setattr(pipeline.repository, "semantic_compilation_guard", recording_guard)
+        monkeypatch.setattr(pipeline.repository, "load_current_semantic_result", recording_load)
+
+        result = service.compile_and_store(constructed)
+
+        assert result.disposition == "failed"
+        assert result.failure_code == "invalid_input"
+        assert guard_calls == load_calls == 0
+        assert _purposes(host) == ["sedna.semantic.extract", "sedna.semantic.critic"]
+
+
 def test_concurrent_stale_services_compile_once_and_return_coherent_results(
     tmp_path: Path,
 ) -> None:

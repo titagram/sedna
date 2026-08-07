@@ -8,6 +8,7 @@ from collections.abc import Iterable, Mapping
 from typing import TypeVar
 
 from sedna.knowledge.parsing import PreparedSource
+from sedna.knowledge.parsing.models import validate_prepared_source
 from sedna.knowledge.schema import (
     ApplicabilityContext,
     CaseStep,
@@ -56,7 +57,7 @@ def materialize_bundle(
     Draft-local identifiers never cross this boundary.  The caller supplies the adjudicated
     status because extractor output is not permitted to declare canonical verification.
     """
-    prepared = PreparedSource.model_validate(prepared.model_dump(mode="json"))
+    prepared = validate_prepared_source(prepared)
     drafts = SemanticDraftBundle.model_validate(drafts.model_dump(mode="json"))
     call_metadata = SemanticCallMetadata.model_validate(call_metadata.model_dump(mode="json"))
     verification_status = VerificationStatus(verification_status)

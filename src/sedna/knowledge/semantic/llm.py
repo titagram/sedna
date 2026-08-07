@@ -9,9 +9,10 @@ from itertools import pairwise
 from types import MappingProxyType
 from typing import Generic, Literal, Protocol, Self, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from sedna.knowledge.parsing import PreparedSource
+from sedna.knowledge.parsing.sanitize import sanitize_asset_target
 from sedna.knowledge.schema import DocumentType, KnowledgeRole, SourceQuality
 from sedna.knowledge.schema.common import SearchableNonEmptyString, SearchableString
 from sedna.knowledge.semantic.drafts import CriticVerdict, SemanticDraftBundle
@@ -125,8 +126,16 @@ class SafeSegmentAsset(BaseModel):
     )
 
     asset_index: int = Field(ge=0)
+    target: SearchableNonEmptyString
     start_line: int = Field(ge=1)
     end_line: int = Field(ge=1)
+
+    @field_validator("target")
+    @classmethod
+    def validate_safe_locator(cls, value: str) -> str:
+        if sanitize_asset_target(value) != value:
+            raise ValueError("asset target must be a retrieval-safe locator")
+        return value
 
     @model_validator(mode="after")
     def validate_line_span(self) -> Self:
@@ -242,6 +251,7 @@ def build_safe_source_payload(prepared: PreparedSource) -> SafePreparedSourcePay
                 assets=tuple(
                     SafeSegmentAsset(
                         asset_index=asset.asset_index,
+                        target=asset.target,
                         start_line=asset.start_line,
                         end_line=asset.end_line,
                     )

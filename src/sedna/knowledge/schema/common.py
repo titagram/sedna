@@ -133,8 +133,8 @@ class SourceLocation(BaseModel):
     start_line: int | None = Field(default=None, ge=1)
     end_line: int | None = Field(default=None, ge=1)
     page: int | None = Field(default=None, ge=1)
-    section: str | None = Field(default=None, min_length=1)
-    asset_path: str | None = Field(default=None, min_length=1)
+    section: SearchableNonEmptyString | None = None
+    asset_path: SearchableNonEmptyString | None = None
 
     @model_validator(mode="after")
     def validate_location(self) -> SourceLocation:
@@ -152,7 +152,7 @@ class SourceRef(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     source_id: str = Field(min_length=1)
-    path: str = Field(min_length=1)
+    path: SearchableNonEmptyString
     location: SourceLocation
 
 

@@ -158,9 +158,7 @@ def test_manifest_only_transition_rolls_back_if_manifest_write_fails(
             "quarantine_reasons": ("ambiguous",),
         }
     )
-    old_quarantine = complete_quarantine().model_copy(
-        update={"reason_codes": ("ambiguous",)}
-    )
+    old_quarantine = complete_quarantine().model_copy(update={"reason_codes": ("ambiguous",)})
     repository.write_manifest(old_manifest)
     repository.write_quarantine(old_quarantine)
     new_manifest = complete_manifest().model_copy(
@@ -376,8 +374,7 @@ def test_atomic_replace_failure_preserves_old_target_and_cleans_temp(
 def test_concurrent_writers_to_one_target_never_collide_or_corrupt(tmp_path: Path) -> None:
     repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
     manifests = tuple(
-        complete_manifest("source-shared", title=f"Candidate {index}")
-        for index in range(16)
+        complete_manifest("source-shared", title=f"Candidate {index}") for index in range(16)
     )
 
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -405,6 +402,38 @@ def test_repository_rejects_unsafe_record_ids(tmp_path: Path, source_id: str) ->
 
     with pytest.raises(ValueError, match="safe path segment"):
         repository.write_manifest(complete_manifest(source_id))
+
+
+@pytest.mark.parametrize("method_name", ("load_manifest", "load_quarantine"))
+def test_repository_loaders_reject_empty_id_without_dot_json_fallback(
+    tmp_path: Path,
+    method_name: str,
+) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+
+    with pytest.raises(ValueError, match="safe path segment"):
+        getattr(repository, method_name)("")
+
+    assert not any(path.name == ".json" for path in repository.root.rglob(".json"))
+
+
+@pytest.mark.parametrize(
+    "journal_name",
+    (".transaction.json", ".semantic-transaction.json"),
+)
+def test_startup_recovery_rejects_empty_journal_id_without_dot_lock_fallback(
+    tmp_path: Path,
+    journal_name: str,
+) -> None:
+    root = tmp_path / "knowledge"
+    transactions = root / "transactions"
+    transactions.mkdir(parents=True)
+    (transactions / journal_name).write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="safe path segment"):
+        CanonicalKnowledgeRepository(root)
+
+    assert not (transactions / ".lock").exists()
 
 
 def test_repository_rejects_symlinked_directory_escape(tmp_path: Path) -> None:
@@ -442,9 +471,7 @@ def test_parent_symlink_swap_during_write_cannot_redirect_output(
         nonlocal swapped
         if not swapped and os.fspath(path).startswith(".source-123.json."):
             (repository.root / "manifests").rename(original_directory)
-            (repository.root / "manifests").symlink_to(
-                outside, target_is_directory=True
-            )
+            (repository.root / "manifests").symlink_to(outside, target_is_directory=True)
             swapped = True
         return real_open(path, flags, mode, dir_fd=dir_fd)
 
@@ -516,9 +543,7 @@ def test_parent_symlink_swap_during_load_cannot_redirect_read(
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "source-123.json").write_text(
-        repository_module.json.dumps(
-            complete_manifest(title="Untrusted").model_dump(mode="json")
-        ),
+        repository_module.json.dumps(complete_manifest(title="Untrusted").model_dump(mode="json")),
         encoding="utf-8",
     )
     original_directory = repository.root / "manifests-original"
@@ -535,9 +560,7 @@ def test_parent_symlink_swap_during_load_cannot_redirect_read(
         nonlocal swapped
         if not swapped and os.fspath(path) == "source-123.json":
             (repository.root / "manifests").rename(original_directory)
-            (repository.root / "manifests").symlink_to(
-                outside, target_is_directory=True
-            )
+            (repository.root / "manifests").symlink_to(outside, target_is_directory=True)
             swapped = True
         return real_open(path, flags, mode, dir_fd=dir_fd)
 

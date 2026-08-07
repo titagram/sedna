@@ -208,6 +208,7 @@ def test_safe_payload_reconstructs_only_whitelisted_retrieval_safe_fields(monkey
     }
     assert set(dumped["segments"][0]["assets"][0]) == {
         "asset_index",
+        "target",
         "start_line",
         "end_line",
     }
@@ -224,7 +225,7 @@ def test_safe_payload_reconstructs_only_whitelisted_retrieval_safe_fields(monkey
     assert "metadata" not in serialized
     assert "blocks" not in serialized
     assert "relationships" not in serialized
-    assert "target" not in dumped["segments"][0]["assets"][0]
+    assert dumped["segments"][0]["assets"][0]["target"] == prepared.segments[0].assets[0].target
 
 
 def test_safe_payload_rejects_final_flags_in_whitelisted_fields():
@@ -239,15 +240,16 @@ def test_safe_payload_rejects_final_flags_in_whitelisted_fields():
         SafeSourceSegment(index=0, start_line=1, end_line=1, text="HTB{segment_flag}")
 
 
-def test_safe_payload_omits_asset_locator_strings_regardless_of_their_content():
+def test_safe_payload_uses_only_the_foundation_sanitized_asset_locator():
     prepared = _prepared_source()
     credentialed_asset = prepared.document.assets[0].model_copy(
         update={
             "target": (
                 "https://alice:sk-userinfo@example.test/proof.png"
                 "?api_key=sk-query-example#private-fragment"
-            )
-        }
+            ),
+            "metadata": {"provider_api_key": "sk-metadata-example"},
+        },
     )
     document = prepared.document.model_copy(update={"assets": (credentialed_asset,)})
     prepared = PreparedSource(
@@ -256,14 +258,54 @@ def test_safe_payload_omits_asset_locator_strings_regardless_of_their_content():
         segments=segment_document(document),
     )
 
-    serialized = build_safe_source_payload(prepared).model_dump_json()
+    segment_target = prepared.segments[0].assets[0].target
+    host = _RecordingHost(_HostResult(parsed={"artifacts": [], "ignored_segment_indexes": [0]}))
+    payload = build_safe_source_payload(prepared)
+    HadesLlmAdapter(host).complete(
+        SemanticDraftBundle,
+        instructions=EXTRACTOR_PROMPT,
+        payload=payload,
+        purpose="sedna.semantic.extract",
+    )
+    serialized = host.calls[0]["input"][0]["text"]
+    recorded = json.loads(serialized)
 
+    assert prepared.document.assets[0].target.startswith("https://alice:")
+    assert segment_target == "https://example.test/proof.png"
+    assert payload.segments[0].assets[0].target == segment_target
+    assert recorded["segments"][0]["assets"][0]["target"] == segment_target
     assert "alice" not in serialized
     assert "sk-userinfo" not in serialized
     assert "api_key" not in serialized
     assert "sk-query-example" not in serialized
     assert "private-fragment" not in serialized
-    assert "target" not in SafeSegmentAsset.model_fields
+    assert "sk-metadata-example" not in serialized
+    assert "metadata" not in serialized
+    assert SafeSegmentAsset.model_fields["target"].is_required()
+
+
+def test_safe_payload_preserves_benign_relative_and_remote_asset_locators_for_host():
+    prepared = _prepared_from_markdown(
+        """# Evidence
+
+![relative](shots/proof.png)
+![remote](https://example.test/evidence/proof.png)
+"""
+    )
+    host = _RecordingHost(_HostResult(parsed={"artifacts": [], "ignored_segment_indexes": [0]}))
+
+    HadesLlmAdapter(host).complete(
+        SemanticDraftBundle,
+        instructions=EXTRACTOR_PROMPT,
+        payload=build_safe_source_payload(prepared),
+        purpose="sedna.semantic.extract",
+    )
+
+    recorded = json.loads(host.calls[0]["input"][0]["text"])
+    assert [asset["target"] for asset in recorded["segments"][0]["assets"]] == [
+        "shots/proof.png",
+        "https://example.test/evidence/proof.png",
+    ]
 
 
 def test_source_authored_credential_examples_reach_recorded_extractor_unchanged():
@@ -317,9 +359,9 @@ def test_closed_critic_and_repair_envelopes_accept_only_safe_typed_content():
 @pytest.mark.parametrize(
     "asset",
     [
-        {"asset_index": -1, "start_line": 1, "end_line": 1},
-        {"asset_index": 0, "start_line": 0, "end_line": 1},
-        {"asset_index": 0, "start_line": 3, "end_line": 2},
+        {"asset_index": -1, "target": "proof.png", "start_line": 1, "end_line": 1},
+        {"asset_index": 0, "target": "proof.png", "start_line": 0, "end_line": 1},
+        {"asset_index": 0, "target": "proof.png", "start_line": 3, "end_line": 2},
     ],
 )
 def test_safe_asset_records_reject_invalid_indexes_and_line_spans(asset):
@@ -359,6 +401,7 @@ def test_safe_segment_requires_asset_spans_to_be_contained(start_line, end_line)
             assets=(
                 SafeSegmentAsset(
                     asset_index=0,
+                    target="proof.png",
                     start_line=start_line,
                     end_line=end_line,
                 ),
@@ -370,27 +413,28 @@ def test_safe_segment_requires_asset_spans_to_be_contained(start_line, end_line)
     "assets",
     [
         (
-            SafeSegmentAsset(asset_index=0, start_line=11, end_line=11),
-            SafeSegmentAsset(asset_index=0, start_line=12, end_line=12),
+            {"asset_index": 0, "target": "one.png", "start_line": 11, "end_line": 11},
+            {"asset_index": 0, "target": "two.png", "start_line": 12, "end_line": 12},
         ),
         (
-            SafeSegmentAsset(asset_index=1, start_line=11, end_line=11),
-            SafeSegmentAsset(asset_index=0, start_line=12, end_line=12),
+            {"asset_index": 1, "target": "one.png", "start_line": 11, "end_line": 11},
+            {"asset_index": 0, "target": "two.png", "start_line": 12, "end_line": 12},
         ),
         (
-            SafeSegmentAsset(asset_index=0, start_line=12, end_line=12),
-            SafeSegmentAsset(asset_index=1, start_line=11, end_line=11),
+            {"asset_index": 0, "target": "two.png", "start_line": 12, "end_line": 12},
+            {"asset_index": 1, "target": "one.png", "start_line": 11, "end_line": 11},
         ),
     ],
 )
 def test_safe_segment_requires_unique_deterministically_ordered_assets(assets):
+    constructed_assets = tuple(SafeSegmentAsset.model_construct(**asset) for asset in assets)
     with pytest.raises(ValidationError, match="unique and ordered"):
         SafeSourceSegment(
             index=0,
             start_line=10,
             end_line=20,
             text="safe",
-            assets=assets,
+            assets=constructed_assets,
         )
 
 
@@ -434,16 +478,19 @@ def test_adapter_deep_revalidation_blocks_impossible_provenance_before_host_call
     segment = source.segments[0]
     contained = SafeSegmentAsset(
         asset_index=0,
+        target="contained.png",
         start_line=segment.start_line,
         end_line=segment.start_line,
     )
     later = SafeSegmentAsset(
         asset_index=1,
+        target="later.png",
         start_line=segment.end_line,
         end_line=segment.end_line,
     )
     outside = SafeSegmentAsset(
         asset_index=0,
+        target="outside.png",
         start_line=segment.end_line + 1,
         end_line=segment.end_line + 1,
     )
@@ -490,6 +537,42 @@ def test_adapter_deep_revalidation_blocks_impossible_provenance_before_host_call
                 payload=corrupted,
                 purpose="sedna.semantic.extract",
             )
+
+    assert host.calls == []
+
+
+@pytest.mark.parametrize(
+    "unsafe_target",
+    (
+        "HTB{asset_final}.png",
+        "HTB%2526%2523123%253Basset_final%2526%2523125%253B.png",
+        "Root flag abcdef0123456789abcdef0123456789.png",
+        "User flag 0123456789abcdef0123456789abcdef.png",
+    ),
+)
+def test_adapter_rejects_constructed_unsafe_asset_targets_before_host(
+    unsafe_target: str,
+):
+    source = build_safe_source_payload(_prepared_source())
+    segment = source.segments[0]
+    unsafe_asset = SafeSegmentAsset.model_construct(
+        asset_index=0,
+        target=unsafe_target,
+        start_line=segment.start_line,
+        end_line=segment.start_line,
+    )
+    corrupted = source.model_copy(
+        update={"segments": (segment.model_copy(update={"assets": (unsafe_asset,)}),)}
+    )
+    host = _RecordingHost(_HostResult(parsed={"artifacts": [], "ignored_segment_indexes": []}))
+
+    with pytest.raises(TypeError, match="safe semantic request payload"):
+        HadesLlmAdapter(host).complete(
+            SemanticDraftBundle,
+            instructions=EXTRACTOR_PROMPT,
+            payload=corrupted,
+            purpose="sedna.semantic.extract",
+        )
 
     assert host.calls == []
 

@@ -24,6 +24,7 @@ from pydantic import (
 )
 
 from sedna.knowledge.parsing import PreparedSource
+from sedna.knowledge.parsing.models import validate_prepared_source
 from sedna.knowledge.schema import (
     DocumentManifest,
     ExtractionMetadata,
@@ -47,7 +48,8 @@ _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
 def _validate_stable_id(value: str) -> str:
     if (
-        value in {".", ".."}
+        not value
+        or value in {".", ".."}
         or "\x00" in value
         or "/" in value
         or "\\" in value
@@ -342,8 +344,7 @@ class CanonicalKnowledgeRepository:
         critic_model_id: str | None = None,
     ) -> SemanticCompilationResult | None:
         """Atomically load one current, cross-validated verified semantic pair."""
-        if not isinstance(prepared, PreparedSource):
-            raise TypeError("prepared must be a PreparedSource")
+        prepared = validate_prepared_source(prepared)
         if pin_models and (not extractor_model_id or not critic_model_id):
             raise ValueError("model-pinned currentness requires both model identifiers")
         source_id = prepared.manifest.source_id

@@ -5,7 +5,7 @@ from __future__ import annotations
 import html
 import re
 from typing import NamedTuple
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 EXCLUDED_FLAG = "<EXCLUDED_FLAG>"
 
@@ -18,9 +18,7 @@ _HTB_FLAG_RE = re.compile(r"HTB\{[^}]*\}", re.IGNORECASE)
 _HTB_OPEN_MARKER_RE = re.compile(r"HTB\{", re.IGNORECASE)
 _HTB_ENCODED_FLAG_RE = re.compile(r"HTB%7B(?:(?!%7D).)*%7D", re.IGNORECASE)
 _HTB_ENCODED_OPEN_MARKER_RE = re.compile(r"HTB%7B", re.IGNORECASE)
-_STANDALONE_32_HEX_RE = re.compile(
-    r"(?<![A-Za-z0-9])[0-9A-Fa-f]{32}(?![A-Za-z0-9])"
-)
+_STANDALONE_32_HEX_RE = re.compile(r"(?<![A-Za-z0-9])[0-9A-Fa-f]{32}(?![A-Za-z0-9])")
 _EXACT_HEX_FLAG_HEADINGS = frozenset(
     {
         "flag",
@@ -57,11 +55,13 @@ def sanitize_asset_target(target: str) -> str:
     Asset locators are not strategic evidence and opaque 32-hex path components have
     no retrieval value, so this boundary redacts them conservatively in every context.
     """
-    sanitized = _sanitize_asset_target_once(target)
     decoded = _recursively_decode(target)
     if not decoded.stable:
         return EXCLUDED_FLAG
-    decoded_sanitized = _sanitize_asset_target_once(decoded.value)
+    safe_target = _strip_unsafe_asset_locator_components(target)
+    safe_decoded = _strip_unsafe_asset_locator_components(decoded.value)
+    sanitized = _sanitize_asset_target_once(safe_target)
+    decoded_sanitized = _sanitize_asset_target_once(safe_decoded)
     return decoded_sanitized if decoded_sanitized != decoded.value else sanitized
 
 
@@ -75,8 +75,7 @@ def _contextual_hex_flag_values(
     if not decoded.stable:
         return frozenset()
     return frozenset(
-        match.group().casefold()
-        for match in _STANDALONE_32_HEX_RE.finditer(decoded.value)
+        match.group().casefold() for match in _STANDALONE_32_HEX_RE.finditer(decoded.value)
     )
 
 
@@ -109,9 +108,7 @@ def _sanitize_searchable_text_once(
     elif known_hex_flags:
         sanitized = _STANDALONE_32_HEX_RE.sub(
             lambda match: (
-                EXCLUDED_FLAG
-                if match.group().casefold() in known_hex_flags
-                else match.group()
+                EXCLUDED_FLAG if match.group().casefold() in known_hex_flags else match.group()
             ),
             sanitized,
         )
@@ -124,6 +121,30 @@ def _sanitize_asset_target_once(target: str) -> str:
     sanitized = _HTB_FLAG_RE.sub(EXCLUDED_FLAG, sanitized)
     sanitized = _HTB_OPEN_MARKER_RE.sub(EXCLUDED_FLAG, sanitized)
     return _STANDALONE_32_HEX_RE.sub(EXCLUDED_FLAG, sanitized)
+
+
+def _strip_unsafe_asset_locator_components(target: str) -> str:
+    """Remove URL credentials and non-provenance components from a locator copy."""
+    try:
+        parsed = urlsplit(target)
+    except ValueError:
+        return "<REDACTED_ASSET_LOCATOR>"
+    if not parsed.scheme and not parsed.netloc:
+        return urlunsplit(("", "", parsed.path, "", "")) or "<REDACTED_ASSET_LOCATOR>"
+
+    scheme = parsed.scheme.casefold()
+    if scheme not in {"http", "https"} or parsed.hostname is None:
+        return "<REDACTED_ASSET_LOCATOR>"
+
+    hostname = parsed.hostname
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        return "<REDACTED_ASSET_LOCATOR>"
+    authority = f"{hostname}:{port}" if port is not None else hostname
+    return urlunsplit((scheme, authority, parsed.path, "", ""))
 
 
 def _recursively_decode(text: str) -> _DecodeResult:
@@ -163,9 +184,7 @@ def _heading_is_hex_flag_context(heading: str) -> bool:
         return True
     words = tuple(normalized.split())
     if any(
-        word in _DIRECT_FLAG_CONTEXTS
-        and index + 1 < len(words)
-        and words[index + 1] in _FLAG_WORDS
+        word in _DIRECT_FLAG_CONTEXTS and index + 1 < len(words) and words[index + 1] in _FLAG_WORDS
         for index, word in enumerate(words)
     ):
         return True
@@ -180,11 +199,7 @@ def _is_capture_flag_phrase(words: tuple[str, ...], index: int) -> bool:
     following = words[index + 1]
     if following in _FLAG_WORDS:
         return True
-    return (
-        following == "the"
-        and index + 2 < len(words)
-        and words[index + 2] in _FLAG_WORDS
-    )
+    return following == "the" and index + 2 < len(words) and words[index + 2] in _FLAG_WORDS
 
 
 def _normalize_heading(heading: str) -> str:

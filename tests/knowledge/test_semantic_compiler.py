@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import html
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import unquote
 
 import pytest
 
@@ -62,10 +64,10 @@ class _ScriptedHost:
         return result
 
 
-def _prepared_source() -> PreparedSource:
+def _prepared_source(*, path: str = "raw_src/compiler.md") -> PreparedSource:
     document = parse_markdown(
         "compiler-source",
-        "raw_src/compiler.md",
+        path,
         """# Service
 
 Inspect the HTTP service before selecting an action.
@@ -77,7 +79,7 @@ The observed host uses x86_64 architecture.
     )
     manifest = DocumentManifest(
         source_id="compiler-source",
-        path="raw_src/compiler.md",
+        path=path,
         sha256="a" * 64,
         title="Compiler notes",
         language="en",
@@ -423,6 +425,41 @@ def test_unsafe_canonical_material_is_quarantined(monkeypatch: pytest.MonkeyPatc
     assert result.bundle is None
     assert result.quarantine is not None
     assert result.quarantine.reason_codes == ("unsafe_material",)
+    assert _purposes(host) == ["sedna.semantic.extract", "sedna.semantic.critic"]
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    (
+        "raw_src/HTB{path_final}.md",
+        "raw_src/HTB%2526%2523123%253Bpath_final%2526%2523125%253B.md",
+        "raw_src/Root flag abcdef0123456789abcdef0123456789.md",
+        "raw_src/User flag 0123456789abcdef0123456789abcdef.md",
+    ),
+)
+def test_final_flag_foundation_path_compiles_to_safe_unsafe_material_quarantine(
+    unsafe_path: str,
+):
+    """Would fail if an unsafe raw filename became canonical or bypassed quarantine."""
+    compiler, host = _compiler(
+        [_HostResult(_draft().model_dump(mode="json")), _HostResult({"accepted": True})]
+    )
+
+    result = compiler.compile(_prepared_source(path=unsafe_path))
+
+    assert result.disposition == "quarantined"
+    assert result.bundle is None
+    assert result.quarantine is not None
+    assert result.quarantine.reason_codes == ("unsafe_material",)
+    decoded = result.model_dump_json()
+    for _ in range(8):
+        next_decoded = unquote(html.unescape(decoded))
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
+    assert "htb{" not in decoded.casefold()
+    assert "abcdef0123456789abcdef0123456789" not in decoded.casefold()
+    assert "0123456789abcdef0123456789abcdef" not in decoded.casefold()
     assert _purposes(host) == ["sedna.semantic.extract", "sedna.semantic.critic"]
 
 

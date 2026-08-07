@@ -167,6 +167,44 @@ def test_source_location_rejects_reversed_lines():
         SourceLocation(start_line=18, end_line=10)
 
 
+@pytest.mark.parametrize(
+    "unsafe_path",
+    (
+        "raw_src/HTB{path_final}.md",
+        "raw_src/HTB%2526%2523123%253Bpath_final%2526%2523125%253B.md",
+        "raw_src/Root flag abcdef0123456789abcdef0123456789.md",
+        "raw_src/User flag 0123456789abcdef0123456789abcdef.md",
+    ),
+)
+def test_canonical_source_ref_paths_reject_final_flag_filenames(unsafe_path: str):
+    """Would fail if raw foundation paths could enter canonical searchable provenance."""
+    with pytest.raises(ValidationError, match="final flag"):
+        SourceRef(
+            source_id="htb-lame",
+            path=unsafe_path,
+            location=SourceLocation(start_line=10, end_line=18),
+        )
+
+
+@pytest.mark.parametrize("field", ("section", "asset_path"))
+@pytest.mark.parametrize(
+    "unsafe_value",
+    (
+        "HTB{location_final}",
+        "HTB%2526%2523123%253Blocation_final%2526%2523125%253B",
+        "Root flag abcdef0123456789abcdef0123456789",
+        "User flag 0123456789abcdef0123456789abcdef",
+    ),
+)
+def test_canonical_source_locations_reject_final_flag_strings(
+    field: str,
+    unsafe_value: str,
+):
+    """Would fail if canonical section or asset provenance bypassed searchable validation."""
+    with pytest.raises(ValidationError, match="final flag"):
+        SourceLocation.model_validate({field: unsafe_value})
+
+
 def test_extraction_metadata_records_reproducibility_versions():
     metadata = ExtractionMetadata(
         schema_version="1.0.0",

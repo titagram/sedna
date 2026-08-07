@@ -232,7 +232,10 @@ def test_failed_semantic_result_does_not_mutate_existing_state(tmp_path: Path) -
         "load_semantic_quarantine",
     ),
 )
-@pytest.mark.parametrize("source_id", ("../escape", "nested/escape", r"nested\escape", ".", ".."))
+@pytest.mark.parametrize(
+    "source_id",
+    ("", "../escape", "nested/escape", r"nested\escape", ".", ".."),
+)
 def test_semantic_loaders_reject_unsafe_source_ids(
     tmp_path: Path, method_name: str, source_id: str
 ) -> None:
@@ -240,6 +243,8 @@ def test_semantic_loaders_reject_unsafe_source_ids(
 
     with pytest.raises(ValueError, match="safe path segment"):
         getattr(repository, method_name)(source_id)
+    assert not (repository.root / ".json").exists()
+    assert not any(path.name == ".json" for path in repository.root.rglob(".json"))
 
 
 @pytest.mark.parametrize(
@@ -508,6 +513,81 @@ def test_current_semantic_result_is_one_linearizable_pair_across_instances(
         == "critic-original"
     )
     assert reader.load_semantic_bundle("semantic-source") == replacement.bundle
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    ("load_current_semantic_result", "semantic_result_is_current"),
+)
+@pytest.mark.parametrize("corrupt_field", ("document", "segments"))
+def test_currentness_deeply_rejects_constructed_prepared_source_before_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+    corrupt_field: str,
+) -> None:
+    """Would fail if currentness read a valid manifest before validating nested input."""
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    prepared = _prepared()
+    corruption = {
+        "document": {"document": "corrupt", "segments": ()},
+        "segments": {"document": prepared.document, "segments": ("corrupt",)},
+    }[corrupt_field]
+    constructed = PreparedSource.model_construct(
+        manifest=prepared.manifest,
+        **corruption,
+    )
+    target_calls = 0
+    lock_calls = 0
+    real_target = repository._target
+    real_lock = repository._source_transition_lock
+
+    def recording_target(*args: object, **kwargs: object) -> object:
+        nonlocal target_calls
+        target_calls += 1
+        return real_target(*args, **kwargs)
+
+    def recording_lock(*args: object, **kwargs: object) -> object:
+        nonlocal lock_calls
+        lock_calls += 1
+        return real_lock(*args, **kwargs)
+
+    monkeypatch.setattr(repository, "_target", recording_target)
+    monkeypatch.setattr(repository, "_source_transition_lock", recording_lock)
+
+    with pytest.raises(ValueError, match="prepared source"):
+        getattr(repository, method_name)(constructed)
+
+    assert target_calls == lock_calls == 0
+
+
+def test_currentness_rejects_empty_source_id_without_dot_lock_fallback(tmp_path: Path) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    prepared = _prepared()
+    empty = PreparedSource.model_construct(
+        manifest=prepared.manifest.model_copy(update={"source_id": ""}),
+        document=prepared.document.model_copy(update={"source_id": ""}),
+        segments=prepared.segments,
+    )
+
+    with pytest.raises(ValueError):
+        repository.semantic_result_is_current(empty)
+
+    assert not (repository.root / "transactions" / ".lock").exists()
+
+
+def test_semantic_compilation_guard_rejects_empty_id_without_dot_lock_fallback(
+    tmp_path: Path,
+) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+
+    with (
+        pytest.raises(ValueError, match="safe path segment"),
+        repository.semantic_compilation_guard(""),
+    ):
+        pass
+
+    assert not (repository.root / "semantic_compilation_guards" / ".lock").exists()
 
 
 def test_semantic_compilation_guard_serializes_only_the_same_safe_source(

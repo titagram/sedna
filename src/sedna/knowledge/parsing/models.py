@@ -189,10 +189,7 @@ class LogicalSegment(BaseModel):
         if sanitize_searchable_text(self.text, self.heading_path) != self.text:
             raise ValueError("logical segment text must be retrieval-safe")
         for index, component in enumerate(self.heading_path):
-            if (
-                sanitize_searchable_text(component, self.heading_path[: index + 1])
-                != component
-            ):
+            if sanitize_searchable_text(component, self.heading_path[: index + 1]) != component:
                 raise ValueError("logical segment heading path must be retrieval-safe")
         return self
 
@@ -236,9 +233,7 @@ class PreparedSource(BaseModel):
             ):
                 raise ValueError("segment line range must exactly span its referenced blocks")
 
-            referenced_contexts = tuple(
-                block_contexts[index] for index in segment.block_indices
-            )
+            referenced_contexts = tuple(block_contexts[index] for index in segment.block_indices)
             expected_text = "\n\n".join(
                 _sanitize_searchable_text(block.text, heading_path, known_hex_flags)
                 for block, heading_path in referenced_contexts
@@ -268,6 +263,17 @@ class PreparedSource(BaseModel):
                 if asset.end_line < segment.start_line or asset.start_line > segment.end_line:
                     raise ValueError("segment asset line range must overlap the segment span")
         return self
+
+
+def validate_prepared_source(prepared: PreparedSource) -> PreparedSource:
+    """Deeply revalidate a possibly non-validating Pydantic instance."""
+    if not isinstance(prepared, PreparedSource):
+        raise TypeError("prepared must be a PreparedSource")
+    try:
+        payload = prepared.model_dump(mode="json", warnings="error")
+        return PreparedSource.model_validate(payload)
+    except Exception:
+        raise ValueError("prepared source failed deep validation") from None
 
 
 def _document_block_contexts(
