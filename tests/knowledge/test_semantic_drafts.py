@@ -15,6 +15,7 @@ from sedna.knowledge.schema import (
 )
 from sedna.knowledge.semantic.drafts import (
     CompilationDisposition,
+    CompilationFailureCode,
     CriticVerdict,
     DraftCitation,
     DraftContextAssertion,
@@ -50,6 +51,20 @@ def verification(adjudication: str = "verified") -> SemanticVerificationRecord:
         ),
         adjudication=adjudication,
         recorded_at=datetime(2026, 8, 7, tzinfo=UTC),
+    )
+
+
+def semantic_calls(critic_call: SemanticCallMetadata) -> tuple[SemanticCallMetadata, ...]:
+    return (
+        SemanticCallMetadata(
+            purpose="sedna.semantic.extract",
+            provider="host",
+            model="extractor-model",
+            agent_id="agent-7",
+            input_tokens=100,
+            output_tokens=50,
+        ),
+        critic_call,
     )
 
 
@@ -231,10 +246,12 @@ def test_compiler_range_validation_covers_ignored_and_cited_indexes():
 
 @pytest.mark.parametrize("disposition", ("verified", "unchanged"))
 def test_verified_and_unchanged_results_require_a_bundle_and_verification(disposition: str):
+    record = verification(disposition)
     result = SemanticCompilationResult(
         disposition=disposition,
         bundle=bundle(),
-        verification=verification(disposition),
+        verification=record,
+        calls=semantic_calls(record.critic_call) if disposition == "verified" else (),
     )
 
     assert result.disposition == disposition
@@ -243,30 +260,36 @@ def test_verified_and_unchanged_results_require_a_bundle_and_verification(dispos
 
 
 def test_result_disposition_agrees_with_verified_or_quarantined_audit_adjudication():
+    incorrect_verified = verification("quarantined")
     with pytest.raises(ValidationError, match="verification adjudication"):
         SemanticCompilationResult(
             disposition="verified",
             bundle=bundle(),
-            verification=verification("quarantined"),
+            verification=incorrect_verified,
+            calls=semantic_calls(incorrect_verified.critic_call),
         )
+    incorrect_quarantine = verification("verified")
     with pytest.raises(ValidationError, match="verification adjudication"):
         SemanticCompilationResult(
             disposition="quarantined",
-            verification=verification("verified"),
+            verification=incorrect_quarantine,
             quarantine=quarantine(),
+            calls=semantic_calls(incorrect_quarantine.critic_call),
         )
 
 
 def test_quarantined_and_failed_results_have_exclusive_payload_shapes():
+    quarantine_verification = verification("quarantined")
     quarantined = SemanticCompilationResult(
         disposition="quarantined",
-        verification=verification("quarantined"),
+        verification=quarantine_verification,
         quarantine=quarantine(),
+        calls=semantic_calls(quarantine_verification.critic_call),
     )
     failed = SemanticCompilationResult(
         disposition="failed",
-        failure_code="unsafe_material",
-        failure_message="The artifact contains unsafe material.",
+        failure_code="transport_failure",
+        failure_message="The host LLM request failed.",
     )
 
     assert quarantined.bundle is None
@@ -274,11 +297,28 @@ def test_quarantined_and_failed_results_have_exclusive_payload_shapes():
     with pytest.raises(ValidationError, match="only a safe failure reason"):
         SemanticCompilationResult(
             disposition="failed",
-            failure_code="unsafe_material",
-            failure_message="The artifact contains unsafe material.",
+            failure_code="transport_failure",
+            failure_message="The host LLM request failed.",
             verification=verification("failed"),
         )
 
 
 def test_compilation_disposition_has_the_closed_protocol_vocabulary():
     assert CompilationDisposition.__args__ == ("verified", "quarantined", "failed", "unchanged")
+
+
+def test_failure_codes_are_closed_and_do_not_reuse_critic_finding_codes():
+    assert CompilationFailureCode.__args__ == (
+        "transport_failure",
+        "missing_parsed_response",
+        "invalid_structured_response",
+        "invalid_input",
+        "materialization_failure",
+        "internal_failure",
+    )
+    with pytest.raises(ValidationError, match="failure_code"):
+        SemanticCompilationResult(
+            disposition="failed",
+            failure_code="unsafe_material",
+            failure_message="The artifact contains unsafe material.",
+        )

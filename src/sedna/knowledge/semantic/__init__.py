@@ -1,7 +1,9 @@
 """LLM-facing semantic compilation contracts."""
 
 from sedna.knowledge.semantic.drafts import (
+    CANONICAL_COMPILATION_FAILURE_MESSAGES,
     CompilationDisposition,
+    CompilationFailureCode,
     CriticVerdict,
     DraftApplicabilityContext,
     DraftArtifact,
@@ -17,9 +19,12 @@ from sedna.knowledge.semantic.drafts import (
     SemanticCompilationResult,
     SemanticDraftBundle,
 )
+from sedna.knowledge.semantic.compiler import SemanticCompiler
 
 __all__ = [
     "CompilationDisposition",
+    "CompilationFailureCode",
+    "CANONICAL_COMPILATION_FAILURE_MESSAGES",
     "CriticVerdict",
     "DraftApplicabilityContext",
     "DraftArtifact",
@@ -33,5 +38,6 @@ __all__ = [
     "DraftServiceContext",
     "DraftTypedContext",
     "SemanticCompilationResult",
+    "SemanticCompiler",
     "SemanticDraftBundle",
 ]

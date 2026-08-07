@@ -18,8 +18,7 @@ from sedna.knowledge.schema.common import (
 )
 from sedna.knowledge.schema.context import ContextRelation
 from sedna.knowledge.schema.semantic import (
-    CANONICAL_FINDING_MESSAGES,
-    FindingCode,
+    SemanticCallMetadata,
     SemanticKnowledgeBundle,
     SemanticQuarantineRecord,
     SemanticVerificationRecord,
@@ -31,7 +30,35 @@ DraftLocalId = Annotated[
     Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$"),
 ]
 CompilationDisposition = Literal["verified", "quarantined", "failed", "unchanged"]
+CompilationFailureCode = Literal[
+    "transport_failure",
+    "missing_parsed_response",
+    "invalid_structured_response",
+    "invalid_input",
+    "materialization_failure",
+    "internal_failure",
+]
+CANONICAL_COMPILATION_FAILURE_MESSAGES: dict[CompilationFailureCode, str] = {
+    "transport_failure": "The host LLM request failed.",
+    "missing_parsed_response": "The host LLM returned no parsed structured response.",
+    "invalid_structured_response": "The host LLM response failed semantic validation.",
+    "invalid_input": "The semantic compiler input failed validation.",
+    "materialization_failure": "Semantic artifacts could not be materialized safely.",
+    "internal_failure": "The semantic compiler encountered an internal failure.",
+}
 _SAFE_DRAFT_LOCAL_ID = re.compile(r"^(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9._-]*$")
+_VALID_CALL_SEQUENCES = (
+    (),
+    ("sedna.semantic.extract",),
+    ("sedna.semantic.extract", "sedna.semantic.critic"),
+    ("sedna.semantic.extract", "sedna.semantic.critic", "sedna.semantic.repair"),
+    (
+        "sedna.semantic.extract",
+        "sedna.semantic.critic",
+        "sedna.semantic.repair",
+        "sedna.semantic.critic",
+    ),
+)
 
 
 class DraftCitation(BaseModel):
@@ -331,12 +358,16 @@ class SemanticCompilationResult(BaseModel):
     bundle: SemanticKnowledgeBundle | None = None
     verification: SemanticVerificationRecord | None = None
     quarantine: SemanticQuarantineRecord | None = None
-    failure_code: FindingCode | None = None
+    failure_code: CompilationFailureCode | None = None
     failure_message: SearchableNonEmptyString | None = None
+    calls: tuple[SemanticCallMetadata, ...] = ()
 
     @model_validator(mode="after")
     def validate_payload_shape(self) -> Self:
         """Keep completed outcomes mutually exclusive and failed results safely bounded."""
+        purposes = tuple(call.purpose for call in self.calls)
+        if purposes not in _VALID_CALL_SEQUENCES:
+            raise ValueError("semantic call metadata must follow the bounded purpose sequence")
         if self.disposition in {"verified", "unchanged"}:
             if self.bundle is None or self.verification is None:
                 raise ValueError("verified and unchanged results require a bundle and verification")
@@ -349,6 +380,8 @@ class SemanticCompilationResult(BaseModel):
                 raise ValueError(
                     "verified result verification adjudication must agree with disposition"
                 )
+            if self.disposition == "verified":
+                self._validate_final_critic_call(purposes)
             return self
 
         if self.disposition == "quarantined":
@@ -360,6 +393,7 @@ class SemanticCompilationResult(BaseModel):
                 raise ValueError(
                     "quarantined result verification adjudication must agree with disposition"
                 )
+            self._validate_final_critic_call(purposes)
             return self
 
         if (
@@ -368,9 +402,15 @@ class SemanticCompilationResult(BaseModel):
             or any((self.bundle, self.verification, self.quarantine))
         ):
             raise ValueError("failed results contain only a safe failure reason")
-        if self.failure_message != CANONICAL_FINDING_MESSAGES[self.failure_code]:
+        if self.failure_message != CANONICAL_COMPILATION_FAILURE_MESSAGES[self.failure_code]:
             raise ValueError("failed result message must match its canonical failure code")
         return self
+
+    def _validate_final_critic_call(self, purposes: tuple[str, ...]) -> None:
+        if purposes not in _VALID_CALL_SEQUENCES[2::2] or self.verification is None:
+            raise ValueError("terminal semantic results require an extractor and final critic call")
+        if self.verification.critic_call != self.calls[-1]:
+            raise ValueError("verification critic call must match final call metadata")
 
 
 def _validate_deterministic_indexes(indexes: tuple[int, ...]) -> None:
