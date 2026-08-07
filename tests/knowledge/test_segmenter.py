@@ -347,6 +347,8 @@ def test_unclosed_htb_marker_cannot_survive_sanitization():
         "HTB%7Burl_secret%7D",
         "htb%257bdouble_url_secret%257d",
         "HTB&#123;html_secret&#125;",
+        "HTB&#123html_secret&#125",
+        "HTB&#x7bhtml_secret&#x7d",
         "HTB&amp;#123;double_html_secret&amp;#125;",
         "HTB%26%23123%3Bmixed_secret%26%23125%3B",
     ],
@@ -363,6 +365,20 @@ def test_recursively_encoded_contextual_hex_flag_is_redacted():
     sanitized = sanitize_searchable_text(encoded_flag, ("Root Flag",))
 
     assert sanitized == "<EXCLUDED_FLAG>"
+
+
+@pytest.mark.parametrize(
+    "encoded_context",
+    [
+        "Root&#32flag: abcdef0123456789abcdef0123456789",
+        "Root&nbspflag: abcdef0123456789abcdef0123456789",
+    ],
+)
+def test_semicolonless_html_context_redacts_bare_hex_flag(encoded_context: str):
+    sanitized = sanitize_searchable_text(encoded_context, (encoded_context,))
+
+    assert "abcdef0123456789abcdef0123456789" not in sanitized
+    assert "<EXCLUDED_FLAG>" in sanitized
 
 
 @pytest.mark.parametrize("depth", [20, 2_500])
@@ -388,6 +404,12 @@ def test_benign_stable_url_encoding_remains_byte_preserved():
     encoded_reference = "MD5%3A%20abcdef0123456789abcdef0123456789"
 
     assert sanitize_searchable_text(encoded_reference, ()) == encoded_reference
+
+
+def test_benign_ampersand_remains_byte_preserved():
+    reference = "R&D notes MD5: abcdef0123456789abcdef0123456789"
+
+    assert sanitize_searchable_text(reference, (reference,)) == reference
 
 
 def test_decode_round_limit_allows_eight_transformations_and_rejects_nine():

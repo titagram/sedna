@@ -12,9 +12,7 @@ EXCLUDED_FLAG = "<EXCLUDED_FLAG>"
 _MAX_DECODE_INPUT_CHARS = 65_536
 _MAX_DECODE_ROUNDS = 8
 _MAX_DECODE_WORK_CHARS = 262_144
-_ENCODING_MARKER_RE = re.compile(
-    r"%(?:[0-9A-Fa-f]{2})|&(?:#(?:\d+|[xX][0-9A-Fa-f]+)|[A-Za-z][A-Za-z0-9]+);"
-)
+_ENCODING_MARKER_RE = re.compile(r"%(?:[0-9A-Fa-f]{2})|&")
 
 _HTB_FLAG_RE = re.compile(r"HTB\{[^}]*\}", re.IGNORECASE)
 _HTB_OPEN_MARKER_RE = re.compile(r"HTB\{", re.IGNORECASE)

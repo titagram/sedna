@@ -525,8 +525,23 @@ def test_nested_case_searchable_fields_apply_their_own_flag_context():
 @pytest.mark.parametrize(
     "statement",
     [
+        "HTB&#123canonical_secret&#125",
+        "HTB&#x7bsecret&#x7d",
+        "Root&#32flag: abcdef0123456789abcdef0123456789",
+        "Root&nbspflag: abcdef0123456789abcdef0123456789",
+    ],
+)
+def test_canonical_fields_reject_semicolonless_html_entity_bypasses(statement: str):
+    with pytest.raises(ValidationError, match="final flag"):
+        ReferenceArtifact.model_validate({**reference_payload(), "statement": statement})
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
         "MD5: abcdef0123456789abcdef0123456789",
         "MD5%3A%20abcdef0123456789abcdef0123456789",
+        "R&D notes MD5: abcdef0123456789abcdef0123456789",
     ],
 )
 def test_canonical_searchable_fields_preserve_unrelated_md5_hashes(statement: str):

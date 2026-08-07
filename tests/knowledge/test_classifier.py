@@ -108,6 +108,33 @@ def test_table_dominant_academy_source_is_a_cheatsheet(tmp_path: Path) -> None:
     assert result.parser_profile == "academy_obsidian"
 
 
+def test_compact_delimiter_table_with_local_technical_cells_is_a_cheatsheet(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "compact-cheatsheet.md"
+    text = """# Service reference
+
+| Command | Description |
+|-|-|
+| `nmap -sV TARGET` | Identify service versions locally |
+"""
+    path.write_text(text, encoding="utf-8")
+    candidate = SourceCandidate(
+        source_id="source-compact-cheatsheet",
+        path=path,
+        relative_path="Write-ups/Academy/Recon/compact-cheatsheet.md",
+        suffix=".md",
+        sha256="a" * 64,
+        size_bytes=len(text.encode()),
+        assets=(),
+    )
+
+    result = classify_document(candidate, text)
+
+    assert result.document_type == DocumentType.CHEATSHEET_REFERENCE
+    assert result.ingestion_status == IngestionStatus.ACCEPTED
+
+
 @pytest.mark.parametrize(
     "relative_path",
     [
@@ -171,6 +198,119 @@ def test_academy_external_link_label_alone_is_not_local_substance(
     assert result.document_type == DocumentType.EXTERNAL_STUB
     assert result.ingestion_status == IngestionStatus.EXCLUDED
     assert "no_local_substance" in result.reasons
+
+
+@pytest.mark.parametrize(
+    "link_only_body",
+    [
+        (
+            "[Complete course covering network enumeration concepts][guide]\n\n"
+            "[guide]: https://example.com/course\n"
+        ),
+        (
+            "[Complete course covering network enumeration concepts][]\n\n"
+            "[Complete course covering network enumeration concepts]: "
+            "https://example.com/course\n"
+        ),
+        (
+            "[Complete course covering network enumeration concepts]\n\n"
+            "[Complete course covering network enumeration concepts]: "
+            "https://example.com/course\n"
+        ),
+        (
+            '<a href="https://example.com/course">'
+            "Complete course covering network enumeration concepts"
+            "</a>\n"
+        ),
+    ],
+)
+def test_academy_reference_or_html_link_label_is_not_local_substance(
+    tmp_path: Path,
+    link_only_body: str,
+) -> None:
+    path = tmp_path / "external-reference.md"
+    text = f"# Network enumeration\n\n{link_only_body}"
+    path.write_text(text, encoding="utf-8")
+    candidate = SourceCandidate(
+        source_id="source-external-reference",
+        path=path,
+        relative_path="Write-ups/Academy/Recon/external-reference.md",
+        suffix=".md",
+        sha256="1" * 64,
+        size_bytes=len(text.encode()),
+        assets=(),
+    )
+
+    result = classify_document(candidate, text)
+
+    assert result.document_type == DocumentType.EXTERNAL_STUB
+    assert result.ingestion_status == IngestionStatus.EXCLUDED
+    assert "no_local_substance" in result.reasons
+
+
+def test_academy_table_with_only_external_link_body_is_not_a_cheatsheet(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "external-table.md"
+    text = """# Network resources
+
+| Resource | Details |
+| --- | --- |
+|  | [Complete external command catalog](https://example.com/catalog) |
+"""
+    path.write_text(text, encoding="utf-8")
+    candidate = SourceCandidate(
+        source_id="source-external-table",
+        path=path,
+        relative_path="Write-ups/Academy/Recon/external-table.md",
+        suffix=".md",
+        sha256="2" * 64,
+        size_bytes=len(text.encode()),
+        assets=(),
+    )
+
+    result = classify_document(candidate, text)
+
+    assert result.document_type == DocumentType.EXTERNAL_STUB
+    assert result.ingestion_status == IngestionStatus.EXCLUDED
+    assert "no_local_substance" in result.reasons
+
+
+@pytest.mark.parametrize(
+    "explained_body",
+    [
+        (
+            "Read the [official syntax][guide], then compare its examples against "
+            "the response observed in the local lab.\n\n"
+            "[guide]: https://example.com/syntax\n"
+        ),
+        (
+            'Read the <a href="https://example.com/syntax">official syntax</a>, '
+            "then compare its examples against the response observed locally.\n"
+        ),
+    ],
+)
+def test_explanatory_prose_around_reference_or_html_link_remains_substance(
+    tmp_path: Path,
+    explained_body: str,
+) -> None:
+    path = tmp_path / "explained-reference.md"
+    text = f"# Network enumeration\n\n{explained_body}"
+    path.write_text(text, encoding="utf-8")
+    candidate = SourceCandidate(
+        source_id="source-explained-reference",
+        path=path,
+        relative_path="Write-ups/Academy/Recon/explained-reference.md",
+        suffix=".md",
+        sha256="3" * 64,
+        size_bytes=len(text.encode()),
+        assets=(),
+    )
+
+    result = classify_document(candidate, text)
+
+    assert result.document_type == DocumentType.LESSON
+    assert result.ingestion_status == IngestionStatus.ACCEPTED
 
 
 def test_explanatory_text_around_academy_link_remains_local_substance(

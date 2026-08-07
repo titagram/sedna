@@ -23,6 +23,13 @@ _INDENTED_CODE_RE = re.compile(r"(?m)^(?: {4}|\t)\S")
 _URL_RE = re.compile(r"https?://[^\s<>\])]+", re.IGNORECASE)
 _MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[[^\]\n]+\]\([^\)\n]+\)")
 _WIKI_LINK_RE = re.compile(r"(?<!!)\[\[[^\]\n]+\]\]")
+_REFERENCE_DEFINITION_RE = re.compile(r"(?m)^[ ]{0,3}\[(?P<label>[^\]\n]+)\]:[ \t]*\S.*$")
+_REFERENCE_LINK_RE = re.compile(r"(?<!!)\[(?P<label>[^\]\n]+)\]\[(?P<identifier>[^\]\n]*)\]")
+_SHORTCUT_REFERENCE_RE = re.compile(r"(?<!!)\[(?P<label>[^\]\n]+)\](?![\[(])")
+_HTML_ANCHOR_RE = re.compile(
+    r"<a\b(?=[^>]*\bhref\s*=)[^>]*>.*?</a\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
 _HTB_FLAG_RE = re.compile(r"HTB\{[^}\r\n]+\}", re.IGNORECASE)
 _FLAG_HEADING_RE = re.compile(r"(?ims)^\s{0,3}#{1,6}[^\n]*\bflag\b[^\n]*\n(?P<body>.{0,500})")
 _HEX_32_RE = re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])", re.IGNORECASE)
@@ -82,6 +89,7 @@ class _DocumentSignals:
     code_block_count: int
     word_count: int
     table_line_count: int
+    table_has_local_content: bool
     narrative_line_count: int
     has_flag: bool
     procedural: bool
@@ -252,7 +260,8 @@ def _classify_pdf(candidate: SourceCandidate) -> ClassificationResult:
 
 def _collect_signals(text: str) -> _DocumentSignals:
     visible_text = _HTML_COMMENT_RE.sub("", text)
-    local_signal_text = _strip_reference_links(visible_text)
+    reference_ids = _reference_definition_ids(visible_text)
+    local_signal_text = _strip_reference_links(visible_text, reference_ids)
     headings = tuple(
         _clean_heading(heading)
         for heading in (
@@ -275,13 +284,16 @@ def _collect_signals(text: str) -> _DocumentSignals:
     walkthrough_urls = tuple(url for url in urls if _url_is_external_walkthrough(visible_text, url))
     lines = visible_text.splitlines()
     table_line_count = sum(bool(_TABLE_ROW_RE.match(line)) for line in lines)
-    narrative_line_count = sum(_is_narrative_line(line) for line in lines)
+    table_has_local_content = _table_has_local_content(lines, reference_ids)
+    narrative_line_count = sum(_is_narrative_line(line, reference_ids) for line in lines)
     reference_link_count = (
         len(urls)
         + len(_MARKDOWN_LINK_RE.findall(visible_text))
         + len(_WIKI_LINK_RE.findall(visible_text))
+        + len(_REFERENCE_DEFINITION_RE.findall(visible_text))
+        + len(_HTML_ANCHOR_RE.findall(visible_text))
     )
-    local_substance = bool(code_block_count or table_line_count >= 3 or narrative_line_count)
+    local_substance = bool(code_block_count or table_has_local_content or narrative_line_count)
 
     return _DocumentSignals(
         headings=headings,
@@ -289,6 +301,7 @@ def _collect_signals(text: str) -> _DocumentSignals:
         code_block_count=code_block_count,
         word_count=len(re.findall(r"\b[\w'-]+\b", local_signal_text)),
         table_line_count=table_line_count,
+        table_has_local_content=table_has_local_content,
         narrative_line_count=narrative_line_count,
         has_flag=_contains_final_flag(text),
         procedural=procedural,
@@ -356,9 +369,38 @@ def _clean_heading(heading: str) -> str:
     return re.sub(r"<[^>]+>", " ", heading).strip()
 
 
-def _strip_reference_links(text: str) -> str:
-    local_text = _MARKDOWN_LINK_RE.sub("", text)
+def _reference_definition_ids(text: str) -> frozenset[str]:
+    return frozenset(
+        _normalize_reference_id(match.group("label"))
+        for match in _REFERENCE_DEFINITION_RE.finditer(text)
+    )
+
+
+def _normalize_reference_id(identifier: str) -> str:
+    return re.sub(r"\s+", " ", identifier).strip().casefold()
+
+
+def _strip_reference_links(
+    text: str,
+    reference_ids: frozenset[str] = frozenset(),
+) -> str:
+    def strip_full_reference(match: re.Match[str]) -> str:
+        identifier = match.group("identifier") or match.group("label")
+        if _normalize_reference_id(identifier) in reference_ids:
+            return ""
+        return match.group(0)
+
+    def strip_shortcut_reference(match: re.Match[str]) -> str:
+        if _normalize_reference_id(match.group("label")) in reference_ids:
+            return ""
+        return match.group(0)
+
+    local_text = _REFERENCE_DEFINITION_RE.sub("", text)
+    local_text = _MARKDOWN_LINK_RE.sub("", local_text)
     local_text = _WIKI_LINK_RE.sub("", local_text)
+    local_text = _REFERENCE_LINK_RE.sub(strip_full_reference, local_text)
+    local_text = _SHORTCUT_REFERENCE_RE.sub(strip_shortcut_reference, local_text)
+    local_text = _HTML_ANCHOR_RE.sub("", local_text)
     return _URL_RE.sub("", local_text)
 
 
@@ -367,7 +409,10 @@ def _is_substantive(heading: str) -> bool:
     return normalized not in {"user", "root"} and not _NON_PROCEDURAL_HEADING_RE.search(heading)
 
 
-def _is_narrative_line(line: str) -> bool:
+def _is_narrative_line(
+    line: str,
+    reference_ids: frozenset[str] = frozenset(),
+) -> bool:
     stripped = line.strip()
     if not stripped or _TABLE_ROW_RE.match(stripped):
         return False
@@ -377,14 +422,47 @@ def _is_narrative_line(line: str) -> bool:
         return False
     if re.fullmatch(r"[-=* _]{3,}", stripped):
         return False
-    local_text = _strip_reference_links(stripped)
+    local_text = _strip_reference_links(stripped, reference_ids)
     return len(re.findall(r"\b[\w'-]+\b", local_text)) >= 5
 
 
+def _table_has_local_content(
+    lines: list[str],
+    reference_ids: frozenset[str],
+) -> bool:
+    inside_body = False
+    for line in lines:
+        if not _TABLE_ROW_RE.match(line):
+            inside_body = False
+            continue
+        if _is_table_delimiter(line):
+            inside_body = True
+            continue
+        if not inside_body:
+            continue
+        local_row = _strip_reference_links(line, reference_ids)
+        if any(re.search(r"[\w]", cell) for cell in _table_cells(local_row)):
+            return True
+    return False
+
+
+def _is_table_delimiter(line: str) -> bool:
+    cells = _table_cells(line)
+    return bool(cells) and all(re.fullmatch(r":?-+:?", cell.strip()) for cell in cells)
+
+
+def _table_cells(line: str) -> tuple[str, ...]:
+    return tuple(cell.strip(" `*_~") for cell in line.strip().strip("|").split("|"))
+
+
 def _is_table_dominant(signals: _DocumentSignals) -> bool:
-    return signals.table_line_count >= 3 and (
-        signals.table_line_count >= signals.narrative_line_count
-        or any("cheatsheet" in heading.casefold() for heading in signals.headings)
+    return (
+        signals.table_has_local_content
+        and signals.table_line_count >= 3
+        and (
+            signals.table_line_count >= signals.narrative_line_count
+            or any("cheatsheet" in heading.casefold() for heading in signals.headings)
+        )
     )
 
 
