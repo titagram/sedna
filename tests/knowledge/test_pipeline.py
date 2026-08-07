@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import yaml
 
 import sedna.knowledge.pipeline as pipeline_module
 from sedna.knowledge import IngestionPipeline as PublicIngestionPipeline
@@ -22,10 +23,37 @@ from sedna.knowledge.pipeline import (
 from sedna.knowledge.schema import DocumentType, IngestionStatus
 
 FIXTURES = Path(__file__).parent / "fixtures"
+GOLDEN_FIXTURES = FIXTURES / "golden"
+GOLDEN_MANIFEST = Path(__file__).parent / "golden_manifest.yaml"
 FIXTURE_PATHS = {
     "machine-walkthrough.md": "Write-ups/Machines/Example/walkthrough.md",
     "challenge-flag-only.md": "Write-ups/Challanges/Example/readme.md",
 }
+GOLDEN_SOURCE_PATHS = {
+    "lesson-narrative.md": "Write-ups/Academy/Strategy/lesson-narrative.md",
+    "lesson-cheatsheet.md": "Write-ups/Academy/Strategy/lesson-cheatsheet.md",
+    "htb-scrape.md": "01_Information-Gathering/Academy/htb-scrape.md",
+    "obsidian-with-assets.md": "Write-ups/Academy/Strategy/obsidian-with-assets.md",
+    "machine-complete.md": "Write-ups/Machines/Complete/walkthrough.md",
+    "machine-failed-attempt.md": "Write-ups/Machines/FailedAttempt/walkthrough.md",
+    "machine-html-wrapper.md": "Write-ups/Machines/HtmlWrapper/readme.md",
+    "challenge-complete.md": "Write-ups/Challenges/Complete/readme.md",
+    "challenge-flag-only.md": "Write-ups/Challenges/FlagOnly/readme.md",
+    "machine-external-stub.md": "Write-ups/Machines/ExternalStub/readme.md",
+    "machine-flags-only.md": "Write-ups/Machines/FlagsOnly/readme.md",
+    "empty.md": "Imported/empty.md",
+    "malformed-ambiguous.md": "Imported/malformed-ambiguous.md",
+    "setext-lesson.md": "01_Information-Gathering/Academy/setext-lesson.md",
+    "reference-cheatsheet.pdf": "References/reference-cheatsheet.pdf",
+}
+
+
+def _load_golden_cases() -> tuple[dict[str, object], ...]:
+    payload = yaml.safe_load(GOLDEN_MANIFEST.read_text(encoding="utf-8"))
+    return tuple(payload["cases"])
+
+
+GOLDEN_CASES = _load_golden_cases()
 
 
 def _fixture_pipeline(tmp_path: Path, fixture: str) -> tuple[IngestionPipeline, SourceCandidate]:
@@ -50,6 +78,48 @@ def _tree_fingerprint(root: Path) -> tuple[tuple[str, bytes], ...]:
         for path in sorted(root.rglob("*"))
         if path.is_file()
     )
+
+
+@pytest.mark.parametrize("case", GOLDEN_CASES, ids=lambda case: str(case["path"]))
+def test_golden_corpus_matches_reviewed_ingestion_contract(
+    tmp_path: Path,
+    case: dict[str, object],
+) -> None:
+    """Catch drift in family routing, disposition, quality, or segmentation."""
+    fixture_name = str(case["path"])
+    source_root = tmp_path / "raw_src"
+    destination = source_root / GOLDEN_SOURCE_PATHS[fixture_name]
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes((GOLDEN_FIXTURES / fixture_name).read_bytes())
+    candidates = discover_sources(source_root)
+    assert len(candidates) == 1
+    source_fingerprint = _tree_fingerprint(source_root)
+
+    pipeline = IngestionPipeline(source_root, tmp_path / "knowledge")
+    prepared = pipeline.prepare(candidates[0])
+    manifest = pipeline.repository.load_manifest(candidates[0].source_id)
+
+    assert manifest.document_type.value == case["document_type"]
+    assert manifest.parser_profile == case["parser_profile"]
+    assert manifest.quality.value == case["quality"]
+    assert manifest.ingestion_status.value == case["status"]
+    segment_count = len(prepared.segments) if prepared is not None else 0
+    assert segment_count >= int(case["minimum_segments"])
+    assert (prepared is not None) is (case["status"] == "accepted")
+    if prepared is not None:
+        searchable_payload = json.dumps(
+            {
+                "manifest": manifest.model_dump(mode="json"),
+                "segments": [segment.model_dump(mode="json") for segment in prepared.segments],
+            },
+            sort_keys=True,
+        ).casefold()
+        assert "htb{" not in searchable_payload
+        assert "htb%7b" not in searchable_payload
+
+    assert _tree_fingerprint(source_root) == source_fingerprint
+    assert pipeline.prepare(candidates[0]) is None
+    assert pipeline.last_outcome == "unchanged"
 
 
 def test_prepare_accepted_walkthrough_returns_segments_and_manifest(tmp_path: Path) -> None:

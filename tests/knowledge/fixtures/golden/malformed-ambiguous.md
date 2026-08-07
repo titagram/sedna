@@ -1,0 +1,1 @@
+Imported fragments mention a target and a response, but they provide no headings, procedure, evidence chain, source family, or reliable context from which a deterministic strategy could be reconstructed.
