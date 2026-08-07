@@ -349,7 +349,10 @@ class CanonicalKnowledgeRepository:
         self._target("semantic_bundles", source_id)
         with self._source_transition_lock(source_id):
             self._recover_source(source_id)
-            bundle, verification, quarantine = self._load_semantic_state(source_id)
+            try:
+                bundle, verification, quarantine = self._load_semantic_state(source_id)
+            except ValueError:
+                return False
         if bundle is None and verification is None and quarantine is None:
             return False
         if bundle is None or verification is None or quarantine is not None:
@@ -590,6 +593,11 @@ class CanonicalKnowledgeRepository:
                 raise ValueError(
                     f"invalid semantic state for source_id {source_id!r}: "
                     "bundle and verification disposition mismatch"
+                )
+            if verification.critic_call.model != bundle.compilation_manifest.critic_model_id:
+                raise ValueError(
+                    f"invalid semantic state for source_id {source_id!r}: "
+                    "critic model identity mismatch"
                 )
         elif quarantine is not None:
             if verification is None or verification.adjudication != "quarantined":

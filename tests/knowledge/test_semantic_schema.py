@@ -288,6 +288,18 @@ def test_semantic_bundle_contains_only_validated_canonical_records():
     assert dumped["references"][0]["assessment"]["verification_status"] == "verified"
 
 
+def test_persistable_semantic_bundle_requires_verified_manifest_disposition():
+    with pytest.raises(ValidationError, match="verified compilation manifest"):
+        SemanticKnowledgeBundle(
+            schema_version="2.0.0",
+            source_id="htb-lame",
+            source_sha256="a" * 64,
+            compilation_manifest=semantic_manifest().model_copy(update={"disposition": "failed"}),
+            references=(reference_artifact(),),
+            cases=(case_artifact(),),
+        )
+
+
 def test_semantic_bundle_requires_sorted_unique_artifacts_and_exact_manifest_ids():
     artifact = reference_artifact()
     with pytest.raises(ValidationError, match="unique"):
@@ -380,6 +392,24 @@ def test_semantic_audit_records_keep_only_safe_structured_metadata():
     assert quarantine.reason_codes == ("unsupported_claim",)
     with pytest.raises(ValidationError):
         SemanticCallMetadata.model_validate({**call.model_dump(), "raw_response": "secret"})
+
+
+def test_semantic_verification_requires_a_critic_purpose_call():
+    with pytest.raises(ValidationError, match="critic call purpose"):
+        SemanticVerificationRecord(
+            source_id="htb-lame",
+            source_sha256="a" * 64,
+            critic_call=SemanticCallMetadata(
+                purpose="sedna.semantic.extract",
+                provider="host",
+                model="critic-model",
+                agent_id="agent-7",
+                input_tokens=100,
+                output_tokens=50,
+            ),
+            adjudication="verified",
+            recorded_at=datetime(2026, 8, 7, tzinfo=UTC),
+        )
 
 
 @pytest.mark.parametrize(

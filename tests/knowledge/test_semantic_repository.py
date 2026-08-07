@@ -304,6 +304,47 @@ def test_semantic_loaders_reject_corruption_and_cross_record_identity_mismatch(
         repository.load_semantic_verification("semantic-source")
 
 
+@pytest.mark.parametrize(
+    ("tamper", "loader_name", "error_pattern"),
+    (
+        ("manifest_disposition", "load_semantic_bundle", "verified compilation manifest"),
+        ("critic_purpose", "load_semantic_verification", "critic call purpose"),
+        ("critic_model", "load_semantic_bundle", "critic model identity mismatch"),
+    ),
+)
+def test_semantic_load_and_currentness_reject_tampered_result_invariants(
+    tmp_path: Path,
+    tamper: str,
+    loader_name: str,
+    error_pattern: str,
+) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    prepared = _prepared()
+    repository.write_semantic_result(_verified_result(prepared))
+    bundle_path = repository.root / "semantic_bundles" / "semantic-source.json"
+    verification_path = repository.root / "semantic_verification" / "semantic-source.json"
+
+    if tamper == "manifest_disposition":
+        path = bundle_path
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["compilation_manifest"]["disposition"] = "failed"
+    else:
+        path = verification_path
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if tamper == "critic_purpose":
+            payload["critic_call"]["purpose"] = "sedna.semantic.extract"
+        else:
+            payload["critic_call"]["model"] = "different-critic-model"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    if tamper == "critic_model":
+        SemanticKnowledgeBundle.model_validate_json(bundle_path.read_bytes())
+        SemanticVerificationRecord.model_validate_json(verification_path.read_bytes())
+    with pytest.raises(ValueError, match=error_pattern):
+        getattr(repository, loader_name)("semantic-source")
+    assert not repository.semantic_result_is_current(prepared)
+
+
 def test_semantic_transition_restores_byte_exact_snapshots_and_original_exception(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -95,3 +95,86 @@ Ruff emitted only the repository's pre-existing deprecation warning for top-leve
 
 None. The semantic manifest amendment is intentionally strict: older records missing the newly
 required persisted version evidence fail validation rather than being inferred from artifacts.
+
+---
+
+## Fix Round 1: Restore Persisted Result Invariants
+
+### Review Finding
+
+Individually valid persisted semantic JSON could bypass invariants enforced only by
+`SemanticCompilationResult`: a stored bundle could carry a non-verified compilation disposition,
+a verification record could identify a non-critic call, and bundle/verification records could
+disagree on the critic model. Loaders returned these states and currentness could accept the model
+disagreement under the default non-pinned policy.
+
+### RED Evidence
+
+Added schema and real-file tampering regressions before production changes. The focused RED run
+reported five expected failures:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
+  tests/knowledge/test_semantic_schema.py \
+  tests/knowledge/test_semantic_repository.py \
+  -k 'persistable_semantic_bundle or critic_purpose_call or tampered_result_invariants'
+5 failed, 54 deselected in 0.16s
+```
+
+The failures demonstrated that non-verified bundle manifests and non-critic verification calls
+were accepted, that cross-record critic-model disagreement was not checked, and that currentness
+did not reject the tampered states.
+
+### Changes
+
+- `SemanticKnowledgeBundle` now universally requires a compilation manifest whose disposition is
+  exactly `verified`; `unchanged` remains only a per-run result disposition.
+- `SemanticVerificationRecord` now universally requires
+  `critic_call.purpose == "sedna.semantic.critic"` for verified and quarantined audits.
+- Repository semantic-state validation now requires the verification critic model to equal the
+  bundle manifest critic model.
+- Strict loaders continue to raise `ValueError` for invalid persisted state. Currentness catches
+  persisted semantic validation failures and returns `False`, while journal recovery failures
+  remain exceptions.
+
+### GREEN and Verification Evidence
+
+```text
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
+  tests/knowledge/test_semantic_repository.py \
+  tests/knowledge/test_repository.py \
+  tests/knowledge/test_semantic_compiler.py
+85 passed in 0.80s
+
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q tests/knowledge
+504 passed in 1.21s
+
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q
+524 passed in 1.23s
+
+.venv/bin/ruff check [4 changed Python files]
+All checks passed!
+
+.venv/bin/ruff format --check [4 changed Python files]
+4 files already formatted
+
+git diff --check
+passed
+```
+
+Ruff emitted only the repository's existing top-level configuration deprecation warning.
+
+### Self-Review
+
+- The schema rules apply equally to direct construction, compiler output, and persisted reloads;
+  no repository-only path can create a weaker canonical record.
+- Cross-record model matching remains repository-owned because neither file can validate the
+  other independently. Model changes still do not force re-extraction unless pinning is requested;
+  this check only proves one stored result is internally coherent.
+- The new currentness exception handling maps persisted semantic-state validation errors to false;
+  source locking, journal recovery, byte-exact rollback, and foundation transaction behavior are
+  unchanged.
+
+### Concerns
+
+None.

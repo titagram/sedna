@@ -128,6 +128,8 @@ class SemanticVerificationRecord(BaseModel):
     @model_validator(mode="after")
     def validate_adjudication(self) -> SemanticVerificationRecord:
         """Do not mark material critic disagreement as verified."""
+        if self.critic_call.purpose != "sedna.semantic.critic":
+            raise ValueError("verification critic call purpose must be sedna.semantic.critic")
         has_material_finding = any(finding.severity == "material" for finding in self.findings)
         if self.adjudication == "verified" and has_material_finding:
             raise ValueError("verified adjudication cannot contain material findings")
@@ -176,6 +178,8 @@ class SemanticKnowledgeBundle(BaseModel):
     @model_validator(mode="after")
     def validate_bundle(self) -> SemanticKnowledgeBundle:
         """Require sorted unique artifacts and exact manifest coverage of nested IDs."""
+        if self.compilation_manifest.disposition != "verified":
+            raise ValueError("semantic bundle requires a verified compilation manifest")
         self._validate_sorted_unique(self.references, "artifact_id", "references")
         self._validate_sorted_unique(self.cases, "case_id", "cases")
         self._validate_sorted_unique(self.guidance, "rule_id", "guidance")
