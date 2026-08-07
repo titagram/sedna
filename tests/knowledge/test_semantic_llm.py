@@ -340,6 +340,60 @@ def test_safe_segment_records_reject_invalid_indexes_and_line_spans(segment):
         SafeSourceSegment.model_validate(segment)
 
 
+@pytest.mark.parametrize(
+    ("start_line", "end_line"),
+    [
+        (1, 2),
+        (9, 10),
+        (20, 21),
+        (21, 22),
+    ],
+)
+def test_safe_segment_requires_asset_spans_to_be_contained(start_line, end_line):
+    with pytest.raises(ValidationError, match="contained by segment span"):
+        SafeSourceSegment(
+            index=0,
+            start_line=10,
+            end_line=20,
+            text="safe",
+            assets=(
+                SafeSegmentAsset(
+                    asset_index=0,
+                    start_line=start_line,
+                    end_line=end_line,
+                ),
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "assets",
+    [
+        (
+            SafeSegmentAsset(asset_index=0, start_line=11, end_line=11),
+            SafeSegmentAsset(asset_index=0, start_line=12, end_line=12),
+        ),
+        (
+            SafeSegmentAsset(asset_index=1, start_line=11, end_line=11),
+            SafeSegmentAsset(asset_index=0, start_line=12, end_line=12),
+        ),
+        (
+            SafeSegmentAsset(asset_index=0, start_line=12, end_line=12),
+            SafeSegmentAsset(asset_index=1, start_line=11, end_line=11),
+        ),
+    ],
+)
+def test_safe_segment_requires_unique_deterministically_ordered_assets(assets):
+    with pytest.raises(ValidationError, match="unique and ordered"):
+        SafeSourceSegment(
+            index=0,
+            start_line=10,
+            end_line=20,
+            text="safe",
+            assets=assets,
+        )
+
+
 @pytest.mark.parametrize("indexes", [(0, 0), (1, 0), (0, 2)])
 def test_safe_payload_rejects_duplicate_out_of_order_or_gapped_segment_indexes(indexes):
     prepared = _prepared_source()
@@ -349,6 +403,95 @@ def test_safe_payload_rejects_duplicate_out_of_order_or_gapped_segment_indexes(i
 
     with pytest.raises(ValidationError, match="consecutive and ordered"):
         SafePreparedSourcePayload.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "line_ranges",
+    [
+        ((10, 20), (1, 2)),
+        ((1, 10), (10, 20)),
+        ((1, 20), (5, 10)),
+    ],
+)
+def test_safe_payload_requires_source_ordered_nonoverlapping_segment_spans(line_ranges):
+    source = build_safe_source_payload(_prepared_source()).model_dump(mode="python")
+    source["segments"] = tuple(
+        {
+            "index": index,
+            "start_line": start_line,
+            "end_line": end_line,
+            "text": "safe",
+        }
+        for index, (start_line, end_line) in enumerate(line_ranges)
+    )
+
+    with pytest.raises(ValidationError, match="source line ranges"):
+        SafePreparedSourcePayload.model_validate(source)
+
+
+def test_adapter_deep_revalidation_blocks_impossible_provenance_before_host_call():
+    source = build_safe_source_payload(_prepared_with_credential_examples())
+    segment = source.segments[0]
+    contained = SafeSegmentAsset(
+        asset_index=0,
+        start_line=segment.start_line,
+        end_line=segment.start_line,
+    )
+    later = SafeSegmentAsset(
+        asset_index=1,
+        start_line=segment.end_line,
+        end_line=segment.end_line,
+    )
+    outside = SafeSegmentAsset(
+        asset_index=0,
+        start_line=segment.end_line + 1,
+        end_line=segment.end_line + 1,
+    )
+    corrupted_sources = (
+        source.model_copy(
+            update={"segments": (segment.model_copy(update={"assets": (outside,)}),)}
+        ),
+        source.model_copy(
+            update={"segments": (segment.model_copy(update={"assets": (contained, contained)}),)}
+        ),
+        source.model_copy(
+            update={"segments": (segment.model_copy(update={"assets": (later, contained)}),)}
+        ),
+        SafePreparedSourcePayload.model_construct(
+            source_id=source.source_id,
+            title=source.title,
+            document_type=source.document_type,
+            knowledge_role=source.knowledge_role,
+            quality=source.quality,
+            segments=(
+                SafeSourceSegment(
+                    index=0,
+                    start_line=10,
+                    end_line=20,
+                    text=SOURCE_CREDENTIAL_EXAMPLES,
+                ),
+                SafeSourceSegment(
+                    index=1,
+                    start_line=1,
+                    end_line=2,
+                    text="safe",
+                ),
+            ),
+        ),
+    )
+    host = _RecordingHost(_HostResult(parsed={"artifacts": [], "ignored_segment_indexes": []}))
+    adapter = HadesLlmAdapter(host)
+
+    for corrupted in corrupted_sources:
+        with pytest.raises(TypeError, match="safe semantic request payload"):
+            adapter.complete(
+                SemanticDraftBundle,
+                instructions=EXTRACTOR_PROMPT,
+                payload=corrupted,
+                purpose="sedna.semantic.extract",
+            )
+
+    assert host.calls == []
 
 
 @pytest.mark.parametrize(

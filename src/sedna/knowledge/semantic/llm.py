@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from itertools import pairwise
 from types import MappingProxyType
 from typing import Generic, Literal, Protocol, Self, TypeVar
 
@@ -154,6 +155,21 @@ class SafeSourceSegment(BaseModel):
     def validate_line_span(self) -> Self:
         if self.end_line < self.start_line:
             raise ValueError("segment end_line must not precede start_line")
+        if any(
+            asset.start_line < self.start_line or asset.end_line > self.end_line
+            for asset in self.assets
+        ):
+            raise ValueError("asset line span must be contained by segment span")
+        asset_indexes = tuple(asset.asset_index for asset in self.assets)
+        asset_source_order = tuple(
+            (asset.start_line, asset.end_line, asset.asset_index) for asset in self.assets
+        )
+        if (
+            len(set(asset_indexes)) != len(asset_indexes)
+            or asset_indexes != tuple(sorted(asset_indexes))
+            or asset_source_order != tuple(sorted(asset_source_order))
+        ):
+            raise ValueError("segment assets must be unique and ordered deterministically")
         return self
 
 
@@ -178,6 +194,10 @@ class SafePreparedSourcePayload(SafeSemanticRequestPayload):
         indexes = tuple(segment.index for segment in self.segments)
         if indexes != tuple(range(len(self.segments))):
             raise ValueError("segment indexes must be consecutive and ordered from zero")
+        if any(
+            current.start_line <= previous.end_line for previous, current in pairwise(self.segments)
+        ):
+            raise ValueError("segment source line ranges must be increasing and nonoverlapping")
         return self
 
 
