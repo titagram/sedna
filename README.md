@@ -48,3 +48,8 @@ extracted.
 `ingest_markdown` remains available temporarily for callers of the original
 SQLite-backed `KnowledgeChunk` workflow. It does not feed the strategic pipeline;
 new ingestion integrations should use `IngestionPipeline`.
+
+Third-party corpora are evaluated as pinned, untrusted reference sources rather
+than installed as agent instructions. See the
+[Claude-Red integration assessment](docs/architecture/2026-08-06-claude-red-integration-assessment.md)
+for the proposed source adapter, Hades boundary, quality gates, and pilot rollout.
