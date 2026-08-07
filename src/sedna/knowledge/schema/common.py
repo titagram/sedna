@@ -11,7 +11,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validat
 def _reject_final_flag_material(value: str) -> str:
     from sedna.knowledge.parsing.sanitize import sanitize_searchable_text
 
-    if sanitize_searchable_text(value, ()) != value:
+    if sanitize_searchable_text(value, (value,)) != value:
         raise ValueError("searchable text contains raw or encoded final flag material")
     return value
 

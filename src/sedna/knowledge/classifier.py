@@ -252,6 +252,7 @@ def _classify_pdf(candidate: SourceCandidate) -> ClassificationResult:
 
 def _collect_signals(text: str) -> _DocumentSignals:
     visible_text = _HTML_COMMENT_RE.sub("", text)
+    local_signal_text = _strip_reference_links(visible_text)
     headings = tuple(
         _clean_heading(heading)
         for heading in (
@@ -264,8 +265,8 @@ def _collect_signals(text: str) -> _DocumentSignals:
     if not code_block_count and _INDENTED_CODE_RE.search(visible_text):
         code_block_count = 1
 
-    action_language = bool(_ACTION_LANGUAGE_RE.search(visible_text))
-    result_language = bool(_RESULT_LANGUAGE_RE.search(visible_text))
+    action_language = bool(_ACTION_LANGUAGE_RE.search(local_signal_text))
+    result_language = bool(_RESULT_LANGUAGE_RE.search(local_signal_text))
     procedural = (len(substantive_headings) >= 2 and code_block_count >= 1) or (
         action_language and result_language
     )
@@ -286,7 +287,7 @@ def _collect_signals(text: str) -> _DocumentSignals:
         headings=headings,
         substantive_heading_count=len(substantive_headings),
         code_block_count=code_block_count,
-        word_count=len(re.findall(r"\b[\w'-]+\b", visible_text)),
+        word_count=len(re.findall(r"\b[\w'-]+\b", local_signal_text)),
         table_line_count=table_line_count,
         narrative_line_count=narrative_line_count,
         has_flag=_contains_final_flag(text),
@@ -305,13 +306,17 @@ def _contains_final_flag(text: str) -> bool:
 
 
 def _count_fenced_code_blocks(text: str) -> int:
-    """Count CommonMark fences, including a final fence left open through EOF."""
+    """Count nonempty CommonMark fences, including one left open through EOF."""
     open_character: str | None = None
     open_length = 0
+    has_payload = False
     block_count = 0
 
     for line in text.splitlines():
         match = _FENCE_LINE_RE.match(line)
+        if open_character is not None and match is None:
+            has_payload = has_payload or bool(line.strip())
+            continue
         if match is None:
             continue
 
@@ -323,10 +328,17 @@ def _count_fenced_code_blocks(text: str) -> int:
                 continue
             open_character = character
             open_length = len(fence)
-            block_count += 1
+            has_payload = False
         elif character == open_character and len(fence) >= open_length and not rest.strip():
+            block_count += int(has_payload)
             open_character = None
             open_length = 0
+            has_payload = False
+        else:
+            has_payload = has_payload or bool(line.strip())
+
+    if open_character is not None:
+        block_count += int(has_payload)
 
     return block_count
 
@@ -344,6 +356,12 @@ def _clean_heading(heading: str) -> str:
     return re.sub(r"<[^>]+>", " ", heading).strip()
 
 
+def _strip_reference_links(text: str) -> str:
+    local_text = _MARKDOWN_LINK_RE.sub("", text)
+    local_text = _WIKI_LINK_RE.sub("", local_text)
+    return _URL_RE.sub("", local_text)
+
+
 def _is_substantive(heading: str) -> bool:
     normalized = re.sub(r"\s+", " ", heading).strip().casefold()
     return normalized not in {"user", "root"} and not _NON_PROCEDURAL_HEADING_RE.search(heading)
@@ -359,7 +377,8 @@ def _is_narrative_line(line: str) -> bool:
         return False
     if re.fullmatch(r"[-=* _]{3,}", stripped):
         return False
-    return len(re.findall(r"\b[\w'-]+\b", stripped)) >= 5
+    local_text = _strip_reference_links(stripped)
+    return len(re.findall(r"\b[\w'-]+\b", local_text)) >= 5
 
 
 def _is_table_dominant(signals: _DocumentSignals) -> bool:

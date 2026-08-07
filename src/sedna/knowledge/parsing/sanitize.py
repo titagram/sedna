@@ -4,9 +4,17 @@ from __future__ import annotations
 
 import html
 import re
+from typing import NamedTuple
 from urllib.parse import unquote
 
 EXCLUDED_FLAG = "<EXCLUDED_FLAG>"
+
+_MAX_DECODE_INPUT_CHARS = 65_536
+_MAX_DECODE_ROUNDS = 8
+_MAX_DECODE_WORK_CHARS = 262_144
+_ENCODING_MARKER_RE = re.compile(
+    r"%(?:[0-9A-Fa-f]{2})|&(?:#(?:\d+|[xX][0-9A-Fa-f]+)|[A-Za-z][A-Za-z0-9]+);"
+)
 
 _HTB_FLAG_RE = re.compile(r"HTB\{[^}]*\}", re.IGNORECASE)
 _HTB_OPEN_MARKER_RE = re.compile(r"HTB\{", re.IGNORECASE)
@@ -29,6 +37,11 @@ _DIRECT_FLAG_CONTEXTS = frozenset({"final", "root", "user"})
 _CAPTURE_VERBS = frozenset({"read", "retrieve", "submit"})
 
 
+class _DecodeResult(NamedTuple):
+    value: str
+    stable: bool
+
+
 def sanitize_searchable_text(text: str, heading_path: tuple[str, ...]) -> str:
     """Return a searchable copy with deterministic final-flag redaction.
 
@@ -48,8 +61,10 @@ def sanitize_asset_target(target: str) -> str:
     """
     sanitized = _sanitize_asset_target_once(target)
     decoded = _recursively_decode(target)
-    decoded_sanitized = _sanitize_asset_target_once(decoded)
-    return decoded_sanitized if decoded_sanitized != decoded else sanitized
+    if not decoded.stable:
+        return EXCLUDED_FLAG
+    decoded_sanitized = _sanitize_asset_target_once(decoded.value)
+    return decoded_sanitized if decoded_sanitized != decoded.value else sanitized
 
 
 def _contextual_hex_flag_values(
@@ -59,8 +74,11 @@ def _contextual_hex_flag_values(
     if not _is_hex_flag_context(heading_path):
         return frozenset()
     decoded = _recursively_decode(text)
+    if not decoded.stable:
+        return frozenset()
     return frozenset(
-        match.group().casefold() for match in _STANDALONE_32_HEX_RE.finditer(decoded)
+        match.group().casefold()
+        for match in _STANDALONE_32_HEX_RE.finditer(decoded.value)
     )
 
 
@@ -71,12 +89,14 @@ def _sanitize_searchable_text(
 ) -> str:
     sanitized = _sanitize_searchable_text_once(text, heading_path, known_hex_flags)
     decoded = _recursively_decode(text)
+    if not decoded.stable:
+        return EXCLUDED_FLAG
     decoded_sanitized = _sanitize_searchable_text_once(
-        decoded,
+        decoded.value,
         heading_path,
         known_hex_flags,
     )
-    return decoded_sanitized if decoded_sanitized != decoded else sanitized
+    return decoded_sanitized if decoded_sanitized != decoded.value else sanitized
 
 
 def _sanitize_searchable_text_once(
@@ -108,17 +128,35 @@ def _sanitize_asset_target_once(target: str) -> str:
     return _STANDALONE_32_HEX_RE.sub(EXCLUDED_FLAG, sanitized)
 
 
-def _recursively_decode(text: str) -> str:
+def _recursively_decode(text: str) -> _DecodeResult:
+    if not _ENCODING_MARKER_RE.search(text):
+        return _DecodeResult(text, True)
+    if len(text) > _MAX_DECODE_INPUT_CHARS:
+        return _DecodeResult(text, False)
+
     decoded = text
-    while True:
-        next_value = html.unescape(unquote(decoded))
+    work_chars = 0
+    for _ in range(_MAX_DECODE_ROUNDS):
+        if work_chars + len(decoded) > _MAX_DECODE_WORK_CHARS:
+            return _DecodeResult(decoded, False)
+        url_decoded = unquote(decoded)
+        work_chars += len(decoded)
+        if work_chars + len(url_decoded) > _MAX_DECODE_WORK_CHARS:
+            return _DecodeResult(url_decoded, False)
+        next_value = html.unescape(url_decoded)
+        work_chars += len(url_decoded)
         if next_value == decoded:
-            return decoded
+            return _DecodeResult(decoded, True)
         decoded = next_value
+    return _DecodeResult(decoded, not _ENCODING_MARKER_RE.search(decoded))
 
 
 def _is_hex_flag_context(heading_path: tuple[str, ...]) -> bool:
-    return any(_heading_is_hex_flag_context(part) for part in heading_path)
+    for part in heading_path:
+        decoded = _recursively_decode(part)
+        if not decoded.stable or _heading_is_hex_flag_context(decoded.value):
+            return True
+    return False
 
 
 def _heading_is_hex_flag_context(heading: str) -> bool:

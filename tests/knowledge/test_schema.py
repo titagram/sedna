@@ -502,6 +502,58 @@ def test_canonical_models_accept_the_explicit_exclusion_sentinel():
     assert reference.statement == "The result is <EXCLUDED_FLAG>."
 
 
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "Root flag: abcdef0123456789abcdef0123456789",
+        "User flag: %61bcdef0123456789abcdef0123456789",
+        "Root%20flag%3A%20abcdef0123456789abcdef0123456789",
+    ],
+)
+def test_canonical_searchable_fields_reject_contextual_bare_hex_flags(
+    statement: str,
+):
+    with pytest.raises(ValidationError, match="final flag"):
+        ReferenceArtifact.model_validate({**reference_payload(), "statement": statement})
+
+
+def test_nested_case_searchable_fields_apply_their_own_flag_context():
+    with pytest.raises(ValidationError, match="final flag"):
+        CaseState(access="User flag: abcdef0123456789abcdef0123456789")
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "MD5: abcdef0123456789abcdef0123456789",
+        "MD5%3A%20abcdef0123456789abcdef0123456789",
+    ],
+)
+def test_canonical_searchable_fields_preserve_unrelated_md5_hashes(statement: str):
+    reference = ReferenceArtifact.model_validate(
+        {**reference_payload(), "statement": statement}
+    )
+
+    assert reference.statement == statement
+
+
+@pytest.mark.parametrize(
+    "unstable_value",
+    [
+        f"HTB%{'25' * 20}7Bcanonical_deep_leak%{'25' * 20}7D",
+        "note:%2525252525252541;" * 2_500,
+        f"HTB%{'25' * 20_000}7Bcanonical_deep_leak%{'25' * 20_000}7D",
+    ],
+)
+def test_canonical_searchable_fields_reject_decode_budget_exhaustion(
+    unstable_value: str,
+):
+    with pytest.raises(ValidationError, match="final flag"):
+        ReferenceArtifact.model_validate(
+            {**reference_payload(), "statement": unstable_value}
+        )
+
+
 def test_knowledge_case_rejects_steps_from_a_different_epistemic_lane():
     negative_step = CaseStep(
         ordinal=1,

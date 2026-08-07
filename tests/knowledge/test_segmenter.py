@@ -365,6 +365,39 @@ def test_recursively_encoded_contextual_hex_flag_is_redacted():
     assert sanitized == "<EXCLUDED_FLAG>"
 
 
+@pytest.mark.parametrize("depth", [20, 2_500])
+def test_excessive_url_encoding_depth_fails_closed(depth: int):
+    deeply_encoded_flag = f"HTB%{'25' * depth}7Bdeep_secret%{'25' * depth}7D"
+
+    assert sanitize_searchable_text(deeply_encoded_flag, ()) == "<EXCLUDED_FLAG>"
+
+
+def test_excessive_decode_input_fails_closed_without_unbounded_work():
+    oversized_encoded_flag = f"HTB%{'25' * 20_000}7Bdeep_secret%{'25' * 20_000}7D"
+
+    assert sanitize_searchable_text(oversized_encoded_flag, ()) == "<EXCLUDED_FLAG>"
+
+
+def test_excessive_decode_work_fails_closed_even_without_visible_flag_marker():
+    unstable_encoded_value = "note:%2525252525252541;" * 2_500
+
+    assert sanitize_searchable_text(unstable_encoded_value, ()) == "<EXCLUDED_FLAG>"
+
+
+def test_benign_stable_url_encoding_remains_byte_preserved():
+    encoded_reference = "MD5%3A%20abcdef0123456789abcdef0123456789"
+
+    assert sanitize_searchable_text(encoded_reference, ()) == encoded_reference
+
+
+def test_decode_round_limit_allows_eight_transformations_and_rejects_nine():
+    eight_rounds = f"note:%{'25' * 7}41"
+    nine_rounds = f"note:%{'25' * 8}41"
+
+    assert sanitize_searchable_text(eight_rounds, ()) == eight_rounds
+    assert sanitize_searchable_text(nine_rounds, ()) == "<EXCLUDED_FLAG>"
+
+
 def test_multiline_htb_flag_inside_code_is_removed_from_segment_text():
     document = parsed("```text\nlabelHTB{line one\nline two}\n```\n")
 

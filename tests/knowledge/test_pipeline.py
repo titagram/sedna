@@ -159,6 +159,32 @@ def test_pipeline_redacts_complete_url_encoded_flag_from_searchable_segments(
     assert searchable.count("<EXCLUDED_FLAG>") == 1
 
 
+def test_pipeline_fails_closed_for_excessively_nested_encoded_flag(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "raw_src"
+    encoded_flag = f"HTB%{'25' * 20}7Bpipeline_deep_leak%{'25' * 20}7D"
+    candidate = _write_candidate(
+        source_root,
+        "Write-ups/Machines/DeepEncoded/walkthrough.md",
+        (
+            "# Deep encoded walkthrough\n"
+            "## Enumerate service\n"
+            "Observe port 80 and inspect the service.\n\n"
+            "```text\nHTTP service exposed\n```\n\n"
+            f"## Result\nThe final value is {encoded_flag}.\n"
+        ).encode(),
+    )
+    pipeline = IngestionPipeline(source_root, tmp_path / "knowledge")
+
+    prepared = pipeline.prepare(candidate)
+
+    assert prepared is not None
+    searchable = "\n".join(segment.text for segment in prepared.segments)
+    assert "pipeline_deep_leak" not in searchable
+    assert "<EXCLUDED_FLAG>" in searchable
+
+
 def test_pipeline_is_exported_from_public_knowledge_package() -> None:
     assert PublicIngestionPipeline is IngestionPipeline
 

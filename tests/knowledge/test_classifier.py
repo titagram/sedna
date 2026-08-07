@@ -147,6 +147,135 @@ Previous: [[HTB Academy]]
     assert "no_local_substance" in result.reasons
 
 
+def test_academy_external_link_label_alone_is_not_local_substance(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "external-course.md"
+    text = """# Network enumeration
+
+[Complete course covering network enumeration concepts](https://example.com/course)
+"""
+    path.write_text(text, encoding="utf-8")
+    candidate = SourceCandidate(
+        source_id="source-external-course",
+        path=path,
+        relative_path="Write-ups/Academy/Recon/external-course.md",
+        suffix=".md",
+        sha256="6" * 64,
+        size_bytes=len(text.encode()),
+        assets=(),
+    )
+
+    result = classify_document(candidate, text)
+
+    assert result.document_type == DocumentType.EXTERNAL_STUB
+    assert result.ingestion_status == IngestionStatus.EXCLUDED
+    assert "no_local_substance" in result.reasons
+
+
+def test_explanatory_text_around_academy_link_remains_local_substance(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "explained-link.md"
+    text = """# Network enumeration
+
+Read the [official syntax](https://example.com/syntax), then compare its examples
+against the response observed in the local lab.
+"""
+    path.write_text(text, encoding="utf-8")
+    candidate = SourceCandidate(
+        source_id="source-explained-link",
+        path=path,
+        relative_path="Write-ups/Academy/Recon/explained-link.md",
+        suffix=".md",
+        sha256="7" * 64,
+        size_bytes=len(text.encode()),
+        assets=(),
+    )
+
+    result = classify_document(candidate, text)
+
+    assert result.document_type == DocumentType.LESSON
+    assert result.ingestion_status == IngestionStatus.ACCEPTED
+
+
+def test_academy_empty_fence_is_not_code_or_local_substance(tmp_path: Path) -> None:
+    path = tmp_path / "empty-example.md"
+    text = "# Network enumeration\n\n## Example command\n\n```bash\n   \n```\n"
+    path.write_text(text, encoding="utf-8")
+    candidate = SourceCandidate(
+        source_id="source-empty-example",
+        path=path,
+        relative_path="Write-ups/Academy/Recon/empty-example.md",
+        suffix=".md",
+        sha256="8" * 64,
+        size_bytes=len(text.encode()),
+        assets=(),
+    )
+
+    result = classify_document(candidate, text)
+
+    assert result.document_type == DocumentType.EXCLUDED
+    assert result.ingestion_status == IngestionStatus.EXCLUDED
+    assert "no_local_substance" in result.reasons
+
+
+def test_machine_headings_and_empty_fence_are_not_procedural(tmp_path: Path) -> None:
+    path = tmp_path / "empty-walkthrough.md"
+    text = """# Example machine
+
+## Enumeration
+
+```text
+
+```
+"""
+    path.write_text(text, encoding="utf-8")
+    candidate = SourceCandidate(
+        source_id="source-empty-walkthrough",
+        path=path,
+        relative_path="Write-ups/Machines/Example/empty-walkthrough.md",
+        suffix=".md",
+        sha256="9" * 64,
+        size_bytes=len(text.encode()),
+        assets=(),
+    )
+
+    result = classify_document(candidate, text)
+
+    assert result.document_type == DocumentType.EXCLUDED
+    assert result.ingestion_status == IngestionStatus.QUARANTINED
+    assert "ambiguous" in result.reasons
+
+
+def test_machine_link_label_does_not_supply_action_and_result_language(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "linked-summary.md"
+    text = """# Example machine
+
+## External notes
+
+[We ran a scan and we found an exposed service](https://example.com/notes)
+"""
+    path.write_text(text, encoding="utf-8")
+    candidate = SourceCandidate(
+        source_id="source-linked-summary",
+        path=path,
+        relative_path="Write-ups/Machines/Example/linked-summary.md",
+        suffix=".md",
+        sha256="0" * 64,
+        size_bytes=len(text.encode()),
+        assets=(),
+    )
+
+    result = classify_document(candidate, text)
+
+    assert result.document_type == DocumentType.EXCLUDED
+    assert result.ingestion_status == IngestionStatus.QUARANTINED
+    assert "ambiguous" in result.reasons
+
+
 @pytest.mark.skipif(not REAL_CORPUS.is_dir(), reason="real source corpus is unavailable")
 def test_real_academy_stubs_are_excluded_without_losing_concise_cheatsheets() -> None:
     stub_paths = (
