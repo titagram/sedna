@@ -175,6 +175,7 @@ class CanonicalKnowledgeRepository:
             "quarantine",
             "ingestion_reports",
             "semantic_bundles",
+            "semantic_compilation_guards",
             "semantic_verification",
             "semantic_quarantine",
             "transactions",
@@ -327,6 +328,91 @@ class CanonicalKnowledgeRepository:
         """Load a strictly validated semantic quarantine record."""
         return self._load_semantic_component(source_id, "quarantine")
 
+    def load_current_semantic_result(
+        self,
+        prepared: PreparedSource,
+        *,
+        semantic_schema_version: str = SEMANTIC_SCHEMA_VERSION,
+        extractor_prompt_version: str = EXTRACTOR_PROMPT_VERSION,
+        critic_prompt_version: str = CRITIC_PROMPT_VERSION,
+        repair_prompt_version: str = REPAIR_PROMPT_VERSION,
+        compiler_version: str = SEMANTIC_COMPILER_VERSION,
+        pin_models: bool = False,
+        extractor_model_id: str | None = None,
+        critic_model_id: str | None = None,
+    ) -> SemanticCompilationResult | None:
+        """Atomically load one current, cross-validated verified semantic pair."""
+        if not isinstance(prepared, PreparedSource):
+            raise TypeError("prepared must be a PreparedSource")
+        if pin_models and (not extractor_model_id or not critic_model_id):
+            raise ValueError("model-pinned currentness requires both model identifiers")
+        source_id = prepared.manifest.source_id
+        self._target("semantic_bundles", source_id)
+        with self._source_transition_lock(source_id):
+            self._recover_source(source_id)
+            try:
+                bundle, verification, quarantine = self._load_semantic_state(source_id)
+            except ValueError:
+                return None
+            if bundle is None or verification is None or quarantine is not None:
+                return None
+
+            foundation = prepared.manifest.extraction
+            manifest = bundle.compilation_manifest
+            current = (
+                bundle.source_id == source_id
+                and bundle.source_sha256 == prepared.manifest.sha256
+                and manifest.foundation_schema_version == foundation.schema_version
+                and manifest.foundation_parser_id == foundation.parser_id
+                and manifest.foundation_parser_version == foundation.parser_version
+                and bundle.schema_version == semantic_schema_version
+                and manifest.extractor_prompt_version == extractor_prompt_version
+                and manifest.critic_prompt_version == critic_prompt_version
+                and manifest.repair_prompt_version == repair_prompt_version
+                and manifest.compiler_version == compiler_version
+            )
+            if pin_models:
+                current = current and (
+                    manifest.extractor_model_id == extractor_model_id
+                    and manifest.critic_model_id == critic_model_id
+                )
+            if not current:
+                return None
+            return SemanticCompilationResult(
+                disposition="unchanged",
+                bundle=bundle,
+                verification=verification,
+            )
+
+    @contextmanager
+    def semantic_compilation_guard(self, source_id: str) -> Iterator[None]:
+        """Serialize check, compile, and persistence for one semantic source."""
+        _validate_stable_id(source_id)
+        directory_fd = self._open_child_directory("semantic_compilation_guards", create=True)
+        lock_fd = -1
+        try:
+            try:
+                lock_fd = os.open(
+                    f"{source_id}.lock",
+                    self._lock_open_flags(),
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+            except OSError as exc:
+                raise ValueError(
+                    f"semantic compilation guard is not a confined regular file: {exc}"
+                ) from exc
+            if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+                raise ValueError("semantic compilation guard is not a regular file")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            if lock_fd >= 0:
+                with suppress(OSError):
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            os.close(directory_fd)
+
     def semantic_result_is_current(
         self,
         prepared: PreparedSource,
@@ -341,42 +427,19 @@ class CanonicalKnowledgeRepository:
         critic_model_id: str | None = None,
     ) -> bool:
         """Return whether verified canonical semantics match all configured inputs."""
-        if not isinstance(prepared, PreparedSource):
-            raise TypeError("prepared must be a PreparedSource")
-        if pin_models and (not extractor_model_id or not critic_model_id):
-            raise ValueError("model-pinned currentness requires both model identifiers")
-        source_id = prepared.manifest.source_id
-        self._target("semantic_bundles", source_id)
-        with self._source_transition_lock(source_id):
-            self._recover_source(source_id)
-            try:
-                bundle, verification, quarantine = self._load_semantic_state(source_id)
-            except ValueError:
-                return False
-        if bundle is None and verification is None and quarantine is None:
-            return False
-        if bundle is None or verification is None or quarantine is not None:
-            return False
-
-        foundation = prepared.manifest.extraction
-        manifest = bundle.compilation_manifest
-        current = (
-            bundle.source_id == source_id
-            and bundle.source_sha256 == prepared.manifest.sha256
-            and manifest.foundation_schema_version == foundation.schema_version
-            and manifest.foundation_parser_id == foundation.parser_id
-            and manifest.foundation_parser_version == foundation.parser_version
-            and bundle.schema_version == semantic_schema_version
-            and manifest.extractor_prompt_version == extractor_prompt_version
-            and manifest.critic_prompt_version == critic_prompt_version
-            and manifest.repair_prompt_version == repair_prompt_version
-            and manifest.compiler_version == compiler_version
-        )
-        if not current or not pin_models:
-            return current
         return (
-            manifest.extractor_model_id == extractor_model_id
-            and manifest.critic_model_id == critic_model_id
+            self.load_current_semantic_result(
+                prepared,
+                semantic_schema_version=semantic_schema_version,
+                extractor_prompt_version=extractor_prompt_version,
+                critic_prompt_version=critic_prompt_version,
+                repair_prompt_version=repair_prompt_version,
+                compiler_version=compiler_version,
+                pin_models=pin_models,
+                extractor_model_id=extractor_model_id,
+                critic_model_id=critic_model_id,
+            )
+            is not None
         )
 
     def quarantine_exists(self, source_id: str) -> bool:

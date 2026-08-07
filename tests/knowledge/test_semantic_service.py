@@ -8,10 +8,12 @@ import html
 import json
 import re
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 from typing import Any
 from urllib.parse import unquote
 
@@ -160,6 +162,21 @@ class _ScriptedHost:
             provider="scripted-provider",
             model=f"scripted-{purpose}",
         )
+
+
+class _BlockingScriptedHost(_ScriptedHost):
+    """Pause the first LLM call so a competing service reaches the source guard."""
+
+    def __init__(self, responses: list[object], entered: Event, release: Event) -> None:
+        super().__init__(responses)
+        self._entered = entered
+        self._release = release
+
+    def complete_structured(self, **kwargs: Any) -> object:
+        if not self.calls:
+            self._entered.set()
+            assert self._release.wait(5)
+        return super().complete_structured(**kwargs)
 
 
 def _load_responses(name: str) -> list[object]:
@@ -368,6 +385,7 @@ def test_material_architecture_omission_is_repaired_once_with_cited_context(
 
 def test_current_second_pass_loads_typed_unchanged_result_without_an_llm_call(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with _prepared_case(tmp_path, "reference") as (pipeline, prepared, _, _):
         service, host = _service(
@@ -376,6 +394,13 @@ def test_current_second_pass_loads_typed_unchanged_result_without_an_llm_call(
         )
         verified = service.compile_and_store(prepared)
 
+        def reject_split_load(*args: object, **kwargs: object) -> object:
+            raise AssertionError("service must use one atomic current-result snapshot")
+
+        monkeypatch.setattr(pipeline.repository, "semantic_result_is_current", reject_split_load)
+        monkeypatch.setattr(pipeline.repository, "load_semantic_bundle", reject_split_load)
+        monkeypatch.setattr(pipeline.repository, "load_semantic_verification", reject_split_load)
+
         unchanged = service.compile_and_store(prepared)
 
         assert unchanged.disposition == "unchanged"
@@ -383,6 +408,53 @@ def test_current_second_pass_loads_typed_unchanged_result_without_an_llm_call(
         assert unchanged.verification == verified.verification
         assert unchanged.calls == ()
         assert _purposes(host) == ["sedna.semantic.extract", "sedna.semantic.critic"]
+
+
+def test_concurrent_stale_services_compile_once_and_return_coherent_results(
+    tmp_path: Path,
+) -> None:
+    responses = _load_responses(SOURCE_CASES["reference"].fixture_name)
+    with _prepared_case(tmp_path, "reference") as (pipeline, prepared, _, _):
+        competing_repository = CanonicalKnowledgeRepository(pipeline.repository.root)
+        extractor_entered = Event()
+        release_extractor = Event()
+        competing_host = _ScriptedHost(copy.deepcopy(responses))
+        winning_host = _BlockingScriptedHost(
+            copy.deepcopy(responses), extractor_entered, release_extractor
+        )
+        winning_service = SemanticIngestionService(
+            pipeline.repository,
+            SemanticCompiler(HadesLlmAdapter(winning_host), clock=lambda: NOW),
+        )
+        competing_service = SemanticIngestionService(
+            competing_repository,
+            SemanticCompiler(HadesLlmAdapter(competing_host), clock=lambda: NOW),
+        )
+        competing_started = Event()
+
+        def compile_competing() -> object:
+            competing_started.set()
+            return competing_service.compile_and_store(prepared)
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                winning_future = executor.submit(winning_service.compile_and_store, prepared)
+                assert extractor_entered.wait(5)
+                competing_future = executor.submit(compile_competing)
+                assert competing_started.wait(5)
+                assert not competing_host.calls
+                assert not competing_future.done()
+                release_extractor.set()
+                winning = winning_future.result(timeout=5)
+                competing = competing_future.result(timeout=5)
+        finally:
+            competing_repository.close()
+
+        assert (winning.disposition, competing.disposition) == ("verified", "unchanged")
+        assert len(winning_host.calls) + len(competing_host.calls) == 2
+        assert competing.bundle == winning.bundle
+        assert competing.verification == winning.verification
+        assert competing.calls == ()
 
 
 @pytest.mark.parametrize(
@@ -446,7 +518,9 @@ def test_quarantined_result_is_persisted_without_a_bundle(tmp_path: Path) -> Non
             pipeline.repository.load_semantic_bundle(prepared.manifest.source_id)
 
 
-def test_failed_result_remains_run_local_and_is_retried(tmp_path: Path) -> None:
+def test_failed_result_remains_run_local_and_is_retried_by_another_instance(
+    tmp_path: Path,
+) -> None:
     with _prepared_case(tmp_path, "reference") as (pipeline, prepared, _, _):
         failed_service, _ = _service(
             pipeline.repository,
@@ -464,13 +538,17 @@ def test_failed_result_remains_run_local_and_is_retried(tmp_path: Path) -> None:
             with pytest.raises(FileNotFoundError):
                 loader(prepared.manifest.source_id)
 
-        retry_service, retry_host = _service(
-            pipeline.repository,
-            _load_responses(SOURCE_CASES["reference"].fixture_name),
-        )
-        retried = retry_service.compile_and_store(prepared)
-        assert retried.disposition == "verified"
-        assert _purposes(retry_host) == ["sedna.semantic.extract", "sedna.semantic.critic"]
+        retry_repository = CanonicalKnowledgeRepository(pipeline.repository.root)
+        try:
+            retry_service, retry_host = _service(
+                retry_repository,
+                _load_responses(SOURCE_CASES["reference"].fixture_name),
+            )
+            retried = retry_service.compile_and_store(prepared)
+            assert retried.disposition == "verified"
+            assert _purposes(retry_host) == ["sedna.semantic.extract", "sedna.semantic.critic"]
+        finally:
+            retry_repository.close()
 
 
 @pytest.mark.parametrize("case_name", tuple(SOURCE_CASES))

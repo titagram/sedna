@@ -34,25 +34,23 @@ class SemanticIngestionService:
 
     def compile_and_store(self, prepared: PreparedSource) -> SemanticCompilationResult:
         """Return current canonical semantics or compile and persist one stale source."""
-        if self._repository.semantic_result_is_current(
-            prepared,
-            semantic_schema_version=SEMANTIC_SCHEMA_VERSION,
-            extractor_prompt_version=EXTRACTOR_PROMPT_VERSION,
-            critic_prompt_version=CRITIC_PROMPT_VERSION,
-            repair_prompt_version=REPAIR_PROMPT_VERSION,
-            compiler_version=SEMANTIC_COMPILER_VERSION,
-        ):
-            source_id = prepared.manifest.source_id
-            return SemanticCompilationResult(
-                disposition="unchanged",
-                bundle=self._repository.load_semantic_bundle(source_id),
-                verification=self._repository.load_semantic_verification(source_id),
+        source_id = prepared.manifest.source_id
+        with self._repository.semantic_compilation_guard(source_id):
+            current = self._repository.load_current_semantic_result(
+                prepared,
+                semantic_schema_version=SEMANTIC_SCHEMA_VERSION,
+                extractor_prompt_version=EXTRACTOR_PROMPT_VERSION,
+                critic_prompt_version=CRITIC_PROMPT_VERSION,
+                repair_prompt_version=REPAIR_PROMPT_VERSION,
+                compiler_version=SEMANTIC_COMPILER_VERSION,
             )
+            if current is not None:
+                return current
 
-        result = self._compiler.compile(prepared)
-        if result.disposition in {"verified", "quarantined"}:
-            self._repository.write_semantic_result(result)
-        return result
+            result = self._compiler.compile(prepared)
+            if result.disposition in {"verified", "quarantined"}:
+                self._repository.write_semantic_result(result)
+            return result
 
 
 __all__ = ["SemanticIngestionService"]

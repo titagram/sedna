@@ -449,6 +449,150 @@ def test_semantic_transition_serializes_across_repository_instances(
         second.load_semantic_bundle("semantic-source")
 
 
+def test_current_semantic_result_is_one_linearizable_pair_across_instances(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "knowledge"
+    reader = CanonicalKnowledgeRepository(root)
+    writer = CanonicalKnowledgeRepository(root)
+    prepared = _prepared()
+    original = _verified_result(
+        prepared,
+        extractor_model="extractor-original",
+        critic_model="critic-original",
+    )
+    replacement = _verified_result(
+        prepared,
+        extractor_model="extractor-replacement",
+        critic_model="critic-replacement",
+    )
+    reader.write_semantic_result(original)
+    snapshot_loaded = Event()
+    release_snapshot = Event()
+    writer_started = Event()
+    writer_finished = Event()
+    real_load_state = reader._load_semantic_state
+
+    def pause_loaded_snapshot(source_id: str) -> object:
+        state = real_load_state(source_id)
+        snapshot_loaded.set()
+        assert release_snapshot.wait(5)
+        return state
+
+    def replace_state() -> None:
+        writer_started.set()
+        writer.write_semantic_result(replacement)
+        writer_finished.set()
+
+    monkeypatch.setattr(reader, "_load_semantic_state", pause_loaded_snapshot)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        read_future = executor.submit(reader.load_current_semantic_result, prepared)
+        assert snapshot_loaded.wait(5)
+        write_future = executor.submit(replace_state)
+        assert writer_started.wait(5)
+        assert not writer_finished.wait(0.2)
+        release_snapshot.set()
+        unchanged = read_future.result(timeout=5)
+        write_future.result(timeout=5)
+
+    assert unchanged is not None
+    assert unchanged.disposition == "unchanged"
+    assert unchanged.calls == ()
+    assert unchanged.bundle == original.bundle
+    assert unchanged.verification == original.verification
+    assert unchanged.bundle is not None
+    assert unchanged.verification is not None
+    assert (
+        unchanged.bundle.compilation_manifest.critic_model_id
+        == unchanged.verification.critic_call.model
+        == "critic-original"
+    )
+    assert reader.load_semantic_bundle("semantic-source") == replacement.bundle
+
+
+def test_semantic_compilation_guard_serializes_only_the_same_safe_source(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "knowledge"
+    first = CanonicalKnowledgeRepository(root)
+    second = CanonicalKnowledgeRepository(root)
+    same_source_started = Event()
+    same_source_entered = Event()
+    different_source_entered = Event()
+    colliding_state_lock_finished = Event()
+
+    def enter_same_source() -> None:
+        same_source_started.set()
+        with second.semantic_compilation_guard("semantic-source"):
+            same_source_entered.set()
+
+    def enter_different_source() -> None:
+        with second.semantic_compilation_guard("different-source"):
+            different_source_entered.set()
+
+    def write_source_whose_id_matches_the_old_guard_suffix() -> None:
+        prepared = _prepared(source_id="semantic-source.semantic-compilation")
+        second.write_semantic_result(_verified_result(prepared))
+        colliding_state_lock_finished.set()
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        with first.semantic_compilation_guard("semantic-source"):
+            same_future = executor.submit(enter_same_source)
+            assert same_source_started.wait(5)
+            different_future = executor.submit(enter_different_source)
+            state_lock_future = executor.submit(write_source_whose_id_matches_the_old_guard_suffix)
+            assert different_source_entered.wait(5)
+            assert colliding_state_lock_finished.wait(5)
+            assert not same_source_entered.wait(0.2)
+            different_future.result(timeout=5)
+            state_lock_future.result(timeout=5)
+            assert not same_source_entered.is_set()
+        same_future.result(timeout=5)
+    assert same_source_entered.is_set()
+
+
+def test_semantic_compilation_guard_rejects_unsafe_ids_and_symlinks(
+    tmp_path: Path,
+) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+
+    with (
+        pytest.raises(ValueError, match="safe path segment"),
+        repository.semantic_compilation_guard("../escape"),
+    ):
+        pass
+
+    guard_directory = repository.root / "semantic_compilation_guards"
+    guard_directory.mkdir(exist_ok=True)
+    outside = tmp_path / "outside.lock"
+    outside.write_text("untouched", encoding="utf-8")
+    guard_path = guard_directory / "semantic-source.lock"
+    guard_path.symlink_to(outside)
+
+    with (
+        pytest.raises(ValueError, match="semantic compilation guard"),
+        repository.semantic_compilation_guard("semantic-source"),
+    ):
+        pass
+
+    assert outside.read_text(encoding="utf-8") == "untouched"
+
+
+def test_semantic_compilation_guard_releases_after_exception(tmp_path: Path) -> None:
+    root = tmp_path / "knowledge"
+    first = CanonicalKnowledgeRepository(root)
+    second = CanonicalKnowledgeRepository(root)
+
+    with (
+        pytest.raises(RuntimeError, match="compile crashed"),
+        first.semantic_compilation_guard("semantic-source"),
+    ):
+        raise RuntimeError("compile crashed")
+
+    with second.semantic_compilation_guard("semantic-source"):
+        pass
+
+
 def test_repository_startup_recovers_interrupted_semantic_journal(tmp_path: Path) -> None:
     root = tmp_path / "knowledge"
     repository = CanonicalKnowledgeRepository(root)
