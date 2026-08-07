@@ -86,6 +86,10 @@ class SemanticCompilationManifest(BaseModel):
 
     source_id: NonEmptyString
     source_sha256: Sha256
+    foundation_schema_version: NonEmptyString
+    foundation_parser_id: NonEmptyString
+    foundation_parser_version: NonEmptyString
+    compiler_version: NonEmptyString
     extractor_prompt_version: NonEmptyString
     critic_prompt_version: NonEmptyString
     repair_prompt_version: NonEmptyString

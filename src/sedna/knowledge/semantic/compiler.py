@@ -52,6 +52,7 @@ from sedna.knowledge.semantic.prompts import (
 )
 
 SEMANTIC_SCHEMA_VERSION = "2.0.0"
+SEMANTIC_COMPILER_VERSION = "1"
 
 
 class SemanticCompiler:
@@ -324,6 +325,10 @@ class SemanticCompiler:
             compilation_manifest=SemanticCompilationManifest(
                 source_id=prepared.manifest.source_id,
                 source_sha256=prepared.manifest.sha256,
+                foundation_schema_version=prepared.manifest.extraction.schema_version,
+                foundation_parser_id=prepared.manifest.extraction.parser_id,
+                foundation_parser_version=prepared.manifest.extraction.parser_version,
+                compiler_version=SEMANTIC_COMPILER_VERSION,
                 extractor_prompt_version=EXTRACTOR_PROMPT_VERSION,
                 critic_prompt_version=CRITIC_PROMPT_VERSION,
                 repair_prompt_version=REPAIR_PROMPT_VERSION,

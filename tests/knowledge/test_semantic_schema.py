@@ -132,6 +132,10 @@ def semantic_manifest() -> SemanticCompilationManifest:
     return SemanticCompilationManifest(
         source_id="htb-lame",
         source_sha256="a" * 64,
+        foundation_schema_version="1.1.0",
+        foundation_parser_id="markdown-it-commonmark",
+        foundation_parser_version="1",
+        compiler_version="1",
         extractor_prompt_version="extract-v1",
         critic_prompt_version="critic-v1",
         repair_prompt_version="repair-v1",
@@ -143,6 +147,21 @@ def semantic_manifest() -> SemanticCompilationManifest:
         started_at=datetime(2026, 8, 7, tzinfo=UTC),
         completed_at=datetime(2026, 8, 7, 0, 1, tzinfo=UTC),
     )
+
+
+def test_semantic_manifest_requires_persisted_foundation_and_compiler_versions():
+    payload = semantic_manifest().model_dump()
+
+    for required_field in (
+        "foundation_schema_version",
+        "foundation_parser_id",
+        "foundation_parser_version",
+        "compiler_version",
+    ):
+        missing = dict(payload)
+        del missing[required_field]
+        with pytest.raises(ValidationError):
+            SemanticCompilationManifest.model_validate(missing)
 
 
 def test_context_assertion_requires_provenance_and_bounded_confidence():

@@ -76,6 +76,10 @@ def bundle() -> SemanticKnowledgeBundle:
         compilation_manifest=SemanticCompilationManifest(
             source_id="htb-lame",
             source_sha256="a" * 64,
+            foundation_schema_version="1.1.0",
+            foundation_parser_id="markdown-it-commonmark",
+            foundation_parser_version="1",
+            compiler_version="1",
             extractor_prompt_version="extract-v1",
             critic_prompt_version="critic-v1",
             repair_prompt_version="repair-v1",

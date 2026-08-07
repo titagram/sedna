@@ -19,7 +19,7 @@ from sedna.knowledge.semantic.drafts import (
     SemanticCompilationResult,
     SemanticDraftBundle,
 )
-from sedna.knowledge.semantic.compiler import SemanticCompiler
+from sedna.knowledge.semantic.compiler import SEMANTIC_COMPILER_VERSION, SemanticCompiler
 
 __all__ = [
     "CompilationDisposition",
@@ -38,6 +38,7 @@ __all__ = [
     "DraftServiceContext",
     "DraftTypedContext",
     "SemanticCompilationResult",
+    "SEMANTIC_COMPILER_VERSION",
     "SemanticCompiler",
     "SemanticDraftBundle",
 ]

@@ -20,6 +20,7 @@ from sedna.knowledge.schema import (
     SourceQuality,
 )
 from sedna.knowledge.semantic import (
+    SEMANTIC_COMPILER_VERSION,
     CriticVerdict,
     DraftApplicabilityContext,
     DraftCitation,
@@ -170,6 +171,10 @@ def test_accepted_extraction_materializes_verified_bundle_with_exact_two_calls()
     assert result.disposition == "verified"
     assert result.bundle is not None
     assert result.bundle.compilation_manifest.repair_count == 0
+    assert result.bundle.compilation_manifest.foundation_schema_version == "1"
+    assert result.bundle.compilation_manifest.foundation_parser_id == "markdown-it"
+    assert result.bundle.compilation_manifest.foundation_parser_version == "1"
+    assert result.bundle.compilation_manifest.compiler_version == SEMANTIC_COMPILER_VERSION
     assert result.bundle.compilation_manifest.emitted_artifact_ids == (
         result.bundle.references[0].artifact_id,
     )
