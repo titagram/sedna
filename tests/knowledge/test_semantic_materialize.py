@@ -156,6 +156,32 @@ def test_canonical_id_ignores_draft_local_id_model_and_adjudication():
     assert second[0].assessment.verification_status is VerificationStatus.VERIFIED
 
 
+def test_reference_observation_time_is_retained_but_excluded_from_its_canonical_id():
+    """Would fail if a source observation timestamp changed canonical identity."""
+    prepared = _prepared_source()
+    first_reference = _reference(local_id="first").model_copy(update={"observed_at": "2024-01-01"})
+    second_reference = _reference(local_id="second").model_copy(
+        update={"observed_at": "2025-02-02"}
+    )
+
+    first = materialize_bundle(
+        prepared,
+        _bundle(first_reference, ignored=(1,)),
+        _call_metadata(),
+        VerificationStatus.VERIFIED,
+    )[0]
+    second = materialize_bundle(
+        prepared,
+        _bundle(second_reference, ignored=(1,)),
+        _call_metadata(),
+        VerificationStatus.VERIFIED,
+    )[0]
+
+    assert first.artifact_id == second.artifact_id
+    assert first.observed_at == "2024-01-01"
+    assert second.observed_at == "2025-02-02"
+
+
 def test_materialize_deduplicates_only_identical_normalized_content_and_citations():
     """Would fail if different source evidence was collapsed with otherwise equal content."""
     artifacts = materialize_bundle(

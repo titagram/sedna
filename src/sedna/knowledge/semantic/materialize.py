@@ -126,10 +126,11 @@ def _materialize_artifact(
             "capability_refs": _sorted_unique(draft.capability_refs),
             "observed_at": draft.observed_at,
         }
+        identity_content = {key: value for key, value in content.items() if key != "observed_at"}
         artifact_id = stable_artifact_id(
             prepared.manifest.source_id,
             draft.artifact_type,
-            content,
+            identity_content,
             source_refs,
             applicability,
         )
