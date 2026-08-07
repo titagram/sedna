@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-07
 
-**Status:** Draft for user review; architecture approved
+**Status:** Approved for implementation
 
 **Scope:** Semantic compilation, automatic verification, canonical knowledge, local retrieval,
 and the Hades-facing document-learning workflow
