@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from sedna.knowledge.schema import (
+    ApplicabilityContext,
     ArtifactType,
     AssetRef,
     CaseAction,
@@ -14,11 +15,13 @@ from sedna.knowledge.schema import (
     DecisionRule,
     DocumentManifest,
     DocumentType,
+    EpistemicAssessment,
     ExtractionMetadata,
     Generalizability,
     IngestionStatus,
     KnowledgeCase,
     KnowledgeRole,
+    ObservedOutcome,
     Origin,
     ReferenceArtifact,
     ReviewStatus,
@@ -63,9 +66,33 @@ def canonical_metadata(
     }
 
 
+def semantic_metadata(
+    artifact_type: ArtifactType,
+    knowledge_role: KnowledgeRole,
+) -> dict[str, object]:
+    return {
+        "artifact_type": artifact_type,
+        "knowledge_role": knowledge_role,
+        "origin": Origin.EXPLICIT,
+        "applicability": ApplicabilityContext(),
+        "assessment": EpistemicAssessment(
+            source_reliability=0.9,
+            extraction_confidence=0.8,
+            generalizability=Generalizability.MEDIUM,
+            context_specificity=0.7,
+            verification_status=VerificationStatus.VERIFIED,
+            observed_outcome=ObservedOutcome.INFORMATIONAL,
+            independence_group="htb-lame",
+        ),
+        "source_refs": (walkthrough_ref(),),
+        "extraction": foundation_metadata(),
+    }
+
+
 def reference_payload() -> dict[str, object]:
     return {
         "artifact_id": "reference-http",
+        "subject": "HTTP service inspection",
         "statement": "Inspect HTTP.",
         **canonical_metadata(ArtifactType.METHODOLOGY, KnowledgeRole.REFERENCE),
     }
@@ -75,6 +102,7 @@ def case_step_payload(
     knowledge_role: KnowledgeRole = KnowledgeRole.CASE_STUDY,
 ) -> dict[str, object]:
     return {
+        "step_id": "case-http-step-1",
         "ordinal": 1,
         "state_before": CaseState(access="none"),
         "observations": ("HTTP service exposed",),
@@ -161,6 +189,9 @@ def test_enums_match_the_design_vocabulary():
         "case_step",
         "negative_evidence",
         "anti_pattern",
+        "constraint",
+        "evidence_interpretation",
+        "exception",
     }
     assert {member.value for member in Origin} == {"explicit", "inferred", "derived"}
     assert {member.value for member in ReviewStatus} == {
@@ -294,6 +325,41 @@ def test_canonical_artifacts_carry_required_epistemic_and_extraction_metadata():
     assert rule.knowledge_role is KnowledgeRole.REFERENCE
 
 
+def test_canonical_artifacts_store_applicability_and_assessment_as_canonical_metadata():
+    reference = ReferenceArtifact(
+        artifact_id="reference-http",
+        subject="HTTP service inspection",
+        statement="Inspect HTTP.",
+        **semantic_metadata(ArtifactType.METHODOLOGY, KnowledgeRole.REFERENCE),
+    )
+
+    assert reference.applicability == ApplicabilityContext()
+    assert reference.assessment.verification_status is VerificationStatus.VERIFIED
+    assert reference.review_status is ReviewStatus.APPROVED
+    assert reference.generalizability is Generalizability.MEDIUM
+
+
+def test_legacy_review_metadata_maps_only_when_no_explicit_assessment_is_supplied():
+    legacy = ReferenceArtifact(
+        artifact_id="reference-http",
+        subject="HTTP service inspection",
+        statement="Inspect HTTP.",
+        **canonical_metadata(ArtifactType.METHODOLOGY, KnowledgeRole.REFERENCE),
+    )
+
+    assert legacy.assessment.verification_status is VerificationStatus.EXTRACTED
+    assert legacy.assessment.generalizability is Generalizability.MEDIUM
+    assert legacy.applicability == ApplicabilityContext()
+    with pytest.raises(ValidationError, match="review_status"):
+        ReferenceArtifact(
+            artifact_id="reference-http",
+            subject="HTTP service inspection",
+            statement="Inspect HTTP.",
+            review_status=ReviewStatus.REJECTED,
+            **semantic_metadata(ArtifactType.METHODOLOGY, KnowledgeRole.REFERENCE),
+        )
+
+
 def test_every_canonical_artifact_metadata_field_is_required():
     step = CaseStep.model_validate(case_step_payload())
     artifacts = (
@@ -308,8 +374,8 @@ def test_every_canonical_artifact_metadata_field_is_required():
             "artifact_type",
             "knowledge_role",
             "origin",
-            "review_status",
-            "generalizability",
+            "applicability",
+            "assessment",
             "source_refs",
             "extraction",
         ):
@@ -423,14 +489,7 @@ def _searchable_field_cases(
         *_searchable_field_cases(
             KnowledgeCase,
             knowledge_case_payload(),
-            (
-                "title",
-                "starting_access",
-                "outcome",
-                "platform",
-                "operating_system",
-                "difficulty",
-            ),
+            ("title", "starting_access", "outcome", "difficulty"),
             ("transferable_properties", "non_transferable_properties"),
         ),
         *_searchable_field_cases(
@@ -506,6 +565,7 @@ def test_nested_case_searchable_fields_reject_encoded_flags(
 def test_canonical_models_accept_the_explicit_exclusion_sentinel():
     reference = ReferenceArtifact(
         artifact_id="reference-excluded-result",
+        subject="Excluded result",
         statement="The result is <EXCLUDED_FLAG>.",
         **canonical_metadata(ArtifactType.METHODOLOGY, KnowledgeRole.REFERENCE),
     )
@@ -578,6 +638,7 @@ def test_canonical_searchable_fields_reject_decode_budget_exhaustion(
 
 def test_knowledge_case_rejects_steps_from_a_different_epistemic_lane():
     negative_step = CaseStep(
+        step_id="mixed-lane-step",
         ordinal=1,
         state_before=CaseState(access="none"),
         observations=("The attempted path produced no evidence.",),
@@ -602,6 +663,7 @@ def test_knowledge_case_rejects_steps_from_a_different_epistemic_lane():
 
 def test_knowledge_case_rejects_duplicate_step_ordinals():
     step = CaseStep(
+        step_id="duplicate-step",
         ordinal=1,
         state_before=CaseState(access="none"),
         observations=("HTTP service exposed",),

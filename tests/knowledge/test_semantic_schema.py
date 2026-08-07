@@ -1,21 +1,36 @@
-"""Tests for immutable applicability and epistemic schema contracts."""
+"""Tests for immutable semantic knowledge schema contracts."""
+
+import json
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
 
 from sedna.knowledge.schema import (
     ApplicabilityContext,
+    ArtifactType,
+    CaseAction,
+    CaseState,
+    CaseStep,
     ContextAssertion,
     ContextFacet,
     ContextRelation,
     EpistemicAssessment,
     Generalizability,
+    KnowledgeCase,
     ObservedOutcome,
     Origin,
+    ReferenceArtifact,
+    SemanticCallMetadata,
+    SemanticCompilationManifest,
+    SemanticKnowledgeBundle,
+    SemanticQuarantineRecord,
+    SemanticVerificationRecord,
     ServiceContext,
     SourceLocation,
     SourceRef,
     TypedContext,
+    VerificationFinding,
     VerificationStatus,
 )
 
@@ -35,6 +50,98 @@ def observed(value: str) -> ContextAssertion:
         origin=Origin.EXPLICIT,
         confidence=0.8,
         source_refs=(walkthrough_ref(),),
+    )
+
+
+def semantic_assessment() -> EpistemicAssessment:
+    return EpistemicAssessment(
+        source_reliability=0.9,
+        extraction_confidence=0.8,
+        generalizability=Generalizability.MEDIUM,
+        context_specificity=0.7,
+        verification_status=VerificationStatus.VERIFIED,
+        observed_outcome=ObservedOutcome.INFORMATIONAL,
+        independence_group="htb-lame",
+    )
+
+
+def extraction_metadata() -> dict[str, str]:
+    return {
+        "schema_version": "2.0.0",
+        "parser_id": "markdown-it-commonmark",
+        "parser_version": "1",
+        "extractor_id": "semantic-compiler",
+        "extractor_version": "1",
+    }
+
+
+def reference_artifact() -> ReferenceArtifact:
+    return ReferenceArtifact(
+        artifact_type=ArtifactType.METHODOLOGY,
+        knowledge_role="reference",
+        artifact_id="reference-http",
+        subject="HTTP service inspection",
+        statement="Inspect HTTP before choosing an exploit.",
+        origin=Origin.EXPLICIT,
+        applicability=ApplicabilityContext(),
+        assessment=semantic_assessment(),
+        source_refs=(walkthrough_ref(),),
+        extraction=extraction_metadata(),
+    )
+
+
+def case_step() -> CaseStep:
+    return CaseStep(
+        artifact_type=ArtifactType.CASE_STEP,
+        knowledge_role="case_study",
+        step_id="case-http-step-1",
+        ordinal=1,
+        state_before=CaseState(access="none"),
+        observations=("HTTP service exposed",),
+        hypotheses=(),
+        selected_action=CaseAction(intent="inspect_http"),
+        evidence=(),
+        state_after=CaseState(access="none"),
+        origin=Origin.EXPLICIT,
+        applicability=ApplicabilityContext(),
+        assessment=semantic_assessment(),
+        source_refs=(walkthrough_ref(),),
+        extraction=extraction_metadata(),
+    )
+
+
+def case_artifact() -> KnowledgeCase:
+    return KnowledgeCase(
+        artifact_type=ArtifactType.CASE,
+        knowledge_role="case_study",
+        case_id="case-http",
+        title="HTTP case",
+        starting_access="none",
+        steps=(case_step(),),
+        outcome="HTTP inspected.",
+        source_quality="complete",
+        origin=Origin.EXPLICIT,
+        applicability=ApplicabilityContext(),
+        assessment=semantic_assessment(),
+        source_refs=(walkthrough_ref(),),
+        extraction=extraction_metadata(),
+    )
+
+
+def semantic_manifest() -> SemanticCompilationManifest:
+    return SemanticCompilationManifest(
+        source_id="htb-lame",
+        source_sha256="a" * 64,
+        extractor_prompt_version="extract-v1",
+        critic_prompt_version="critic-v1",
+        repair_prompt_version="repair-v1",
+        extractor_model_id="extractor-model",
+        critic_model_id="critic-model",
+        disposition="verified",
+        repair_count=0,
+        emitted_artifact_ids=("case-http", "case-http-step-1", "reference-http"),
+        started_at=datetime(2026, 8, 7, tzinfo=UTC),
+        completed_at=datetime(2026, 8, 7, 0, 1, tzinfo=UTC),
     )
 
 
@@ -144,3 +251,84 @@ def test_context_and_epistemic_models_are_immutable_and_strict():
             observed_outcome=ObservedOutcome.SUCCESS,
             independence_group="htb-lame",
         )
+
+
+def test_semantic_bundle_contains_only_validated_canonical_records():
+    bundle = SemanticKnowledgeBundle(
+        schema_version="2.0.0",
+        source_id="htb-lame",
+        source_sha256="a" * 64,
+        compilation_manifest=semantic_manifest(),
+        references=(reference_artifact(),),
+        cases=(case_artifact(),),
+        guidance=(),
+    )
+
+    dumped = bundle.model_dump(mode="json")
+    assert "raw_response" not in json.dumps(dumped)
+    assert dumped["references"][0]["assessment"]["verification_status"] == "verified"
+
+
+def test_semantic_bundle_requires_sorted_unique_artifacts_and_exact_manifest_ids():
+    artifact = reference_artifact()
+    with pytest.raises(ValidationError, match="unique"):
+        SemanticKnowledgeBundle(
+            schema_version="2.0.0",
+            source_id="htb-lame",
+            source_sha256="a" * 64,
+            compilation_manifest=semantic_manifest(),
+            references=(artifact, artifact),
+            cases=(),
+            guidance=(),
+        )
+    with pytest.raises(ValidationError, match="manifest"):
+        SemanticKnowledgeBundle(
+            schema_version="2.0.0",
+            source_id="htb-lame",
+            source_sha256="a" * 64,
+            compilation_manifest=semantic_manifest().model_copy(
+                update={"emitted_artifact_ids": ("reference-http",)}
+            ),
+            references=(artifact,),
+            cases=(case_artifact(),),
+            guidance=(),
+        )
+
+
+def test_semantic_audit_records_keep_only_safe_structured_metadata():
+    call = SemanticCallMetadata(
+        purpose="sedna.semantic.critic",
+        provider="host",
+        model="critic-model",
+        agent_id="agent-7",
+        input_tokens=100,
+        output_tokens=50,
+    )
+    finding = VerificationFinding(
+        code="unsupported_claim",
+        severity="material",
+        artifact_local_id="reference-http",
+        message="The source does not support the claim.",
+        segment_indexes=(2,),
+    )
+    verification = SemanticVerificationRecord(
+        source_id="htb-lame",
+        source_sha256="a" * 64,
+        critic_call=call,
+        findings=(finding,),
+        adjudication="quarantined",
+        recorded_at=datetime(2026, 8, 7, tzinfo=UTC),
+    )
+    quarantine = SemanticQuarantineRecord(
+        source_id="htb-lame",
+        source_sha256="a" * 64,
+        reason_codes=("unsupported_claim",),
+        messages=("The claim needs evidence.",),
+        segment_indexes=(2,),
+        recorded_at=datetime(2026, 8, 7, tzinfo=UTC),
+    )
+
+    assert verification.findings == (finding,)
+    assert quarantine.reason_codes == ("unsupported_claim",)
+    with pytest.raises(ValidationError):
+        SemanticCallMetadata.model_validate({**call.model_dump(), "raw_response": "secret"})

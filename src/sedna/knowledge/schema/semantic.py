@@ -1,0 +1,196 @@
+"""Immutable source-level records emitted by semantic knowledge compilation."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from sedna.knowledge.schema.case import KnowledgeCase
+from sedna.knowledge.schema.common import SearchableNonEmptyString
+from sedna.knowledge.schema.manifest import Sha256
+from sedna.knowledge.schema.reference import ReferenceArtifact
+from sedna.knowledge.schema.rule import DecisionRule
+
+NonEmptyString = SearchableNonEmptyString
+TokenCount = int
+FindingCode = Literal[
+    "unsupported_claim",
+    "missing_prerequisite",
+    "missing_exception",
+    "context_omission",
+    "overgeneralization",
+    "origin_mismatch",
+    "unsafe_material",
+    "lost_negative_evidence",
+    "invalid_provenance",
+]
+FindingSeverity = Literal["warning", "material"]
+CompilationDisposition = Literal["verified", "quarantined", "failed", "unchanged"]
+
+
+class SemanticCallMetadata(BaseModel):
+    """Safe operational metadata for one semantic model call."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    purpose: NonEmptyString
+    provider: NonEmptyString
+    model: NonEmptyString
+    agent_id: NonEmptyString
+    input_tokens: TokenCount = Field(ge=0, le=1_000_000)
+    output_tokens: TokenCount = Field(ge=0, le=1_000_000)
+
+
+class VerificationFinding(BaseModel):
+    """A closed-vocabulary critic finding safe to retain in canonical audits."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    code: FindingCode
+    severity: FindingSeverity
+    artifact_local_id: NonEmptyString | None = None
+    message: NonEmptyString
+    segment_indexes: tuple[int, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_segment_indexes(self) -> VerificationFinding:
+        """Keep citations deterministic and non-negative without source content."""
+        if any(index < 0 for index in self.segment_indexes):
+            raise ValueError("segment indexes must be non-negative")
+        if len(set(self.segment_indexes)) != len(self.segment_indexes):
+            raise ValueError("segment indexes must be unique")
+        if tuple(sorted(self.segment_indexes)) != self.segment_indexes:
+            raise ValueError("segment indexes must be sorted")
+        return self
+
+
+class SemanticCompilationManifest(BaseModel):
+    """Reproducibility metadata for one semantic compilation attempt."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source_id: NonEmptyString
+    source_sha256: Sha256
+    extractor_prompt_version: NonEmptyString
+    critic_prompt_version: NonEmptyString
+    repair_prompt_version: NonEmptyString
+    extractor_model_id: NonEmptyString
+    critic_model_id: NonEmptyString
+    disposition: CompilationDisposition
+    repair_count: int = Field(ge=0, le=1)
+    emitted_artifact_ids: tuple[NonEmptyString, ...] = ()
+    started_at: datetime
+    completed_at: datetime
+
+    @model_validator(mode="after")
+    def validate_manifest(self) -> SemanticCompilationManifest:
+        """Keep emitted identities canonical and caller timestamps chronological."""
+        if tuple(sorted(self.emitted_artifact_ids)) != self.emitted_artifact_ids:
+            raise ValueError("emitted artifact IDs must be sorted")
+        if len(set(self.emitted_artifact_ids)) != len(self.emitted_artifact_ids):
+            raise ValueError("emitted artifact IDs must be unique")
+        if self.completed_at < self.started_at:
+            raise ValueError("completed_at must not precede started_at")
+        return self
+
+
+class SemanticVerificationRecord(BaseModel):
+    """A safe, source-level verification audit without model prose or prompts."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source_id: NonEmptyString
+    source_sha256: Sha256
+    critic_call: SemanticCallMetadata
+    findings: tuple[VerificationFinding, ...] = ()
+    adjudication: CompilationDisposition
+    recorded_at: datetime
+
+    @model_validator(mode="after")
+    def validate_adjudication(self) -> SemanticVerificationRecord:
+        """Do not mark material critic disagreement as verified."""
+        has_material_finding = any(finding.severity == "material" for finding in self.findings)
+        if self.adjudication == "verified" and has_material_finding:
+            raise ValueError("verified adjudication cannot contain material findings")
+        return self
+
+
+class SemanticQuarantineRecord(BaseModel):
+    """An explainable semantic quarantine that contains only safe citations and messages."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source_id: NonEmptyString
+    source_sha256: Sha256
+    reason_codes: tuple[FindingCode, ...] = Field(min_length=1)
+    messages: tuple[NonEmptyString, ...] = Field(min_length=1)
+    segment_indexes: tuple[int, ...] = ()
+    recorded_at: datetime
+
+    @model_validator(mode="after")
+    def validate_quarantine_citations(self) -> SemanticQuarantineRecord:
+        """Require a safe message for every quarantine reason and valid citations."""
+        if len(self.reason_codes) != len(self.messages):
+            raise ValueError("quarantine reason codes and messages must have matching lengths")
+        if any(index < 0 for index in self.segment_indexes):
+            raise ValueError("segment indexes must be non-negative")
+        if len(set(self.segment_indexes)) != len(self.segment_indexes):
+            raise ValueError("segment indexes must be unique")
+        if tuple(sorted(self.segment_indexes)) != self.segment_indexes:
+            raise ValueError("segment indexes must be sorted")
+        return self
+
+
+class SemanticKnowledgeBundle(BaseModel):
+    """Validated canonical artifacts emitted for a single source identity."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: NonEmptyString
+    source_id: NonEmptyString
+    source_sha256: Sha256
+    compilation_manifest: SemanticCompilationManifest
+    references: tuple[ReferenceArtifact, ...] = ()
+    cases: tuple[KnowledgeCase, ...] = ()
+    guidance: tuple[DecisionRule, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_bundle(self) -> SemanticKnowledgeBundle:
+        """Require sorted unique artifacts and exact manifest coverage of nested IDs."""
+        self._validate_sorted_unique(self.references, "artifact_id", "references")
+        self._validate_sorted_unique(self.cases, "case_id", "cases")
+        self._validate_sorted_unique(self.guidance, "rule_id", "guidance")
+
+        if (
+            self.compilation_manifest.source_id != self.source_id
+            or self.compilation_manifest.source_sha256 != self.source_sha256
+        ):
+            raise ValueError("bundle source identity must match its compilation manifest")
+
+        nested_ids = (
+            tuple(reference.artifact_id for reference in self.references)
+            + tuple(knowledge_case.case_id for knowledge_case in self.cases)
+            + tuple(step.step_id for knowledge_case in self.cases for step in knowledge_case.steps)
+            + tuple(rule.rule_id for rule in self.guidance)
+        )
+        if len(set(nested_ids)) != len(nested_ids):
+            raise ValueError("artifact IDs must be unique across the semantic bundle")
+        if set(self.compilation_manifest.emitted_artifact_ids) != set(nested_ids):
+            raise ValueError("compilation manifest IDs must exactly match bundle artifact IDs")
+        return self
+
+    @staticmethod
+    def _validate_sorted_unique(
+        artifacts: tuple[ReferenceArtifact, ...]
+        | tuple[KnowledgeCase, ...]
+        | tuple[DecisionRule, ...],
+        attribute: Literal["artifact_id", "case_id", "rule_id"],
+        field_name: str,
+    ) -> None:
+        identifiers = tuple(getattr(artifact, attribute) for artifact in artifacts)
+        if tuple(sorted(identifiers)) != identifiers:
+            raise ValueError(f"{field_name} must be sorted")
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError(f"{field_name} must be unique")

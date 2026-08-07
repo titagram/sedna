@@ -64,11 +64,13 @@ class CaseStep(CanonicalArtifactMetadata):
 
     artifact_type: Literal[ArtifactType.CASE_STEP]
     knowledge_role: Literal[KnowledgeRole.CASE_STUDY, KnowledgeRole.NEGATIVE_CASE]
+    step_id: NonEmptyString
     ordinal: int = Field(ge=1)
     state_before: CaseState
     observations: tuple[SearchableString, ...]
     hypotheses: tuple[CaseHypothesis, ...]
     selected_action: CaseAction
+    expected_information_gain: NonEmptyString | None = None
     evidence: tuple[CaseEvidence, ...]
     state_after: CaseState
     negative_evidence: tuple[SearchableString, ...] = ()
@@ -90,8 +92,6 @@ class KnowledgeCase(CanonicalArtifactMetadata):
     steps: tuple[CaseStep, ...]
     outcome: NonEmptyString
     source_quality: SourceQuality
-    platform: NonEmptyString | None = None
-    operating_system: NonEmptyString | None = None
     difficulty: NonEmptyString | None = None
     transferable_properties: tuple[NonEmptyString, ...] = ()
     non_transferable_properties: tuple[NonEmptyString, ...] = ()
@@ -104,3 +104,15 @@ class KnowledgeCase(CanonicalArtifactMetadata):
         if any(step.knowledge_role is not self.knowledge_role for step in self.steps):
             raise ValueError("case step knowledge_role must match its knowledge case")
         return self
+
+    @property
+    def platform(self) -> str | None:
+        """Expose the former platform field from the shared applicability context."""
+        assertion = self.applicability.typed_context.execution_environment
+        return assertion.value if assertion is not None else None
+
+    @property
+    def operating_system(self) -> str | None:
+        """Expose the former operating-system field from shared applicability."""
+        assertion = self.applicability.typed_context.os_family
+        return assertion.value if assertion is not None else None

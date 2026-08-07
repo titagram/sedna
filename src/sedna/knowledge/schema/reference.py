@@ -22,16 +22,22 @@ class ReferenceArtifact(CanonicalArtifactMetadata):
     artifact_type: Literal[
         ArtifactType.CONCEPT,
         ArtifactType.METHODOLOGY,
+        ArtifactType.CONSTRAINT,
+        ArtifactType.EVIDENCE_INTERPRETATION,
         ArtifactType.NEGATIVE_EVIDENCE,
         ArtifactType.ANTI_PATTERN,
+        ArtifactType.EXCEPTION,
     ]
     knowledge_role: Literal[KnowledgeRole.REFERENCE]
     artifact_id: NonEmptyString
+    subject: NonEmptyString
     statement: NonEmptyString
     applicable_situations: tuple[NonEmptyString, ...] = ()
     prerequisites: tuple[NonEmptyString, ...] = ()
     action_intent: NonEmptyString | None = None
+    expected_information_gain: NonEmptyString | None = None
     expected_evidence: tuple[NonEmptyString, ...] = ()
+    evidence_interpretation: NonEmptyString | None = None
     success_implications: tuple[NonEmptyString, ...] = ()
     failure_implications: tuple[NonEmptyString, ...] = ()
     stop_implications: tuple[NonEmptyString, ...] = ()

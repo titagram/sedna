@@ -2,6 +2,7 @@
 
 from sedna.knowledge.schema.common import (
     ArtifactType,
+    CanonicalArtifactMetadata,
     DocumentType,
     ExtractionMetadata,
     Generalizability,
@@ -36,6 +37,29 @@ from sedna.knowledge.schema.case import (
 from sedna.knowledge.schema.manifest import AssetRef, DocumentManifest
 from sedna.knowledge.schema.reference import ReferenceArtifact
 from sedna.knowledge.schema.rule import DecisionRule
+from sedna.knowledge.schema.semantic import (
+    SemanticCallMetadata,
+    SemanticCompilationManifest,
+    SemanticKnowledgeBundle,
+    SemanticQuarantineRecord,
+    SemanticVerificationRecord,
+    VerificationFinding,
+)
+
+for _canonical_model in (
+    CanonicalArtifactMetadata,
+    ReferenceArtifact,
+    CaseStep,
+    KnowledgeCase,
+    DecisionRule,
+):
+    _canonical_model.model_rebuild(
+        force=True,
+        _types_namespace={
+            "ApplicabilityContext": ApplicabilityContext,
+            "EpistemicAssessment": EpistemicAssessment,
+        },
+    )
 
 __all__ = [
     "ArtifactType",
@@ -46,6 +70,7 @@ __all__ = [
     "CaseHypothesis",
     "CaseState",
     "CaseStep",
+    "CanonicalArtifactMetadata",
     "ContextAssertion",
     "ContextFacet",
     "ContextRelation",
@@ -66,7 +91,13 @@ __all__ = [
     "SourceQuality",
     "SourceRef",
     "ServiceContext",
+    "SemanticCallMetadata",
+    "SemanticCompilationManifest",
+    "SemanticKnowledgeBundle",
+    "SemanticQuarantineRecord",
+    "SemanticVerificationRecord",
     "TypedContext",
     "VerificationStatus",
+    "VerificationFinding",
     "verification_from_legacy_review",
 ]
