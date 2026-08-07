@@ -25,6 +25,8 @@ from sedna.knowledge.schema import (
     SourceLocation,
     SourceQuality,
     SourceRef,
+    VerificationStatus,
+    verification_from_legacy_review,
 )
 
 
@@ -179,6 +181,15 @@ def test_enums_match_the_design_vocabulary():
         "excluded",
         "quarantined",
     }
+
+
+def test_legacy_review_statuses_map_to_verification_statuses():
+    assert (
+        verification_from_legacy_review(ReviewStatus.AUTO_EXTRACTED) is VerificationStatus.EXTRACTED
+    )
+    assert verification_from_legacy_review(ReviewStatus.DRAFT) is VerificationStatus.EXTRACTED
+    assert verification_from_legacy_review(ReviewStatus.APPROVED) is VerificationStatus.VERIFIED
+    assert verification_from_legacy_review(ReviewStatus.REJECTED) is VerificationStatus.REJECTED
 
 
 def test_schema_models_are_immutable_and_forbid_unknown_fields():
@@ -545,9 +556,7 @@ def test_canonical_fields_reject_semicolonless_html_entity_bypasses(statement: s
     ],
 )
 def test_canonical_searchable_fields_preserve_unrelated_md5_hashes(statement: str):
-    reference = ReferenceArtifact.model_validate(
-        {**reference_payload(), "statement": statement}
-    )
+    reference = ReferenceArtifact.model_validate({**reference_payload(), "statement": statement})
 
     assert reference.statement == statement
 
@@ -564,9 +573,7 @@ def test_canonical_searchable_fields_reject_decode_budget_exhaustion(
     unstable_value: str,
 ):
     with pytest.raises(ValidationError, match="final flag"):
-        ReferenceArtifact.model_validate(
-            {**reference_payload(), "statement": unstable_value}
-        )
+        ReferenceArtifact.model_validate({**reference_payload(), "statement": unstable_value})
 
 
 def test_knowledge_case_rejects_steps_from_a_different_epistemic_lane():

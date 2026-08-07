@@ -64,12 +64,33 @@ class Origin(StrEnum):
 
 
 class ReviewStatus(StrEnum):
-    """The human-review state of an artifact."""
+    """The legacy human-review state retained for existing artifact callers."""
 
     AUTO_EXTRACTED = "auto_extracted"
     DRAFT = "draft"
     APPROVED = "approved"
     REJECTED = "rejected"
+
+
+class VerificationStatus(StrEnum):
+    """The current verification state of source-backed knowledge."""
+
+    EXTRACTED = "extracted"
+    VERIFIED = "verified"
+    CORROBORATED = "corroborated"
+    CONTESTED = "contested"
+    DEPRECATED = "deprecated"
+    REJECTED = "rejected"
+
+
+def verification_from_legacy_review(status: ReviewStatus) -> VerificationStatus:
+    """Translate a legacy review state without making it canonical metadata."""
+    return {
+        ReviewStatus.AUTO_EXTRACTED: VerificationStatus.EXTRACTED,
+        ReviewStatus.DRAFT: VerificationStatus.EXTRACTED,
+        ReviewStatus.APPROVED: VerificationStatus.VERIFIED,
+        ReviewStatus.REJECTED: VerificationStatus.REJECTED,
+    }[status]
 
 
 class Generalizability(StrEnum):
