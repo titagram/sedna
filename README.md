@@ -45,6 +45,12 @@ foundation boundary. In particular, PDF contents remain quarantined until a
 deterministic PDF parser is added rather than being partially or silently
 extracted.
 
+The approved architecture for the next phase is documented in the
+[semantic ingestion and retrieval design](docs/superpowers/specs/2026-08-07-sedna-semantic-ingestion-retrieval-design.md).
+It defines the host-LLM extractor and critic, applicability facets, automatic
+verification, canonical JSON/JSONL storage, SQLite FTS5 retrieval, the future
+document-learning skill, and the evaluation gate for any later vector database.
+
 `ingest_markdown` remains available temporarily for callers of the original
 SQLite-backed `KnowledgeChunk` workflow. It does not feed the strategic pipeline;
 new ingestion integrations should use `IngestionPipeline`.
