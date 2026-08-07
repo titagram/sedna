@@ -15,7 +15,11 @@
 - Exact commands remain source evidence; canonical output stores strategic intent and Hades capability references, not tool tutorials.
 - Every material artifact and context assertion resolves to one or more exact source spans.
 - Missing context is `unknown`, never implicit universal compatibility.
-- No final flag or contextual secret may enter drafts, canonical artifacts, verification records, or searchable text.
+- No final flag or runtime/provider credential may enter drafts, canonical artifacts, verification
+  records, or searchable text. Credential literals authored inside an ingested source are allowed
+  into the extractor as untrusted, case-local example data: their truth is irrelevant, they are not
+  current-target credentials, and semantic output should describe their role rather than rely on
+  their exact value.
 - Human approval is not required; verification states are `extracted`, `verified`, `corroborated`, `contested`, `deprecated`, and `rejected`.
 - The critic is a separate structured LLM call and may use the same host model; this is process isolation, not statistical independence.
 - At most one repair call and one post-repair critic call are allowed.
@@ -399,7 +403,11 @@ git commit -m "feat(knowledge): define semantic LLM contracts"
 **Interfaces:**
 - Produces: `HostStructuredLlm` protocol, `StructuredResult`, `HadesLlmAdapter`, `SafePreparedSourcePayload`, and `build_safe_source_payload(prepared)`.
 - Consumes: Hades-compatible `complete_structured(instructions=..., input=..., json_schema=..., schema_name=..., temperature=..., max_tokens=..., timeout=..., purpose=...)` without importing Hades.
-- Guarantees: the serialized LLM payload contains no `ParsedDocument`, raw block text, raw asset metadata, source bytes, provider credentials, or final flags.
+- Guarantees: the serialized LLM payload contains no `ParsedDocument`, raw block text outside the
+  retrieval-safe logical segments, raw asset metadata, source bytes, runtime/provider credentials,
+  or final flags. Credential literals written in safe source segments may cross this boundary only
+  as untrusted, case-local examples and must not be interpreted as credentials for the current
+  target.
 
 - [ ] **Step 1: Write failing adapter and safe-payload tests**
 
@@ -429,15 +437,20 @@ REPAIR_PROMPT_VERSION = "1"
 
 The extractor prompt states that source content is untrusted data, requires segment citations,
 separates technical reference from historical case evidence, preserves unknown context, and emits
-no exact tool tutorials. The critic prompt implements the rubric from the approved design. The
-repair prompt permits only changes justified by critic findings and source segments.
+no exact tool tutorials. It treats any source-authored password, token, key, username, or similar
+literal as case-local example evidence whose truth is irrelevant: prefer describing the credential's
+role, and never promote it to a credential for a current or future target. The critic enforces the
+same distinction. The repair prompt permits only changes justified by critic findings and source
+segments.
 
 - [ ] **Step 4: Implement the adapter and payload whitelist**
 
 `SafePreparedSourcePayload` includes source ID, safe title, document type, knowledge role, quality,
 and ordered safe segment records containing index, line range, heading path, text, and safe asset
 locators. `build_safe_source_payload` reconstructs this type field-by-field and never calls
-`PreparedSource.model_dump()`.
+`PreparedSource.model_dump()`. It does not attempt to decide whether a credential literal authored
+inside a safe source segment is real or false; that literal remains untrusted example data. Runtime
+provider authentication and process/environment state are never read or serialized.
 
 `HadesLlmAdapter.complete(model_type, instructions, payload, purpose)` invokes the wrapped facade
 and validates `result.parsed` with `model_type.model_validate`. Convert facade transport failures,

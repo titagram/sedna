@@ -645,7 +645,10 @@ rationale remains labeled as inferred.
 - Canonical writes are atomic; index updates occur only after canonical success.
 - Index failure leaves canonical files valid and reports that a rebuild is required.
 - Rebuild verifies every canonical record before indexing it.
-- Searchable fields retain the existing final-flag and contextual-secret protections.
+- Searchable fields retain final-flag protections. Source-authored credential literals are treated
+  as case-local examples, never as current-target credentials; their truth is deliberately not
+  inferred during ingestion, and retrieval must communicate their evidentiary role rather than
+  recommend reusing their exact value.
 - LLM prompt material from untrusted sources is data, never agent instruction.
 
 ## Testing Strategy
@@ -692,7 +695,9 @@ Extend the deterministic golden corpus with reviewed expected artifacts for:
 - Negative evidence and failed cases appear beside successful analogies when relevant.
 - Copied sources do not create false corroboration.
 - Deleting the SQLite index and rebuilding it preserves retrieval results.
-- No final flag or contextual secret enters canonical searchable fields or the index.
+- No final flag or runtime/provider credential enters canonical searchable fields or the index.
+- Credential literals present in a source remain explicitly case-local/example-only and are never
+  presented as valid credentials for the current target.
 
 ## Milestones
 
