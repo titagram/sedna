@@ -453,11 +453,12 @@ def _assessment(
 def _deduplicate_and_sort(
     artifacts: tuple[CanonicalArtifact, ...],
 ) -> tuple[CanonicalArtifact, ...]:
-    unique: dict[str, CanonicalArtifact] = {}
+    duplicates: dict[str, list[CanonicalArtifact]] = {}
     for artifact in artifacts:
         key = _canonical_json(_identity_payload(artifact))
-        unique.setdefault(key, artifact)
-    return tuple(sorted(unique.values(), key=_artifact_id))
+        duplicates.setdefault(key, []).append(artifact)
+    unique = tuple(_select_duplicate(group) for group in duplicates.values())
+    return tuple(sorted(unique, key=_artifact_id))
 
 
 def _identity_payload(artifact: CanonicalArtifact) -> object:
@@ -467,12 +468,28 @@ def _identity_payload(artifact: CanonicalArtifact) -> object:
     payload.pop("rule_id", None)
     payload.pop("assessment", None)
     payload.pop("extraction", None)
+    if isinstance(artifact, ReferenceArtifact):
+        payload.pop("observed_at", None)
     if "steps" in payload:
         for step in payload["steps"]:
             step.pop("step_id", None)
             step.pop("assessment", None)
             step.pop("extraction", None)
     return payload
+
+
+def _select_duplicate(artifacts: list[CanonicalArtifact]) -> CanonicalArtifact:
+    """Select one canonical duplicate independently of extractor response order."""
+    first = artifacts[0]
+    if isinstance(first, ReferenceArtifact):
+        return min(
+            artifacts,
+            key=lambda artifact: (
+                not isinstance(artifact, ReferenceArtifact) or artifact.observed_at is None,
+                artifact.observed_at if isinstance(artifact, ReferenceArtifact) else "",
+            ),
+        )
+    return min(artifacts, key=lambda artifact: _canonical_json(artifact.model_dump(mode="json")))
 
 
 def _stable_case_step_content(step: CaseStep) -> object:

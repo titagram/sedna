@@ -182,6 +182,43 @@ def test_reference_observation_time_is_retained_but_excluded_from_its_canonical_
     assert second.observed_at == "2025-02-02"
 
 
+def test_duplicate_timestamp_variants_collapse_to_the_earliest_known_observation():
+    """Would fail if timestamp-free duplicate identity still emitted duplicate artifacts."""
+    older = _reference(local_id="older").model_copy(update={"observed_at": "2024-01-01"})
+    newer = _reference(local_id="newer").model_copy(update={"observed_at": "2025-02-02"})
+    unknown = _reference(local_id="unknown").model_copy(update={"observed_at": None})
+
+    forward = materialize_bundle(
+        _prepared_source(),
+        _bundle(newer, unknown, older, ignored=(1,)),
+        _call_metadata(),
+        VerificationStatus.VERIFIED,
+    )
+    reverse = materialize_bundle(
+        _prepared_source(),
+        _bundle(older, unknown, newer, ignored=(1,)),
+        _call_metadata(),
+        VerificationStatus.VERIFIED,
+    )
+
+    assert len(forward) == len(reverse) == 1
+    assert forward[0].artifact_id == reverse[0].artifact_id
+    assert forward[0].observed_at == reverse[0].observed_at == "2024-01-01"
+
+
+def test_duplicate_references_without_observation_times_retain_none():
+    """Would fail if a duplicate merge invented an observation timestamp."""
+    artifacts = materialize_bundle(
+        _prepared_source(),
+        _bundle(_reference(local_id="one"), _reference(local_id="two"), ignored=(1,)),
+        _call_metadata(),
+        VerificationStatus.VERIFIED,
+    )
+
+    assert len(artifacts) == 1
+    assert artifacts[0].observed_at is None
+
+
 def test_materialize_deduplicates_only_identical_normalized_content_and_citations():
     """Would fail if different source evidence was collapsed with otherwise equal content."""
     artifacts = materialize_bundle(
