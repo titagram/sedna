@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import re
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from sedna.knowledge.schema.case import KnowledgeCase
 from sedna.knowledge.schema.common import SearchableNonEmptyString, SourceRef
@@ -29,11 +28,17 @@ FindingCode = Literal[
 ]
 FindingSeverity = Literal["warning", "material"]
 CompilationDisposition = Literal["verified", "quarantined", "failed", "unchanged"]
-MAX_SAFE_FINDING_DETAIL_CHARS = 280
-RAW_MODEL_DUMP_MARKER = re.compile(
-    r"\b(?:model|assistant|raw)\s+(?:response|output)|\b(?:system|user|developer)\s+prompt\b",
-    re.IGNORECASE,
-)
+CANONICAL_FINDING_MESSAGES: dict[FindingCode, str] = {
+    "unsupported_claim": "The source does not support the claim.",
+    "missing_prerequisite": "A required prerequisite is not represented.",
+    "missing_exception": "A relevant exception is not represented.",
+    "context_omission": "Required applicability context is omitted.",
+    "overgeneralization": "The claim generalizes beyond the cited context.",
+    "origin_mismatch": "The claim origin does not match the cited evidence.",
+    "unsafe_material": "The artifact contains unsafe material.",
+    "lost_negative_evidence": "Negative evidence from the source is missing.",
+    "invalid_provenance": "The artifact provenance is invalid.",
+}
 
 
 class SemanticCallMetadata(BaseModel):
@@ -60,22 +65,11 @@ class VerificationFinding(BaseModel):
     message: NonEmptyString
     segment_indexes: tuple[int, ...] = ()
 
-    @field_validator("message")
-    @classmethod
-    def validate_safe_finding_detail(cls, value: str) -> str:
-        """Retain a concise critic summary, never a prompt or response transcript."""
-        if len(value) > MAX_SAFE_FINDING_DETAIL_CHARS:
-            raise ValueError(
-                "safe finding detail must contain at most "
-                f"{MAX_SAFE_FINDING_DETAIL_CHARS} characters"
-            )
-        if "\n" in value or "\r" in value or RAW_MODEL_DUMP_MARKER.search(value):
-            raise ValueError("safe finding detail cannot contain a raw prompt or response dump")
-        return value
-
     @model_validator(mode="after")
     def validate_segment_indexes(self) -> VerificationFinding:
-        """Keep citations deterministic and non-negative without source content."""
+        """Keep finding summaries canonical and citations deterministic."""
+        if self.message != CANONICAL_FINDING_MESSAGES[self.code]:
+            raise ValueError("verification finding message must match its canonical message")
         if any(index < 0 for index in self.segment_indexes):
             raise ValueError("segment indexes must be non-negative")
         if len(set(self.segment_indexes)) != len(self.segment_indexes):
