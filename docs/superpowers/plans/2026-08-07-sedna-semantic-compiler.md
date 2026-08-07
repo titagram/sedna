@@ -736,7 +736,7 @@ Run:
 pytest -q tests/knowledge
 pytest -q
 ruff check src/sedna/knowledge tests/knowledge
-ruff format --check src/sedna/knowledge tests/knowledge
+git diff --name-only 85aac46 -- '*.py' | xargs ruff format --check
 git diff --check
 ```
 
@@ -759,8 +759,10 @@ git commit -m "feat(knowledge): complete semantic compiler milestone"
 
 ## Final Verification and Handoff
 
-- [ ] Run the complete suite, scoped Ruff checks, format check, and `git diff --check` again from
-  the final commit.
+- [ ] Run the complete suite, scoped Ruff checks, `ruff format --check` on Python files changed
+  since `85aac46`, and `git diff --check` again from the final commit. Eleven unchanged foundation
+  files fail the repository-wide format check at baseline and must not be mechanically reformatted
+  as part of M2.
 - [ ] Inspect `git status --short` and confirm no raw corpus, index, virtual environment, or model
   response dump is tracked.
 - [ ] Compare public exports against the M2 interfaces in this plan.
