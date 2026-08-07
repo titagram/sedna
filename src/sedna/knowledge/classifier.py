@@ -22,7 +22,6 @@ from sedna.knowledge.schema import (
 _ATX_HEADING_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
 _SETEXT_HEADING_RE = re.compile(r"(?m)^([^\n]+)\n\s*(?:={4,}|-{4,})\s*$")
 _URL_RE = re.compile(r"https?://[^\s<>\])]+", re.IGNORECASE)
-_WIKI_LINK_RE = re.compile(r"(?<!!)\[\[[^\]\n]+\]\]")
 _HTB_FLAG_RE = re.compile(r"HTB\{[^}\r\n]+\}", re.IGNORECASE)
 _FLAG_HEADING_RE = re.compile(r"(?ims)^\s{0,3}#{1,6}[^\n]*\bflag\b[^\n]*\n(?P<body>.{0,500})")
 _HEX_32_RE = re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])", re.IGNORECASE)
@@ -104,6 +103,13 @@ class _ContentSignals:
 class _InlineSignals:
     local_text: str
     reference_link_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _WikiScanResult:
+    local_text: str
+    reference_link_count: int
+    scanned_characters: int
 
 
 class _HTMLContentParser(HTMLParser):
@@ -476,10 +482,65 @@ def _html_content_signals(html: str) -> _InlineSignals:
 
 
 def _strip_text_references(text: str) -> tuple[str, int]:
-    wiki_link_count = len(_WIKI_LINK_RE.findall(text))
-    local_text = _WIKI_LINK_RE.sub("", text)
-    urls = _URL_RE.findall(local_text)
-    return _URL_RE.sub("", local_text), wiki_link_count + len(urls)
+    wiki = _scan_wiki_links(text)
+    urls = _URL_RE.findall(wiki.local_text)
+    return (
+        _URL_RE.sub("", wiki.local_text),
+        wiki.reference_link_count + len(urls),
+    )
+
+
+def _scan_wiki_links(text: str) -> _WikiScanResult:
+    """Remove valid Obsidian wiki links with one bounded left-to-right scan."""
+    local_parts: list[str] = []
+    literal_start = 0
+    opening: int | None = None
+    position = 0
+    reference_link_count = 0
+    scanned_characters = 0
+
+    while position < len(text):
+        scanned_characters += 1
+        if opening is None:
+            if text.startswith("[[", position) and (position == 0 or text[position - 1] != "!"):
+                local_parts.append(text[literal_start:position])
+                opening = position
+                position += 2
+            else:
+                position += 1
+            continue
+
+        if text[position] == "\n":
+            local_parts.append(text[opening : position + 1])
+            opening = None
+            position += 1
+            literal_start = position
+        elif text.startswith("[[", position):
+            local_parts.append(text[opening:position])
+            opening = position
+            position += 2
+        elif text.startswith("]]", position):
+            content = text[opening + 2 : position]
+            target = content.partition("|")[0].strip()
+            position += 2
+            if target:
+                reference_link_count += 1
+            else:
+                local_parts.append(text[opening:position])
+            opening = None
+            literal_start = position
+        else:
+            position += 1
+
+    if opening is None:
+        local_parts.append(text[literal_start:])
+    else:
+        local_parts.append(text[opening:])
+    return _WikiScanResult(
+        local_text="".join(local_parts),
+        reference_link_count=reference_link_count,
+        scanned_characters=scanned_characters,
+    )
 
 
 def _is_external_target(target: str) -> bool:

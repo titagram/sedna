@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import sedna.knowledge.classifier as classifier_module
 from sedna.knowledge.classifier import ClassificationResult, classify_document
 from sedna.knowledge.inventory import SourceCandidate
 from sedna.knowledge.schema import (
@@ -172,6 +173,47 @@ Previous: [[HTB Academy]]
     assert result.parser_profile == "none"
     assert result.ingestion_status == IngestionStatus.EXCLUDED
     assert "no_local_substance" in result.reasons
+
+
+def test_wiki_link_scanner_has_a_deterministic_linear_work_bound() -> None:
+    scanner = getattr(classifier_module, "_scan_wiki_links", None)
+    assert callable(scanner), "classifier must expose instrumentable wiki scanning"
+    unmatched = "[" * 40_000
+
+    result = scanner(unmatched)
+
+    assert result.local_text == unmatched
+    assert result.reference_link_count == 0
+    assert result.scanned_characters <= len(unmatched)
+
+
+def test_wiki_link_scanner_handles_aliases_surrounding_prose_and_embeds() -> None:
+    scanner = getattr(classifier_module, "_scan_wiki_links", None)
+    assert callable(scanner), "classifier must expose instrumentable wiki scanning"
+    text = (
+        "Review [[Academy/Guide|the guide]] before comparing five local observations. "
+        "Keep ![[diagram.png]] as an asset."
+    )
+
+    result = scanner(text)
+
+    assert result.local_text == (
+        "Review  before comparing five local observations. Keep ![[diagram.png]] as an asset."
+    )
+    assert result.reference_link_count == 1
+    assert result.scanned_characters <= len(text)
+
+
+def test_wiki_link_scanner_preserves_malformed_text_and_recovers_next_line() -> None:
+    scanner = getattr(classifier_module, "_scan_wiki_links", None)
+    assert callable(scanner), "classifier must expose instrumentable wiki scanning"
+    text = "prefix [[unclosed\nsuffix [[valid|label]] end"
+
+    result = scanner(text)
+
+    assert result.local_text == "prefix [[unclosed\nsuffix  end"
+    assert result.reference_link_count == 1
+    assert result.scanned_characters <= len(text)
 
 
 def test_academy_external_link_label_alone_is_not_local_substance(
