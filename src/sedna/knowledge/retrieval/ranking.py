@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from enum import Enum
 from hashlib import sha256
 from types import MappingProxyType
 from typing import Any
@@ -49,6 +50,10 @@ _MAX_PROVENANCE_SCAN_ITEMS = 256
 _MAX_OUTPUT_SEQUENCE_ITEMS = 256
 _MAX_CANONICAL_FACETS = 256
 _MAX_CANONICAL_PAYLOAD_BYTES = 262_144
+_MAX_CANONICAL_COLLECTION_ITEMS = 4096
+_MAX_CANONICAL_MODEL_FIELDS = 8192
+_MAX_CANONICAL_NODES = 16_384
+_PREFLIGHT_TEXT_CHUNK_CHARS = 1024
 _MIN_KNOWN_FACT_CONFIDENCE = 0.75
 _UNKNOWN_VALUES = frozenset({"", "unknown", "unspecified", "not established"})
 _HARD_OBSERVED_DIMENSIONS = frozenset(
@@ -124,10 +129,8 @@ class RankedCandidates(BaseModel):
         for lane, hits in lanes:
             if any(hit.lane is not lane for hit in hits):
                 raise ValueError("ranked hit is in the wrong epistemic lane")
-            if hits != _diversified_lane_order(hits):
-                raise ValueError(
-                    "ranked hits must use stable lane-local independence-group ordering"
-                )
+            if hits != _score_order(hits):
+                raise ValueError("ranked hits must use stable lane-local score ordering")
             for hit in hits:
                 if hit.artifact_id in all_hit_ids:
                     raise ValueError("an artifact can qualify in only one epistemic lane")
@@ -181,6 +184,13 @@ class _SafeArtifactView:
 
 
 @dataclass(frozen=True, slots=True)
+class _PreparedCandidate:
+    candidate: IndexCandidate
+    safe_view: _SafeArtifactView
+    budget_reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _EvaluatedCandidate:
     candidate: IndexCandidate
     lane: EpistemicLane | None
@@ -190,20 +200,36 @@ class _EvaluatedCandidate:
     rejection_reasons: tuple[str, ...]
 
 
+@dataclass(slots=True)
+class _PreflightState:
+    text_bytes: int = 0
+    collection_items: int = 0
+    model_fields: int = 0
+    nodes: int = 0
+
+
+class _PreflightBudgetError(Exception):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 def rank_candidates(
     query: RetrievalQuery,
     candidates: Iterable[IndexCandidate],
 ) -> RankedCandidates:
     """Filter hard incompatibilities and rank candidates inside independent evidence lanes.
 
-    All Pydantic inputs are checked for hidden ``model_copy`` state, JSON-round-tripped, and
-    strictly revalidated before any field influences ranking.  Source-local case details are
-    removed from returned retrieval views; canonical repository lookup remains the explicit path
-    for inspecting them.
+    A bounded structural preflight runs before serialization.  Inputs inside that budget are
+    deeply revalidated; oversized artifacts are compacted into a validated safe view and rejected
+    before ranking.  Source-local case details are removed from returned retrieval views;
+    canonical repository lookup remains the explicit path for inspecting them.
     """
 
+    _preflight_or_raise(query, label="retrieval query")
     query = _strict_revalidate(query, RetrievalQuery)
-    canonical_candidates = _bounded_candidates(candidates)
+    prepared_candidates = _bounded_candidates(candidates)
+    canonical_candidates = tuple(item.candidate for item in prepared_candidates)
     if len({candidate.artifact_id for candidate in canonical_candidates}) != len(
         canonical_candidates
     ):
@@ -215,11 +241,12 @@ def rank_candidates(
 
     evaluated: list[_EvaluatedCandidate] = []
     all_questions: set[str] = set()
-    for candidate in canonical_candidates:
+    for prepared in prepared_candidates:
+        candidate = prepared.candidate
         artifact = candidate.artifact
         lane = _lane_for(artifact)
-        budget_reasons = _ranking_budget_reasons(artifact)
-        safe_view = _safe_retrieval_artifact(artifact)
+        budget_reasons = prepared.budget_reasons
+        safe_view = prepared.safe_view
         applicability = (
             _empty_applicability()
             if budget_reasons
@@ -262,14 +289,16 @@ def rank_candidates(
         safe_artifact = item.safe_artifact
         applicability = item.applicability
         if item.rejection_reasons:
-            rejection_reasons = (*item.rejection_reasons, *item.safe_view_notes)
             rejected.append(
                 RejectedCandidate(
                     artifact_id=candidate.artifact_id,
                     artifact=safe_artifact,
                     lane=lane,
                     provenance=safe_artifact.source_refs,
-                    rejection_reasons=rejection_reasons[:_MAX_EXPLANATION_ITEMS],
+                    rejection_reasons=_reserve_mandatory_reasons(
+                        item.rejection_reasons,
+                        mandatory=item.safe_view_notes,
+                    ),
                     missing_context=applicability.missing_context[:_MAX_EXPLANATION_ITEMS],
                 )
             )
@@ -293,8 +322,9 @@ def rank_candidates(
                     artifact=safe_artifact,
                     lane=lane,
                     provenance=safe_artifact.source_refs,
-                    rejection_reasons=(
-                        f"score {score.total:.3f} below {lane.value} threshold {threshold:.2f}",
+                    rejection_reasons=_reserve_mandatory_reasons(
+                        (f"score {score.total:.3f} below {lane.value} threshold {threshold:.2f}",),
+                        mandatory=item.safe_view_notes,
                     ),
                     missing_context=applicability.missing_context[:_MAX_EXPLANATION_ITEMS],
                 )
@@ -312,7 +342,6 @@ def rank_candidates(
             and score.freshness < 1.0
         ):
             qualification_reasons.append("deprecated evidence retained with reduced freshness")
-        qualification_reasons.extend(item.safe_view_notes)
         qualification_reasons.extend(applicability.matched_descriptions)
         hits[lane].append(
             RetrievalHit(
@@ -322,13 +351,16 @@ def rank_candidates(
                 provenance=safe_artifact.source_refs,
                 score=score,
                 matched_facets=applicability.matched_facets[:_MAX_EXPLANATION_ITEMS],
-                qualification_reasons=tuple(qualification_reasons[:_MAX_EXPLANATION_ITEMS]),
+                qualification_reasons=_reserve_mandatory_reasons(
+                    qualification_reasons,
+                    mandatory=item.safe_view_notes,
+                ),
                 missing_context=applicability.missing_context[:_MAX_EXPLANATION_ITEMS],
             )
         )
 
     for lane, lane_hits in tuple(hits.items()):
-        hits[lane] = list(_diversified_lane_order(lane_hits))
+        hits[lane] = list(_score_order(lane_hits))
     rejected.sort(key=lambda item: item.artifact_id)
     return RankedCandidates(
         references=tuple(hits[EpistemicLane.REFERENCE]),
@@ -366,13 +398,235 @@ def _diversified_lane_order(hits: Iterable[RetrievalHit]) -> tuple[RetrievalHit,
     return tuple(ordered)
 
 
-def _bounded_candidates(candidates: Iterable[IndexCandidate]) -> tuple[IndexCandidate, ...]:
-    validated: list[IndexCandidate] = []
+def _score_order(hits: Iterable[RetrievalHit]) -> tuple[RetrievalHit, ...]:
+    return tuple(sorted(hits, key=lambda hit: (-hit.score.total, hit.artifact_id)))
+
+
+def select_diversified_hits(
+    hits: Iterable[RetrievalHit],
+    *,
+    limit: int,
+) -> tuple[RetrievalHit, ...]:
+    """Select lane-local independent evidence, then restore the public score-order contract."""
+
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        raise ValueError("diversified hit limit must be a non-negative integer")
+    lane_hits = tuple(hits)
+    if any(not isinstance(hit, RetrievalHit) for hit in lane_hits):
+        raise ValueError("diversified selection requires RetrievalHit values")
+    if len({hit.lane for hit in lane_hits}) > 1:
+        raise ValueError("diversified selection cannot mix epistemic lanes")
+    selected = _diversified_lane_order(lane_hits)[:limit]
+    return _score_order(selected)
+
+
+def _reserve_mandatory_reasons(
+    reasons: Iterable[str],
+    *,
+    mandatory: Iterable[str],
+) -> tuple[str, ...]:
+    mandatory_items = tuple(dict.fromkeys(mandatory))[:_MAX_EXPLANATION_ITEMS]
+    mandatory_set = set(mandatory_items)
+    regular_items = tuple(
+        dict.fromkeys(reason for reason in reasons if reason not in mandatory_set)
+    )
+    available = _MAX_EXPLANATION_ITEMS - len(mandatory_items)
+    return (*regular_items[:available], *mandatory_items)
+
+
+def _bounded_candidates(candidates: Iterable[IndexCandidate]) -> tuple[_PreparedCandidate, ...]:
+    prepared: list[_PreparedCandidate] = []
     for offset, candidate in enumerate(candidates):
         if offset >= _MAX_RANKING_CANDIDATES:
             raise ValueError("ranking candidate count exceeds the cumulative bound")
-        validated.append(_strict_revalidate(candidate, IndexCandidate))
-    return tuple(validated)
+        if not isinstance(candidate, IndexCandidate):
+            raise ValueError("ranking requires an IndexCandidate")
+        _check_model_shape(candidate)
+        budget_reasons = _candidate_preflight_reasons(candidate)
+        if budget_reasons:
+            artifact = candidate.__dict__.get("artifact")
+            if not isinstance(
+                artifact,
+                (ReferenceArtifact, KnowledgeCase, CaseStep, DecisionRule),
+            ):
+                raise ValueError("oversized candidate does not contain a canonical artifact")
+            safe_view = _safe_retrieval_artifact(artifact, allow_full_digest=False)
+            safe_candidate = IndexCandidate(
+                artifact_id=candidate.__dict__.get("artifact_id"),
+                artifact=safe_view.artifact,
+                lexical_relevance=candidate.__dict__.get("lexical_relevance"),
+            )
+            prepared.append(
+                _PreparedCandidate(
+                    candidate=safe_candidate,
+                    safe_view=safe_view,
+                    budget_reasons=budget_reasons,
+                )
+            )
+            continue
+        validated = _strict_revalidate(candidate, IndexCandidate)
+        safe_view = _safe_retrieval_artifact(validated.artifact, allow_full_digest=True)
+        prepared.append(
+            _PreparedCandidate(
+                candidate=validated,
+                safe_view=safe_view,
+                budget_reasons=(),
+            )
+        )
+    return tuple(prepared)
+
+
+def _candidate_preflight_reasons(candidate: IndexCandidate) -> tuple[str, ...]:
+    artifact = candidate.__dict__.get("artifact")
+    if isinstance(artifact, (ReferenceArtifact, KnowledgeCase, CaseStep, DecisionRule)):
+        facet_count = _untrusted_facet_count(artifact)
+        if facet_count is not None and facet_count > _MAX_CANONICAL_FACETS:
+            return (
+                f"candidate applicability exceeds {_MAX_CANONICAL_FACETS}-facet ranking budget",
+            )
+    try:
+        _bounded_preflight(candidate, label="candidate canonical")
+    except _PreflightBudgetError as error:
+        return (error.reason,)
+    return ()
+
+
+def _untrusted_facet_count(artifact: IndexedArtifact) -> int | None:
+    applicability = artifact.__dict__.get("applicability")
+    if not isinstance(applicability, BaseModel):
+        return None
+    typed = applicability.__dict__.get("typed_context")
+    facets = applicability.__dict__.get("facets")
+    if not isinstance(typed, BaseModel) or type(facets) not in {tuple, list}:
+        return None
+    scalar_count = sum(
+        typed.__dict__.get(key) is not None
+        for key in (
+            "os_family",
+            "os_version",
+            "cpu_architecture",
+            "execution_environment",
+            "system_role",
+            "identity_context",
+            "initial_access",
+            "network_position",
+            "observation_date",
+        )
+    )
+    collections = tuple(
+        typed.__dict__.get(key) for key in ("services", "privileges", "security_controls")
+    )
+    if any(type(value) not in {tuple, list} for value in collections):
+        return None
+    return scalar_count + len(facets) + sum(len(value) for value in collections)
+
+
+def _preflight_or_raise(value: object, *, label: str) -> None:
+    try:
+        _bounded_preflight(value, label=label)
+    except _PreflightBudgetError as error:
+        raise ValueError(error.reason) from None
+
+
+def _bounded_preflight(value: object, *, label: str) -> None:
+    state = _PreflightState()
+    _preflight_value(value, state=state, label=label, seen=set())
+
+
+def _preflight_value(
+    value: object,
+    *,
+    state: _PreflightState,
+    label: str,
+    seen: set[int],
+) -> None:
+    state.nodes += 1
+    if state.nodes > _MAX_CANONICAL_NODES:
+        raise _PreflightBudgetError(f"{label} exceeds {_MAX_CANONICAL_NODES}-node preflight budget")
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, int):
+        if value.bit_length() > 256:
+            raise ValueError(f"{label} contains an oversized integer")
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{label} contains a non-finite number")
+        return
+    if isinstance(value, Enum):
+        _preflight_value(value.value, state=state, label=label, seen=seen)
+        return
+    if isinstance(value, str):
+        if type(value) is not str:
+            raise ValueError(f"{label} contains an unsafe string subtype")
+        _consume_text_budget(value, state=state, label=label)
+        return
+
+    identity = id(value)
+    if identity in seen:
+        raise ValueError(f"{label} contains a recursive value")
+    seen.add(identity)
+    try:
+        if isinstance(value, BaseModel):
+            _check_model_shape(value)
+            present_fields = tuple(
+                field_name
+                for field_name in type(value).model_fields
+                if field_name in value.__dict__
+            )
+            state.model_fields += len(present_fields)
+            if state.model_fields > _MAX_CANONICAL_MODEL_FIELDS:
+                raise _PreflightBudgetError(
+                    f"{label} exceeds {_MAX_CANONICAL_MODEL_FIELDS}-field preflight budget"
+                )
+            for field_name in present_fields:
+                _preflight_value(
+                    value.__dict__[field_name],
+                    state=state,
+                    label=label,
+                    seen=seen,
+                )
+            return
+        if type(value) in {tuple, list}:
+            state.collection_items += len(value)
+            if state.collection_items > _MAX_CANONICAL_COLLECTION_ITEMS:
+                raise _PreflightBudgetError(
+                    f"{label} exceeds "
+                    f"{_MAX_CANONICAL_COLLECTION_ITEMS}-item collection preflight budget"
+                )
+            for item in value:
+                _preflight_value(item, state=state, label=label, seen=seen)
+            return
+        if type(value) is dict:
+            state.collection_items += len(value)
+            if state.collection_items > _MAX_CANONICAL_COLLECTION_ITEMS:
+                raise _PreflightBudgetError(
+                    f"{label} exceeds "
+                    f"{_MAX_CANONICAL_COLLECTION_ITEMS}-item collection preflight budget"
+                )
+            for key, item in value.items():
+                _preflight_value(key, state=state, label=label, seen=seen)
+                _preflight_value(item, state=state, label=label, seen=seen)
+            return
+        raise ValueError(f"{label} contains an unsupported value type")
+    finally:
+        seen.remove(identity)
+
+
+def _consume_text_budget(value: str, *, state: _PreflightState, label: str) -> None:
+    for offset in range(0, len(value), _PREFLIGHT_TEXT_CHUNK_CHARS):
+        chunk = value[offset : offset + _PREFLIGHT_TEXT_CHUNK_CHARS]
+        state.text_bytes += len(chunk.encode("utf-8"))
+        if state.text_bytes > _MAX_CANONICAL_PAYLOAD_BYTES:
+            raise _PreflightBudgetError(
+                f"{label} payload exceeds {_MAX_CANONICAL_PAYLOAD_BYTES}-byte ranking budget"
+            )
+
+
+def _check_model_shape(value: BaseModel) -> None:
+    fields = type(value).model_fields
+    if set(value.__dict__) - set(fields) or value.__pydantic_extra__:
+        raise ValueError("unsafe retrieval model state")
 
 
 def _strict_revalidate(value: Any, model: type[BaseModel]):
@@ -380,7 +634,9 @@ def _strict_revalidate(value: Any, model: type[BaseModel]):
         raise ValueError(f"ranking requires a {model.__name__}")
     _reject_hidden_model_state(value)
     try:
-        primitive = json.loads(json.dumps(value.model_dump(mode="json"), allow_nan=False))
+        primitive = json.loads(
+            json.dumps(value.model_dump(mode="json", warnings="error"), allow_nan=False)
+        )
     except (TypeError, ValueError) as error:
         raise ValueError("retrieval model is not JSON-primitive safe") from error
     return model.model_validate(primitive)
@@ -429,48 +685,6 @@ def _live_values(
         if normalized not in _UNKNOWN_VALUES:
             values[(facet.namespace, facet.key)].add(normalized)
     return {dimension: tuple(sorted(items)) for dimension, items in values.items()}
-
-
-def _ranking_budget_reasons(artifact: IndexedArtifact) -> tuple[str, ...]:
-    encoded = json.dumps(
-        artifact.model_dump(mode="json"),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    reasons: list[str] = []
-    if len(encoded) > _MAX_CANONICAL_PAYLOAD_BYTES:
-        reasons.append(
-            "candidate canonical payload exceeds "
-            f"{_MAX_CANONICAL_PAYLOAD_BYTES}-byte ranking budget"
-        )
-    typed = artifact.applicability.typed_context
-    typed_scalar_count = sum(
-        getattr(typed, key) is not None
-        for key in (
-            "os_family",
-            "os_version",
-            "cpu_architecture",
-            "execution_environment",
-            "system_role",
-            "identity_context",
-            "initial_access",
-            "network_position",
-            "observation_date",
-        )
-    )
-    facet_count = (
-        typed_scalar_count
-        + len(typed.services)
-        + len(typed.privileges)
-        + len(typed.security_controls)
-        + len(artifact.applicability.facets)
-    )
-    if facet_count > _MAX_CANONICAL_FACETS:
-        reasons.append(
-            f"candidate applicability exceeds {_MAX_CANONICAL_FACETS}-facet ranking budget"
-        )
-    return tuple(reasons)
 
 
 def _empty_applicability() -> _ApplicabilityResult:
@@ -773,15 +987,17 @@ def _freshness(artifact: IndexedArtifact, *, as_of: date | None) -> float:
 
 
 def _query_observation_date(query: RetrievalQuery) -> date | None:
-    live_dates = frozenset(
-        parsed
+    raw_dates = frozenset(
+        normalized
         for facet in (*query.situation.facts, *query.facets)
         if facet.namespace == "typed"
         and facet.key == "observation_date"
         and facet.confidence >= _MIN_KNOWN_FACT_CONFIDENCE
-        and (parsed := _parse_date(facet.value)) is not None
+        and (normalized := _normalize(facet.value)) not in _UNKNOWN_VALUES
     )
-    return next(iter(live_dates)) if len(live_dates) == 1 else None
+    if len(raw_dates) != 1:
+        return None
+    return _parse_date(next(iter(raw_dates)))
 
 
 def _artifact_observed_date(artifact: IndexedArtifact) -> date | None:
@@ -848,37 +1064,84 @@ def _lane_for(artifact: IndexedArtifact) -> EpistemicLane | None:
     return EpistemicLane.REFERENCE
 
 
-def _safe_retrieval_artifact(artifact: IndexedArtifact) -> _SafeArtifactView:
-    payload = artifact.model_dump(mode="json")
+def _safe_retrieval_artifact(
+    artifact: IndexedArtifact,
+    *,
+    allow_full_digest: bool,
+) -> _SafeArtifactView:
     notes: set[str] = set()
+    active: set[int] = set()
 
     def compact(value: Any, *, key: str | None = None, top_level: bool = False) -> Any:
-        if isinstance(value, dict):
-            return {
-                item_key: compact(
-                    item_value,
-                    key=item_key,
-                    top_level=top_level and item_key == "source_refs",
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, Enum):
+            return compact(value.value, key=key, top_level=top_level)
+        if isinstance(value, str):
+            if type(value) is not str:
+                raise ValueError("canonical artifact contains an unsafe string subtype")
+            if len(value) > _MAX_OUTPUT_STRING_CHARS:
+                notes.add("artifact retrieval view compacted to bounded output")
+                return _truncate_text(
+                    value,
+                    limit=_MAX_OUTPUT_STRING_CHARS,
+                    include_full_digest=allow_full_digest,
                 )
-                for item_key, item_value in value.items()
-                if item_key != "case_specific_details"
-            } | ({"case_specific_details": []} if "case_specific_details" in value else {})
-        if isinstance(value, list):
+            return value
+
+        active_identity = id(value)
+        if active_identity in active:
+            raise ValueError("canonical artifact contains a recursive value")
+        active.add(active_identity)
+        try:
+            if isinstance(value, BaseModel):
+                _check_model_shape(value)
+                payload: dict[str, Any] = {}
+                for field_name in type(value).model_fields:
+                    if field_name not in value.__dict__:
+                        continue
+                    if field_name == "case_specific_details":
+                        payload[field_name] = []
+                        continue
+                    payload[field_name] = compact(
+                        value.__dict__[field_name],
+                        key=field_name,
+                        top_level=top_level and field_name == "source_refs",
+                    )
+                return payload
+            if type(value) is dict:
+                items = tuple(value.items())
+                if len(items) > _MAX_OUTPUT_SEQUENCE_ITEMS:
+                    items = items[:_MAX_OUTPUT_SEQUENCE_ITEMS]
+                    notes.add(
+                        "artifact retrieval view mappings bounded to "
+                        f"{_MAX_OUTPUT_SEQUENCE_ITEMS} items"
+                    )
+                payload = {}
+                for item_key, item_value in items:
+                    if type(item_key) is not str:
+                        raise ValueError("canonical artifact mapping keys must be strings")
+                    payload[item_key] = compact(item_value, key=item_key)
+                return payload
+            if type(value) not in {tuple, list}:
+                raise ValueError("canonical artifact contains an unsupported value type")
+
             items = value
             if key == "source_refs":
                 scanned_items = items[:_MAX_PROVENANCE_SCAN_ITEMS]
                 unique: list[Any] = []
                 identities: set[str] = set()
                 for item in scanned_items:
-                    identity = json.dumps(
-                        item,
+                    compacted_item = compact(item)
+                    reference_identity = json.dumps(
+                        compacted_item,
                         ensure_ascii=False,
                         sort_keys=True,
                         separators=(",", ":"),
                     )
-                    if identity not in identities:
-                        identities.add(identity)
-                        unique.append(item)
+                    if reference_identity not in identities:
+                        identities.add(reference_identity)
+                        unique.append(compacted_item)
                 items = unique[:_MAX_OUTPUT_PROVENANCE]
                 if top_level:
                     if len(unique) != len(scanned_items):
@@ -910,6 +1173,7 @@ def _safe_retrieval_artifact(artifact: IndexedArtifact) -> _SafeArtifactView:
                     or len(value) > _MAX_PROVENANCE_SCAN_ITEMS
                 ):
                     notes.add("nested provenance bounded in retrieval view")
+                return items
             elif len(items) > _MAX_OUTPUT_SEQUENCE_ITEMS:
                 items = items[:_MAX_OUTPUT_SEQUENCE_ITEMS]
                 notes.add(
@@ -917,12 +1181,10 @@ def _safe_retrieval_artifact(artifact: IndexedArtifact) -> _SafeArtifactView:
                     f"{_MAX_OUTPUT_SEQUENCE_ITEMS} items"
                 )
             return [compact(item) for item in items]
-        if isinstance(value, str) and len(value) > _MAX_OUTPUT_STRING_CHARS:
-            notes.add("artifact retrieval view compacted to bounded output")
-            return _truncate_text(value, limit=_MAX_OUTPUT_STRING_CHARS)
-        return value
+        finally:
+            active.remove(active_identity)
 
-    safe_payload = compact(payload, top_level=True)
+    safe_payload = compact(artifact, top_level=True)
     safe_artifact = type(artifact).model_validate(safe_payload)
     return _SafeArtifactView(artifact=safe_artifact, notes=tuple(sorted(notes)))
 
@@ -931,11 +1193,19 @@ def _normalize(value: str) -> str:
     return " ".join(value.split()).casefold()
 
 
-def _truncate_text(value: str, *, limit: int) -> str:
+def _truncate_text(
+    value: str,
+    *,
+    limit: int,
+    include_full_digest: bool = True,
+) -> str:
     if len(value) <= limit:
         return value
-    digest = sha256(value.encode("utf-8")).hexdigest()[:16]
-    suffix = f" … [truncated sha256:{digest}]"
+    if include_full_digest:
+        digest = sha256(value.encode("utf-8")).hexdigest()[:16]
+        suffix = f" … [truncated sha256:{digest}]"
+    else:
+        suffix = " … [truncated: canonical value exceeds ranking budget]"
     return f"{value[: limit - len(suffix)]}{suffix}"
 
 
@@ -945,4 +1215,9 @@ def _bounded(value: float) -> float:
     return round(min(1.0, max(0.0, value)), 6)
 
 
-__all__ = ["LANE_THRESHOLDS", "RankedCandidates", "rank_candidates"]
+__all__ = [
+    "LANE_THRESHOLDS",
+    "RankedCandidates",
+    "rank_candidates",
+    "select_diversified_hits",
+]

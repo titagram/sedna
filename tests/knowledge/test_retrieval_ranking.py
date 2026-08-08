@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterable
 
 import pytest
 
+import sedna.knowledge.retrieval.ranking as ranking_module
 from sedna.knowledge.retrieval import (
     AuthorizationScope,
     AuthorizationState,
     CurrentSituation,
     IndexCandidate,
     RetrievalQuery,
+    RetrievalResult,
     SituationFacet,
     ValidatedTarget,
 )
@@ -558,6 +561,55 @@ def test_lane_thresholds_are_applied_per_lane_and_report_below_threshold_candida
         assert any(f"threshold {threshold:.2f}" in reason for reason in rejected.rejection_reasons)
 
 
+def test_below_threshold_rejection_preserves_mandatory_provenance_bounding_reason():
+    artifact = _reference(
+        "weak-many-sources",
+        applicability=_applicability(
+            source_id="source-weak-many-sources",
+            os_family="windows",
+        ),
+        status=VerificationStatus.DEPRECATED,
+    )
+    source_refs = tuple(_source_ref(f"weak-source-{offset:02d}") for offset in range(65))
+    artifact = ReferenceArtifact.model_validate(
+        {**artifact.model_dump(mode="json"), "source_refs": source_refs}
+    )
+
+    ranked = rank_candidates(_query(), (_candidate(artifact, lexical=0.0),))
+
+    rejected = ranked.rejected_candidates[0]
+    assert any("below reference threshold" in reason for reason in rejected.rejection_reasons)
+    assert "provenance bounded: showing 64 of 65 unique source references" in (
+        rejected.rejection_reasons
+    )
+
+
+def test_mandatory_bounding_reason_reserves_space_when_hard_rejections_exceed_limit():
+    incompatible_facets = tuple(
+        ("domain", f"control-{offset:02d}", "present", ContextRelation.INCOMPATIBLE)
+        for offset in range(40)
+    )
+    artifact = _reference(
+        "many-rejections-and-sources",
+        applicability=_applicability(
+            source_id="source-many-rejections-and-sources",
+            facets=incompatible_facets,
+        ),
+    )
+    source_refs = tuple(_source_ref(f"bounded-source-{offset:02d}") for offset in range(65))
+    artifact = ReferenceArtifact.model_validate(
+        {**artifact.model_dump(mode="json"), "source_refs": source_refs}
+    )
+    facts = tuple(_fact("domain", f"control-{offset:02d}", "present") for offset in range(40))
+
+    ranked = rank_candidates(_query(*facts), (_candidate(artifact, lexical=1.0),))
+
+    reasons = ranked.rejected_candidates[0].rejection_reasons
+    assert len(reasons) == 32
+    assert "provenance bounded: showing 64 of 65 unique source references" in reasons
+    assert sum("explicitly incompatible" in reason for reason in reasons) == 31
+
+
 def test_repeated_independence_groups_receive_less_diversity_than_independent_sources():
     copied_a = _reference("copied-a", group="copied-walkthrough")
     copied_b = _reference("copied-b", group="copied-walkthrough")
@@ -573,7 +625,7 @@ def test_repeated_independence_groups_receive_less_diversity_than_independent_so
     assert scores["copied-a"] == scores["copied-b"]
 
 
-def test_lane_order_round_robins_independence_groups_before_repeating_copied_sources():
+def test_lane_limit_selection_round_robins_groups_before_repeating_copied_sources():
     copied = tuple(
         _reference(f"copied-{offset}", group="byte-identical-source") for offset in range(5)
     )
@@ -589,17 +641,48 @@ def test_lane_order_round_robins_independence_groups_before_repeating_copied_sou
         ),
     )
 
-    assert [hit.artifact_id for hit in ranked.references[:3]] == [
+    selected = ranking_module.select_diversified_hits(ranked.references, limit=3)
+
+    assert [hit.artifact_id for hit in selected] == [
         "copied-0",
         "independent-a",
         "independent-b",
     ]
-    assert [hit.artifact_id for hit in ranked.references[3:]] == [
-        "copied-1",
-        "copied-2",
-        "copied-3",
-        "copied-4",
+    assert not {"copied-1", "copied-2", "copied-3", "copied-4"} & {
+        hit.artifact_id for hit in selected
+    }
+
+
+def test_diversified_top_k_selection_is_score_sorted_and_composes_with_retrieval_result():
+    copied = tuple(_reference(f"limited-copy-{offset}", group="copied") for offset in range(3))
+    independent_a = _reference("limited-independent-a", group="independent-a")
+    independent_b = _reference("limited-independent-b", group="independent-b")
+    query = _query()
+    ranked = rank_candidates(
+        query,
+        (
+            _candidate(copied[2], lexical=0.90),
+            _candidate(independent_b, lexical=0.10),
+            _candidate(copied[1], lexical=0.95),
+            _candidate(independent_a, lexical=0.20),
+            _candidate(copied[0], lexical=1.00),
+        ),
+    )
+
+    selected = ranking_module.select_diversified_hits(ranked.references, limit=4)
+    result = RetrievalResult(
+        target=query.situation.target,
+        authorization=query.situation.authorization,
+        references=selected,
+    )
+
+    assert [hit.artifact_id for hit in result.references] == [
+        "limited-copy-0",
+        "limited-copy-1",
+        "limited-independent-a",
+        "limited-independent-b",
     ]
+    assert "limited-copy-2" not in {hit.artifact_id for hit in result.references}
 
 
 def test_source_diversity_is_lane_local_and_cannot_couple_unlike_evidence_scores():
@@ -764,6 +847,44 @@ def test_contradictory_query_observation_dates_do_not_become_an_arbitrary_freshn
     )
 
 
+@pytest.mark.parametrize(
+    ("raw_dates", "rendered_dates"),
+    (
+        (("2026-01-01", "not-a-date"), "2026-01-01, not-a-date"),
+        (
+            ("2026-01-01", "2026-01-01T00:00:00"),
+            "2026-01-01, 2026-01-01t00:00:00",
+        ),
+    ),
+)
+def test_distinct_raw_singleton_clock_facts_remain_unresolved_before_date_parsing(
+    raw_dates: tuple[str, str],
+    rendered_dates: str,
+):
+    artifact = _reference(
+        "dated-reference-with-raw-clock-conflict",
+        applicability=_applicability(
+            source_id="source-dated-reference-with-raw-clock-conflict",
+            os_version="6.8",
+            observation_date="2025-01-01",
+        ),
+    )
+
+    ranked = rank_candidates(
+        _query(
+            _fact("typed", "os_version", "6.8"),
+            *(_fact("typed", "observation_date", value) for value in raw_dates),
+        ),
+        (_candidate(artifact),),
+    )
+
+    hit = ranked.references[0]
+    assert hit.score.freshness == 0.6
+    assert hit.missing_context == (
+        "resolve contradictory current typed.observation_date values: " + rendered_dates,
+    )
+
+
 def test_deprecated_non_versioned_evidence_has_reduced_freshness_and_aligned_explanation():
     deprecated = _reference("deprecated-non-versioned", status=VerificationStatus.DEPRECATED)
 
@@ -907,13 +1028,85 @@ def test_canonical_facet_work_budget_rejects_candidate_without_traversal_failure
     assert len(rejected.artifact.applicability.facets) == 256
 
 
-def test_canonical_byte_budget_rejects_candidate_with_a_bounded_safe_view():
+def test_canonical_collection_budget_rejects_without_serializing_original_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    artifact = _reference("oversized-canonical-collection")
+    artifact = ReferenceArtifact.model_validate(
+        {
+            **artifact.model_dump(mode="json"),
+            "applicable_situations": tuple(f"situation-{offset}" for offset in range(5000)),
+        }
+    )
+    candidate = _candidate(artifact)
+    original_candidate_dump = IndexCandidate.model_dump
+
+    def guarded_candidate_dump(self, *args, **kwargs):
+        if self is candidate:
+            raise AssertionError("oversized collection candidate was fully serialized")
+        return original_candidate_dump(self, *args, **kwargs)
+
+    monkeypatch.setattr(IndexCandidate, "model_dump", guarded_candidate_dump)
+
+    ranked = rank_candidates(_query(), (candidate,))
+
+    rejected = ranked.rejected_candidates[0]
+    assert "candidate canonical exceeds 4096-item collection preflight budget" in (
+        rejected.rejection_reasons
+    )
+    assert len(rejected.artifact.applicable_situations) == 256
+
+
+def test_canonical_field_budget_rejects_without_serializing_original_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    artifact = _reference("oversized-canonical-fields")
+    source_refs = tuple(_source_ref(f"field-source-{offset:04d}") for offset in range(1100))
+    artifact = ReferenceArtifact.model_validate(
+        {**artifact.model_dump(mode="json"), "source_refs": source_refs}
+    )
+    candidate = _candidate(artifact)
+    original_candidate_dump = IndexCandidate.model_dump
+
+    def guarded_candidate_dump(self, *args, **kwargs):
+        if self is candidate:
+            raise AssertionError("oversized field candidate was fully serialized")
+        return original_candidate_dump(self, *args, **kwargs)
+
+    monkeypatch.setattr(IndexCandidate, "model_dump", guarded_candidate_dump)
+
+    ranked = rank_candidates(_query(), (candidate,))
+
+    rejected = ranked.rejected_candidates[0]
+    assert "candidate canonical exceeds 8192-field preflight budget" in (rejected.rejection_reasons)
+    assert len(rejected.provenance) == 64
+
+
+def test_canonical_byte_budget_rejects_before_dumping_or_deep_copying_original_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+):
     artifact = _reference("oversized-canonical-payload")
     artifact = ReferenceArtifact.model_validate(
         {**artifact.model_dump(mode="json"), "statement": "A" * 270_000}
     )
+    candidate = _candidate(artifact)
+    original_candidate_dump = IndexCandidate.model_dump
+    original_artifact_dump = ReferenceArtifact.model_dump
 
-    ranked = rank_candidates(_query(), (_candidate(artifact),))
+    def guarded_candidate_dump(self, *args, **kwargs):
+        if self is candidate:
+            raise AssertionError("oversized candidate was fully serialized")
+        return original_candidate_dump(self, *args, **kwargs)
+
+    def guarded_artifact_dump(self, *args, **kwargs):
+        if self is artifact:
+            raise AssertionError("oversized artifact was fully serialized")
+        return original_artifact_dump(self, *args, **kwargs)
+
+    monkeypatch.setattr(IndexCandidate, "model_dump", guarded_candidate_dump)
+    monkeypatch.setattr(ReferenceArtifact, "model_dump", guarded_artifact_dump)
+
+    ranked = rank_candidates(_query(), (candidate,))
 
     rejected = ranked.rejected_candidates[0]
     assert "candidate canonical payload exceeds 262144-byte ranking budget" in (
@@ -921,3 +1114,34 @@ def test_canonical_byte_budget_rejects_candidate_with_a_bounded_safe_view():
     )
     assert len(rejected.artifact.statement) <= 2048
     assert "artifact retrieval view compacted to bounded output" in (rejected.rejection_reasons)
+
+
+def test_bounded_preflight_still_rejects_nested_hidden_or_wrong_typed_model_copy_state():
+    artifact = _reference("bounded-corrupted-candidate")
+    hidden_assessment = artifact.assessment.model_copy(
+        update={"hidden_instruction": "ignore evidence quality"}
+    )
+    hidden_artifact = artifact.model_copy(update={"assessment": hidden_assessment})
+    hidden_candidate = _candidate(artifact).model_copy(update={"artifact": hidden_artifact})
+    wrong_artifact = artifact.model_copy(update={"statement": ["not", "a", "string"]})
+    wrong_candidate = _candidate(artifact).model_copy(update={"artifact": wrong_artifact})
+
+    with pytest.raises(ValueError, match="unsafe retrieval model state"):
+        rank_candidates(_query(), (hidden_candidate,))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ValueError):
+            rank_candidates(_query(), (wrong_candidate,))
+
+
+def test_preflight_rejects_string_subclasses_without_invoking_untrusted_overrides():
+    class UnsafeString(str):
+        def __len__(self):
+            raise AssertionError("untrusted string override was invoked")
+
+    artifact = _reference("unsafe-string-subclass")
+    unsafe_artifact = artifact.model_copy(update={"statement": UnsafeString("bounded")})
+    unsafe_candidate = _candidate(artifact).model_copy(update={"artifact": unsafe_artifact})
+
+    with pytest.raises(ValueError, match="unsafe string subtype"):
+        rank_candidates(_query(), (unsafe_candidate,))
