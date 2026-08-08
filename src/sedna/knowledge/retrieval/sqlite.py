@@ -991,8 +991,12 @@ class SQLiteRetrievalIndex:
                     backup_created = False
                 os.fsync(parent_fd)
                 # Backup deletion and its directory sync are part of the
-                # commit boundary. Recheck the exact installed inode and
-                # bytes afterwards while both retained readers are open.
+                # commit boundary. This finite stable-byte check is the
+                # cooperative commit linearization point; no fallible or
+                # expensive work follows before the committed identity is
+                # returned. A same-UID process can still mutate the file
+                # after this method returns, which no pathname protocol can
+                # prevent.
                 self._verify_retained_bytes(
                     validated_descriptor,
                     self._filename,
@@ -1001,6 +1005,7 @@ class SQLiteRetrievalIndex:
                 )
             except BaseException as original_error:
                 rollback_errors, restored_identity = self._rollback_persistence(
+                    backup_name=backup_name,
                     backup_descriptor=backup_descriptor,
                     backup_identity=backup_identity,
                     backup_digest=backup_digest,
@@ -1017,8 +1022,6 @@ class SQLiteRetrievalIndex:
                     self._generation = generation
                     installed = False
                 if not rollback_errors:
-                    if backup_identity is not None:
-                        self._unlink_named_identity_if_present(backup_name, backup_identity)
                     backup_created = False
                 else:
                     preserve_backup = True
@@ -1128,16 +1131,28 @@ class SQLiteRetrievalIndex:
         parent_fd = self._ensure_parent_open()
         retained_before = os.fstat(descriptor)
         current_before = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+        retained_before_metadata = _stable_file_metadata(retained_before)
+        current_before_metadata = _stable_file_metadata(current_before)
         database_bytes = self._read_descriptor_bytes(descriptor)
+        observed_digest = sha256(database_bytes).hexdigest()
         retained_after = os.fstat(descriptor)
+        retained_after_metadata = _stable_file_metadata(retained_after)
         current_after = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+        current_after_metadata = _stable_file_metadata(current_after)
         for status in (retained_before, current_before, retained_after, current_after):
             if not stat.S_ISREG(status.st_mode) or expected_identity != (
                 status.st_dev,
                 status.st_ino,
             ):
                 raise ValueError("serialized database sibling identity changed after validation")
-        if sha256(database_bytes).hexdigest() != expected_digest:
+        if not (
+            retained_before_metadata
+            == current_before_metadata
+            == retained_after_metadata
+            == current_after_metadata
+        ):
+            raise ValueError("serialized database sibling metadata changed after validation")
+        if observed_digest != expected_digest:
             raise ValueError("serialized database sibling bytes changed after validation")
         return database_bytes
 
@@ -1216,6 +1231,7 @@ class SQLiteRetrievalIndex:
     def _rollback_persistence(
         self,
         *,
+        backup_name: str,
         backup_descriptor: int | None,
         backup_identity: tuple[int, int] | None,
         backup_digest: str | None,
@@ -1228,10 +1244,13 @@ class SQLiteRetrievalIndex:
         errors: list[BaseException] = []
         parent_fd = self._ensure_parent_open()
         restored_identity: tuple[int, int] | None = None
+        rollback_ready = False
+        rollback_name: str | None = None
+        rollback_identity: tuple[int, int] | None = None
+        rollback_descriptor: int | None = None
+        rollback_digest: str | None = None
         if had_previous:
             rollback_name = f".{self._filename}.{secrets.token_hex(16)}.rollback"
-            rollback_identity: tuple[int, int] | None = None
-            rollback_descriptor: int | None = None
             try:
                 if backup_descriptor is None or backup_identity is None or backup_digest is None:
                     raise RuntimeError("database rollback backup was not retained")
@@ -1292,20 +1311,14 @@ class SQLiteRetrievalIndex:
                         rollback_identity,
                         rollback_digest,
                     )
-                restored_identity = rollback_identity
+                rollback_ready = True
             except BaseException as error:
                 errors.append(error)
-            finally:
-                if rollback_descriptor is not None:
-                    with suppress(OSError):
-                        os.close(rollback_descriptor)
-                if rollback_identity is not None and restored_identity != rollback_identity:
-                    self._unlink_named_identity_if_present(rollback_name, rollback_identity)
         else:
             try:
                 current = self._target_status()
                 if current is None:
-                    restored_identity = None
+                    rollback_ready = True
                 elif installed_identity != (current.st_dev, current.st_ino):
                     raise RuntimeError("database target changed before empty-index rollback")
                 else:
@@ -1315,23 +1328,70 @@ class SQLiteRetrievalIndex:
                     os.fsync(parent_fd)
                     if self._target_status() is not None:
                         raise RuntimeError("database target remained after empty-index rollback")
+                    rollback_ready = True
             except BaseException as error:
                 errors.append(error)
-        if restore_generation and (not had_previous or restored_identity is not None):
+        if restore_generation and rollback_ready:
             try:
                 self._write_generation(generation)
-                if had_previous and restored_identity is not None:
-                    database_bytes, current_identity = self._read_database_bytes()
-                    if current_identity != restored_identity or database_bytes is None:
-                        raise RuntimeError("restored database identity changed after rollback")
-                    if sha256(database_bytes).hexdigest() != backup_digest:
-                        raise RuntimeError("restored database content changed after rollback")
+                if had_previous:
+                    if (
+                        rollback_descriptor is None
+                        or rollback_identity is None
+                        or rollback_digest is None
+                    ):
+                        raise RuntimeError("restored database identity was not retained")
                     if backup_is_database:
-                        self._validate_database_bytes(database_bytes, generation)
-                    elif database_bytes:
-                        raise RuntimeError("restored empty database target gained content")
+                        self._verify_retained_sibling(
+                            rollback_descriptor,
+                            self._filename,
+                            rollback_identity,
+                            rollback_digest,
+                            expected_generation=generation,
+                        )
+                    else:
+                        database_bytes = self._verify_retained_bytes(
+                            rollback_descriptor,
+                            self._filename,
+                            rollback_identity,
+                            rollback_digest,
+                        )
+                        if database_bytes:
+                            raise RuntimeError("restored empty database target gained content")
             except BaseException as error:
                 errors.append(error)
+                rollback_ready = False
+        if rollback_ready and had_previous:
+            try:
+                if (
+                    backup_identity is None
+                    or rollback_descriptor is None
+                    or rollback_identity is None
+                    or rollback_digest is None
+                ):
+                    raise RuntimeError("restored database identity was not retained")
+                self._unlink_named_identity_if_present(backup_name, backup_identity)
+                os.fsync(parent_fd)
+                self._verify_retained_bytes(
+                    rollback_descriptor,
+                    self._filename,
+                    rollback_identity,
+                    rollback_digest,
+                )
+                # Cooperative writers remain excluded by the retained parent
+                # lock. This finite reread is the rollback linearization point:
+                # all fallible cleanup is complete, so publish success now.
+                # Arbitrary same-UID mutation after this method returns is
+                # outside the enforceable pathname boundary.
+                restored_identity = rollback_identity
+            except BaseException as error:
+                errors.append(error)
+                rollback_ready = False
+        if rollback_descriptor is not None:
+            with suppress(OSError):
+                os.close(rollback_descriptor)
+        if rollback_name is not None and rollback_identity is not None and not rollback_ready:
+            self._unlink_named_identity_if_present(rollback_name, rollback_identity)
         return errors, restored_identity
 
     def _read_verified_descriptor_bytes(
@@ -1551,6 +1611,25 @@ def _validated_identifier(value: str, field: str) -> str:
     if not isinstance(value, str) or not value or len(value) > 2048 or "\x00" in value:
         raise ValueError(f"{field} must be bounded non-empty text")
     return value
+
+
+def _stable_file_metadata(status: os.stat_result) -> tuple[object, ...]:
+    """Return mutation-sensitive metadata, excluding read-affected access time."""
+    return (
+        status.st_mode,
+        status.st_dev,
+        status.st_ino,
+        status.st_nlink,
+        status.st_uid,
+        status.st_gid,
+        status.st_size,
+        getattr(status, "st_mtime_ns", status.st_mtime),
+        getattr(status, "st_ctime_ns", status.st_ctime),
+        getattr(status, "st_birthtime", None),
+        getattr(status, "st_flags", None),
+        getattr(status, "st_gen", None),
+        getattr(status, "st_blocks", None),
+    )
 
 
 def _validated_source_id(value: str) -> str:

@@ -841,6 +841,50 @@ def test_live_database_change_during_final_validation_restores_prior_bytes(
         assert index.get_artifact("reference-http-replacement") is None
 
 
+def test_final_commit_check_rejects_in_place_write_after_descriptor_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    original = _bundle()
+    replacement = _renamed_bundle("source-replacement", "replacement")
+
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(original)
+        before = path.read_bytes()
+        real_read = index._read_descriptor_bytes
+        attacked = False
+
+        def mutate_live_inode_after_final_read(descriptor: int) -> bytes:
+            nonlocal attacked
+            database_bytes = real_read(descriptor)
+            retained = os.fstat(descriptor)
+            current = os.stat(path, follow_symlinks=False)
+            backups = list(tmp_path.glob(".*sedna.sqlite*.backup"))
+            if (
+                not attacked
+                and (retained.st_dev, retained.st_ino) == (current.st_dev, current.st_ino)
+                and not backups
+            ):
+                writer = os.open(path, os.O_WRONLY)
+                try:
+                    os.pwrite(writer, b"BROKEN-HEADER!!!", 0)
+                    os.fsync(writer)
+                finally:
+                    os.close(writer)
+                attacked = True
+            return database_bytes
+
+        monkeypatch.setattr(index, "_read_descriptor_bytes", mutate_live_inode_after_final_read)
+        with pytest.raises(ValueError, match="changed"):
+            index.rebuild((replacement,))
+
+        assert attacked
+        assert path.read_bytes() == before
+        assert index.get_artifact("reference-http") == original.references[0]
+        assert index.get_artifact("reference-http-replacement") is None
+
+
 def test_rollback_restores_from_retained_backup_when_backup_path_is_replaced(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -875,6 +919,91 @@ def test_rollback_restores_from_retained_backup_when_backup_path_is_replaced(
         assert path.read_bytes() == before
         assert index.get_artifact("reference-http") == original.references[0]
         assert index.get_artifact("reference-http-replacement") is None
+
+
+@pytest.mark.parametrize(
+    "attack_point",
+    ("after_semantic_validation", "during_recovery_cleanup"),
+)
+def test_rollback_rechecks_live_path_before_removing_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attack_point: str,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    original = _bundle()
+    replacement = _renamed_bundle("source-replacement", "replacement")
+
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(original)
+        before = path.read_bytes()
+        previous_generation = index._generation
+        real_verify = index._verify_retained_sibling
+        real_validate = index._validate_database_bytes
+        real_write_generation = index._write_generation
+        real_unlink = index._unlink_named_identity_if_present
+        verification_count = 0
+        generation_repaired = False
+        attacked = False
+
+        def fail_after_postinstall_verification(*args: object, **kwargs: object) -> None:
+            nonlocal verification_count
+            verification_count += 1
+            real_verify(*args, **kwargs)
+            if verification_count == 2:
+                raise OSError("injected postinstall failure")
+
+        def replace_after_final_rollback_validation(
+            database_bytes: bytes,
+            expected_generation: int,
+        ) -> None:
+            nonlocal attacked
+            real_validate(database_bytes, expected_generation)
+            if (
+                attack_point == "after_semantic_validation"
+                and expected_generation == previous_generation
+                and generation_repaired
+                and not attacked
+            ):
+                attacker = tmp_path / "attacker-live.sqlite"
+                attacker.write_bytes(b"attacker-controlled live replacement")
+                os.replace(attacker, path)
+                attacked = True
+
+        def track_generation_repair(generation: int) -> None:
+            nonlocal generation_repaired
+            real_write_generation(generation)
+            if generation == previous_generation:
+                generation_repaired = True
+
+        def replace_during_recovery_cleanup(
+            filename: str,
+            identity: tuple[int, int],
+        ) -> None:
+            nonlocal attacked
+            real_unlink(filename, identity)
+            if attack_point == "during_recovery_cleanup" and filename.endswith(".backup"):
+                attacker = tmp_path / "attacker-live.sqlite"
+                attacker.write_bytes(b"attacker-controlled live replacement")
+                os.replace(attacker, path)
+                attacked = True
+
+        monkeypatch.setattr(index, "_verify_retained_sibling", fail_after_postinstall_verification)
+        monkeypatch.setattr(
+            index, "_validate_database_bytes", replace_after_final_rollback_validation
+        )
+        monkeypatch.setattr(index, "_write_generation", track_generation_repair)
+        monkeypatch.setattr(
+            index, "_unlink_named_identity_if_present", replace_during_recovery_cleanup
+        )
+        with pytest.raises(OSError, match="postinstall failure") as raised:
+            index.rebuild((replacement,))
+
+        assert attacked
+        notes = getattr(raised.value, "__notes__", ())
+        assert any("rollback failed" in note for note in notes)
+        recovery_paths = list(tmp_path.glob(".*sedna.sqlite*.backup*"))
+        assert any(recovery.read_bytes() == before for recovery in recovery_paths)
 
 
 def test_unprovable_rollback_surfaces_failure_and_preserves_exact_recovery_bytes(
