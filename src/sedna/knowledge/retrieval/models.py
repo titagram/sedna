@@ -41,9 +41,10 @@ _HOSTNAME = re.compile(
 )
 _NUMERIC_DOTTED = re.compile(r"^[0-9.]+$")
 _IPV6ISH = re.compile(r"^[0-9a-fA-F:.]+$")
+_IPV6_COMPONENT = re.compile(r"^[0-9a-fA-F]{1,4}$")
 _HOST_PORT = re.compile(r"^[a-z0-9.-]+:\d+$", re.IGNORECASE)
 _EXPLICIT_URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
-_MALFORMED_HTTP_PREFIX = re.compile(r"^https?(?::|//)", re.IGNORECASE)
+_MALFORMED_HTTP_PREFIX = re.compile(r"^https?(?::|/)", re.IGNORECASE)
 _MAX_SITUATION_ITEMS = 64
 _MAX_QUERY_TERMS = 32
 _MAX_HIT_REASONS = 32
@@ -160,7 +161,22 @@ def _looks_structured_target(value: str) -> bool:
         or _EXPLICIT_URL_SCHEME.match(value) is not None
         or _MALFORMED_HTTP_PREFIX.match(value) is not None
         or _HOST_PORT.fullmatch(value)
-        or value.count(":") >= 2
+        or _looks_ipv6_like(value)
+    )
+
+
+def _looks_ipv6_like(value: str) -> bool:
+    """Recognize malformed IPv6 shapes without claiming arbitrary namespaces."""
+    if "::" in value:
+        return True
+    components = value.split(":")
+    return bool(
+        len(components) >= 3
+        and all(component and len(component) <= 4 for component in components)
+        and (
+            any(_IPV6_COMPONENT.fullmatch(component) for component in components)
+            or any(character in "0123456789" for component in components for character in component)
+        )
     )
 
 
@@ -238,7 +254,7 @@ class ValidatedTarget(BaseModel):
             or value.startswith("[")
             or _MALFORMED_HTTP_PREFIX.match(value) is not None
             or _HOST_PORT.fullmatch(value)
-            or value.count(":") >= 2
+            or _looks_ipv6_like(value)
         ):
             return TargetKind.INVALID, None, "invalid_target"
         if _HOSTNAME.fullmatch(value) is not None:

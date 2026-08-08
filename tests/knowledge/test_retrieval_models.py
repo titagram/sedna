@@ -220,11 +220,24 @@ def test_structured_invalid_targets_cannot_be_reclassified_as_generic(value: str
     assert not explicit_generic.is_valid
 
 
-@pytest.mark.parametrize("value", ("http-server", "http2.example", "https-worker.example"))
+@pytest.mark.parametrize("value", ("http-server", "http2.example", "https-worker"))
 def test_hostnames_starting_with_http_or_https_are_not_misclassified_as_urls(value: str):
     target = ValidatedTarget.parse(value)
 
     assert target.kind is TargetKind.HOSTNAME
+
+
+@pytest.mark.parametrize(
+    "value",
+    ("http/host", "HTTP/host", "https/host", "HtTp/host", "HTTPS/HOST"),
+)
+def test_single_slash_http_targets_are_invalid_even_when_declared_generic(value: str):
+    parsed = ValidatedTarget.parse(value)
+    explicit_generic = ValidatedTarget(value=value, kind=TargetKind.GENERIC)
+
+    assert parsed.kind is TargetKind.INVALID
+    assert explicit_generic.kind is TargetKind.INVALID
+    assert not explicit_generic.is_valid
 
 
 @pytest.mark.parametrize(
@@ -247,13 +260,44 @@ def test_invalid_colon_bearing_structured_identifiers_cannot_be_generic(value: s
     assert target.kind is TargetKind.INVALID
 
 
-def test_ordinary_generic_text_remains_available_when_it_is_not_structured_syntax():
-    target = ValidatedTarget(value="lab:alpha", kind=TargetKind.GENERIC)
+@pytest.mark.parametrize(
+    "value",
+    (
+        "lab:alpha",
+        "lab:alpha:beta",
+        "org:project:item",
+        "urn:example:asset",
+        "svc:api:web",
+        "lab:2001:asset",
+    ),
+)
+def test_named_generic_namespaces_remain_available_when_not_address_shaped(value: str):
+    target = ValidatedTarget(value=value, kind=TargetKind.GENERIC)
 
     assert target.is_valid
+    assert target.kind is TargetKind.GENERIC
+    assert target.normalized == value
 
 
-@pytest.mark.parametrize("value", ("http-server", "http2.example", "https-worker.example"))
+@pytest.mark.parametrize(
+    "value",
+    (
+        "2001:db8:zzzz",
+        "1:2:3:4:5:6:7:gg",
+        "abcd::gg",
+        "node:2001:zz",
+        "tag:beef:item",
+        "gggg:g1:zzzz",
+    ),
+)
+def test_ipv6_shaped_generic_bypasses_remain_invalid(value: str):
+    target = ValidatedTarget(value=value, kind=TargetKind.GENERIC)
+
+    assert target.kind is TargetKind.INVALID
+    assert not target.is_valid
+
+
+@pytest.mark.parametrize("value", ("http-server", "http2.example", "https-worker"))
 def test_malformed_scheme_detection_does_not_reject_valid_http_prefixed_hostnames(value: str):
     assert ValidatedTarget.parse(value).kind is TargetKind.HOSTNAME
 
