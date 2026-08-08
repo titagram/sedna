@@ -1,0 +1,495 @@
+"""Behavioral tests for the disposable SQLite retrieval projection."""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import sqlite3
+import stat
+from pathlib import Path
+
+import pytest
+
+from sedna.knowledge.retrieval import (
+    AuthorizationScope,
+    AuthorizationState,
+    CurrentSituation,
+    EpistemicLane,
+    RetrievalIndex,
+    RetrievalQuery,
+    SituationFacet,
+    ValidatedTarget,
+)
+from sedna.knowledge.retrieval.sqlite import SQLiteRetrievalIndex
+from sedna.knowledge.schema import SemanticKnowledgeBundle
+from tests.knowledge.test_retrieval_projection import _bundle
+
+
+def _query(
+    *terms: str,
+    facets: tuple[SituationFacet, ...] = (),
+    situation_terms: tuple[str, ...] = (),
+    max_candidates: int = 32,
+) -> RetrievalQuery:
+    target = ValidatedTarget.parse("10.10.10.10")
+    return RetrievalQuery(
+        situation=CurrentSituation(
+            target=target,
+            authorization=AuthorizationScope(
+                state=AuthorizationState.AUTHORIZED,
+                exact_targets=(target,),
+            ),
+            terms=situation_terms,
+        ),
+        terms=terms,
+        facets=facets,
+        max_candidates=max_candidates,
+    )
+
+
+def _renamed_bundle(source_id: str, suffix: str) -> SemanticKnowledgeBundle:
+    payload = _bundle().model_dump(mode="json")
+
+    def replace_source(value: object) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "source_id" and item == "source-retrieval":
+                    value[key] = source_id
+                else:
+                    replace_source(item)
+        elif isinstance(value, list):
+            for item in value:
+                replace_source(item)
+
+    replace_source(payload)
+    manifest = payload["compilation_manifest"]
+    id_fields = {
+        "case-negative": f"case-negative-{suffix}",
+        "case-negative-step": f"case-negative-step-{suffix}",
+        "case-positive": f"case-positive-{suffix}",
+        "case-positive-step": f"case-positive-step-{suffix}",
+        "reference-http": f"reference-http-{suffix}",
+        "rule-http": f"rule-http-{suffix}",
+    }
+    manifest["emitted_artifact_ids"] = [
+        id_fields[identifier] for identifier in manifest["emitted_artifact_ids"]
+    ]
+    payload["references"][0]["artifact_id"] = id_fields["reference-http"]
+    for case in payload["cases"]:
+        old_case_id = case["case_id"]
+        case["case_id"] = id_fields[old_case_id]
+        for step in case["steps"]:
+            step["step_id"] = id_fields[step["step_id"]]
+    payload["guidance"][0]["rule_id"] = id_fields["rule-http"]
+    return SemanticKnowledgeBundle.model_validate(payload)
+
+
+def _table_rows(path: Path, table: str) -> list[tuple[object, ...]]:
+    with sqlite3.connect(path) as connection:
+        return connection.execute(f"SELECT * FROM {table} ORDER BY 1, 2").fetchall()
+
+
+def test_schema_uses_fts5_foreign_keys_indexes_and_a_version(tmp_path: Path) -> None:
+    path = tmp_path / "indexes" / "sedna.sqlite"
+
+    with SQLiteRetrievalIndex(path) as index:
+        assert isinstance(index, RetrievalIndex)
+        index.upsert_bundle(_bundle())
+
+        connection = index._connection
+        assert connection is not None
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        tables = {
+            row[0]: row[1]
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type IN ('table', 'view')"
+            )
+        }
+        assert {"artifacts", "facet_values", "artifact_links", "artifact_sources"} <= tables.keys()
+        assert "USING fts5" in tables["artifact_fts"]
+        indexes = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+        }
+        assert {
+            "artifacts_owner_source_idx",
+            "artifacts_lane_idx",
+            "facet_values_lookup_idx",
+            "artifact_links_target_idx",
+            "artifact_sources_source_idx",
+        } <= indexes
+        assert [
+            row[0] for row in connection.execute("SELECT DISTINCT canonical_path FROM artifacts")
+        ] == ["semantic_bundles/source-retrieval.json"]
+
+    assert [row[0] for row in _table_rows(path, "artifacts")] == [
+        "case-negative",
+        "case-negative-step",
+        "case-positive",
+        "case-positive-step",
+        "reference-http",
+        "rule-http",
+    ]
+    assert len(_table_rows(path, "facet_values")) == 24
+    assert len(_table_rows(path, "artifact_links")) == 2
+    assert len(_table_rows(path, "artifact_sources")) >= 6
+    assert len(_table_rows(path, "artifact_fts")) == 6
+
+
+def test_existing_empty_regular_target_is_initialized_as_a_new_index(tmp_path: Path) -> None:
+    path = tmp_path / "sedna.sqlite"
+    path.touch()
+
+    with SQLiteRetrievalIndex(path) as index:
+        audit = index.audit()
+        assert audit.rebuild_required is False
+        assert audit.issues == ()
+
+
+def test_source_upsert_is_complete_and_rolls_back_after_injected_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    original = _bundle()
+    updated_payload = original.model_dump(mode="json")
+    updated_payload["references"][0]["statement"] = "replacement-only-token"
+    updated = SemanticKnowledgeBundle.model_validate(updated_payload)
+
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(original)
+        before = path.read_bytes()
+        original_insert = index._insert_projection_rows
+
+        def fail_after_source_delete(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise RuntimeError("injected insertion failure")
+
+        monkeypatch.setattr(index, "_insert_projection_rows", fail_after_source_delete)
+        with pytest.raises(RuntimeError, match="injected"):
+            index.upsert_bundle(updated)
+        monkeypatch.setattr(index, "_insert_projection_rows", original_insert)
+
+        assert index.get_artifact("reference-http") == original.references[0]
+        assert index.audit().rebuild_required is False
+        index.upsert_bundle(updated)
+        assert index.get_artifact("reference-http") == updated.references[0]
+
+    assert path.read_bytes() != before
+
+
+def test_delete_source_removes_only_its_complete_projection(tmp_path: Path) -> None:
+    first = _renamed_bundle("source-first", "a")
+    second = _renamed_bundle("source-second", "b")
+
+    with SQLiteRetrievalIndex(tmp_path / "sedna.sqlite") as index:
+        index.upsert_bundle(first)
+        index.upsert_bundle(second)
+        index.delete_source("source-first")
+
+        assert index.get_artifact("reference-http-a") is None
+        assert index.get_artifact("reference-http-b") == second.references[0]
+        audit = index.audit()
+        assert audit.artifact_count == 6
+        assert audit.source_count == 1
+        assert audit.facet_count == 24
+        assert audit.fts_count == 6
+        assert audit.rebuild_required is False
+
+
+def test_get_artifact_revalidates_canonical_json_and_identity(tmp_path: Path) -> None:
+    path = tmp_path / "sedna.sqlite"
+    index = SQLiteRetrievalIndex(path)
+    index.upsert_bundle(_bundle())
+    assert index.get_artifact("reference-http") == _bundle().references[0]
+    index.close()
+
+    with sqlite3.connect(path) as connection:
+        payload = json.loads(
+            connection.execute(
+                "SELECT canonical_json FROM artifacts WHERE artifact_id = 'reference-http'"
+            ).fetchone()[0]
+        )
+        payload["statement"] = "HTB{unsafe_reconstruction}"
+        connection.execute(
+            "UPDATE artifacts SET canonical_json = ? WHERE artifact_id = 'reference-http'",
+            (json.dumps(payload),),
+        )
+
+    with SQLiteRetrievalIndex(path) as reopened:
+        with pytest.raises(ValueError, match="canonical artifact"):
+            reopened.get_artifact("reference-http")
+        audit = reopened.audit()
+        assert audit.corruption_count >= 1
+        assert audit.rebuild_required
+
+
+def test_search_is_lane_scoped_explainable_bounded_and_deterministic(tmp_path: Path) -> None:
+    first = _renamed_bundle("source-first", "a")
+    second = _renamed_bundle("source-second", "b")
+
+    with SQLiteRetrievalIndex(tmp_path / "sedna.sqlite") as index:
+        index.upsert_bundle(first)
+        index.upsert_bundle(second)
+
+        hits = index.search_candidates(
+            _query("reference-statement-token"),
+            lane=EpistemicLane.REFERENCE,
+            limit=20,
+        )
+        assert [hit.artifact_id for hit in hits] == ["reference-http-a", "reference-http-b"]
+        assert all(math.isfinite(hit.lexical_relevance) for hit in hits)
+        assert all(0.0 <= hit.lexical_relevance <= 1.0 for hit in hits)
+        assert hits[0].lexical_relevance == hits[1].lexical_relevance
+        assert hits[0].matched_terms == ("reference-statement-token",)
+        assert "statement" in hits[0].matched_fields
+        assert any("reference-statement-token" in item for item in hits[0].matched_evidence)
+
+        assert {
+            candidate.artifact_id
+            for candidate in index.search_candidates(
+                _query("step-action-token"), lane=EpistemicLane.CASE_STEP, limit=20
+            )
+        } == {"case-positive-step-a", "case-positive-step-b"}
+        assert {
+            candidate.artifact_id
+            for candidate in index.search_candidates(
+                _query("step-action-token"), lane=EpistemicLane.NEGATIVE_EVIDENCE, limit=20
+            )
+        } == {"case-negative-step-a", "case-negative-step-b"}
+        assert {
+            candidate.artifact_id
+            for candidate in index.search_candidates(
+                _query("rule-action-token"), lane=EpistemicLane.GUIDANCE, limit=20
+            )
+        } == {"rule-http-a", "rule-http-b"}
+        assert (
+            len(
+                index.search_candidates(
+                    _query("token", max_candidates=1), lane=EpistemicLane.REFERENCE, limit=20
+                )
+            )
+            == 1
+        )
+        with pytest.raises(ValueError, match="limit"):
+            index.search_candidates(_query("token"), lane=EpistemicLane.REFERENCE, limit=0)
+
+
+def test_search_uses_safe_fts_terms_and_exact_facet_prefilters(tmp_path: Path) -> None:
+    with SQLiteRetrievalIndex(tmp_path / "sedna.sqlite") as index:
+        index.upsert_bundle(_bundle())
+
+        hostile = index.search_candidates(
+            _query('reference OR "unterminated); DROP TABLE artifacts; --'),
+            lane=EpistemicLane.REFERENCE,
+            limit=10,
+        )
+        assert isinstance(hostile, tuple)
+        assert index.get_artifact("reference-http") is not None
+
+        matching_facet = SituationFacet(
+            namespace="typed", key="os_family", value="linux", confidence=1.0
+        )
+        mismatching_facet = matching_facet.model_copy(update={"value": "windows"})
+        facet_hits = index.search_candidates(
+            _query(facets=(matching_facet,)), lane=EpistemicLane.REFERENCE, limit=20
+        )
+        assert [candidate.artifact_id for candidate in facet_hits] == ["reference-http"]
+        assert facet_hits[0].lexical_relevance == 0.0
+        assert (
+            index.search_candidates(
+                _query(facets=(mismatching_facet,)), lane=EpistemicLane.REFERENCE, limit=20
+            )
+            == ()
+        )
+        assert index.search_candidates(_query(), lane=EpistemicLane.REFERENCE, limit=20) == ()
+
+
+def test_rebuild_atomically_replaces_only_after_closed_checked_fsynced_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    first = _renamed_bundle("source-first", "a")
+    second = _renamed_bundle("source-second", "b")
+
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(first)
+        before = path.read_bytes()
+        real_replace = os.replace
+
+        def fail_replace(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise OSError("injected rebuild replace failure")
+
+        monkeypatch.setattr(os, "replace", fail_replace)
+        with pytest.raises(OSError, match="replace failure"):
+            index.rebuild((second,))
+        assert index.get_artifact("reference-http-a") == first.references[0]
+        assert path.read_bytes() == before
+
+        monkeypatch.setattr(os, "replace", real_replace)
+        audit = index.rebuild((second,))
+        assert audit.artifact_count == 6
+        assert audit.rebuild_required is False
+        assert index.get_artifact("reference-http-a") is None
+        assert index.get_artifact("reference-http-b") == second.references[0]
+
+    assert not list(tmp_path.glob(".*sedna.sqlite*.tmp*"))
+    assert not list(tmp_path.glob("*.sqlite-wal"))
+    assert not list(tmp_path.glob("*.sqlite-shm"))
+
+
+def test_rebuild_validation_failure_preserves_live_database(tmp_path: Path) -> None:
+    path = tmp_path / "sedna.sqlite"
+    original = _bundle()
+    corrupt = original.model_copy(
+        update={
+            "references": (original.references[0].model_copy(update={"statement": "HTB{unsafe}"}),)
+        }
+    )
+
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(original)
+        before = path.read_bytes()
+        with pytest.raises(ValueError, match="final flag"):
+            index.rebuild((corrupt,))
+        assert index.get_artifact("reference-http") == original.references[0]
+        assert path.read_bytes() == before
+
+
+def test_rebuild_restores_live_database_when_post_replace_sync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    original = _renamed_bundle("source-first", "a")
+    replacement = _renamed_bundle("source-second", "b")
+
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(original)
+        before = path.read_bytes()
+        real_fsync = os.fsync
+        failed = False
+
+        def fail_first_directory_sync(descriptor: int) -> None:
+            nonlocal failed
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode) and not failed:
+                failed = True
+                raise OSError("injected post-replace sync failure")
+            real_fsync(descriptor)
+
+        monkeypatch.setattr(os, "fsync", fail_first_directory_sync)
+        with pytest.raises(OSError, match="sync failure"):
+            index.rebuild((replacement,))
+
+        assert failed
+        assert path.read_bytes() == before
+        assert index.get_artifact("reference-http-a") == original.references[0]
+        assert index.get_artifact("reference-http-b") is None
+
+    assert not list(tmp_path.glob(".*sedna.sqlite*.backup*"))
+
+
+def test_audit_detects_orphans_fts_parity_source_coverage_and_schema_version(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(_bundle())
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("DELETE FROM artifact_fts WHERE artifact_id = 'reference-http'")
+        connection.execute(
+            "DELETE FROM artifact_sources "
+            "WHERE artifact_id = 'case-positive' AND relation = 'artifact'"
+        )
+        connection.execute(
+            "INSERT INTO facet_values "
+            "(artifact_id, facet_id, channel, namespace, key, value, relation, origin, confidence) "
+            "VALUES ('missing-artifact', 'orphan', 'typed', 'typed', 'os_family', 'linux', "
+            "'required', 'explicit', 1.0)"
+        )
+        connection.execute("PRAGMA user_version = 999")
+
+    with SQLiteRetrievalIndex(path) as index:
+        audit = index.audit()
+
+    assert audit.artifact_count == 6
+    assert audit.fts_count == 5
+    assert audit.orphan_count >= 1
+    assert audit.rebuild_required
+    assert {
+        "fts_count_mismatch",
+        "orphan_rows",
+        "schema_version_mismatch",
+        "source_coverage_mismatch",
+    } <= set(audit.issues)
+
+
+@pytest.mark.parametrize("target_kind", ("symlink", "fifo", "directory"))
+def test_database_target_must_be_a_fixed_regular_file(
+    tmp_path: Path,
+    target_kind: str,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    if target_kind == "symlink":
+        outside = tmp_path / "outside.sqlite"
+        outside.write_bytes(b"outside")
+        path.symlink_to(outside)
+    elif target_kind == "fifo":
+        os.mkfifo(path)
+    else:
+        path.mkdir()
+
+    with pytest.raises(ValueError, match="regular file"):
+        SQLiteRetrievalIndex(path)
+
+
+def test_bundle_source_id_must_be_a_safe_canonical_repository_segment(tmp_path: Path) -> None:
+    unsafe = _renamed_bundle("../source-escape", "a")
+
+    with (
+        SQLiteRetrievalIndex(tmp_path / "sedna.sqlite") as index,
+        pytest.raises(ValueError, match="safe path segment"),
+    ):
+        index.upsert_bundle(unsafe)
+
+
+def test_parent_symlink_and_target_swap_are_rejected(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(ValueError, match="parent"):
+        SQLiteRetrievalIndex(linked_parent / "sedna.sqlite")
+
+    path = tmp_path / "sedna.sqlite"
+    index = SQLiteRetrievalIndex(path)
+    replacement = tmp_path / "replacement.sqlite"
+    replacement.write_bytes(path.read_bytes())
+    os.replace(replacement, path)
+    with pytest.raises(RuntimeError, match="changed"):
+        index.audit()
+    index.close()
+
+
+def test_context_manager_and_close_are_strict_and_idempotent(tmp_path: Path) -> None:
+    index = SQLiteRetrievalIndex(tmp_path / "sedna.sqlite")
+    with index as entered:
+        assert entered is index
+
+    index.close()
+    for operation in (
+        lambda: index.audit(),
+        lambda: index.get_artifact("reference-http"),
+        lambda: index.delete_source("source-retrieval"),
+        lambda: index.upsert_bundle(_bundle()),
+        lambda: index.rebuild((_bundle(),)),
+        lambda: index.search_candidates(_query("http"), lane=EpistemicLane.REFERENCE, limit=1),
+        lambda: index.__enter__(),
+    ):
+        with pytest.raises(RuntimeError, match="closed"):
+            operation()
