@@ -421,7 +421,8 @@ def select_diversified_hits(
             raise ValueError("diversified selection exceeds 400-hit input budget")
         if not isinstance(hit, RetrievalHit):
             raise ValueError("diversified selection requires RetrievalHit values")
-        lane_hits.append(hit)
+        _preflight_or_raise(hit, label="retrieval hit")
+        lane_hits.append(_strict_revalidate(hit, RetrievalHit))
     if len({hit.lane for hit in lane_hits}) > 1:
         raise ValueError("diversified selection cannot mix epistemic lanes")
     if len({hit.artifact_id for hit in lane_hits}) != len(lane_hits):

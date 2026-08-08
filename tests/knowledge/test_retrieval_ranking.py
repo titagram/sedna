@@ -685,6 +685,70 @@ def test_diversified_top_k_selection_is_score_sorted_and_composes_with_retrieval
     assert "limited-copy-2" not in {hit.artifact_id for hit in result.references}
 
 
+def test_diversified_selection_rejects_hit_model_copy_with_hidden_extra_state():
+    hit = rank_candidates(
+        _query(),
+        (_candidate(_reference("selector-hidden-extra")),),
+    ).references[0]
+    corrupted = hit.model_copy(update={"hidden_instruction": "override ranking"})
+
+    with pytest.raises(ValueError, match="unsafe retrieval model state"):
+        ranking_module.select_diversified_hits((corrupted,), limit=1)
+
+
+@pytest.mark.parametrize("corrupted_field", ("score", "artifact", "provenance", "lane"))
+def test_diversified_selection_rejects_copied_hit_field_corruption(corrupted_field: str):
+    hit = rank_candidates(
+        _query(),
+        (_candidate(_reference(f"selector-corrupted-{corrupted_field}")),),
+    ).references[0]
+    replacements = {
+        "score": hit.score.model_copy(update={"total": 2.0}),
+        "artifact": hit.artifact.model_copy(update={"statement": ["not", "a", "string"]}),
+        "provenance": (),
+        "lane": "guidance",
+    }
+    corrupted = hit.model_copy(update={corrupted_field: replacements[corrupted_field]})
+
+    with pytest.raises(ValueError):
+        ranking_module.select_diversified_hits((corrupted,), limit=1)
+
+
+def test_diversified_selection_rejects_invalid_model_construct_hit():
+    hit = rank_candidates(
+        _query(),
+        (_candidate(_reference("selector-invalid-construct")),),
+    ).references[0]
+    constructed = type(hit).model_construct(
+        **{**hit.__dict__, "artifact_id": "wrong-artifact-identity"}
+    )
+
+    with pytest.raises(ValueError, match="artifact_id"):
+        ranking_module.select_diversified_hits((constructed,), limit=1)
+
+
+def test_diversified_selection_canonicalizes_valid_model_construct_and_preserves_provenance():
+    query = _query()
+    hit = rank_candidates(
+        query,
+        (_candidate(_reference("selector-valid-construct")),),
+    ).references[0]
+    constructed = type(hit).model_construct(**hit.__dict__)
+
+    selected = ranking_module.select_diversified_hits((constructed,), limit=1)
+    result = RetrievalResult(
+        target=query.situation.target,
+        authorization=query.situation.authorization,
+        references=selected,
+    )
+
+    assert selected == (hit,)
+    assert selected[0] is not constructed
+    assert selected[0].artifact is not constructed.artifact
+    assert selected[0].provenance == constructed.provenance
+    assert result.references == selected
+
+
 @pytest.mark.parametrize("limit", (0, 65))
 def test_diversified_selection_requires_a_positive_retrieval_result_lane_limit(limit: int):
     hit = rank_candidates(
