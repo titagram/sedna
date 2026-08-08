@@ -664,6 +664,82 @@ def test_corrupted_serialized_sibling_is_rejected_before_atomic_replace(
         assert index.get_artifact("reference-http-replacement") is None
 
 
+def test_semantically_poisoned_sibling_fails_full_projection_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    original = _bundle()
+    replacement = _renamed_bundle("source-replacement", "replacement")
+
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(original)
+        before = path.read_bytes()
+        real_write = index._write_named_bytes
+
+        def poison_fts(filename: str, payload: bytes) -> tuple[int, int]:
+            identity = real_write(filename, payload)
+            if filename.endswith(".tmp"):
+                with sqlite3.connect(tmp_path / filename) as connection:
+                    connection.execute(
+                        "UPDATE artifact_fts SET statement = 'poisoned after serialization' "
+                        "WHERE artifact_id = 'reference-http-replacement'"
+                    )
+            return identity
+
+        monkeypatch.setattr(index, "_write_named_bytes", poison_fts)
+        with pytest.raises(ValueError, match="projection|audit"):
+            index.rebuild((replacement,))
+
+        assert path.read_bytes() == before
+        assert index.get_artifact("reference-http") == original.references[0]
+
+
+def test_post_validation_sibling_mutation_rolls_back_before_backup_removal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    original = _bundle()
+    replacement = _renamed_bundle("source-replacement", "replacement")
+
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(original)
+        before = path.read_bytes()
+        real_validate = index._validate_serialized_sibling
+
+        def mutate_after_validation(
+            filename: str,
+            expected_identity: tuple[int, int],
+            *,
+            expected_generation: int,
+        ) -> tuple[int, str]:
+            validated = real_validate(
+                filename,
+                expected_identity,
+                expected_generation=expected_generation,
+            )
+            assert index._parent_fd is not None
+            descriptor = os.open(filename, os.O_WRONLY, dir_fd=index._parent_fd)
+            try:
+                os.write(descriptor, b"not a sqlite db!")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            return validated
+
+        monkeypatch.setattr(index, "_validate_serialized_sibling", mutate_after_validation)
+        with pytest.raises(
+            (sqlite3.DatabaseError, ValueError),
+            match="database|validation|changed",
+        ):
+            index.rebuild((replacement,))
+
+        assert path.read_bytes() == before
+        assert index.get_artifact("reference-http") == original.references[0]
+        assert index.get_artifact("reference-http-replacement") is None
+
+
 @pytest.mark.parametrize("generation_bytes", (b"", b"12", b"\xff\xfe"))
 def test_generation_sidecar_is_recovered_from_valid_database(
     tmp_path: Path,
@@ -697,6 +773,32 @@ def test_audit_requires_one_valid_embedded_generation_row(tmp_path: Path) -> Non
 
     assert audit.rebuild_required
     assert "generation_metadata_invalid" in audit.issues
+
+
+def test_audit_rejects_ordinary_table_impersonating_fts5(tmp_path: Path) -> None:
+    path = tmp_path / "sedna.sqlite"
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(_bundle())
+    with sqlite3.connect(path) as connection:
+        fts_rows = connection.execute(
+            "SELECT artifact_id, statement, rationale, observations, action_intent, "
+            "expected_evidence, exceptions FROM artifact_fts ORDER BY artifact_id"
+        ).fetchall()
+        connection.execute("DROP TABLE artifact_fts")
+        connection.execute(
+            "CREATE TABLE artifact_fts(artifact_id, statement, rationale, observations, "
+            "action_intent, expected_evidence, exceptions)"
+        )
+        connection.executemany(
+            "INSERT INTO artifact_fts VALUES (?, ?, ?, ?, ?, ?, ?)",
+            fts_rows,
+        )
+
+    with SQLiteRetrievalIndex(path) as index:
+        audit = index.audit()
+
+    assert audit.rebuild_required
+    assert "schema_object_mismatch" in audit.issues
 
 
 def test_audit_uses_one_snapshot_while_another_index_deletes(

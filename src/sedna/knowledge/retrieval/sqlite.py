@@ -12,6 +12,7 @@ import stat
 import threading
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager, suppress
+from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
 from types import TracebackType
@@ -928,10 +929,11 @@ class SQLiteRetrievalIndex:
         backup_created = False
         installed = False
         generation_written = False
+        validated_descriptor: int | None = None
         next_generation = generation + 1
         try:
             temporary_identity = self._write_named_bytes(temporary_name, database_bytes)
-            self._validate_serialized_sibling(
+            validated_descriptor, validated_digest = self._validate_serialized_sibling(
                 temporary_name,
                 temporary_identity,
                 expected_generation=next_generation,
@@ -942,6 +944,13 @@ class SQLiteRetrievalIndex:
             self._ensure_lock_identity()
             self._verify_expected_target(expected_identity)
             try:
+                self._verify_retained_sibling(
+                    validated_descriptor,
+                    temporary_name,
+                    temporary_identity,
+                    validated_digest,
+                    expected_generation=next_generation,
+                )
                 os.replace(
                     temporary_name,
                     self._filename,
@@ -953,6 +962,13 @@ class SQLiteRetrievalIndex:
                 current = self._target_status()
                 if current is None or temporary_identity != (current.st_dev, current.st_ino):
                     raise OSError("database target changed during atomic persistence")
+                self._verify_retained_sibling(
+                    validated_descriptor,
+                    self._filename,
+                    temporary_identity,
+                    validated_digest,
+                    expected_generation=next_generation,
+                )
                 # The atomically installed database is authoritative.  The
                 # sidecar copy is recoverable and must never make a durable
                 # mutation report failure after installation.
@@ -989,6 +1005,11 @@ class SQLiteRetrievalIndex:
                 raise
             return temporary_identity, next_generation
         finally:
+            if validated_descriptor is not None:
+                # Persistence may already be durable. Descriptor disposal
+                # cannot turn that success into a raised mutation.
+                with suppress(OSError):
+                    os.close(validated_descriptor)
             if not installed:
                 self._unlink_named(temporary_name)
             if backup_created and not installed:
@@ -1000,31 +1021,72 @@ class SQLiteRetrievalIndex:
         expected_identity: tuple[int, int],
         *,
         expected_generation: int,
-    ) -> None:
-        """Reopen and validate the exact sibling inode before it can be installed."""
+    ) -> tuple[int, str]:
+        """Validate and retain a reader for the exact inode eligible for install."""
+        descriptor = self._open_named_reader(filename, expected_identity)
         try:
-            database_bytes = self._read_named_bytes(filename, expected_identity)
-            connection = self._connection_from_bytes(database_bytes)
-            try:
-                self._require_current_schema(connection)
-                if _database_generation(connection) != expected_generation:
-                    raise ValueError("serialized database generation does not match candidate")
-                quick_check = tuple(row[0] for row in connection.execute("PRAGMA quick_check"))
-                integrity_check = tuple(
-                    row[0] for row in connection.execute("PRAGMA integrity_check")
+            database_bytes = self._read_descriptor_bytes(descriptor)
+            self._validate_database_bytes(database_bytes, expected_generation)
+        except sqlite3.Error as error:
+            os.close(descriptor)
+            raise sqlite3.DatabaseError("serialized database validation failed") from error
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor, sha256(database_bytes).hexdigest()
+
+    def _validate_database_bytes(self, database_bytes: bytes, expected_generation: int) -> None:
+        connection = self._connection_from_bytes(database_bytes)
+        try:
+            self._require_current_schema(connection)
+            if _database_generation(connection) != expected_generation:
+                raise ValueError("serialized database generation does not match candidate")
+            quick_check = tuple(row[0] for row in connection.execute("PRAGMA quick_check"))
+            integrity_check = tuple(row[0] for row in connection.execute("PRAGMA integrity_check"))
+            if quick_check != ("ok",) or integrity_check != ("ok",):
+                raise ValueError("serialized database integrity check failed")
+            audit = self._audit_snapshot(connection)
+            if audit.rebuild_required:
+                raise ValueError(
+                    f"serialized database projection audit failed: {', '.join(audit.issues)}"
                 )
-                if quick_check != ("ok",) or integrity_check != ("ok",):
-                    raise ValueError("serialized database integrity check failed")
-            finally:
-                connection.close()
+        finally:
+            connection.close()
+
+    def _verify_retained_sibling(
+        self,
+        descriptor: int,
+        filename: str,
+        expected_identity: tuple[int, int],
+        expected_digest: str,
+        *,
+        expected_generation: int,
+    ) -> None:
+        retained = os.fstat(descriptor)
+        current = os.stat(
+            filename,
+            dir_fd=self._ensure_parent_open(),
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(retained.st_mode)
+            or expected_identity != (retained.st_dev, retained.st_ino)
+            or expected_identity != (current.st_dev, current.st_ino)
+        ):
+            raise ValueError("serialized database sibling identity changed after validation")
+        database_bytes = self._read_descriptor_bytes(descriptor)
+        if sha256(database_bytes).hexdigest() != expected_digest:
+            raise ValueError("serialized database sibling bytes changed after validation")
+        try:
+            self._validate_database_bytes(database_bytes, expected_generation)
         except sqlite3.Error as error:
             raise sqlite3.DatabaseError("serialized database validation failed") from error
 
-    def _read_named_bytes(
+    def _open_named_reader(
         self,
         filename: str,
         expected_identity: tuple[int, int],
-    ) -> bytes:
+    ) -> int:
         parent_fd = self._ensure_parent_open()
         before = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
         if not stat.S_ISREG(before.st_mode) or expected_identity != (before.st_dev, before.st_ino):
@@ -1034,20 +1096,39 @@ class SQLiteRetrievalIndex:
             os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
             dir_fd=parent_fd,
         )
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or expected_identity != (
+            opened.st_dev,
+            opened.st_ino,
+        ):
+            os.close(descriptor)
+            raise ValueError("serialized database sibling changed during validation")
+        return descriptor
+
+    @staticmethod
+    def _read_descriptor_bytes(descriptor: int) -> bytes:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    def _read_named_bytes(
+        self,
+        filename: str,
+        expected_identity: tuple[int, int],
+    ) -> bytes:
+        descriptor = self._open_named_reader(filename, expected_identity)
         try:
-            opened = os.fstat(descriptor)
-            if not stat.S_ISREG(opened.st_mode) or expected_identity != (
-                opened.st_dev,
-                opened.st_ino,
-            ):
-                raise ValueError("serialized database sibling changed during validation")
-            chunks: list[bytes] = []
-            while chunk := os.read(descriptor, 1024 * 1024):
-                chunks.append(chunk)
-            after = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+            database_bytes = self._read_descriptor_bytes(descriptor)
+            after = os.stat(
+                filename,
+                dir_fd=self._ensure_parent_open(),
+                follow_symlinks=False,
+            )
             if expected_identity != (after.st_dev, after.st_ino):
                 raise ValueError("serialized database sibling changed during validation")
-            return b"".join(chunks)
+            return database_bytes
         finally:
             os.close(descriptor)
 
@@ -1471,7 +1552,44 @@ def _required_schema_issues(connection: sqlite3.Connection) -> set[str]:
         columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
         if not required_columns <= columns:
             issues.add("schema_column_missing")
+    expected_objects = dict(_expected_schema_objects())
+    actual_objects = dict(_schema_objects(connection, frozenset(expected_objects)))
+    for name, expected in expected_objects.items():
+        actual = actual_objects.get(name)
+        if actual is None:
+            issues.add("schema_object_missing")
+        elif actual != expected:
+            issues.add("schema_object_mismatch")
     return issues
+
+
+@lru_cache(maxsize=1)
+def _expected_schema_objects() -> tuple[tuple[str, tuple[str, str, str]], ...]:
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.executescript(_SCHEMA)
+        return _schema_objects(connection)
+    finally:
+        connection.close()
+
+
+def _schema_objects(
+    connection: sqlite3.Connection,
+    names: frozenset[str] | None = None,
+) -> tuple[tuple[str, tuple[str, str, str]], ...]:
+    objects: list[tuple[str, tuple[str, str, str]]] = []
+    for object_type, name, table_name, sql in connection.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE sql IS NOT NULL"
+    ):
+        if name.startswith("sqlite_") or (names is not None and name not in names):
+            continue
+        objects.append(
+            (
+                name,
+                (object_type, table_name, " ".join(sql.split()).casefold()),
+            )
+        )
+    return tuple(sorted(objects))
 
 
 def _safe_table_count(connection: sqlite3.Connection, table: str) -> int:
