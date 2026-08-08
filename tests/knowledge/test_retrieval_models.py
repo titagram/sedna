@@ -220,6 +220,26 @@ def test_structured_invalid_targets_cannot_be_reclassified_as_generic(value: str
     assert not explicit_generic.is_valid
 
 
+@pytest.mark.parametrize("value", ("http-server", "http2.example", "https-worker.example"))
+def test_hostnames_starting_with_http_or_https_are_not_misclassified_as_urls(value: str):
+    target = ValidatedTarget.parse(value)
+
+    assert target.kind is TargetKind.HOSTNAME
+
+
+@pytest.mark.parametrize("value", ("2001:db8::zzzz", "abcd::gg"))
+def test_invalid_colon_bearing_structured_identifiers_cannot_be_generic(value: str):
+    target = ValidatedTarget(value=value, kind=TargetKind.GENERIC)
+
+    assert target.kind is TargetKind.INVALID
+
+
+def test_ordinary_generic_text_remains_available_when_it_is_not_structured_syntax():
+    target = ValidatedTarget(value="lab:alpha", kind=TargetKind.GENERIC)
+
+    assert target.is_valid
+
+
 def test_live_situation_facets_have_no_invented_source_provenance():
     facet = SituationFacet(namespace="Platform", key="OS_Family", value="Linux", confidence=0.8)
 
@@ -390,10 +410,12 @@ def test_artifact_type_and_role_determine_the_only_qualifying_lane():
     negative_step = case_step(negative=True)
     rule = decision_rule()
     negative_reference = reference().model_copy(update={"artifact_type": ArtifactType.ANTI_PATTERN})
+    exception_reference = reference().model_copy(update={"artifact_type": ArtifactType.EXCEPTION})
 
     for artifact, expected_lane, identifier in (
         (reference(), EpistemicLane.REFERENCE, "reference-http"),
         (negative_reference, EpistemicLane.NEGATIVE_EVIDENCE, "reference-http"),
+        (exception_reference, EpistemicLane.NEGATIVE_EVIDENCE, "reference-http"),
         (positive_step, EpistemicLane.CASE_STEP, "case-step-positive"),
         (negative_step, EpistemicLane.NEGATIVE_EVIDENCE, "case-step-negative"),
         (rule, EpistemicLane.GUIDANCE, "rule-http"),
@@ -503,6 +525,46 @@ def test_authorization_scope_is_typed_and_checks_target_relationships():
         )
 
 
+@pytest.mark.parametrize("host", ("10.10.10.10", "300.456.456.123"))
+def test_authorization_hostname_scope_never_accepts_dotted_numeric_ip_like_values(host: str):
+    with pytest.raises(ValidationError, match="hostnames"):
+        AuthorizationScope(state=AuthorizationState.AUTHORIZED, hostnames=(host,))
+
+
+def test_url_targets_with_ip_hosts_use_ip_authorization_not_hostname_scope():
+    ipv4_url = ValidatedTarget.parse("https://10.10.10.10:8443/docs")
+    ipv6_url = ValidatedTarget.parse("https://[2001:db8::1]:8443/docs")
+
+    assert AuthorizationScope(
+        state=AuthorizationState.AUTHORIZED,
+        cidrs=("10.10.10.0/24",),
+    ).authorizes(ipv4_url)
+    assert AuthorizationScope(
+        state=AuthorizationState.AUTHORIZED,
+        exact_targets=(ValidatedTarget.parse("2001:db8::1"),),
+    ).authorizes(ipv6_url)
+    assert not AuthorizationScope(
+        state=AuthorizationState.AUTHORIZED,
+        hostnames=("web.example.test",),
+    ).authorizes(ipv4_url)
+
+
+def test_scope_and_index_candidates_enforce_explicit_cumulative_text_budgets():
+    with pytest.raises(ValidationError, match="authorization scope text"):
+        AuthorizationScope(
+            state=AuthorizationState.AUTHORIZED,
+            generic_ids=tuple(f"scope-{index:02d}-" + "x" * 2039 for index in range(64)),
+        )
+    artifact = reference()
+    with pytest.raises(ValidationError, match="candidate match text"):
+        IndexCandidate(
+            artifact_id=artifact.artifact_id,
+            artifact=artifact,
+            lexical_relevance=0.4,
+            matched_evidence=tuple(f"evidence-{index:02d}-" + "x" * 2036 for index in range(32)),
+        )
+
+
 def test_unauthorized_or_unknown_scope_returns_prebackend_authorization_gap():
     target = ValidatedTarget.parse("10.10.10.10")
     for state in (AuthorizationState.UNAUTHORIZED, AuthorizationState.UNKNOWN):
@@ -516,6 +578,31 @@ def test_unauthorized_or_unknown_scope_returns_prebackend_authorization_gap():
             ),
         )
         assert result.authorization.state is state
+
+
+def test_knowledge_gap_keeps_rejected_candidates_but_never_qualifying_hits():
+    from sedna.knowledge.retrieval import RejectedCandidate
+
+    artifact = reference()
+    target = ValidatedTarget.parse("10.10.10.10")
+    rejection = RejectedCandidate(
+        artifact_id=artifact.artifact_id,
+        artifact=artifact,
+        lane=EpistemicLane.REFERENCE,
+        provenance=artifact.source_refs,
+        rejection_reasons=("confirmed incompatible platform",),
+    )
+    result = RetrievalResult(
+        target=target,
+        authorization=authorized_scope(target),
+        rejected_candidates=(rejection,),
+        knowledge_gap=KnowledgeGap(
+            code=KnowledgeGapCode.NO_APPLICABLE_KNOWLEDGE,
+            summary="No applicable knowledge.",
+        ),
+    )
+
+    assert result.rejected_candidates == (rejection,)
 
 
 def test_retrieval_result_separates_lanes_and_requires_consistent_gap_shape():

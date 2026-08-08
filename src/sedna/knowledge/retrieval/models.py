@@ -42,11 +42,14 @@ _HOSTNAME = re.compile(
 _NUMERIC_DOTTED = re.compile(r"^[0-9.]+$")
 _IPV6ISH = re.compile(r"^[0-9a-fA-F:.]+$")
 _HOST_PORT = re.compile(r"^[a-z0-9.-]+:\d+$", re.IGNORECASE)
+_EXPLICIT_URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 _MAX_SITUATION_ITEMS = 64
 _MAX_QUERY_TERMS = 32
 _MAX_HIT_REASONS = 32
 _MAX_GAP_ITEMS = 32
 _MAX_QUERY_TEXT = 8192
+_MAX_AUTHORIZATION_TEXT = 16_384
+_MAX_CANDIDATE_MATCH_TEXT = 16_384
 
 
 class TargetKind(StrEnum):
@@ -149,13 +152,13 @@ def _target_url(value: str) -> tuple[str | None, str | None]:
 
 def _looks_structured_target(value: str) -> bool:
     """Catch malformed address/URL syntax before it can become an opaque generic ID."""
-    lowered = value.casefold()
     return bool(
         _NUMERIC_DOTTED.fullmatch(value)
         or _IPV6ISH.fullmatch(value)
         or value.startswith("[")
-        or lowered.startswith(("http", "https"))
+        or _EXPLICIT_URL_SCHEME.match(value) is not None
         or _HOST_PORT.fullmatch(value)
+        or "::" in value
     )
 
 
@@ -221,7 +224,7 @@ class ValidatedTarget(BaseModel):
             )
         if _NUMERIC_DOTTED.fullmatch(value):
             return TargetKind.INVALID, None, "invalid_ipv4"
-        if value.casefold().startswith(("http", "https")):
+        if _EXPLICIT_URL_SCHEME.match(value) is not None:
             normalized, error = _target_url(value)
             return (
                 (TargetKind.URL, normalized, None)
@@ -283,7 +286,7 @@ class AuthorizationScope(BaseModel):
                 raise ValueError("authorization CIDRs must be valid networks") from exc
         hosts: list[str] = []
         for value in self.hostnames:
-            if _HOSTNAME.fullmatch(value) is None:
+            if _NUMERIC_DOTTED.fullmatch(value) or _HOSTNAME.fullmatch(value) is None:
                 raise ValueError("authorization hostnames must be valid hostnames")
             hosts.append(value)
         origins: list[str] = []
@@ -310,6 +313,8 @@ class AuthorizationScope(BaseModel):
             (targets, networks, hosts, origins, generic_ids)
         ):
             raise ValueError("authorized scope requires at least one typed target constraint")
+        if _authorization_text_size(self) > _MAX_AUTHORIZATION_TEXT:
+            raise ValueError("authorization scope text exceeds the cumulative bound")
         return self
 
     def authorizes(self, target: ValidatedTarget) -> bool:
@@ -318,8 +323,13 @@ class AuthorizationScope(BaseModel):
             return False
         if target.normalized in {item.normalized for item in self.exact_targets}:
             return True
-        if target.kind in {TargetKind.IPV4, TargetKind.IPV6} and target.normalized is not None:
-            address = ipaddress.ip_address(target.normalized)
+        address = _target_ip_address(target)
+        if address is not None:
+            if any(
+                item.kind in {TargetKind.IPV4, TargetKind.IPV6} and item.normalized == str(address)
+                for item in self.exact_targets
+            ):
+                return True
             if any(address in ipaddress.ip_network(network) for network in self.cidrs):
                 return True
         if target.kind is TargetKind.HOSTNAME and target.normalized in self.hostnames:
@@ -508,7 +518,11 @@ def _artifact_lane(artifact: IndexedArtifact) -> EpistemicLane | None:
         ):
             return EpistemicLane.NEGATIVE_EVIDENCE
         return EpistemicLane.CASE_STEP
-    if artifact.artifact_type in {ArtifactType.NEGATIVE_EVIDENCE, ArtifactType.ANTI_PATTERN}:
+    if artifact.artifact_type in {
+        ArtifactType.NEGATIVE_EVIDENCE,
+        ArtifactType.ANTI_PATTERN,
+        ArtifactType.EXCEPTION,
+    }:
         return EpistemicLane.NEGATIVE_EVIDENCE
     return EpistemicLane.REFERENCE
 
@@ -540,6 +554,8 @@ class IndexCandidate(BaseModel):
     def deeply_validate_candidate(self) -> IndexCandidate:
         if not math.isfinite(self.lexical_relevance):
             raise ValueError("lexical relevance must be finite")
+        if _candidate_match_text_size(self) > _MAX_CANDIDATE_MATCH_TEXT:
+            raise ValueError("candidate match text exceeds the cumulative bound")
         artifact = _deep_revalidate_artifact(self.artifact)
         if self.artifact_id != _artifact_id(artifact):
             raise ValueError("artifact_id must exactly match the canonical artifact identity")
@@ -729,8 +745,8 @@ class RetrievalResult(BaseModel):
                 "authorized retrieval result target must be within the authorization scope"
             )
         elif self.knowledge_gap is not None:
-            if hits or self.rejected_candidates:
-                raise ValueError("knowledge gap results cannot also contain candidates")
+            if hits:
+                raise ValueError("knowledge gap results cannot also contain qualifying lane hits")
             if self.knowledge_gap.code in {
                 KnowledgeGapCode.INVALID_TARGET,
                 KnowledgeGapCode.UNAUTHORIZED_SCOPE,
@@ -797,7 +813,48 @@ def _situation_text_size(situation: CurrentSituation) -> int:
     text = (*situation.terms, *situation.access, *situation.services, *situation.hypotheses)
     text += tuple(part for outcome in situation.tried_outcomes for part in outcome)
     text += situation.unresolved_questions
-    return sum(map(len, text)) + _facet_text_size(situation.facts)
+    return (
+        sum(map(len, text))
+        + _facet_text_size(situation.facts)
+        + _authorization_text_size(situation.authorization)
+    )
+
+
+def _authorization_text_size(scope: AuthorizationScope) -> int:
+    values = (
+        *(target.value for target in scope.exact_targets),
+        *scope.cidrs,
+        *scope.hostnames,
+        *scope.url_origins,
+        *scope.generic_ids,
+    )
+    return sum(map(len, values))
+
+
+def _candidate_match_text_size(candidate: IndexCandidate) -> int:
+    return sum(
+        map(
+            len,
+            (*candidate.matched_terms, *candidate.matched_fields, *candidate.matched_evidence),
+        )
+    )
+
+
+def _target_ip_address(
+    target: ValidatedTarget,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    if target.normalized is None:
+        return None
+    if target.kind in {TargetKind.IPV4, TargetKind.IPV6}:
+        return ipaddress.ip_address(target.normalized)
+    if target.kind is TargetKind.URL:
+        host = urlsplit(target.normalized).hostname
+        if host is not None:
+            try:
+                return ipaddress.ip_address(host)
+            except ValueError:
+                return None
+    return None
 
 
 @runtime_checkable
