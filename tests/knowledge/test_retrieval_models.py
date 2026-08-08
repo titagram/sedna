@@ -838,8 +838,16 @@ def test_index_audit_derives_rebuild_requirement_for_every_integrity_failure():
 
 def test_indexed_source_state_is_bounded_canonical_and_hash_bound() -> None:
     artifacts = (
-        IndexedArtifactState(artifact_id="artifact-a", projection_digest="c" * 64),
-        IndexedArtifactState(artifact_id="artifact-b", projection_digest="d" * 64),
+        IndexedArtifactState(
+            artifact_id="artifact-a",
+            projection_digest="c" * 64,
+            asserted_projection_digest="c" * 64,
+        ),
+        IndexedArtifactState(
+            artifact_id="artifact-b",
+            projection_digest="d" * 64,
+            asserted_projection_digest="d" * 64,
+        ),
     )
     state = IndexedSourceState.from_artifacts(
         source_id="source-a",
@@ -865,7 +873,13 @@ def test_index_state_snapshot_is_generation_bound_sorted_and_cumulatively_bounde
         source_id="source-a",
         source_sha256="a" * 64,
         projection_version="projection-v1",
-        artifacts=(IndexedArtifactState(artifact_id="artifact-a", projection_digest="b" * 64),),
+        artifacts=(
+            IndexedArtifactState(
+                artifact_id="artifact-a",
+                projection_digest="b" * 64,
+                asserted_projection_digest="b" * 64,
+            ),
+        ),
     )
     snapshot = IndexStateSnapshot(
         generation=7,

@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
@@ -15,6 +16,7 @@ import pytest
 from sedna.knowledge.repository import (
     CanonicalKnowledgeRepository,
     SemanticBundleEnumerationError,
+    SemanticSnapshotChangedError,
 )
 from sedna.knowledge.retrieval import EpistemicLane, IndexAudit, IndexStateSnapshot
 from sedna.knowledge.retrieval.maintenance import (
@@ -423,6 +425,120 @@ def test_rebuild_aborts_before_install_when_canonical_source_is_added_during_bui
         assert index.get_artifact("reference-http-a") is None
 
 
+def test_repository_root_lock_cannot_be_split_by_replacing_obsolete_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "knowledge"
+    first = CanonicalKnowledgeRepository(root)
+    second = CanonicalKnowledgeRepository(root)
+    initial = _empty_current_bundle("source-a", "a" * 64)
+    added = _empty_current_bundle("source-b", "b" * 64)
+    first.write_semantic_result(_verified_result(initial))
+    snapshot = first.semantic_bundle_snapshot()
+    obsolete_sidecar = root / "transactions" / ".semantic-inventory.lock"
+    obsolete_sidecar.write_bytes(b"")
+    lock_attempted = Event()
+    lock_acquired = Event()
+    real_lock = second._semantic_inventory_lock
+
+    @contextmanager
+    def observed_lock(*, exclusive: bool):
+        lock_attempted.set()
+        with real_lock(exclusive=exclusive):
+            lock_acquired.set()
+            yield
+
+    monkeypatch.setattr(second, "_semantic_inventory_lock", observed_lock)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with first.semantic_snapshot_guard(snapshot.revision):
+            obsolete_sidecar.unlink()
+            obsolete_sidecar.write_bytes(b"")
+            writer = executor.submit(second.write_semantic_result, _verified_result(added))
+            assert lock_attempted.wait(timeout=2)
+            assert not lock_acquired.wait(timeout=0.1)
+        assert lock_acquired.wait(timeout=2)
+        writer.result(timeout=5)
+
+    assert tuple(bundle.source_id for bundle in first.iter_semantic_bundles()) == (
+        "source-a",
+        "source-b",
+    )
+    first.close()
+    second.close()
+
+
+def test_startup_semantic_recovery_waits_for_repository_snapshot_guard(tmp_path: Path) -> None:
+    root = tmp_path / "knowledge"
+    repository = CanonicalKnowledgeRepository(root)
+    initial = _empty_current_bundle("source-a", "a" * 64)
+    repository.write_semantic_result(_verified_result(initial))
+    snapshot = repository.semantic_bundle_snapshot()
+    snapshots = {
+        directory: repository._read_optional_bytes(directory, "source-a")
+        for directory in repository._SEMANTIC_DIRECTORIES
+    }
+    recovery_attempted = Event()
+    recovery_finished = Event()
+
+    def recover_repository() -> CanonicalKnowledgeRepository:
+        recovery_attempted.set()
+        recovered = CanonicalKnowledgeRepository(root)
+        recovery_finished.set()
+        return recovered
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with (
+            pytest.raises(SemanticSnapshotChangedError),
+            repository.semantic_snapshot_guard(snapshot.revision),
+        ):
+            repository._write_semantic_transition_journal("source-a", snapshots)
+            repository._delete_record("semantic_bundles", "source-a")
+            future = executor.submit(recover_repository)
+            assert recovery_attempted.wait(timeout=2)
+            assert not recovery_finished.wait(timeout=0.1)
+        recovered = future.result(timeout=5)
+
+    assert recovered.load_semantic_bundle("source-a") == initial
+    recovered.close()
+    repository.close()
+
+
+def test_rebuild_rolls_back_when_canonical_bytes_change_after_guard_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "knowledge"
+    path = tmp_path / "sedna.sqlite"
+    with CanonicalKnowledgeRepository(root) as repository, SQLiteRetrievalIndex(path) as index:
+        prior = _current_bundle("source-prior", "c")
+        initial = _current_bundle("source-a", "a")
+        index.rebuild((prior,))
+        before = path.read_bytes()
+        repository.write_semantic_result(_verified_result(initial))
+        verification_path = root / "semantic_verification" / "source-a.json"
+        real_verify = index._verify_retained_sibling
+        changed = False
+
+        def change_after_guard_entry(*args: object, **kwargs: object) -> None:
+            nonlocal changed
+            real_verify(*args, **kwargs)
+            if not changed:
+                changed = True
+                verification_path.write_bytes(verification_path.read_bytes() + b" \n")
+
+        monkeypatch.setattr(index, "_verify_retained_sibling", change_after_guard_entry)
+
+        report = RetrievalMaintenanceService(repository=repository, index=index).rebuild()
+
+        assert changed
+        assert report.succeeded is False
+        assert report.issues[0].code is MaintenanceIssueCode.CANONICAL_REPOSITORY_CHANGED
+        assert path.read_bytes() == before
+        assert index.get_artifact("reference-http-c") == prior.references[0]
+        assert index.get_artifact("reference-http-a") is None
+
+
 def test_audit_derives_missing_artifact_count_from_live_rows_not_source_assertions(
     tmp_path: Path,
 ) -> None:
@@ -452,6 +568,48 @@ def test_audit_derives_missing_artifact_count_from_live_rows_not_source_assertio
     assert report.stale_source_count == 1
     assert report.missing_artifact_count == 1
     reopened.close()
+    repository.close()
+
+
+@pytest.mark.parametrize(
+    ("statement", "parameters", "expected_stale_artifacts"),
+    (
+        (
+            "UPDATE indexed_sources SET projection_digest = ? WHERE source_id = ?",
+            ("f" * 64, "source-a"),
+            0,
+        ),
+        (
+            "UPDATE artifacts SET projection_digest = ? WHERE artifact_id = ?",
+            ("f" * 64, "reference-http-a"),
+            1,
+        ),
+    ),
+)
+def test_audit_counts_exact_stale_source_and_artifacts_for_digest_tampering(
+    tmp_path: Path,
+    statement: str,
+    parameters: tuple[str, str],
+    expected_stale_artifacts: int,
+) -> None:
+    root = tmp_path / "knowledge"
+    path = tmp_path / "sedna.sqlite"
+    repository = CanonicalKnowledgeRepository(root)
+    bundle = _current_bundle("source-a", "a")
+    repository.write_semantic_result(_verified_result(bundle))
+    index = SQLiteRetrievalIndex(path)
+    index.rebuild((bundle,))
+    index.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute(statement, parameters)
+
+    with SQLiteRetrievalIndex(path) as reopened:
+        report = RetrievalMaintenanceService(repository=repository, index=reopened).audit()
+
+    assert report.succeeded
+    assert report.stale_source_count == 1
+    assert report.stale_artifact_count == expected_stale_artifacts
+    assert MaintenanceIssueCode.INDEX_INTEGRITY_FAILURE in {issue.code for issue in report.issues}
     repository.close()
 
 

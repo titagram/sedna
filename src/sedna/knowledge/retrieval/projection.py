@@ -186,12 +186,20 @@ def project_source_state(bundle: SemanticKnowledgeBundle) -> IndexedSourceState:
         source_sha256=bundle.source_sha256,
         projection_version=SOURCE_PROJECTION_VERSION,
         artifacts=tuple(
-            IndexedArtifactState(
-                artifact_id=artifact.artifact_id,
-                projection_digest=projected_artifact_digest(bundle.source_id, artifact),
-            )
-            for artifact in projection
+            _projected_artifact_state(bundle.source_id, artifact) for artifact in projection
         ),
+    )
+
+
+def _projected_artifact_state(
+    source_id: str,
+    artifact: ProjectedArtifact,
+) -> IndexedArtifactState:
+    digest = projected_artifact_digest(source_id, artifact)
+    return IndexedArtifactState(
+        artifact_id=artifact.artifact_id,
+        projection_digest=digest,
+        asserted_projection_digest=digest,
     )
 
 

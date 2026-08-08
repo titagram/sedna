@@ -858,12 +858,13 @@ class IndexAudit(BaseModel):
 
 
 class IndexedArtifactState(BaseModel):
-    """Actual identity and normalized projection digest of one indexed artifact row."""
+    """Actual and persisted projection identity of one indexed artifact row."""
 
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
     artifact_id: Annotated[SearchableNonEmptyString, Field(max_length=2048)]
     projection_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    asserted_projection_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 
 class IndexedSourceState(BaseModel):
@@ -876,6 +877,9 @@ class IndexedSourceState(BaseModel):
     artifact_count: int = Field(ge=0, le=10_000_000)
     projection_version: Annotated[SearchableNonEmptyString, Field(max_length=128)]
     projection_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    asserted_artifact_count: int = Field(ge=0, le=10_000_000)
+    asserted_projection_version: Annotated[SearchableNonEmptyString, Field(max_length=128)]
+    asserted_projection_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     artifacts: tuple[IndexedArtifactState, ...] = Field(
         default=(), max_length=_MAX_SOURCE_ARTIFACTS
     )
@@ -912,18 +916,33 @@ class IndexedSourceState(BaseModel):
         source_sha256: str,
         projection_version: str,
         artifacts: tuple[IndexedArtifactState, ...],
+        asserted_artifact_count: int | None = None,
+        asserted_projection_version: str | None = None,
+        asserted_projection_digest: str | None = None,
     ) -> IndexedSourceState:
         ordered = tuple(sorted(artifacts, key=lambda item: item.artifact_id))
+        actual_digest = source_projection_digest(
+            source_id,
+            source_sha256,
+            projection_version,
+            ordered,
+        )
         return cls(
             source_id=source_id,
             source_sha256=source_sha256,
             artifact_count=len(ordered),
             projection_version=projection_version,
-            projection_digest=source_projection_digest(
-                source_id,
-                source_sha256,
-                projection_version,
-                ordered,
+            projection_digest=actual_digest,
+            asserted_artifact_count=(
+                len(ordered) if asserted_artifact_count is None else asserted_artifact_count
+            ),
+            asserted_projection_version=(
+                projection_version
+                if asserted_projection_version is None
+                else asserted_projection_version
+            ),
+            asserted_projection_digest=(
+                actual_digest if asserted_projection_digest is None else asserted_projection_digest
             ),
             artifacts=ordered,
         )
@@ -978,7 +997,13 @@ def source_projection_digest(
             "source_id": source_id,
             "source_sha256": source_sha256,
             "projection_version": projection_version,
-            "artifacts": [artifact.model_dump(mode="json") for artifact in artifacts],
+            "artifacts": [
+                {
+                    "artifact_id": artifact.artifact_id,
+                    "projection_digest": artifact.projection_digest,
+                }
+                for artifact in artifacts
+            ],
         },
         ensure_ascii=False,
         sort_keys=True,

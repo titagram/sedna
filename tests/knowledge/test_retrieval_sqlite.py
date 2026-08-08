@@ -177,6 +177,60 @@ def test_source_states_bind_hash_artifact_count_digest_and_support_bounded_pagin
             index.list_source_states(after_source_id=None, limit=0)
 
 
+def test_source_state_page_computes_only_the_requested_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundles = (
+        _renamed_bundle("source-a", "a"),
+        _renamed_bundle("source-b", "b"),
+    )
+    with SQLiteRetrievalIndex(tmp_path / "sedna.sqlite") as index:
+        index.rebuild(bundles)
+        computed: list[str] = []
+        real_actual_state = index._actual_source_state
+
+        def observe_actual_state(*args: object, **kwargs: object):
+            computed.append(str(kwargs["source_id"]))
+            return real_actual_state(*args, **kwargs)
+
+        monkeypatch.setattr(index, "_actual_source_state", observe_actual_state)
+
+        page = index.list_source_states(after_source_id=None, limit=1)
+
+        assert tuple(state.source_id for state in page) == ("source-a",)
+        assert computed == ["source-a"]
+
+
+def test_source_state_paging_computes_each_source_once_without_quadratic_rescans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_ids = tuple(f"source-{index:03d}" for index in range(23))
+    bundles = tuple(
+        _renamed_bundle(source_id, f"page-{index:03d}")
+        for index, source_id in enumerate(source_ids)
+    )
+    with SQLiteRetrievalIndex(tmp_path / "sedna.sqlite") as index:
+        index.rebuild(bundles)
+        computed: list[str] = []
+        real_actual_state = index._actual_source_state
+
+        def observe_actual_state(*args: object, **kwargs: object):
+            computed.append(str(kwargs["source_id"]))
+            return real_actual_state(*args, **kwargs)
+
+        monkeypatch.setattr(index, "_actual_source_state", observe_actual_state)
+        seen: list[str] = []
+        cursor: str | None = None
+        while page := index.list_source_states(after_source_id=cursor, limit=3):
+            seen.extend(state.source_id for state in page)
+            cursor = page[-1].source_id
+
+        assert seen == list(source_ids)
+        assert computed == list(source_ids)
+
+
 def test_hash_only_bundle_change_is_visible_in_source_state(tmp_path: Path) -> None:
     original = _bundle()
     payload = original.model_dump(mode="json")

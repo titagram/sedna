@@ -215,7 +215,7 @@ class CanonicalKnowledgeRepository:
     )
 
     def __init__(self, root: Path) -> None:
-        self._descriptor_lock = threading.Lock()
+        self._descriptor_lock = threading.RLock()
         self._root_fd: int | None = None
         self._require_safe_primitives()
         requested_root = Path(root)
@@ -382,12 +382,23 @@ class CanonicalKnowledgeRepository:
         ):
             raise ValueError("semantic snapshot revision must be a lowercase SHA-256 digest")
         with self._semantic_inventory_lock(exclusive=False):
+            self._require_semantic_inventory_revision(expected_revision)
+            try:
+                yield
+            finally:
+                self._require_semantic_inventory_revision(expected_revision)
+
+    def _require_semantic_inventory_revision(self, expected_revision: str) -> None:
+        try:
             entries, _ = self._semantic_inventory_entries()
-            if self._semantic_inventory_revision(entries) != expected_revision:
-                raise SemanticSnapshotChangedError(
-                    "canonical semantic inventory changed before index commit"
-                )
-            yield
+        except Exception as error:
+            raise SemanticSnapshotChangedError(
+                "canonical semantic inventory became unsafe during index commit"
+            ) from error
+        if self._semantic_inventory_revision(entries) != expected_revision:
+            raise SemanticSnapshotChangedError(
+                "canonical semantic inventory changed during index commit"
+            )
 
     def _semantic_bundle_snapshot_locked(self) -> SemanticRepositorySnapshot:
         entries, source_ids = self._semantic_inventory_entries()
@@ -395,7 +406,6 @@ class CanonicalKnowledgeRepository:
         for source_id in source_ids:
             try:
                 with self._source_transition_lock(source_id):
-                    self._recover_source(source_id)
                     bundle, verification, quarantine = self._load_semantic_state(source_id)
                 if bundle is None:
                     # A complete quarantine pair is canonical but deliberately not retrievable.
@@ -443,7 +453,10 @@ class CanonicalKnowledgeRepository:
             raise ValueError("model-pinned currentness requires both model identifiers")
         source_id = prepared.manifest.source_id
         self._target("semantic_bundles", source_id)
-        with self._source_transition_lock(source_id):
+        with (
+            self._semantic_inventory_lock(exclusive=True),
+            self._source_transition_lock(source_id),
+        ):
             self._recover_source(source_id)
             try:
                 bundle, verification, quarantine = self._load_semantic_state(source_id)
@@ -597,7 +610,10 @@ class CanonicalKnowledgeRepository:
     ) -> None:
         """Durably commit one source disposition or recover its previous bytes."""
         self.validate_source_state(manifest, quarantine)
-        with self._source_transition_lock(manifest.source_id):
+        with (
+            self._semantic_inventory_lock(exclusive=True),
+            self._source_transition_lock(manifest.source_id),
+        ):
             self._recover_source(manifest.source_id)
             old_manifest = self._read_optional_bytes("manifests", manifest.source_id)
             old_quarantine = self._read_optional_bytes("quarantine", manifest.source_id)
@@ -690,7 +706,10 @@ class CanonicalKnowledgeRepository:
             "quarantine": "semantic_quarantine",
         }[component]
         target, _ = self._target(directory, source_id)
-        with self._source_transition_lock(source_id):
+        with (
+            self._semantic_inventory_lock(exclusive=True),
+            self._source_transition_lock(source_id),
+        ):
             self._recover_source(source_id)
             bundle, verification, quarantine = self._load_semantic_state(source_id)
         record = {
@@ -1080,25 +1099,25 @@ class CanonicalKnowledgeRepository:
 
     @contextmanager
     def _semantic_inventory_lock(self, *, exclusive: bool) -> Iterator[None]:
-        directory_fd = self._open_child_directory("transactions", create=True)
-        lock_fd = -1
-        try:
-            lock_fd = os.open(
-                ".semantic-inventory.lock",
-                self._lock_open_flags(),
-                0o600,
-                dir_fd=directory_fd,
-            )
-            if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
-                raise ValueError("semantic inventory lock is not a regular file")
-            fcntl.flock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-            yield
-        finally:
-            if lock_fd >= 0:
+        with self._descriptor_lock:
+            root_fd = self._ensure_open()
+            lock_fd = os.dup(root_fd)
+            try:
+                retained = os.fstat(root_fd)
+                duplicated = os.fstat(lock_fd)
+                retained_identity = (retained.st_dev, retained.st_ino)
+                if (
+                    not stat.S_ISDIR(retained.st_mode)
+                    or not stat.S_ISDIR(duplicated.st_mode)
+                    or retained_identity != (duplicated.st_dev, duplicated.st_ino)
+                ):
+                    raise RuntimeError("semantic inventory lock lost repository root identity")
+                fcntl.flock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+                yield
+            finally:
                 with suppress(OSError):
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 os.close(lock_fd)
-            os.close(directory_fd)
 
     @contextmanager
     def _source_transition_lock(self, source_id: str) -> Iterator[None]:
@@ -1124,26 +1143,27 @@ class CanonicalKnowledgeRepository:
             os.close(directory_fd)
 
     def _recover_pending_transactions(self) -> None:
-        try:
-            directory_fd = self._open_child_directory("transactions", create=False)
-        except FileNotFoundError:
-            return
-        try:
-            names = tuple(sorted(os.listdir(directory_fd)))
-        finally:
-            os.close(directory_fd)
-        foundation_suffix = ".transaction.json"
-        semantic_suffix = ".semantic-transaction.json"
-        source_ids: set[str] = set()
-        for name in names:
-            if name.endswith(semantic_suffix):
-                source_ids.add(name[: -len(semantic_suffix)])
-            elif name.endswith(foundation_suffix):
-                source_ids.add(name[: -len(foundation_suffix)])
-        for source_id in sorted(source_ids):
-            _validate_stable_id(source_id)
-            with self._source_transition_lock(source_id):
-                self._recover_source(source_id)
+        with self._semantic_inventory_lock(exclusive=True):
+            try:
+                directory_fd = self._open_child_directory("transactions", create=False)
+            except FileNotFoundError:
+                return
+            try:
+                names = tuple(sorted(os.listdir(directory_fd)))
+            finally:
+                os.close(directory_fd)
+            foundation_suffix = ".transaction.json"
+            semantic_suffix = ".semantic-transaction.json"
+            source_ids: set[str] = set()
+            for name in names:
+                if name.endswith(semantic_suffix):
+                    source_ids.add(name[: -len(semantic_suffix)])
+                elif name.endswith(foundation_suffix):
+                    source_ids.add(name[: -len(foundation_suffix)])
+            for source_id in sorted(source_ids):
+                _validate_stable_id(source_id)
+                with self._source_transition_lock(source_id):
+                    self._recover_source(source_id)
 
     def _recover_source(self, source_id: str) -> None:
         self._recover_foundation_source(source_id)

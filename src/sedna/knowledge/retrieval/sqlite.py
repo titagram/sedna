@@ -415,10 +415,31 @@ class SQLiteRetrievalIndex:
             after_source_id = _validated_source_id(after_source_id)
         if type(limit) is not int or not 1 <= limit <= _MAX_LIMIT:
             raise ValueError(f"limit must be between 1 and {_MAX_LIMIT}")
-        snapshot = self.snapshot_state()
-        return tuple(
-            state for state in snapshot.source_states if state.source_id > (after_source_id or "")
-        )[:limit]
+        with self._read_snapshot() as connection:
+            connection.execute("BEGIN")
+            try:
+                self._require_current_schema(connection)
+                if _database_generation(connection) is None:
+                    raise ValueError("index generation metadata is invalid")
+                rows = connection.execute(
+                    "SELECT source_id, source_sha256, artifact_count, projection_version, "
+                    "projection_digest FROM indexed_sources WHERE source_id > ? "
+                    "ORDER BY source_id LIMIT ?",
+                    (after_source_id or "", limit),
+                ).fetchall()
+                return tuple(
+                    self._actual_source_state(
+                        connection,
+                        source_id=_validated_source_id(row["source_id"]),
+                        source_sha256=_validated_source_hash(row["source_sha256"]),
+                        asserted_artifact_count=row["artifact_count"],
+                        asserted_projection_version=row["projection_version"],
+                        asserted_projection_digest=row["projection_digest"],
+                    )
+                    for row in rows
+                )
+            finally:
+                connection.rollback()
 
     def snapshot_state(self) -> IndexStateSnapshot:
         """Return audit and exact source/artifact states from one locked generation."""
@@ -611,6 +632,9 @@ class SQLiteRetrievalIndex:
                     connection,
                     source_id=source_id,
                     source_sha256=source_sha256,
+                    asserted_artifact_count=row["artifact_count"],
+                    asserted_projection_version=row["projection_version"],
+                    asserted_projection_digest=row["projection_digest"],
                 )
                 if (
                     row["projection_version"] != actual_state.projection_version
@@ -695,9 +719,13 @@ class SQLiteRetrievalIndex:
                 connection,
                 source_id=_validated_source_id(row["source_id"]),
                 source_sha256=_validated_source_hash(row["source_sha256"]),
+                asserted_artifact_count=row["artifact_count"],
+                asserted_projection_version=row["projection_version"],
+                asserted_projection_digest=row["projection_digest"],
             )
             for row in connection.execute(
-                "SELECT source_id, source_sha256 FROM indexed_sources ORDER BY source_id"
+                "SELECT source_id, source_sha256, artifact_count, projection_version, "
+                "projection_digest FROM indexed_sources ORDER BY source_id"
             )
         )
 
@@ -707,11 +735,15 @@ class SQLiteRetrievalIndex:
         *,
         source_id: str,
         source_sha256: str,
+        asserted_artifact_count: int,
+        asserted_projection_version: str,
+        asserted_projection_digest: str,
     ) -> IndexedSourceState:
         artifacts = tuple(
             IndexedArtifactState(
                 artifact_id=row["artifact_id"],
                 projection_digest=_live_projection_digest(connection, row),
+                asserted_projection_digest=row["projection_digest"],
             )
             for row in connection.execute(
                 "SELECT * FROM artifacts WHERE owner_source_id = ? ORDER BY artifact_id",
@@ -723,6 +755,9 @@ class SQLiteRetrievalIndex:
             source_sha256=source_sha256,
             projection_version=SOURCE_PROJECTION_VERSION,
             artifacts=artifacts,
+            asserted_artifact_count=asserted_artifact_count,
+            asserted_projection_version=asserted_projection_version,
+            asserted_projection_digest=asserted_projection_digest,
         )
 
     @contextmanager
@@ -775,6 +810,7 @@ class SQLiteRetrievalIndex:
             IndexedArtifactState(
                 artifact_id=artifact.artifact_id,
                 projection_digest=projected_artifact_digest(source_id, artifact),
+                asserted_projection_digest=projected_artifact_digest(source_id, artifact),
             )
             for artifact in projection
         )
