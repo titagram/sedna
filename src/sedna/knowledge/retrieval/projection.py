@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
+from hashlib import sha256
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -37,12 +38,28 @@ class ProjectedFacet(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
     artifact_id: SearchableNonEmptyString
+    facet_id: SearchableNonEmptyString
+    channel: SearchableNonEmptyString
     namespace: SearchableNonEmptyString
     key: SearchableNonEmptyString
     value: SearchableString
     relation: ContextRelation
     origin: Origin
     confidence: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> ProjectedFacet:
+        if self.facet_id != _facet_id(
+            self.channel,
+            self.namespace,
+            self.key,
+            self.value,
+            self.relation,
+            self.origin,
+            self.confidence,
+        ):
+            raise ValueError("projected facet ID must match its semantic identity")
+        return self
 
 
 class ProjectedSource(BaseModel):
@@ -104,6 +121,8 @@ class ProjectedArtifact(BaseModel):
             raise ValueError("projected facets must belong to their artifact")
         if any(source.artifact_id != self.artifact_id for source in self.sources):
             raise ValueError("projected sources must belong to their artifact")
+        if any(source.independence_group != self.independence_group for source in self.sources):
+            raise ValueError("projected sources must share their artifact independence group")
         if any(link.from_artifact_id != self.artifact_id for link in self.links):
             raise ValueError("projected links must originate from their artifact")
         if tuple(sorted(self.facets, key=_facet_key)) != self.facets:
@@ -160,6 +179,7 @@ def project_semantic_bundle(bundle: SemanticKnowledgeBundle) -> tuple[ProjectedA
 def _deep_revalidate_bundle(bundle: SemanticKnowledgeBundle) -> SemanticKnowledgeBundle:
     if not isinstance(bundle, SemanticKnowledgeBundle):
         raise ValueError("projection requires a SemanticKnowledgeBundle")
+    _reject_hidden_model_state(bundle)
     try:
         primitive = json.loads(json.dumps(bundle.model_dump(mode="json"), allow_nan=False))
     except (TypeError, ValueError) as error:
@@ -171,11 +191,18 @@ def _project_reference(reference: ReferenceArtifact) -> ProjectedArtifact:
     return _row(
         reference,
         artifact_id=reference.artifact_id,
-        statement=reference.statement,
-        rationale=reference.evidence_interpretation,
-        action_intent=reference.action_intent,
+        statement=(reference.subject, reference.statement, *reference.applicable_situations),
+        rationale=(
+            reference.expected_information_gain,
+            reference.evidence_interpretation,
+            *reference.success_implications,
+            *reference.failure_implications,
+            *reference.stop_implications,
+        ),
+        observations=reference.prerequisites,
+        action_intent=(reference.action_intent, *reference.capability_refs),
         expected_evidence=reference.expected_evidence,
-        exceptions=reference.exceptions,
+        exceptions=(*reference.exceptions, *reference.warnings),
         observed_at=reference.observed_at,
     )
 
@@ -184,8 +211,9 @@ def _project_case(case: KnowledgeCase) -> ProjectedArtifact:
     return _row(
         case,
         artifact_id=case.case_id,
-        statement=case.title,
-        rationale=case.outcome,
+        statement=(case.title, case.starting_access),
+        rationale=(case.outcome, case.difficulty),
+        observations=case.transferable_properties,
         exceptions=case.non_transferable_properties,
     )
 
@@ -194,10 +222,22 @@ def _project_step(step: CaseStep, *, parent_case_id: str) -> ProjectedArtifact:
     return _row(
         step,
         artifact_id=step.step_id,
-        observations=step.observations,
-        action_intent=step.selected_action.intent,
+        rationale=(
+            *(hypothesis.statement for hypothesis in step.hypotheses),
+            step.state_after.access,
+            *step.state_after.environment,
+            *step.state_after.privileges,
+        ),
+        observations=(
+            step.state_before.access,
+            *step.state_before.environment,
+            *step.state_before.privileges,
+            *step.observations,
+        ),
+        action_intent=(step.selected_action.intent, step.selected_action.capability_ref),
         expected_evidence=(
             *(evidence.summary for evidence in step.evidence),
+            *(evidence.category for evidence in step.evidence),
             *((step.expected_information_gain,) if step.expected_information_gain else ()),
         ),
         exceptions=(*step.negative_evidence, *step.transfer_conditions),
@@ -216,10 +256,15 @@ def _project_rule(rule: DecisionRule) -> ProjectedArtifact:
         rule,
         artifact_id=rule.rule_id,
         statement=rule.trigger_observations,
-        rationale=rule.rationale,
-        action_intent=rule.action_intent,
-        expected_evidence=rule.expected_evidence,
-        exceptions=rule.exceptions,
+        rationale=(rule.rationale, *rule.alternative_hypotheses),
+        observations=rule.prerequisites,
+        action_intent=(rule.action_intent, *rule.capability_refs),
+        expected_evidence=(
+            *rule.expected_evidence,
+            *rule.success_transitions,
+            *rule.failure_transitions,
+        ),
+        exceptions=(*rule.stop_conditions, *rule.exceptions),
         additional_sources=tuple(
             (source_ref, "contradicts") for source_ref in rule.contradicting_source_refs
         ),
@@ -282,7 +327,7 @@ def _project_context(
     context: Any,
 ) -> tuple[tuple[ProjectedFacet, ...], tuple[tuple[SourceRef, str], ...]]:
     typed = context.typed_context
-    assertions: list[tuple[str, str, ContextAssertion]] = []
+    assertions: list[tuple[str, str, str, ContextAssertion]] = []
     for key in (
         "os_family",
         "os_version",
@@ -296,42 +341,48 @@ def _project_context(
     ):
         assertion = getattr(typed, key)
         if assertion is not None:
-            assertions.append(("typed", key, assertion))
+            assertions.append(("typed", "typed", key, assertion))
     assertions.extend(
-        ("typed", f"services.{service.service_type}", service.identity)
+        ("typed", "typed", f"services.{service.service_type}", service.identity)
         for service in typed.services
     )
-    assertions.extend(("typed", "privileges", assertion) for assertion in typed.privileges)
+    assertions.extend(("typed", "typed", "privileges", assertion) for assertion in typed.privileges)
     assertions.extend(
-        ("typed", "security_controls", assertion) for assertion in typed.security_controls
+        ("typed", "typed", "security_controls", assertion) for assertion in typed.security_controls
     )
-    assertions.extend((facet.namespace, facet.key, facet.assertion) for facet in context.facets)
+    assertions.extend(
+        ("extensible", facet.namespace, facet.key, facet.assertion) for facet in context.facets
+    )
 
-    facets = tuple(
-        sorted(
-            (
-                ProjectedFacet(
-                    artifact_id=artifact_id,
-                    namespace=namespace,
-                    key=key,
-                    value=assertion.value,
-                    relation=assertion.relation,
-                    origin=assertion.origin,
-                    confidence=assertion.confidence,
-                )
-                for namespace, key, assertion in assertions
-            ),
-            key=_facet_key,
+    facets_by_id: dict[str, ProjectedFacet] = {}
+    sources: list[tuple[SourceRef, str]] = []
+    for channel, namespace, key, assertion in assertions:
+        facet_id = _facet_id(
+            channel,
+            namespace,
+            key,
+            assertion.value,
+            assertion.relation,
+            assertion.origin,
+            assertion.confidence,
         )
-    )
-    if len(set(facets)) != len(facets):
-        raise ValueError("projected context facets must be unique")
-    sources = tuple(
-        (source_ref, f"context:{namespace}.{key}")
-        for namespace, key, assertion in assertions
-        for source_ref in assertion.source_refs
-    )
-    return facets, sources
+        facet = ProjectedFacet(
+            artifact_id=artifact_id,
+            facet_id=facet_id,
+            channel=channel,
+            namespace=namespace,
+            key=key,
+            value=assertion.value,
+            relation=assertion.relation,
+            origin=assertion.origin,
+            confidence=assertion.confidence,
+        )
+        previous = facets_by_id.setdefault(facet_id, facet)
+        if previous != facet:
+            raise ValueError("projected facet identity collision")
+        sources.extend((source_ref, f"facet:{facet_id}") for source_ref in assertion.source_refs)
+    facets = tuple(sorted(facets_by_id.values(), key=_facet_key))
+    return facets, tuple(sources)
 
 
 def _project_sources(
@@ -380,8 +431,9 @@ def _canonical_json(artifact: ReferenceArtifact | KnowledgeCase | CaseStep | Dec
         raise ValueError("canonical artifact is not JSON-primitive safe") from error
 
 
-def _facet_key(facet: ProjectedFacet) -> tuple[str, str, str, str, str, float]:
+def _facet_key(facet: ProjectedFacet) -> tuple[str, str, str, str, str, str, float]:
     return (
+        facet.channel,
         facet.namespace,
         facet.key,
         facet.value,
@@ -391,9 +443,10 @@ def _facet_key(facet: ProjectedFacet) -> tuple[str, str, str, str, str, float]:
     )
 
 
-def _source_key(source: ProjectedSource) -> tuple[str, str, str, str]:
+def _source_key(source: ProjectedSource) -> tuple[str, str, str, str, str]:
     return (
         source.relation,
+        source.independence_group,
         source.source_id,
         source.path,
         _location_key(source.location),
@@ -406,3 +459,52 @@ def _link_key(link: ProjectedLink) -> tuple[str, str, str]:
 
 def _location_key(location: SourceLocation) -> str:
     return json.dumps(location.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
+
+
+def _facet_id(
+    channel: str,
+    namespace: str,
+    key: str,
+    value: str,
+    relation: ContextRelation,
+    origin: Origin,
+    confidence: float,
+) -> str:
+    identity = json.dumps(
+        {
+            "channel": channel,
+            "confidence": confidence,
+            "key": key,
+            "namespace": namespace,
+            "origin": origin,
+            "relation": relation,
+            "value": value,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return f"facet-{sha256(identity.encode('utf-8')).hexdigest()}"
+
+
+def _reject_hidden_model_state(value: object, seen: set[int] | None = None) -> None:
+    """Reject unvalidated state injected by ``model_copy(update=...)`` at any depth."""
+    seen = set() if seen is None else seen
+    value_id = id(value)
+    if value_id in seen:
+        return
+    seen.add(value_id)
+    if isinstance(value, BaseModel):
+        fields = type(value).model_fields
+        if set(value.__dict__) - set(fields) or value.__pydantic_extra__:
+            raise ValueError("unsafe canonical model state")
+        for field_name in fields:
+            if field_name in value.__dict__:
+                _reject_hidden_model_state(value.__dict__[field_name], seen)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _reject_hidden_model_state(item, seen)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            _reject_hidden_model_state(item, seen)

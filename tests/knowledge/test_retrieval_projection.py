@@ -12,6 +12,8 @@ from sedna.knowledge.schema import (
     ApplicabilityContext,
     ArtifactType,
     CaseAction,
+    CaseEvidence,
+    CaseHypothesis,
     CaseState,
     CaseStep,
     ContextAssertion,
@@ -104,14 +106,31 @@ def _step(*, identifier: str, negative: bool = False) -> CaseStep:
         knowledge_role=role,
         step_id=identifier,
         ordinal=1,
-        state_before=CaseState(access="none", environment=("linux",)),
-        observations=("HTTP service exposed",),
-        hypotheses=(),
-        selected_action=CaseAction(intent="inspect_http"),
-        evidence=(),
-        state_after=CaseState(access="user"),
-        negative_evidence=("The default credential was rejected",) if negative else (),
-        transfer_conditions=("Validate the service identity",),
+        state_before=CaseState(
+            access="before-access-token",
+            environment=("before-environment-token",),
+            privileges=("before-privilege-token",),
+        ),
+        observations=("step-observation-token",),
+        hypotheses=(CaseHypothesis(statement="step-hypothesis-token", origin=Origin.EXPLICIT),),
+        selected_action=CaseAction(
+            intent="step-action-token", capability_ref="step-capability-token"
+        ),
+        expected_information_gain="step-info-gain-token",
+        evidence=(
+            CaseEvidence(
+                summary="step-evidence-token",
+                origin=Origin.EXPLICIT,
+                category="step-evidence-category-token",
+            ),
+        ),
+        state_after=CaseState(
+            access="after-access-token",
+            environment=("after-environment-token",),
+            privileges=("after-privilege-token",),
+        ),
+        negative_evidence=("step-negative-evidence-token",) if negative else (),
+        transfer_conditions=("step-transfer-condition-token",),
         case_specific_details=("Historical credential example only: trainee:training-password",),
         origin=Origin.EXPLICIT,
         applicability=_applicability(),
@@ -130,11 +149,20 @@ def _bundle() -> SemanticKnowledgeBundle:
         artifact_type=ArtifactType.METHODOLOGY,
         knowledge_role=KnowledgeRole.REFERENCE,
         artifact_id="reference-http",
-        subject="HTTP discovery",
-        statement="Inspect the HTTP service before choosing a method.",
-        action_intent="inspect_http",
-        expected_evidence=("Response headers",),
-        exceptions=("Do not reuse historical credentials",),
+        subject="reference-subject-token",
+        statement="reference-statement-token",
+        applicable_situations=("reference-situation-token",),
+        prerequisites=("reference-prerequisite-token",),
+        action_intent="reference-action-token",
+        expected_information_gain="reference-info-gain-token",
+        expected_evidence=("reference-expected-evidence-token",),
+        evidence_interpretation="reference-interpretation-token",
+        success_implications=("reference-success-token",),
+        failure_implications=("reference-failure-token",),
+        stop_implications=("reference-stop-token",),
+        exceptions=("reference-exception-token",),
+        warnings=("reference-warning-token",),
+        capability_refs=("reference-capability-token",),
         origin=Origin.EXPLICIT,
         applicability=_applicability(),
         assessment=_assessment(),
@@ -146,11 +174,14 @@ def _bundle() -> SemanticKnowledgeBundle:
         artifact_type=ArtifactType.CASE,
         knowledge_role=KnowledgeRole.CASE_STUDY,
         case_id="case-positive",
-        title="Successful HTTP case",
-        starting_access="none",
+        title="positive-case-title-token",
+        starting_access="positive-case-access-token",
         steps=(positive_step,),
-        outcome="HTTP inspected",
+        outcome="positive-case-outcome-token",
         source_quality=SourceQuality.COMPLETE,
+        difficulty="positive-case-difficulty-token",
+        transferable_properties=("positive-case-transferable-token",),
+        non_transferable_properties=("positive-case-nontransferable-token",),
         origin=Origin.EXPLICIT,
         applicability=_applicability(),
         assessment=_assessment(outcome=ObservedOutcome.SUCCESS),
@@ -161,11 +192,14 @@ def _bundle() -> SemanticKnowledgeBundle:
         artifact_type=ArtifactType.CASE,
         knowledge_role=KnowledgeRole.NEGATIVE_CASE,
         case_id="case-negative",
-        title="Failed HTTP case",
-        starting_access="none",
+        title="negative-case-title-token",
+        starting_access="negative-case-access-token",
         steps=(negative_step,),
-        outcome="Credential attempt failed",
+        outcome="negative-case-outcome-token",
         source_quality=SourceQuality.COMPLETE,
+        difficulty="negative-case-difficulty-token",
+        transferable_properties=("negative-case-transferable-token",),
+        non_transferable_properties=("negative-case-nontransferable-token",),
         origin=Origin.EXPLICIT,
         applicability=_applicability(),
         assessment=_assessment(outcome=ObservedOutcome.FAILURE),
@@ -176,11 +210,17 @@ def _bundle() -> SemanticKnowledgeBundle:
         artifact_type=ArtifactType.DECISION_RULE,
         knowledge_role=KnowledgeRole.REFERENCE,
         rule_id="rule-http",
-        trigger_observations=("HTTP service exposed",),
-        rationale="Observed HTTP evidence determines the next decision.",
-        action_intent="inspect_http",
-        expected_evidence=("Response headers",),
-        exceptions=("Do not reuse historical credentials",),
+        trigger_observations=("rule-trigger-token",),
+        rationale="rule-rationale-token",
+        action_intent="rule-action-token",
+        prerequisites=("rule-prerequisite-token",),
+        expected_evidence=("rule-expected-evidence-token",),
+        success_transitions=("rule-success-transition-token",),
+        failure_transitions=("rule-failure-transition-token",),
+        stop_conditions=("rule-stop-condition-token",),
+        exceptions=("rule-exception-token",),
+        alternative_hypotheses=("rule-alternative-token",),
+        capability_refs=("rule-capability-token",),
         origin=Origin.EXPLICIT,
         applicability=_applicability(),
         assessment=_assessment(),
@@ -277,14 +317,68 @@ def test_projection_builds_bounded_sanitized_fts_columns_without_promoting_case_
     reference = artifacts["reference-http"]
     step = artifacts["case-negative-step"]
     rule = artifacts["rule-http"]
-    assert reference.statement == "Inspect the HTTP service before choosing a method."
-    assert reference.action_intent == "inspect_http"
-    assert reference.expected_evidence == "Response headers"
-    assert reference.exceptions == "Do not reuse historical credentials"
-    assert step.observations == "HTTP service exposed"
-    assert step.action_intent == "inspect_http"
+    assert "reference-statement-token" in reference.statement
+    assert "reference-action-token" in reference.action_intent
+    assert reference.expected_evidence == "reference-expected-evidence-token"
+    assert "reference-exception-token" in reference.exceptions
+    assert "step-observation-token" in step.observations
+    assert "step-action-token" in step.action_intent
     assert "trainee:training-password" not in step.fts_text
-    assert rule.rationale == "Observed HTTP evidence determines the next decision."
+    assert "rule-rationale-token" in rule.rationale
+    assert {
+        "reference-subject-token",
+        "reference-statement-token",
+        "reference-situation-token",
+        "reference-prerequisite-token",
+        "reference-action-token",
+        "reference-info-gain-token",
+        "reference-expected-evidence-token",
+        "reference-interpretation-token",
+        "reference-success-token",
+        "reference-failure-token",
+        "reference-stop-token",
+        "reference-exception-token",
+        "reference-warning-token",
+        "reference-capability-token",
+    } <= set(reference.fts_text.split())
+    assert {
+        "positive-case-title-token",
+        "positive-case-access-token",
+        "positive-case-outcome-token",
+        "positive-case-difficulty-token",
+        "positive-case-transferable-token",
+        "positive-case-nontransferable-token",
+    } <= set(artifacts["case-positive"].fts_text.split())
+    assert {
+        "before-access-token",
+        "before-environment-token",
+        "before-privilege-token",
+        "step-observation-token",
+        "step-hypothesis-token",
+        "step-action-token",
+        "step-capability-token",
+        "step-info-gain-token",
+        "step-evidence-token",
+        "step-evidence-category-token",
+        "after-access-token",
+        "after-environment-token",
+        "after-privilege-token",
+        "step-negative-evidence-token",
+        "step-transfer-condition-token",
+    } <= set(step.fts_text.split())
+    assert {
+        "rule-trigger-token",
+        "rule-rationale-token",
+        "rule-action-token",
+        "rule-prerequisite-token",
+        "rule-expected-evidence-token",
+        "rule-success-transition-token",
+        "rule-failure-transition-token",
+        "rule-stop-condition-token",
+        "rule-exception-token",
+        "rule-alternative-token",
+        "rule-capability-token",
+    } <= set(rule.fts_text.split())
 
 
 def test_projection_revalidates_constructed_canonical_bundle_before_emitting_rows():
@@ -294,6 +388,74 @@ def test_projection_revalidates_constructed_canonical_bundle_before_emitting_row
 
     with pytest.raises(ValueError, match="final flag"):
         project_semantic_bundle(corrupt_bundle)
+
+
+def test_projection_rejects_hidden_nested_model_copy_state_without_leaking_it():
+    bundle = _bundle()
+    corrupt_location = (
+        bundle.references[0]
+        .source_refs[0]
+        .location.model_copy(update={"raw_response": "HTB{hidden-final-flag}"})
+    )
+    corrupt_ref = (
+        bundle.references[0].source_refs[0].model_copy(update={"location": corrupt_location})
+    )
+    corrupt_artifact = bundle.references[0].model_copy(update={"source_refs": (corrupt_ref,)})
+    corrupt_bundle = bundle.model_copy(update={"references": (corrupt_artifact,)})
+
+    with pytest.raises(ValueError, match="unsafe canonical model state") as error:
+        project_semantic_bundle(corrupt_bundle)
+
+    assert "hidden-final-flag" not in str(error.value)
+
+
+def test_projection_facet_id_is_injective_and_unions_same_assertion_provenance():
+    bundle = _bundle()
+    same_privilege = _assertion("www-data", relation=ContextRelation.COMPATIBLE).model_copy(
+        update={"source_refs": (_source_ref(line=30),)}
+    )
+    overlapping_facet = ContextFacet(
+        namespace="typed",
+        key="privileges",
+        assertion=_assertion("www-data", relation=ContextRelation.COMPATIBLE),
+    )
+    context = ApplicabilityContext(
+        typed_context=TypedContext(
+            privileges=(
+                _assertion("www-data", relation=ContextRelation.COMPATIBLE),
+                same_privilege,
+            )
+        ),
+        facets=(overlapping_facet,),
+    )
+    artifact = bundle.references[0].model_copy(update={"applicability": context})
+    projected = {
+        row.artifact_id: row
+        for row in project_semantic_bundle(bundle.model_copy(update={"references": (artifact,)}))
+    }["reference-http"]
+
+    typed_privileges = [
+        facet
+        for facet in projected.facets
+        if facet.channel == "typed" and facet.namespace == "typed" and facet.key == "privileges"
+    ]
+    assert len(typed_privileges) == 1
+    assert len({facet.facet_id for facet in projected.facets}) == len(projected.facets)
+    extensible_privileges = [
+        facet
+        for facet in projected.facets
+        if (
+            facet.channel == "extensible"
+            and facet.namespace == "typed"
+            and facet.key == "privileges"
+        )
+    ]
+    assert typed_privileges[0].facet_id != extensible_privileges[0].facet_id
+    assert {
+        source.location.start_line
+        for source in projected.sources
+        if source.relation == f"facet:{typed_privileges[0].facet_id}"
+    } == {20, 30}
 
 
 def test_projection_rejects_conflicting_duplicate_nested_step_ids():
