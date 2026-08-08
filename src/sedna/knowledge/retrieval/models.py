@@ -43,6 +43,7 @@ _NUMERIC_DOTTED = re.compile(r"^[0-9.]+$")
 _IPV6ISH = re.compile(r"^[0-9a-fA-F:.]+$")
 _HOST_PORT = re.compile(r"^[a-z0-9.-]+:\d+$", re.IGNORECASE)
 _EXPLICIT_URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+_MALFORMED_HTTP_PREFIX = re.compile(r"^https?(?::|//)", re.IGNORECASE)
 _MAX_SITUATION_ITEMS = 64
 _MAX_QUERY_TERMS = 32
 _MAX_HIT_REASONS = 32
@@ -157,8 +158,9 @@ def _looks_structured_target(value: str) -> bool:
         or _IPV6ISH.fullmatch(value)
         or value.startswith("[")
         or _EXPLICIT_URL_SCHEME.match(value) is not None
+        or _MALFORMED_HTTP_PREFIX.match(value) is not None
         or _HOST_PORT.fullmatch(value)
-        or "::" in value
+        or value.count(":") >= 2
     )
 
 
@@ -231,7 +233,13 @@ class ValidatedTarget(BaseModel):
                 if error is None
                 else (TargetKind.INVALID, None, error)
             )
-        if _IPV6ISH.fullmatch(value) or value.startswith("[") or _HOST_PORT.fullmatch(value):
+        if (
+            _IPV6ISH.fullmatch(value)
+            or value.startswith("[")
+            or _MALFORMED_HTTP_PREFIX.match(value) is not None
+            or _HOST_PORT.fullmatch(value)
+            or value.count(":") >= 2
+        ):
             return TargetKind.INVALID, None, "invalid_target"
         if _HOSTNAME.fullmatch(value) is not None:
             return TargetKind.HOSTNAME, value.casefold(), None

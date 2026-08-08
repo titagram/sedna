@@ -227,7 +227,20 @@ def test_hostnames_starting_with_http_or_https_are_not_misclassified_as_urls(val
     assert target.kind is TargetKind.HOSTNAME
 
 
-@pytest.mark.parametrize("value", ("2001:db8::zzzz", "abcd::gg"))
+@pytest.mark.parametrize(
+    "value",
+    (
+        "2001:db8::zzzz",
+        "abcd::gg",
+        "2001:db8:zzzz",
+        "1:2:3:4:5:6:7:gg",
+        "http:/host",
+        "https//host",
+        "http:host",
+        "HtTp:/host",
+        "HTTPS//host",
+    ),
+)
 def test_invalid_colon_bearing_structured_identifiers_cannot_be_generic(value: str):
     target = ValidatedTarget(value=value, kind=TargetKind.GENERIC)
 
@@ -238,6 +251,11 @@ def test_ordinary_generic_text_remains_available_when_it_is_not_structured_synta
     target = ValidatedTarget(value="lab:alpha", kind=TargetKind.GENERIC)
 
     assert target.is_valid
+
+
+@pytest.mark.parametrize("value", ("http-server", "http2.example", "https-worker.example"))
+def test_malformed_scheme_detection_does_not_reject_valid_http_prefixed_hostnames(value: str):
+    assert ValidatedTarget.parse(value).kind is TargetKind.HOSTNAME
 
 
 def test_live_situation_facets_have_no_invented_source_provenance():
