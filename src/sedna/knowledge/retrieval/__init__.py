@@ -23,6 +23,7 @@ from sedna.knowledge.retrieval.models import (
     TargetKind,
     ValidatedTarget,
 )
+from sedna.knowledge.retrieval.service import KnowledgeRetrievalService
 
 __all__ = [
     "AuthorizationScope",
@@ -35,6 +36,7 @@ __all__ = [
     "IndexedArtifact",
     "KnowledgeGap",
     "KnowledgeGapCode",
+    "KnowledgeRetrievalService",
     "RejectedCandidate",
     "RetrievalHit",
     "RetrievalIndex",
