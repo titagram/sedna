@@ -272,6 +272,143 @@ def test_rebuild_corrupt_source_returns_typed_failure_without_partial_index_muta
         assert index.get_artifact("reference-http-a") == bundles[0].references[0]
 
 
+def test_rebuild_fails_closed_on_pending_semantic_crash_state_then_recovers(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "knowledge"
+    path = tmp_path / "sedna.sqlite"
+    repository = CanonicalKnowledgeRepository(root)
+    original = _current_bundle("source-a", "a", source_hash="a" * 64)
+    replacement = _current_bundle("source-a", "b", source_hash="b" * 64)
+    prior = _current_bundle("source-prior", "c", source_hash="c" * 64)
+    repository.write_semantic_result(_verified_result(original))
+    snapshots = {
+        directory: repository._read_optional_bytes(directory, original.source_id)
+        for directory in repository._SEMANTIC_DIRECTORIES
+    }
+    index = SQLiteRetrievalIndex(path)
+    index.rebuild((prior,))
+    before = path.read_bytes()
+
+    repository._write_semantic_transition_journal(original.source_id, snapshots)
+    replacement_result = _verified_result(replacement)
+    repository._write_model(
+        "semantic_verification",
+        replacement.source_id,
+        replacement_result.verification,
+    )
+    repository._write_model("semantic_bundles", replacement.source_id, replacement)
+
+    report = RetrievalMaintenanceService(repository=repository, index=index).rebuild()
+
+    assert report.succeeded is False
+    assert report.issues[0].code is MaintenanceIssueCode.CANONICAL_REPOSITORY_INVALID
+    assert report.issues[0].source_ids == ("source-a",)
+    assert path.read_bytes() == before
+    assert index.get_artifact("reference-http-c") == prior.references[0]
+    assert index.get_artifact("reference-http-b") is None
+
+    repository.close()
+    recovered = CanonicalKnowledgeRepository(root)
+    assert recovered.load_semantic_bundle("source-a") == original
+    rebuilt = RetrievalMaintenanceService(repository=recovered, index=index).rebuild()
+    assert rebuilt.succeeded
+    assert index.get_artifact("reference-http-a") == original.references[0]
+    assert index.get_artifact("reference-http-b") is None
+    recovered.close()
+    index.close()
+
+
+@pytest.mark.parametrize(
+    "journal_name",
+    ("source-a.transaction.json", "source-a.semantic-transaction.json"),
+)
+def test_repository_snapshot_rejects_each_pending_transaction_journal_type(
+    tmp_path: Path,
+    journal_name: str,
+) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    transactions = repository.root / "transactions"
+    transactions.mkdir(exist_ok=True)
+    (transactions / journal_name).write_text("{}", encoding="utf-8")
+
+    with pytest.raises(SemanticBundleEnumerationError, match="source-a"):
+        tuple(repository.iter_semantic_bundles())
+    repository.close()
+
+
+def test_repository_snapshot_rejects_malformed_symlink_and_fifo_pending_journal(
+    tmp_path: Path,
+) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    transactions = repository.root / "transactions"
+    transactions.mkdir(exist_ok=True)
+    journal = transactions / "source-a.semantic-transaction.json"
+    journal.write_text("{broken", encoding="utf-8")
+    with pytest.raises(SemanticBundleEnumerationError, match="source-a"):
+        tuple(repository.iter_semantic_bundles())
+
+    journal.unlink()
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    journal.symlink_to(outside)
+    with pytest.raises(SemanticBundleEnumerationError, match="source-a"):
+        tuple(repository.iter_semantic_bundles())
+
+    journal.unlink()
+    os.mkfifo(journal)
+    with pytest.raises(SemanticBundleEnumerationError, match="source-a"):
+        tuple(repository.iter_semantic_bundles())
+    journal.unlink()
+    repository.close()
+
+
+def test_repository_snapshot_detects_transaction_journal_appearing_during_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    repository.write_semantic_result(_verified_result(_current_bundle("source-a", "a")))
+    journal = repository.root / "transactions" / "source-a.semantic-transaction.json"
+    real_inventory = repository._semantic_inventory_entries
+    created = False
+
+    def inventory_then_create_journal():
+        nonlocal created
+        entries = real_inventory()
+        if not created:
+            created = True
+            journal.write_text("{}", encoding="utf-8")
+        return entries
+
+    monkeypatch.setattr(repository, "_semantic_inventory_entries", inventory_then_create_journal)
+
+    with pytest.raises(SemanticBundleEnumerationError, match="source-a"):
+        tuple(repository.iter_semantic_bundles())
+    repository.close()
+
+
+def test_repository_snapshot_rejects_journal_before_it_can_disappear_during_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    repository.write_semantic_result(_verified_result(_current_bundle("source-a", "a")))
+    journal = repository.root / "transactions" / "source-a.semantic-transaction.json"
+    journal.write_text("{}", encoding="utf-8")
+    real_inventory = repository._semantic_inventory_entries
+
+    def remove_journal_then_inventory():
+        journal.unlink(missing_ok=True)
+        return real_inventory()
+
+    monkeypatch.setattr(repository, "_semantic_inventory_entries", remove_journal_then_inventory)
+
+    with pytest.raises(SemanticBundleEnumerationError, match="source-a"):
+        tuple(repository.iter_semantic_bundles())
+    repository.close()
+
+
 def test_audit_detects_hash_only_stale_missing_and_orphan_source_projections(
     tmp_path: Path,
 ) -> None:

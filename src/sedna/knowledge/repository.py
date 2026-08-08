@@ -390,7 +390,9 @@ class CanonicalKnowledgeRepository:
 
     def _require_semantic_inventory_revision(self, expected_revision: str) -> None:
         try:
+            self._require_no_pending_semantic_transactions()
             entries, _ = self._semantic_inventory_entries()
+            self._require_no_pending_semantic_transactions()
         except Exception as error:
             raise SemanticSnapshotChangedError(
                 "canonical semantic inventory became unsafe during index commit"
@@ -401,6 +403,7 @@ class CanonicalKnowledgeRepository:
             )
 
     def _semantic_bundle_snapshot_locked(self) -> SemanticRepositorySnapshot:
+        self._require_no_pending_semantic_transactions()
         entries, source_ids = self._semantic_inventory_entries()
         bundles: list[SemanticKnowledgeBundle] = []
         for source_id in source_ids:
@@ -423,6 +426,7 @@ class CanonicalKnowledgeRepository:
                 ) from exc
             bundles.append(bundle)
         final_entries, _ = self._semantic_inventory_entries()
+        self._require_no_pending_semantic_transactions()
         if final_entries != entries:
             raise SemanticBundleEnumerationError(
                 "<repository>",
@@ -433,6 +437,83 @@ class CanonicalKnowledgeRepository:
             bundles=tuple(bundles),
             revision=self._semantic_inventory_revision(entries),
         )
+
+    def _require_no_pending_semantic_transactions(self) -> None:
+        pending = self._pending_semantic_transaction_journals()
+        if pending:
+            source_id, journal_name = pending[0]
+            raise SemanticBundleEnumerationError(
+                source_id,
+                "pending_semantic_transaction",
+                f"has unresolved canonical transaction journal {journal_name!r}",
+            )
+
+    def _pending_semantic_transaction_journals(self) -> tuple[tuple[str, str], ...]:
+        try:
+            directory_fd = self._open_child_directory("transactions", create=False)
+        except FileNotFoundError:
+            return ()
+        try:
+            names: list[tuple[str, str]] = []
+            entry_count = 0
+            with os.scandir(directory_fd) as iterator:
+                for entry in iterator:
+                    entry_count += 1
+                    if entry_count > _MAX_SEMANTIC_INVENTORY_FILES:
+                        raise SemanticBundleEnumerationError(
+                            "<repository>",
+                            "semantic_transaction_inventory_too_large",
+                            "exceeds the bounded transaction journal inventory",
+                        )
+                    source_id: str | None = None
+                    if entry.name.endswith(".semantic-transaction.json"):
+                        source_id = entry.name[: -len(".semantic-transaction.json")]
+                    elif entry.name.endswith(".transaction.json"):
+                        source_id = entry.name[: -len(".transaction.json")]
+                    if source_id is not None:
+                        names.append((source_id, entry.name))
+
+            checked: list[tuple[str, str]] = []
+            for source_id, name in sorted(names):
+                try:
+                    _validate_stable_id(source_id)
+                    before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if not stat.S_ISREG(before.st_mode):
+                        raise ValueError("transaction journal is not a regular file")
+                    journal_fd = os.open(name, self._file_read_flags(), dir_fd=directory_fd)
+                except (OSError, ValueError) as error:
+                    raise SemanticBundleEnumerationError(
+                        source_id or "<empty>",
+                        "unsafe_semantic_transaction_journal",
+                        f"has unsafe pending transaction journal {name!r}",
+                    ) from error
+                try:
+                    opened = os.fstat(journal_fd)
+                    after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if (
+                        not stat.S_ISREG(opened.st_mode)
+                        or self._semantic_file_identity(opened)
+                        != self._semantic_file_identity(before)
+                        or self._semantic_file_identity(opened)
+                        != self._semantic_file_identity(after)
+                    ):
+                        raise SemanticBundleEnumerationError(
+                            source_id,
+                            "unsafe_semantic_transaction_journal",
+                            f"changed pending transaction journal {name!r}",
+                        )
+                except OSError as error:
+                    raise SemanticBundleEnumerationError(
+                        source_id,
+                        "unsafe_semantic_transaction_journal",
+                        f"could not safely inspect pending transaction journal {name!r}",
+                    ) from error
+                finally:
+                    os.close(journal_fd)
+                checked.append((source_id, name))
+            return tuple(checked)
+        finally:
+            os.close(directory_fd)
 
     def load_current_semantic_result(
         self,
