@@ -1,9 +1,14 @@
 """Public backend-neutral contracts for Sedna's local knowledge retrieval."""
 
 from sedna.knowledge.retrieval.models import (
+    AuthorizationScope,
+    AuthorizationState,
     CurrentSituation,
     EpistemicLane,
+    HitArtifact,
+    IndexCandidate,
     IndexAudit,
+    IndexedArtifact,
     KnowledgeGap,
     KnowledgeGapCode,
     RejectedCandidate,
@@ -12,6 +17,7 @@ from sedna.knowledge.retrieval.models import (
     RetrievalQuery,
     RetrievalResult,
     RetrievableArtifact,
+    SearchCandidate,
     ScoreComponents,
     SituationFacet,
     TargetKind,
@@ -19,9 +25,14 @@ from sedna.knowledge.retrieval.models import (
 )
 
 __all__ = [
+    "AuthorizationScope",
+    "AuthorizationState",
     "CurrentSituation",
     "EpistemicLane",
+    "HitArtifact",
+    "IndexCandidate",
     "IndexAudit",
+    "IndexedArtifact",
     "KnowledgeGap",
     "KnowledgeGapCode",
     "RejectedCandidate",
@@ -30,6 +41,7 @@ __all__ = [
     "RetrievalQuery",
     "RetrievalResult",
     "RetrievableArtifact",
+    "SearchCandidate",
     "ScoreComponents",
     "SituationFacet",
     "TargetKind",

@@ -8,9 +8,12 @@ import pytest
 from pydantic import ValidationError
 
 from sedna.knowledge.retrieval import (
+    AuthorizationScope,
+    AuthorizationState,
     CurrentSituation,
     EpistemicLane,
     IndexAudit,
+    IndexCandidate,
     KnowledgeGap,
     KnowledgeGapCode,
     RetrievalHit,
@@ -25,14 +28,20 @@ from sedna.knowledge.retrieval import (
 from sedna.knowledge.schema import (
     ApplicabilityContext,
     ArtifactType,
+    CaseAction,
+    CaseState,
+    CaseStep,
+    DecisionRule,
     EpistemicAssessment,
     ExtractionMetadata,
     Generalizability,
+    KnowledgeCase,
     KnowledgeRole,
     ObservedOutcome,
     Origin,
     ReferenceArtifact,
     SourceLocation,
+    SourceQuality,
     SourceRef,
     VerificationStatus,
 )
@@ -53,6 +62,79 @@ def reference() -> ReferenceArtifact:
         artifact_id="reference-http",
         subject="HTTP discovery",
         statement="Inspect an HTTP service before choosing a method.",
+        origin=Origin.EXPLICIT,
+        applicability=ApplicabilityContext(),
+        assessment=EpistemicAssessment(
+            source_reliability=0.9,
+            extraction_confidence=0.8,
+            generalizability=Generalizability.MEDIUM,
+            context_specificity=0.4,
+            verification_status=VerificationStatus.VERIFIED,
+            observed_outcome=ObservedOutcome.INFORMATIONAL,
+            independence_group="source-http",
+        ),
+        source_refs=(source_ref(),),
+        extraction=ExtractionMetadata(
+            schema_version="2",
+            parser_id="markdown",
+            parser_version="1",
+            extractor_id="semantic",
+            extractor_version="1",
+        ),
+    )
+
+
+def authorized_scope(target: ValidatedTarget) -> AuthorizationScope:
+    return AuthorizationScope(
+        state=AuthorizationState.AUTHORIZED,
+        exact_targets=(target,),
+    )
+
+
+def case_step(*, negative: bool = False) -> CaseStep:
+    role = KnowledgeRole.NEGATIVE_CASE if negative else KnowledgeRole.CASE_STUDY
+    outcome = ObservedOutcome.FAILURE if negative else ObservedOutcome.SUCCESS
+    return CaseStep(
+        artifact_type=ArtifactType.CASE_STEP,
+        knowledge_role=role,
+        step_id="case-step-negative" if negative else "case-step-positive",
+        ordinal=1,
+        state_before=CaseState(access="none"),
+        observations=("HTTP service exposed",),
+        hypotheses=(),
+        selected_action=CaseAction(intent="inspect_http"),
+        evidence=(),
+        state_after=CaseState(access="none"),
+        origin=Origin.EXPLICIT,
+        applicability=ApplicabilityContext(),
+        assessment=EpistemicAssessment(
+            source_reliability=0.9,
+            extraction_confidence=0.8,
+            generalizability=Generalizability.MEDIUM,
+            context_specificity=0.4,
+            verification_status=VerificationStatus.VERIFIED,
+            observed_outcome=outcome,
+            independence_group="source-http",
+        ),
+        source_refs=(source_ref(),),
+        extraction=ExtractionMetadata(
+            schema_version="2",
+            parser_id="markdown",
+            parser_version="1",
+            extractor_id="semantic",
+            extractor_version="1",
+        ),
+    )
+
+
+def decision_rule() -> DecisionRule:
+    return DecisionRule(
+        artifact_type=ArtifactType.DECISION_RULE,
+        knowledge_role=KnowledgeRole.REFERENCE,
+        rule_id="rule-http",
+        trigger_observations=("HTTP service exposed",),
+        rationale="Use observed services to guide the next decision.",
+        action_intent="inspect_http",
         origin=Origin.EXPLICIT,
         applicability=ApplicabilityContext(),
         assessment=EpistemicAssessment(
@@ -119,6 +201,25 @@ def test_generic_targets_require_an_explicit_kind_instead_of_ambiguous_inference
     assert explicit.normalized == "lab:target"
 
 
+@pytest.mark.parametrize(
+    "value",
+    (
+        "300.456.456.123",
+        "http://300.456.456.123/",
+        "https://[2001:db8:::1]/",
+        "2001:db8:::1",
+        "https://300.456.456.123:8443/",
+    ),
+)
+def test_structured_invalid_targets_cannot_be_reclassified_as_generic(value: str):
+    parsed = ValidatedTarget.parse(value)
+    explicit_generic = ValidatedTarget(value=value, kind=TargetKind.GENERIC)
+
+    assert parsed.kind is TargetKind.INVALID
+    assert explicit_generic.kind is TargetKind.INVALID
+    assert not explicit_generic.is_valid
+
+
 def test_live_situation_facets_have_no_invented_source_provenance():
     facet = SituationFacet(namespace="Platform", key="OS_Family", value="Linux", confidence=0.8)
 
@@ -155,7 +256,10 @@ def test_situation_normalizes_bounds_sorts_and_deduplicates_live_facts():
             ("inspect_http", "informational"),
         ),
         unresolved_questions=(" OS family ", "os family"),
-        authorized_scope=("10.10.10.0/24", "10.10.10.0/24"),
+        authorization=AuthorizationScope(
+            state=AuthorizationState.AUTHORIZED,
+            cidrs=("10.10.10.0/24",),
+        ),
     )
 
     assert situation.terms == ("http", "service discovery")
@@ -165,7 +269,7 @@ def test_situation_normalizes_bounds_sorts_and_deduplicates_live_facts():
     assert situation.hypotheses == ("http virtual host",)
     assert situation.tried_outcomes == (("inspect_http", "informational"),)
     assert situation.unresolved_questions == ("os family",)
-    assert situation.authorized_scope == ("10.10.10.0/24",)
+    assert situation.authorization.state is AuthorizationState.AUTHORIZED
     with pytest.raises(ValidationError, match="unique"):
         CurrentSituation(
             target=ValidatedTarget.parse("10.10.10.10"),
@@ -199,6 +303,13 @@ def test_retrieval_query_is_bounded_and_carries_only_validated_situation():
     assert query.max_candidates == 12
     with pytest.raises(ValidationError):
         RetrievalQuery(situation=situation, max_candidates=101)
+    with pytest.raises(ValidationError):
+        RetrievalQuery(
+            situation=situation,
+            terms=tuple(f"{index:02d}" + "x" * 510 for index in range(32)),
+        )
+    with pytest.raises(ValidationError):
+        CurrentSituation(target=situation.target, terms=("x" * 1_000_000,))
 
 
 @pytest.mark.parametrize("value", (math.inf, -math.inf, math.nan, -0.01, 1.01))
@@ -218,7 +329,7 @@ def test_retrieval_hit_requires_canonical_identity_and_exact_provenance():
         qualification_reasons=("matches normalized HTTP query",),
     )
 
-    assert hit.artifact is artifact
+    assert hit.artifact == artifact
     with pytest.raises(ValidationError, match="artifact_id"):
         RetrievalHit(
             artifact_id="wrong-id",
@@ -239,6 +350,174 @@ def test_retrieval_hit_requires_canonical_identity_and_exact_provenance():
         )
 
 
+def test_index_candidates_expose_deeply_validated_fts_evidence_without_ranking_it():
+    artifact = reference()
+    candidate = IndexCandidate(
+        artifact_id=artifact.artifact_id,
+        artifact=artifact,
+        lexical_relevance=0.7,
+        matched_terms=("HTTP",),
+        matched_fields=("statement",),
+        matched_evidence=("HTTP discovery",),
+    )
+
+    assert candidate.matched_terms == ("http",)
+    assert candidate.lexical_relevance == 0.7
+    with pytest.raises(ValidationError, match="final flag"):
+        IndexCandidate(
+            artifact_id=artifact.artifact_id,
+            artifact=artifact.model_copy(update={"statement": "HTB{copied_flag}"}),
+            lexical_relevance=0.7,
+        )
+
+
+def test_hit_deeply_revalidates_constructed_canonical_artifacts_before_returning_them():
+    artifact = reference().model_copy(update={"statement": "HTB{copied_flag}"})
+
+    with pytest.raises(ValidationError, match="final flag"):
+        RetrievalHit(
+            artifact_id="reference-http",
+            artifact=artifact,
+            lane=EpistemicLane.REFERENCE,
+            provenance=(source_ref(),),
+            score=ScoreComponents(total=0.8),
+            qualification_reasons=("matches",),
+        )
+
+
+def test_artifact_type_and_role_determine_the_only_qualifying_lane():
+    positive_step = case_step()
+    negative_step = case_step(negative=True)
+    rule = decision_rule()
+    negative_reference = reference().model_copy(update={"artifact_type": ArtifactType.ANTI_PATTERN})
+
+    for artifact, expected_lane, identifier in (
+        (reference(), EpistemicLane.REFERENCE, "reference-http"),
+        (negative_reference, EpistemicLane.NEGATIVE_EVIDENCE, "reference-http"),
+        (positive_step, EpistemicLane.CASE_STEP, "case-step-positive"),
+        (negative_step, EpistemicLane.NEGATIVE_EVIDENCE, "case-step-negative"),
+        (rule, EpistemicLane.GUIDANCE, "rule-http"),
+    ):
+        hit = RetrievalHit(
+            artifact_id=identifier,
+            artifact=artifact,
+            lane=expected_lane,
+            provenance=artifact.source_refs,
+            score=ScoreComponents(total=0.8),
+            qualification_reasons=("matches",),
+        )
+        assert hit.lane is expected_lane
+
+    parent_case = KnowledgeCase(
+        artifact_type=ArtifactType.CASE,
+        knowledge_role=KnowledgeRole.CASE_STUDY,
+        case_id="case-http",
+        title="HTTP case",
+        starting_access="none",
+        steps=(positive_step,),
+        outcome="HTTP inspected.",
+        source_quality=SourceQuality.COMPLETE,
+        origin=Origin.EXPLICIT,
+        applicability=ApplicabilityContext(),
+        assessment=positive_step.assessment,
+        source_refs=(source_ref(),),
+        extraction=positive_step.extraction,
+    )
+    with pytest.raises(ValidationError):
+        RetrievalHit(
+            artifact_id="case-http",
+            artifact=parent_case,
+            lane=EpistemicLane.CASE_STEP,
+            provenance=parent_case.source_refs,
+            score=ScoreComponents(total=0.8),
+            qualification_reasons=("matches",),
+        )
+
+
+def test_result_requires_descending_score_order_and_excludes_rejected_hit_overlap():
+    artifact = reference()
+    high = RetrievalHit(
+        artifact_id="reference-http",
+        artifact=artifact,
+        lane=EpistemicLane.REFERENCE,
+        provenance=artifact.source_refs,
+        score=ScoreComponents(total=0.9),
+        qualification_reasons=("matches",),
+    )
+    low_artifact = reference().model_copy(update={"artifact_id": "reference-low"})
+    low = RetrievalHit(
+        artifact_id="reference-low",
+        artifact=low_artifact,
+        lane=EpistemicLane.REFERENCE,
+        provenance=low_artifact.source_refs,
+        score=ScoreComponents(total=0.2),
+        qualification_reasons=("matches",),
+    )
+    target = ValidatedTarget.parse("10.10.10.10")
+    authorization = authorized_scope(target)
+    with pytest.raises(ValidationError, match="ordered"):
+        RetrievalResult(target=target, authorization=authorization, references=(low, high))
+
+    from sedna.knowledge.retrieval import RejectedCandidate
+
+    rejected = RejectedCandidate(
+        artifact_id="reference-http",
+        artifact=artifact,
+        lane=EpistemicLane.REFERENCE,
+        provenance=artifact.source_refs,
+        rejection_reasons=("not applicable",),
+    )
+    with pytest.raises(ValidationError, match="rejected"):
+        RetrievalResult(
+            target=target,
+            authorization=authorization,
+            references=(high,),
+            rejected_candidates=(rejected,),
+        )
+
+
+def test_authorization_scope_is_typed_and_checks_target_relationships():
+    ip_target = ValidatedTarget.parse("10.10.10.10")
+    url_target = ValidatedTarget.parse("https://web.example.test:8443/docs")
+    generic_target = ValidatedTarget(value="lab:alpha", kind=TargetKind.GENERIC)
+
+    assert AuthorizationScope(
+        state=AuthorizationState.AUTHORIZED,
+        cidrs=("10.10.10.0/24",),
+    ).authorizes(ip_target)
+    assert AuthorizationScope(
+        state=AuthorizationState.AUTHORIZED,
+        url_origins=("https://web.example.test:8443",),
+    ).authorizes(url_target)
+    assert AuthorizationScope(
+        state=AuthorizationState.AUTHORIZED,
+        generic_ids=("lab:alpha",),
+    ).authorizes(generic_target)
+    with pytest.raises(ValidationError, match="authorized scope"):
+        CurrentSituation(
+            target=ip_target,
+            authorization=AuthorizationScope(
+                state=AuthorizationState.AUTHORIZED,
+                cidrs=("10.10.11.0/24",),
+            ),
+        )
+
+
+def test_unauthorized_or_unknown_scope_returns_prebackend_authorization_gap():
+    target = ValidatedTarget.parse("10.10.10.10")
+    for state in (AuthorizationState.UNAUTHORIZED, AuthorizationState.UNKNOWN):
+        scope = AuthorizationScope(state=state)
+        result = RetrievalResult(
+            target=target,
+            authorization=scope,
+            knowledge_gap=KnowledgeGap(
+                code=KnowledgeGapCode.UNAUTHORIZED_SCOPE,
+                summary="Authorization has not been established.",
+            ),
+        )
+        assert result.authorization.state is state
+
+
 def test_retrieval_result_separates_lanes_and_requires_consistent_gap_shape():
     artifact = reference()
     hit = RetrievalHit(
@@ -250,14 +529,16 @@ def test_retrieval_result_separates_lanes_and_requires_consistent_gap_shape():
         qualification_reasons=("matches",),
     )
     target = ValidatedTarget.parse("10.10.10.10")
-    result = RetrievalResult(target=target, references=(hit,))
+    authorization = authorized_scope(target)
+    result = RetrievalResult(target=target, authorization=authorization, references=(hit,))
 
     assert result.references == (hit,)
     with pytest.raises(ValidationError, match="case_step"):
-        RetrievalResult(target=target, case_steps=(hit,))
+        RetrievalResult(target=target, authorization=authorization, case_steps=(hit,))
     with pytest.raises(ValidationError, match="knowledge gap"):
         RetrievalResult(
             target=target,
+            authorization=authorization,
             references=(hit,),
             knowledge_gap=KnowledgeGap(
                 code=KnowledgeGapCode.NO_APPLICABLE_KNOWLEDGE,
@@ -277,7 +558,7 @@ def test_invalid_target_result_is_a_gap_without_any_backend_candidates():
     )
 
     assert result.is_invalid_target
-    with pytest.raises(ValidationError, match="invalid target"):
+    with pytest.raises(ValidationError, match="matching knowledge gap"):
         RetrievalResult(target=target, references=())
 
 
@@ -292,6 +573,24 @@ def test_knowledge_gap_codes_are_closed_and_index_protocol_is_runtime_checkable(
     assert isinstance(_IndexDouble(), RetrievalIndex)
     with pytest.raises(ValidationError):
         KnowledgeGap(code="invented", summary="Nope")
+
+
+def test_index_audit_derives_rebuild_requirement_for_every_integrity_failure():
+    audit = IndexAudit(
+        artifact_count=4,
+        fts_count=3,
+        orphan_count=1,
+        duplicate_id_count=1,
+        corruption_count=1,
+    )
+
+    assert audit.rebuild_required
+    assert audit.issues == (
+        "canonical_corruption",
+        "duplicate_artifact_ids",
+        "fts_count_mismatch",
+        "orphan_rows",
+    )
 
 
 class _IndexDouble:
@@ -320,4 +619,15 @@ class _IndexDouble:
         return IndexAudit()
 
     def close(self) -> None:
+        return None
+
+    def __enter__(self) -> _IndexDouble:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: object | None,
+    ) -> None:
         return None
