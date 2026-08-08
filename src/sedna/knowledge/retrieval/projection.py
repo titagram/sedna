@@ -10,7 +10,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from sedna.knowledge.parsing.sanitize import sanitize_searchable_text
-from sedna.knowledge.retrieval.models import IndexedSourceState
+from sedna.knowledge.retrieval.models import IndexedArtifactState, IndexedSourceState
 from sedna.knowledge.schema import (
     ArtifactType,
     CaseStep,
@@ -31,7 +31,7 @@ from sedna.knowledge.schema.common import SearchableNonEmptyString, SearchableSt
 from sedna.knowledge.schema.context import ContextRelation
 
 _MAX_FTS_COLUMN_CHARS = 8_192
-SOURCE_PROJECTION_VERSION = "canonical-projection-v1"
+SOURCE_PROJECTION_VERSION = "canonical-projection-v2"
 
 
 class ProjectedFacet(BaseModel):
@@ -181,30 +181,104 @@ def project_semantic_bundle(bundle: SemanticKnowledgeBundle) -> tuple[ProjectedA
 def project_source_state(bundle: SemanticKnowledgeBundle) -> IndexedSourceState:
     """Bind one canonical source hash to its deterministic complete artifact projection."""
     projection = project_semantic_bundle(bundle)
+    return IndexedSourceState.from_artifacts(
+        source_id=bundle.source_id,
+        source_sha256=bundle.source_sha256,
+        projection_version=SOURCE_PROJECTION_VERSION,
+        artifacts=tuple(
+            IndexedArtifactState(
+                artifact_id=artifact.artifact_id,
+                projection_digest=projected_artifact_digest(bundle.source_id, artifact),
+            )
+            for artifact in projection
+        ),
+    )
+
+
+def projected_artifact_digest(source_id: str, artifact: ProjectedArtifact) -> str:
+    """Digest every backend-neutral normalized field for one artifact projection."""
+    artifact_row = {
+        "artifact_id": artifact.artifact_id,
+        "owner_source_id": source_id,
+        "canonical_path": f"semantic_bundles/{source_id}.json",
+        "artifact_type": artifact.artifact_type,
+        "knowledge_role": artifact.knowledge_role,
+        "verification_status": artifact.verification_status,
+        "source_reliability": artifact.source_reliability,
+        "extraction_confidence": artifact.extraction_confidence,
+        "generalizability": artifact.generalizability,
+        "context_specificity": artifact.context_specificity,
+        "support_count": artifact.support_count,
+        "contradiction_count": artifact.contradiction_count,
+        "observed_outcome": artifact.observed_outcome,
+        "observed_at": artifact.observed_at,
+        "freshness_observed_at": artifact.freshness_observed_at,
+        "independence_group": artifact.independence_group,
+        "canonical_json": artifact.canonical_json,
+    }
+    facets = [facet.model_dump(mode="json") for facet in artifact.facets]
+    links = [link.model_dump(mode="json") for link in artifact.links]
+    sources = [
+        {
+            "artifact_id": source.artifact_id,
+            "source_id": source.source_id,
+            "path": source.path,
+            "location_json": json.dumps(
+                source.location.model_dump(mode="json"),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
+            "independence_group": source.independence_group,
+            "relation": source.relation,
+        }
+        for source in artifact.sources
+    ]
+    fts = [
+        {
+            "artifact_id": artifact.artifact_id,
+            **{
+                field: getattr(artifact, field)
+                for field in (
+                    "statement",
+                    "rationale",
+                    "observations",
+                    "action_intent",
+                    "expected_evidence",
+                    "exceptions",
+                )
+            },
+        }
+    ]
     payload = json.dumps(
         {
-            "source_id": bundle.source_id,
-            "source_sha256": bundle.source_sha256,
-            "projection_version": SOURCE_PROJECTION_VERSION,
-            "artifacts": [
-                {
-                    "artifact_id": artifact.artifact_id,
-                    "canonical_json": artifact.canonical_json,
-                }
-                for artifact in projection
-            ],
+            "artifact": artifact_row,
+            "facets": _sorted_digest_rows(facets),
+            "links": _sorted_digest_rows(links),
+            "sources": _sorted_digest_rows(sources),
+            "fts": _sorted_digest_rows(fts),
         },
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
     )
-    return IndexedSourceState(
-        source_id=bundle.source_id,
-        source_sha256=bundle.source_sha256,
-        artifact_count=len(projection),
-        projection_version=SOURCE_PROJECTION_VERSION,
-        projection_digest=sha256(payload.encode("utf-8")).hexdigest(),
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _sorted_digest_rows(
+    rows: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return sorted(
+        rows,
+        key=lambda row: json.dumps(
+            row,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ),
     )
 
 

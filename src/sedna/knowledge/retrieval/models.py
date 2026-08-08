@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import math
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from contextlib import AbstractContextManager
 from enum import StrEnum
+from hashlib import sha256
 from types import TracebackType
 from typing import Annotated, Any, Protocol, TypeAlias, runtime_checkable
 from urllib.parse import SplitResult, urlsplit, urlunsplit
@@ -53,6 +56,9 @@ _MAX_GAP_ITEMS = 32
 _MAX_QUERY_TEXT = 8192
 _MAX_AUTHORIZATION_TEXT = 16_384
 _MAX_CANDIDATE_MATCH_TEXT = 16_384
+_MAX_INDEX_SOURCES = 100_000
+_MAX_SOURCE_ARTIFACTS = 100_000
+_MAX_INDEX_ARTIFACTS = 10_000_000
 
 
 class TargetKind(StrEnum):
@@ -851,6 +857,15 @@ class IndexAudit(BaseModel):
         return self
 
 
+class IndexedArtifactState(BaseModel):
+    """Actual identity and normalized projection digest of one indexed artifact row."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    artifact_id: Annotated[SearchableNonEmptyString, Field(max_length=2048)]
+    projection_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
 class IndexedSourceState(BaseModel):
     """Bounded, backend-neutral identity of one complete source projection."""
 
@@ -861,6 +876,9 @@ class IndexedSourceState(BaseModel):
     artifact_count: int = Field(ge=0, le=10_000_000)
     projection_version: Annotated[SearchableNonEmptyString, Field(max_length=128)]
     projection_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    artifacts: tuple[IndexedArtifactState, ...] = Field(
+        default=(), max_length=_MAX_SOURCE_ARTIFACTS
+    )
 
     @field_validator("source_id")
     @classmethod
@@ -868,6 +886,106 @@ class IndexedSourceState(BaseModel):
         if value in {".", ".."} or "/" in value or "\\" in value or "\x00" in value:
             raise ValueError("indexed source_id must be a safe path segment")
         return value
+
+    @model_validator(mode="after")
+    def validate_artifact_identity(self) -> IndexedSourceState:
+        if self.artifacts != tuple(sorted(self.artifacts, key=lambda item: item.artifact_id)):
+            raise ValueError("indexed artifact states must be sorted by artifact_id")
+        if len({item.artifact_id for item in self.artifacts}) != len(self.artifacts):
+            raise ValueError("indexed artifact states must have unique artifact IDs")
+        if self.artifact_count != len(self.artifacts):
+            raise ValueError("indexed artifact count must match its exact artifact states")
+        if self.projection_digest != source_projection_digest(
+            self.source_id,
+            self.source_sha256,
+            self.projection_version,
+            self.artifacts,
+        ):
+            raise ValueError("indexed source projection digest must match its artifact states")
+        return self
+
+    @classmethod
+    def from_artifacts(
+        cls,
+        *,
+        source_id: str,
+        source_sha256: str,
+        projection_version: str,
+        artifacts: tuple[IndexedArtifactState, ...],
+    ) -> IndexedSourceState:
+        ordered = tuple(sorted(artifacts, key=lambda item: item.artifact_id))
+        return cls(
+            source_id=source_id,
+            source_sha256=source_sha256,
+            artifact_count=len(ordered),
+            projection_version=projection_version,
+            projection_digest=source_projection_digest(
+                source_id,
+                source_sha256,
+                projection_version,
+                ordered,
+            ),
+            artifacts=ordered,
+        )
+
+
+class IndexStateSnapshot(BaseModel):
+    """One generation-bound audit and exact source/artifact identity snapshot."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    generation: int = Field(ge=0)
+    audit: IndexAudit
+    source_states: tuple[IndexedSourceState, ...] = Field(default=(), max_length=_MAX_INDEX_SOURCES)
+    unowned_artifact_ids: tuple[Reason, ...] = Field(default=(), max_length=_MAX_SOURCE_ARTIFACTS)
+
+    @model_validator(mode="after")
+    def validate_complete_identity_snapshot(self) -> IndexStateSnapshot:
+        if self.source_states != tuple(
+            sorted(self.source_states, key=lambda state: state.source_id)
+        ):
+            raise ValueError("indexed source states must be sorted by source_id")
+        if len({state.source_id for state in self.source_states}) != len(self.source_states):
+            raise ValueError("indexed source states must have unique source IDs")
+        if self.unowned_artifact_ids != tuple(sorted(self.unowned_artifact_ids)) or len(
+            set(self.unowned_artifact_ids)
+        ) != len(self.unowned_artifact_ids):
+            raise ValueError("unowned artifact IDs must be sorted and unique")
+        owned_ids = tuple(
+            artifact.artifact_id for state in self.source_states for artifact in state.artifacts
+        )
+        all_ids = (*owned_ids, *self.unowned_artifact_ids)
+        if len(all_ids) > _MAX_INDEX_ARTIFACTS:
+            raise ValueError("index snapshot exceeds the cumulative artifact bound")
+        if len(set(all_ids)) != len(all_ids):
+            raise ValueError("index snapshot artifact IDs must be globally unique")
+        if self.audit.source_count != len(self.source_states):
+            raise ValueError("index audit source count must match its exact source states")
+        if self.audit.artifact_count != len(all_ids):
+            raise ValueError("index audit artifact count must match its exact artifact states")
+        return self
+
+
+def source_projection_digest(
+    source_id: str,
+    source_sha256: str,
+    projection_version: str,
+    artifacts: Iterable[IndexedArtifactState],
+) -> str:
+    """Compute the backend-neutral aggregate digest for exact artifact projections."""
+    payload = json.dumps(
+        {
+            "source_id": source_id,
+            "source_sha256": source_sha256,
+            "projection_version": projection_version,
+            "artifacts": [artifact.model_dump(mode="json") for artifact in artifacts],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _facet_text_size(facets: Iterable[SituationFacet]) -> int:
@@ -932,7 +1050,12 @@ class RetrievalIndex(Protocol):
 
     def delete_source(self, source_id: str) -> None: ...
 
-    def rebuild(self, bundles: Iterable[SemanticKnowledgeBundle]) -> IndexAudit: ...
+    def rebuild(
+        self,
+        bundles: Iterable[SemanticKnowledgeBundle],
+        *,
+        precommit_guard: Callable[[], AbstractContextManager[None]] | None = None,
+    ) -> IndexAudit: ...
 
     def get_artifact(self, artifact_id: str) -> IndexedArtifact | None: ...
 
@@ -942,6 +1065,8 @@ class RetrievalIndex(Protocol):
         after_source_id: str | None,
         limit: int,
     ) -> tuple[IndexedSourceState, ...]: ...
+
+    def snapshot_state(self) -> IndexStateSnapshot: ...
 
     def search_candidates(
         self,

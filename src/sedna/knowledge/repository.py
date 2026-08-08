@@ -11,6 +11,8 @@ import stat
 import threading
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path, PurePath
 from typing import Annotated, TypeVar
 
@@ -44,6 +46,8 @@ from sedna.knowledge.semantic.prompts import (
 )
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
+_MAX_SEMANTIC_INVENTORY_FILES = 100_000
+_MAX_SEMANTIC_RECORD_BYTES = 64 * 1024 * 1024
 
 
 def _validate_stable_id(value: str) -> str:
@@ -77,6 +81,18 @@ class SemanticBundleEnumerationError(ValueError):
         self.source_id = source_id
         self.reason_code = reason_code
         super().__init__(f"semantic source {source_id!r} {message}")
+
+
+class SemanticSnapshotChangedError(RuntimeError):
+    """The canonical semantic inventory changed before a guarded index commit."""
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticRepositorySnapshot:
+    """One lock-consistent verified semantic corpus and raw inventory revision."""
+
+    bundles: tuple[SemanticKnowledgeBundle, ...]
+    revision: str
 
 
 class QuarantineRecord(BaseModel):
@@ -296,7 +312,10 @@ class CanonicalKnowledgeRepository:
             ):
                 raise ValueError("semantic quarantine and verification identities must match")
 
-        with self._source_transition_lock(source_id):
+        with (
+            self._semantic_inventory_lock(exclusive=True),
+            self._source_transition_lock(source_id),
+        ):
             self._recover_source(source_id)
             snapshots = {
                 directory: self._read_optional_bytes(directory, source_id)
@@ -346,7 +365,32 @@ class CanonicalKnowledgeRepository:
         dispositions are omitted; any unsafe, incomplete, corrupt, or stale verified state
         fails the complete enumeration before a caller can consume a partial corpus.
         """
-        source_ids = self._semantic_enumeration_source_ids()
+        return iter(self.semantic_bundle_snapshot().bundles)
+
+    def semantic_bundle_snapshot(self) -> SemanticRepositorySnapshot:
+        """Return verified bundles and a revision from one shared inventory lock."""
+        with self._semantic_inventory_lock(exclusive=False):
+            return self._semantic_bundle_snapshot_locked()
+
+    @contextmanager
+    def semantic_snapshot_guard(self, expected_revision: str) -> Iterator[None]:
+        """Verify and hold one semantic revision stable through an external commit."""
+        if (
+            type(expected_revision) is not str
+            or len(expected_revision) != 64
+            or any(character not in "0123456789abcdef" for character in expected_revision)
+        ):
+            raise ValueError("semantic snapshot revision must be a lowercase SHA-256 digest")
+        with self._semantic_inventory_lock(exclusive=False):
+            entries, _ = self._semantic_inventory_entries()
+            if self._semantic_inventory_revision(entries) != expected_revision:
+                raise SemanticSnapshotChangedError(
+                    "canonical semantic inventory changed before index commit"
+                )
+            yield
+
+    def _semantic_bundle_snapshot_locked(self) -> SemanticRepositorySnapshot:
+        entries, source_ids = self._semantic_inventory_entries()
         bundles: list[SemanticKnowledgeBundle] = []
         for source_id in source_ids:
             try:
@@ -368,7 +412,17 @@ class CanonicalKnowledgeRepository:
                     f"is invalid for retrieval: {exc}",
                 ) from exc
             bundles.append(bundle)
-        return iter(tuple(bundles))
+        final_entries, _ = self._semantic_inventory_entries()
+        if final_entries != entries:
+            raise SemanticBundleEnumerationError(
+                "<repository>",
+                "semantic_inventory_changed",
+                "changed during canonical enumeration",
+            )
+        return SemanticRepositorySnapshot(
+            bundles=tuple(bundles),
+            revision=self._semantic_inventory_revision(entries),
+        )
 
     def load_current_semantic_result(
         self,
@@ -715,31 +769,128 @@ class CanonicalKnowledgeRepository:
             )
         return bundle, verification, quarantine
 
-    def _semantic_enumeration_source_ids(self) -> tuple[str, ...]:
+    def _semantic_inventory_entries(
+        self,
+    ) -> tuple[tuple[tuple[str, str, str, int], ...], tuple[str, ...]]:
+        entries: list[tuple[str, str, str, int]] = []
         source_ids: set[str] = set()
-        for directory in ("semantic_bundles", "semantic_verification"):
+        for directory in self._SEMANTIC_DIRECTORIES:
             try:
                 directory_fd = self._open_child_directory(directory, create=False)
             except FileNotFoundError:
                 continue
             try:
-                names = tuple(sorted(os.listdir(directory_fd)))
+                names: list[str] = []
+                entry_count = 0
+                with os.scandir(directory_fd) as iterator:
+                    for entry in iterator:
+                        entry_count += 1
+                        if entry_count > _MAX_SEMANTIC_INVENTORY_FILES:
+                            raise SemanticBundleEnumerationError(
+                                "<repository>",
+                                "semantic_inventory_too_large",
+                                "exceeds the bounded semantic file inventory",
+                            )
+                        if entry.name.endswith(".json"):
+                            names.append(entry.name)
+                names.sort()
+                for name in names:
+                    if not name.endswith(".json"):
+                        continue
+                    source_id = name[:-5]
+                    try:
+                        _validate_stable_id(source_id)
+                    except ValueError as exc:
+                        raise SemanticBundleEnumerationError(
+                            source_id or "<empty>",
+                            "unsafe_semantic_filename",
+                            "has an unsafe canonical filename",
+                        ) from exc
+                    try:
+                        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                        if not stat.S_ISREG(before.st_mode):
+                            raise ValueError("semantic record is not a regular file")
+                        file_fd = os.open(name, self._file_read_flags(), dir_fd=directory_fd)
+                    except (OSError, ValueError) as exc:
+                        raise SemanticBundleEnumerationError(
+                            source_id,
+                            "unsafe_semantic_record",
+                            f"has an unsafe {directory} record",
+                        ) from exc
+                    try:
+                        opened = os.fstat(file_fd)
+                        if not stat.S_ISREG(opened.st_mode) or self._semantic_file_identity(
+                            opened
+                        ) != self._semantic_file_identity(before):
+                            raise SemanticBundleEnumerationError(
+                                source_id,
+                                "unsafe_semantic_record",
+                                f"has a non-regular {directory} record",
+                            )
+                        chunks: list[bytes] = []
+                        size = 0
+                        while chunk := os.read(file_fd, 1024 * 1024):
+                            size += len(chunk)
+                            if size > _MAX_SEMANTIC_RECORD_BYTES:
+                                raise SemanticBundleEnumerationError(
+                                    source_id,
+                                    "semantic_record_too_large",
+                                    f"has an oversized {directory} record",
+                                )
+                            chunks.append(chunk)
+                        payload = b"".join(chunks)
+                        final = os.fstat(file_fd)
+                        after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                        if self._semantic_file_identity(opened) != self._semantic_file_identity(
+                            final
+                        ) or self._semantic_file_identity(opened) != self._semantic_file_identity(
+                            after
+                        ):
+                            raise SemanticBundleEnumerationError(
+                                source_id,
+                                "semantic_record_changed",
+                                f"changed while reading {directory}",
+                            )
+                    except OSError as exc:
+                        raise SemanticBundleEnumerationError(
+                            source_id,
+                            "unsafe_semantic_record",
+                            f"could not read {directory} safely",
+                        ) from exc
+                    finally:
+                        os.close(file_fd)
+                    entries.append((directory, name, sha256(payload).hexdigest(), len(payload)))
+                    source_ids.add(source_id)
             finally:
                 os.close(directory_fd)
-            for name in names:
-                if not name.endswith(".json"):
-                    continue
-                source_id = name[:-5]
-                try:
-                    _validate_stable_id(source_id)
-                except ValueError as exc:
-                    raise SemanticBundleEnumerationError(
-                        source_id or "<empty>",
-                        "unsafe_semantic_filename",
-                        "has an unsafe canonical filename",
-                    ) from exc
-                source_ids.add(source_id)
-        return tuple(sorted(source_ids))
+        return tuple(sorted(entries)), tuple(sorted(source_ids))
+
+    @staticmethod
+    def _semantic_file_identity(status: os.stat_result) -> tuple[object, ...]:
+        return (
+            status.st_mode,
+            status.st_dev,
+            status.st_ino,
+            status.st_nlink,
+            status.st_uid,
+            status.st_gid,
+            status.st_size,
+            getattr(status, "st_mtime_ns", status.st_mtime),
+            getattr(status, "st_ctime_ns", status.st_ctime),
+        )
+
+    @staticmethod
+    def _semantic_inventory_revision(
+        entries: tuple[tuple[str, str, str, int], ...],
+    ) -> str:
+        payload = json.dumps(
+            entries,
+            ensure_ascii=True,
+            sort_keys=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        return sha256(payload.encode("ascii")).hexdigest()
 
     @staticmethod
     def _require_current_retrieval_bundle(bundle: SemanticKnowledgeBundle) -> None:
@@ -926,6 +1077,28 @@ class CanonicalKnowledgeRepository:
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
+
+    @contextmanager
+    def _semantic_inventory_lock(self, *, exclusive: bool) -> Iterator[None]:
+        directory_fd = self._open_child_directory("transactions", create=True)
+        lock_fd = -1
+        try:
+            lock_fd = os.open(
+                ".semantic-inventory.lock",
+                self._lock_open_flags(),
+                0o600,
+                dir_fd=directory_fd,
+            )
+            if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+                raise ValueError("semantic inventory lock is not a regular file")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            yield
+        finally:
+            if lock_fd >= 0:
+                with suppress(OSError):
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            os.close(directory_fd)
 
     @contextmanager
     def _source_transition_lock(self, source_id: str) -> Iterator[None]:
@@ -1382,4 +1555,6 @@ __all__ = [
     "IngestionReport",
     "QuarantineRecord",
     "SemanticBundleEnumerationError",
+    "SemanticRepositorySnapshot",
+    "SemanticSnapshotChangedError",
 ]

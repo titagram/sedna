@@ -10,8 +10,8 @@ import secrets
 import sqlite3
 import stat
 import threading
-from collections.abc import Iterable, Iterator, Sequence
-from contextlib import contextmanager, suppress
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
@@ -24,7 +24,9 @@ from sedna.knowledge.retrieval.models import (
     IndexAudit,
     IndexCandidate,
     IndexedArtifact,
+    IndexedArtifactState,
     IndexedSourceState,
+    IndexStateSnapshot,
     RetrievalQuery,
 )
 from sedna.knowledge.retrieval.projection import (
@@ -32,6 +34,7 @@ from sedna.knowledge.retrieval.projection import (
     ProjectedArtifact,
     project_semantic_bundle,
     project_source_state,
+    projected_artifact_digest,
 )
 from sedna.knowledge.schema import (
     CaseStep,
@@ -40,7 +43,7 @@ from sedna.knowledge.schema import (
     SemanticKnowledgeBundle,
 )
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _MAX_LIMIT = 100
 _FTS_FIELDS = (
     "statement",
@@ -337,8 +340,15 @@ class SQLiteRetrievalIndex:
                     raise
                 self._adopt_connection(candidate, new_identity, new_generation)
 
-    def rebuild(self, bundles: Iterable[SemanticKnowledgeBundle]) -> IndexAudit:
+    def rebuild(
+        self,
+        bundles: Iterable[SemanticKnowledgeBundle],
+        *,
+        precommit_guard: Callable[[], AbstractContextManager[None]] | None = None,
+    ) -> IndexAudit:
         """Serialize a checked fresh database and atomically install its synced bytes."""
+        if precommit_guard is not None and not callable(precommit_guard):
+            raise TypeError("precommit_guard must be callable")
         projected: list[tuple[str, str, IndexedSourceState, tuple[ProjectedArtifact, ...]]] = []
         source_ids: set[str] = set()
         for bundle in bundles:
@@ -374,6 +384,7 @@ class SQLiteRetrievalIndex:
                         previous_bytes=previous_bytes,
                         expected_identity=identity,
                         generation=generation,
+                        precommit_guard=precommit_guard,
                     )
                 except BaseException:
                     candidate.close()
@@ -404,18 +415,37 @@ class SQLiteRetrievalIndex:
             after_source_id = _validated_source_id(after_source_id)
         if type(limit) is not int or not 1 <= limit <= _MAX_LIMIT:
             raise ValueError(f"limit must be between 1 and {_MAX_LIMIT}")
+        snapshot = self.snapshot_state()
+        return tuple(
+            state for state in snapshot.source_states if state.source_id > (after_source_id or "")
+        )[:limit]
+
+    def snapshot_state(self) -> IndexStateSnapshot:
+        """Return audit and exact source/artifact states from one locked generation."""
         with self._read_snapshot() as connection:
-            self._require_current_schema(connection)
-            rows = connection.execute(
-                "SELECT source_id, source_sha256, artifact_count, projection_version, "
-                "projection_digest FROM indexed_sources WHERE source_id > ? "
-                "ORDER BY source_id LIMIT ?",
-                (after_source_id or "", limit),
-            ).fetchall()
-        try:
-            return tuple(IndexedSourceState.model_validate(dict(row)) for row in rows)
-        except ValidationError as error:
-            raise ValueError("indexed source state is corrupt") from error
+            connection.execute("BEGIN")
+            try:
+                self._require_current_schema(connection)
+                audit = self._audit_connection(connection)
+                generation = _database_generation(connection)
+                if generation is None:
+                    raise ValueError("index generation metadata is invalid")
+                source_states = self._actual_source_states(connection)
+                unowned_artifact_ids = tuple(
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT artifact_id FROM artifacts WHERE owner_source_id NOT IN "
+                        "(SELECT source_id FROM indexed_sources) ORDER BY artifact_id"
+                    )
+                )
+                return IndexStateSnapshot(
+                    generation=generation,
+                    audit=audit,
+                    source_states=source_states,
+                    unowned_artifact_ids=unowned_artifact_ids,
+                )
+            finally:
+                connection.rollback()
 
     def search_candidates(
         self,
@@ -575,29 +605,17 @@ class SQLiteRetrievalIndex:
             "projection_digest FROM indexed_sources ORDER BY source_id"
         ):
             try:
-                state = IndexedSourceState.model_validate(dict(row))
-                artifact_digests = tuple(
-                    connection.execute(
-                        "SELECT artifact_id, projection_digest FROM artifacts "
-                        "WHERE owner_source_id = ? ORDER BY artifact_id",
-                        (state.source_id,),
-                    )
+                source_id = _validated_source_id(row["source_id"])
+                source_sha256 = _validated_source_hash(row["source_sha256"])
+                actual_state = self._actual_source_state(
+                    connection,
+                    source_id=source_id,
+                    source_sha256=source_sha256,
                 )
                 if (
-                    state.projection_version != SOURCE_PROJECTION_VERSION
-                    or state.artifact_count != len(artifact_digests)
-                    or state.projection_digest
-                    != _source_projection_digest(
-                        state.source_id,
-                        state.source_sha256,
-                        tuple(
-                            connection.execute(
-                                "SELECT artifact_id, canonical_json FROM artifacts "
-                                "WHERE owner_source_id = ? ORDER BY artifact_id",
-                                (state.source_id,),
-                            )
-                        ),
-                    )
+                    row["projection_version"] != actual_state.projection_version
+                    or row["artifact_count"] != actual_state.artifact_count
+                    or row["projection_digest"] != actual_state.projection_digest
                 ):
                     raise ValueError("source projection metadata mismatch")
             except (TypeError, ValueError, ValidationError):
@@ -668,6 +686,45 @@ class SQLiteRetrievalIndex:
             issues=tuple(sorted(issues)),
         )
 
+    def _actual_source_states(
+        self,
+        connection: sqlite3.Connection,
+    ) -> tuple[IndexedSourceState, ...]:
+        return tuple(
+            self._actual_source_state(
+                connection,
+                source_id=_validated_source_id(row["source_id"]),
+                source_sha256=_validated_source_hash(row["source_sha256"]),
+            )
+            for row in connection.execute(
+                "SELECT source_id, source_sha256 FROM indexed_sources ORDER BY source_id"
+            )
+        )
+
+    def _actual_source_state(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source_id: str,
+        source_sha256: str,
+    ) -> IndexedSourceState:
+        artifacts = tuple(
+            IndexedArtifactState(
+                artifact_id=row["artifact_id"],
+                projection_digest=_live_projection_digest(connection, row),
+            )
+            for row in connection.execute(
+                "SELECT * FROM artifacts WHERE owner_source_id = ? ORDER BY artifact_id",
+                (source_id,),
+            )
+        )
+        return IndexedSourceState.from_artifacts(
+            source_id=source_id,
+            source_sha256=source_sha256,
+            projection_version=SOURCE_PROJECTION_VERSION,
+            artifacts=artifacts,
+        )
+
     @contextmanager
     def _read_snapshot(self) -> Iterator[_MemoryConnection]:
         with self._mutex:
@@ -714,10 +771,15 @@ class SQLiteRetrievalIndex:
             or source_state.projection_version != SOURCE_PROJECTION_VERSION
         ):
             raise ValueError("source state does not match its projected bundle")
-        artifact_digests = tuple(
-            (artifact.artifact_id, _projected_digest(source_id, artifact))
+        artifact_states = tuple(
+            IndexedArtifactState(
+                artifact_id=artifact.artifact_id,
+                projection_digest=projected_artifact_digest(source_id, artifact),
+            )
             for artifact in projection
         )
+        if source_state.artifacts != artifact_states:
+            raise ValueError("source state artifact identities do not match the projection")
         connection.execute(
             """
             INSERT INTO indexed_sources(
@@ -733,7 +795,9 @@ class SQLiteRetrievalIndex:
                 source_state.projection_digest,
             ),
         )
-        digest_by_artifact = dict(artifact_digests)
+        digest_by_artifact = {
+            artifact.artifact_id: artifact.projection_digest for artifact in artifact_states
+        }
         for artifact in projection:
             connection.execute(
                 """
@@ -1050,6 +1114,7 @@ class SQLiteRetrievalIndex:
         previous_bytes: bytes,
         expected_identity: tuple[int, int] | None,
         generation: int,
+        precommit_guard: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> tuple[tuple[int, int], int]:
         parent_fd = self._ensure_parent_open()
         temporary_name = f".{self._filename}.{secrets.token_hex(16)}.tmp"
@@ -1082,56 +1147,58 @@ class SQLiteRetrievalIndex:
             self._ensure_lock_identity()
             self._verify_expected_target(expected_identity)
             try:
-                self._verify_retained_sibling(
-                    validated_descriptor,
-                    temporary_name,
-                    temporary_identity,
-                    validated_digest,
-                    expected_generation=next_generation,
-                )
-                os.replace(
-                    temporary_name,
-                    self._filename,
-                    src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
-                )
-                installed = True
-                os.fsync(parent_fd)
-                current = self._target_status()
-                if current is None or temporary_identity != (current.st_dev, current.st_ino):
-                    raise OSError("database target changed during atomic persistence")
-                self._verify_retained_sibling(
-                    validated_descriptor,
-                    self._filename,
-                    temporary_identity,
-                    validated_digest,
-                    expected_generation=next_generation,
-                )
-                # The atomically installed database is authoritative.  The
-                # sidecar copy is recoverable and must never make a durable
-                # mutation report failure after installation.
-                with suppress(OSError):
-                    self._write_generation(next_generation)
-                generation_written = True
-                if backup_created:
-                    if backup_identity is None:
-                        raise RuntimeError("database backup identity was not retained")
-                    self._unlink_named_identity(backup_name, backup_identity)
-                    backup_created = False
-                os.fsync(parent_fd)
-                # Backup deletion and its directory sync are part of the
-                # commit boundary. This finite stable-byte check is the
-                # cooperative commit linearization point; no fallible or
-                # expensive work follows before the committed identity is
-                # returned. A same-UID process can still mutate the file
-                # after this method returns, which no pathname protocol can
-                # prevent.
-                self._verify_retained_bytes(
-                    validated_descriptor,
-                    self._filename,
-                    temporary_identity,
-                    validated_digest,
-                )
+                guard_context = nullcontext() if precommit_guard is None else precommit_guard()
+                with guard_context:
+                    self._verify_retained_sibling(
+                        validated_descriptor,
+                        temporary_name,
+                        temporary_identity,
+                        validated_digest,
+                        expected_generation=next_generation,
+                    )
+                    os.replace(
+                        temporary_name,
+                        self._filename,
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
+                    )
+                    installed = True
+                    os.fsync(parent_fd)
+                    current = self._target_status()
+                    if current is None or temporary_identity != (current.st_dev, current.st_ino):
+                        raise OSError("database target changed during atomic persistence")
+                    self._verify_retained_sibling(
+                        validated_descriptor,
+                        self._filename,
+                        temporary_identity,
+                        validated_digest,
+                        expected_generation=next_generation,
+                    )
+                    # The atomically installed database is authoritative.  The
+                    # sidecar copy is recoverable and must never make a durable
+                    # mutation report failure after installation.
+                    with suppress(OSError):
+                        self._write_generation(next_generation)
+                    generation_written = True
+                    if backup_created:
+                        if backup_identity is None:
+                            raise RuntimeError("database backup identity was not retained")
+                        self._unlink_named_identity(backup_name, backup_identity)
+                        backup_created = False
+                    os.fsync(parent_fd)
+                    # Backup deletion and its directory sync are part of the
+                    # commit boundary. This finite stable-byte check is the
+                    # cooperative commit linearization point; no fallible or
+                    # expensive work follows before the committed identity is
+                    # returned. A same-UID process can still mutate the file
+                    # after this method returns, which no pathname protocol can
+                    # prevent.
+                    self._verify_retained_bytes(
+                        validated_descriptor,
+                        self._filename,
+                        temporary_identity,
+                        validated_digest,
+                    )
             except BaseException as original_error:
                 rollback_errors, restored_identity = self._rollback_persistence(
                     backup_name=backup_name,
@@ -1810,90 +1877,6 @@ def _location_json(location: object) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
-
-
-def _projected_digest(source_id: str, artifact: ProjectedArtifact) -> str:
-    artifact_row = {
-        "artifact_id": artifact.artifact_id,
-        "owner_source_id": source_id,
-        "canonical_path": _canonical_path(source_id),
-        "artifact_type": artifact.artifact_type,
-        "knowledge_role": artifact.knowledge_role,
-        "verification_status": artifact.verification_status,
-        "source_reliability": artifact.source_reliability,
-        "extraction_confidence": artifact.extraction_confidence,
-        "generalizability": artifact.generalizability,
-        "context_specificity": artifact.context_specificity,
-        "support_count": artifact.support_count,
-        "contradiction_count": artifact.contradiction_count,
-        "observed_outcome": artifact.observed_outcome,
-        "observed_at": artifact.observed_at,
-        "freshness_observed_at": artifact.freshness_observed_at,
-        "independence_group": artifact.independence_group,
-        "canonical_json": artifact.canonical_json,
-    }
-    facets = [
-        {
-            "artifact_id": facet.artifact_id,
-            "facet_id": facet.facet_id,
-            "channel": facet.channel,
-            "namespace": facet.namespace,
-            "key": facet.key,
-            "value": facet.value,
-            "relation": facet.relation,
-            "origin": facet.origin,
-            "confidence": facet.confidence,
-        }
-        for facet in artifact.facets
-    ]
-    links = [
-        {
-            "from_artifact_id": link.from_artifact_id,
-            "relation": link.relation,
-            "to_artifact_id": link.to_artifact_id,
-        }
-        for link in artifact.links
-    ]
-    sources = [
-        {
-            "artifact_id": source.artifact_id,
-            "source_id": source.source_id,
-            "path": source.path,
-            "location_json": _location_json(source.location.model_dump(mode="json")),
-            "independence_group": source.independence_group,
-            "relation": source.relation,
-        }
-        for source in artifact.sources
-    ]
-    fts = [
-        {
-            "artifact_id": artifact.artifact_id,
-            **{field: getattr(artifact, field) for field in _FTS_FIELDS},
-        }
-    ]
-    return _digest_payload(artifact_row, facets, links, sources, fts)
-
-
-def _source_projection_digest(
-    source_id: str,
-    source_sha256: str,
-    artifacts: Iterable[Sequence[object]],
-) -> str:
-    payload = json.dumps(
-        {
-            "source_id": source_id,
-            "source_sha256": source_sha256,
-            "projection_version": SOURCE_PROJECTION_VERSION,
-            "artifacts": [
-                {"artifact_id": str(row[0]), "canonical_json": str(row[1])} for row in artifacts
-            ],
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-    return sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _live_projection_digest(connection: sqlite3.Connection, row: sqlite3.Row) -> str:

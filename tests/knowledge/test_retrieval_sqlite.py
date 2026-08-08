@@ -104,7 +104,7 @@ def test_schema_uses_fts5_foreign_keys_indexes_and_a_version(tmp_path: Path) -> 
         connection = index._connection
         assert connection is not None
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         tables = {
             row[0]: row[1]
             for row in connection.execute(

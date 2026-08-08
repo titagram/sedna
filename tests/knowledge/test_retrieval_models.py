@@ -14,7 +14,9 @@ from sedna.knowledge.retrieval import (
     EpistemicLane,
     IndexAudit,
     IndexCandidate,
+    IndexedArtifactState,
     IndexedSourceState,
+    IndexStateSnapshot,
     KnowledgeGap,
     KnowledgeGapCode,
     RejectedCandidate,
@@ -835,25 +837,50 @@ def test_index_audit_derives_rebuild_requirement_for_every_integrity_failure():
 
 
 def test_indexed_source_state_is_bounded_canonical_and_hash_bound() -> None:
-    state = IndexedSourceState(
+    artifacts = (
+        IndexedArtifactState(artifact_id="artifact-a", projection_digest="c" * 64),
+        IndexedArtifactState(artifact_id="artifact-b", projection_digest="d" * 64),
+    )
+    state = IndexedSourceState.from_artifacts(
         source_id="source-a",
         source_sha256="a" * 64,
-        artifact_count=2,
         projection_version="sqlite-projection-v1",
-        projection_digest="b" * 64,
+        artifacts=artifacts,
     )
 
     assert state.source_id == "source-a"
     with pytest.raises(ValidationError):
-        IndexedSourceState(
+        IndexedSourceState.from_artifacts(
             source_id="source-a",
             source_sha256="not-a-hash",
-            artifact_count=2,
             projection_version="sqlite-projection-v1",
-            projection_digest="b" * 64,
+            artifacts=artifacts,
         )
     with pytest.raises(ValidationError):
         IndexedSourceState.model_validate(state.model_dump() | {"projection_digest": "B" * 64})
+
+
+def test_index_state_snapshot_is_generation_bound_sorted_and_cumulatively_bounded() -> None:
+    state = IndexedSourceState.from_artifacts(
+        source_id="source-a",
+        source_sha256="a" * 64,
+        projection_version="projection-v1",
+        artifacts=(IndexedArtifactState(artifact_id="artifact-a", projection_digest="b" * 64),),
+    )
+    snapshot = IndexStateSnapshot(
+        generation=7,
+        audit=IndexAudit(artifact_count=1, source_count=1, fts_count=1),
+        source_states=(state,),
+    )
+
+    assert snapshot.generation == 7
+    assert snapshot.source_states == (state,)
+    with pytest.raises(ValidationError):
+        IndexStateSnapshot(
+            generation=7,
+            audit=IndexAudit(artifact_count=2, source_count=1, fts_count=2),
+            source_states=(state,),
+        )
 
 
 class _IndexDouble:
@@ -863,8 +890,12 @@ class _IndexDouble:
     def delete_source(self, source_id: str) -> None:
         return None
 
-    def rebuild(self, bundles: object) -> IndexAudit:
+    def rebuild(self, bundles: object, *, precommit_guard: object | None = None) -> IndexAudit:
+        del bundles, precommit_guard
         return IndexAudit()
+
+    def snapshot_state(self) -> IndexStateSnapshot:
+        return IndexStateSnapshot(generation=0, audit=IndexAudit())
 
     def get_artifact(self, artifact_id: str) -> object | None:
         return None

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -13,12 +16,12 @@ from sedna.knowledge.repository import (
     CanonicalKnowledgeRepository,
     SemanticBundleEnumerationError,
 )
-from sedna.knowledge.retrieval import EpistemicLane
+from sedna.knowledge.retrieval import EpistemicLane, IndexAudit, IndexStateSnapshot
 from sedna.knowledge.retrieval.maintenance import (
     MaintenanceIssueCode,
     RetrievalMaintenanceService,
 )
-from sedna.knowledge.retrieval.projection import project_semantic_bundle
+from sedna.knowledge.retrieval.projection import project_semantic_bundle, project_source_state
 from sedna.knowledge.retrieval.sqlite import SQLiteRetrievalIndex
 from sedna.knowledge.schema import (
     SemanticCallMetadata,
@@ -59,6 +62,15 @@ def _current_bundle(
         critic_prompt_version=CRITIC_PROMPT_VERSION,
         repair_prompt_version=REPAIR_PROMPT_VERSION,
     )
+    return SemanticKnowledgeBundle.model_validate(payload)
+
+
+def _empty_current_bundle(source_id: str, source_hash: str) -> SemanticKnowledgeBundle:
+    payload = _current_bundle(source_id, "a", source_hash=source_hash).model_dump(mode="json")
+    payload["references"] = []
+    payload["cases"] = []
+    payload["guidance"] = []
+    payload["compilation_manifest"]["emitted_artifact_ids"] = []
     return SemanticKnowledgeBundle.model_validate(payload)
 
 
@@ -184,6 +196,25 @@ def test_repository_enumeration_never_follows_symlink_or_blocks_on_fifo(tmp_path
     repository.close()
 
 
+def test_repository_enumeration_rejects_orphan_and_unsafe_quarantine_records(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "knowledge"
+    repository = CanonicalKnowledgeRepository(root)
+    repository.write_semantic_result(_quarantined_result("source-quarantined"))
+    verification = root / "semantic_verification" / "source-quarantined.json"
+    verification.unlink()
+    with pytest.raises(SemanticBundleEnumerationError, match="source-quarantined"):
+        tuple(repository.iter_semantic_bundles())
+
+    quarantine = root / "semantic_quarantine" / "source-quarantined.json"
+    quarantine.unlink()
+    os.symlink(tmp_path / "outside.json", quarantine)
+    with pytest.raises(SemanticBundleEnumerationError, match="source-quarantined"):
+        tuple(repository.iter_semantic_bundles())
+    repository.close()
+
+
 def test_rebuild_empty_and_populated_repository_is_typed_atomic_and_canonical_immutable(
     tmp_path: Path,
 ) -> None:
@@ -283,19 +314,19 @@ def test_audit_detects_canonical_change_that_occurs_during_index_snapshot(
         initial = _current_bundle("source-a", "a")
         repository.write_semantic_result(_verified_result(initial))
         index.rebuild((initial,))
-        real_audit = index.audit
+        real_snapshot = index.snapshot_state
         changed = False
 
-        def mutate_canonical_then_audit():
+        def mutate_canonical_then_snapshot():
             nonlocal changed
             if not changed:
                 changed = True
                 repository.write_semantic_result(
                     _verified_result(_current_bundle("source-new", "b"))
                 )
-            return real_audit()
+            return real_snapshot()
 
-        monkeypatch.setattr(index, "audit", mutate_canonical_then_audit)
+        monkeypatch.setattr(index, "snapshot_state", mutate_canonical_then_snapshot)
 
         report = RetrievalMaintenanceService(repository=repository, index=index).audit()
 
@@ -304,6 +335,163 @@ def test_audit_detects_canonical_change_that_occurs_during_index_snapshot(
         assert MaintenanceIssueCode.CANONICAL_REPOSITORY_CHANGED in {
             issue.code for issue in report.issues
         }
+
+
+def test_audit_cannot_mix_two_index_generations_across_a_101_source_page_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "knowledge"
+    old_hash = "a" * 64
+    new_hash = "b" * 64
+    source_ids = tuple(f"source-{index:03d}" for index in range(101))
+    canonical = tuple(
+        _empty_current_bundle(
+            source_id,
+            old_hash if index < 100 else new_hash,
+        )
+        for index, source_id in enumerate(source_ids)
+    )
+    old_generation = tuple(_empty_current_bundle(source_id, old_hash) for source_id in source_ids)
+    new_generation = tuple(_empty_current_bundle(source_id, new_hash) for source_id in source_ids)
+
+    with (
+        CanonicalKnowledgeRepository(root) as repository,
+        SQLiteRetrievalIndex(tmp_path / "sedna.sqlite") as index,
+    ):
+        for bundle in canonical:
+            repository.write_semantic_result(_verified_result(bundle))
+        index.rebuild(old_generation)
+        writer = SQLiteRetrievalIndex(tmp_path / "sedna.sqlite")
+        real_audit_connection = index._audit_connection
+        writer_attempting = Event()
+        snapshot_entered = Event()
+
+        def observe_snapshot(connection: sqlite3.Connection):
+            snapshot_entered.set()
+            writer_attempting.wait(timeout=5)
+            return real_audit_connection(connection)
+
+        def rebuild_concurrently() -> None:
+            snapshot_entered.wait(timeout=5)
+            writer_attempting.set()
+            writer.rebuild(new_generation)
+
+        monkeypatch.setattr(index, "_audit_connection", observe_snapshot)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(rebuild_concurrently)
+            report = RetrievalMaintenanceService(repository=repository, index=index).audit()
+            future.result(timeout=10)
+
+        assert report.rebuild_required
+        assert report.stale_source_count > 0
+        writer.close()
+
+
+def test_rebuild_aborts_before_install_when_canonical_source_is_added_during_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "knowledge"
+    path = tmp_path / "sedna.sqlite"
+    with CanonicalKnowledgeRepository(root) as repository, SQLiteRetrievalIndex(path) as index:
+        prior = _current_bundle("source-prior", "c")
+        initial = _current_bundle("source-a", "a")
+        added = _current_bundle("source-new", "b")
+        index.rebuild((prior,))
+        before = path.read_bytes()
+        repository.write_semantic_result(_verified_result(initial))
+        real_insert = index._insert_projection_rows
+        changed = False
+
+        def add_source_during_candidate_build(*args: object, **kwargs: object) -> None:
+            nonlocal changed
+            real_insert(*args, **kwargs)
+            if not changed:
+                changed = True
+                repository.write_semantic_result(_verified_result(added))
+
+        monkeypatch.setattr(index, "_insert_projection_rows", add_source_during_candidate_build)
+
+        report = RetrievalMaintenanceService(repository=repository, index=index).rebuild()
+
+        assert changed
+        assert report.succeeded is False
+        assert report.rebuild_required
+        assert path.read_bytes() == before
+        assert index.get_artifact("reference-http-c") == prior.references[0]
+        assert index.get_artifact("reference-http-a") is None
+
+
+def test_audit_derives_missing_artifact_count_from_live_rows_not_source_assertions(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "knowledge"
+    path = tmp_path / "sedna.sqlite"
+    repository = CanonicalKnowledgeRepository(root)
+    bundle = _current_bundle("source-a", "a")
+    repository.write_semantic_result(_verified_result(bundle))
+    index = SQLiteRetrievalIndex(path)
+    index.rebuild((bundle,))
+    index.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "DELETE FROM artifact_fts WHERE artifact_id = ?",
+            ("reference-http-a",),
+        )
+        connection.execute(
+            "DELETE FROM artifacts WHERE artifact_id = ?",
+            ("reference-http-a",),
+        )
+
+    reopened = SQLiteRetrievalIndex(path)
+    report = RetrievalMaintenanceService(repository=repository, index=reopened).audit()
+
+    assert report.canonical_artifact_count == 6
+    assert report.indexed_artifact_count == 5
+    assert report.stale_source_count == 1
+    assert report.missing_artifact_count == 1
+    reopened.close()
+    repository.close()
+
+
+def test_malformed_backend_audit_hidden_state_maps_to_typed_unavailable(tmp_path: Path) -> None:
+    state = project_source_state(_empty_current_bundle("source-hidden", "a" * 64))
+    valid = IndexStateSnapshot(
+        generation=0,
+        audit=IndexAudit(source_count=1),
+        source_states=(state,),
+    )
+    malformed_snapshots = (
+        valid.model_copy(update={"hidden": "discarded"}),
+        valid.model_copy(
+            update={
+                "audit": valid.audit.model_copy(update={"hidden": "discarded"}),
+            }
+        ),
+        valid.model_copy(
+            update={
+                "source_states": (state.model_copy(update={"hidden": "discarded"}),),
+            }
+        ),
+    )
+    with CanonicalKnowledgeRepository(tmp_path / "knowledge") as repository:
+        for malformed in malformed_snapshots:
+
+            class MalformedIndex:
+                def __init__(self, snapshot: object) -> None:
+                    self._snapshot = snapshot
+
+                def snapshot_state(self):
+                    return self._snapshot
+
+            report = RetrievalMaintenanceService(
+                repository=repository,
+                index=MalformedIndex(malformed),  # type: ignore[arg-type]
+            ).audit()
+
+            assert report.succeeded is False
+            assert report.issues[0].code is MaintenanceIssueCode.INDEX_UNAVAILABLE
 
 
 def test_delete_and_rebuild_is_result_equivalent_even_when_index_bytes_change(
