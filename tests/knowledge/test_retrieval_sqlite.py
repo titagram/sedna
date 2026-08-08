@@ -7,6 +7,7 @@ import math
 import os
 import sqlite3
 import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ from sedna.knowledge.retrieval import (
     SituationFacet,
     ValidatedTarget,
 )
+from sedna.knowledge.retrieval import sqlite as retrieval_sqlite_module
 from sedna.knowledge.retrieval.sqlite import SQLiteRetrievalIndex
 from sedna.knowledge.schema import SemanticKnowledgeBundle
 from tests.knowledge.test_retrieval_projection import _bundle
@@ -100,7 +102,7 @@ def test_schema_uses_fts5_foreign_keys_indexes_and_a_version(tmp_path: Path) -> 
         connection = index._connection
         assert connection is not None
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
         tables = {
             row[0]: row[1]
             for row in connection.execute(
@@ -429,6 +431,226 @@ def test_audit_detects_orphans_fts_parity_source_coverage_and_schema_version(
     } <= set(audit.issues)
 
 
+@pytest.mark.parametrize(
+    "tamper_sql",
+    (
+        "UPDATE artifact_fts SET statement = 'tampered fts' WHERE artifact_id = 'reference-http'",
+        "UPDATE facet_values SET value = 'tampered-facet' "
+        "WHERE rowid = (SELECT rowid FROM facet_values "
+        "WHERE artifact_id = 'reference-http' LIMIT 1)",
+        "UPDATE artifact_links SET relation = 'tampered-link' "
+        "WHERE from_artifact_id = 'case-positive-step'",
+        "UPDATE artifact_sources SET relation = 'tampered-provenance' "
+        "WHERE rowid = (SELECT rowid FROM artifact_sources "
+        "WHERE artifact_id = 'reference-http' AND relation LIKE 'facet:%' LIMIT 1)",
+        "UPDATE artifacts SET owner_source_id = 'source-tampered' "
+        "WHERE artifact_id = 'reference-http'",
+        "UPDATE artifacts SET canonical_json = "
+        "replace(canonical_json, 'reference-statement-token', 'tampered-json-token') "
+        "WHERE artifact_id = 'reference-http'",
+    ),
+)
+def test_audit_digest_detects_every_normalized_projection_tamper(
+    tmp_path: Path,
+    tamper_sql: str,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(_bundle())
+    with sqlite3.connect(path) as connection:
+        connection.execute(tamper_sql)
+
+    with SQLiteRetrievalIndex(path) as index:
+        audit = index.audit()
+
+    assert audit.rebuild_required
+    assert "projection_digest_mismatch" in audit.issues
+
+
+def test_connect_time_target_swap_cannot_write_through_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    path.touch()
+    outside = tmp_path / "outside.sqlite"
+    with sqlite3.connect(outside) as connection:
+        connection.execute("CREATE TABLE sentinel(value TEXT)")
+        connection.execute("INSERT INTO sentinel VALUES ('unchanged')")
+    outside_before = outside.read_bytes()
+    real_connect = sqlite3.connect
+    swapped = False
+
+    def racing_connect(database: object, *args: object, **kwargs: object) -> sqlite3.Connection:
+        nonlocal swapped
+        if not swapped:
+            path.unlink()
+            path.symlink_to(outside)
+            swapped = True
+        connection = real_connect(database, *args, **kwargs)
+        if database != ":memory:":
+            connection.execute("PRAGMA user_version = 77")
+        return connection
+
+    monkeypatch.setattr(retrieval_sqlite_module.sqlite3, "connect", racing_connect)
+
+    with pytest.raises((ValueError, RuntimeError), match="regular file|changed"):
+        SQLiteRetrievalIndex(path)
+
+    assert swapped
+    assert outside.read_bytes() == outside_before
+
+
+@pytest.mark.parametrize("operation", ("upsert", "delete"))
+def test_mutation_failure_after_candidate_commit_preserves_prior_bytes_and_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    original = _bundle()
+    updated_payload = original.model_dump(mode="json")
+    updated_payload["references"][0]["statement"] = "replacement-only-token"
+    updated = SemanticKnowledgeBundle.model_validate(updated_payload)
+
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(original)
+        before = path.read_bytes()
+        real_fsync = os.fsync
+        failed = False
+
+        def fail_first_directory_sync(descriptor: int) -> None:
+            nonlocal failed
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode) and not failed:
+                failed = True
+                raise OSError("injected mutation sync failure")
+            real_fsync(descriptor)
+
+        monkeypatch.setattr(os, "fsync", fail_first_directory_sync)
+        with pytest.raises(OSError, match="sync failure"):
+            if operation == "upsert":
+                index.upsert_bundle(updated)
+            else:
+                index.delete_source(original.source_id)
+
+        assert failed
+        assert path.read_bytes() == before
+        assert index.get_artifact("reference-http") == original.references[0]
+
+
+def test_audit_uses_one_snapshot_while_another_index_deletes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(_bundle())
+        before = index.audit()
+        attempted = threading.Event()
+        committed = threading.Event()
+        errors: list[BaseException] = []
+
+        def delete_source() -> None:
+            attempted.set()
+            try:
+                with SQLiteRetrievalIndex(path) as writer:
+                    writer.delete_source("source-retrieval")
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                committed.set()
+
+        worker = threading.Thread(target=delete_source)
+        blocked = False
+
+        def trace(statement: str) -> None:
+            nonlocal blocked
+            if not blocked and statement.startswith("SELECT COUNT(*) FROM facet_values"):
+                blocked = True
+                worker.start()
+                assert attempted.wait(timeout=2)
+                committed.wait(timeout=0.5)
+
+        original_audit = index._audit_connection
+
+        def blocking_audit(connection: sqlite3.Connection):
+            connection.set_trace_callback(trace)
+            try:
+                return original_audit(connection)
+            finally:
+                connection.set_trace_callback(None)
+
+        monkeypatch.setattr(index, "_audit_connection", blocking_audit)
+        observed = index.audit()
+        worker.join(timeout=3)
+
+        assert not worker.is_alive()
+        assert errors == []
+        assert observed == before
+        assert observed.rebuild_required is False
+        assert index.audit().artifact_count == 0
+
+
+def test_match_explanations_follow_fts5_diacritic_and_phrase_semantics(tmp_path: Path) -> None:
+    payload = _bundle().model_dump(mode="json")
+    payload["references"][0]["statement"] = "café alpha gap beta"
+    bundle = SemanticKnowledgeBundle.model_validate(payload)
+
+    with SQLiteRetrievalIndex(tmp_path / "sedna.sqlite") as index:
+        index.upsert_bundle(bundle)
+        candidates = index.search_candidates(
+            _query("cafe", "alpha beta", "alpha"),
+            lane=EpistemicLane.REFERENCE,
+            limit=10,
+        )
+
+    assert [candidate.artifact_id for candidate in candidates] == ["reference-http"]
+    assert candidates[0].matched_terms == ("alpha", "cafe")
+    assert candidates[0].matched_fields == ("statement",)
+    assert any("[café]" in evidence for evidence in candidates[0].matched_evidence)
+    assert all("alpha beta" not in evidence for evidence in candidates[0].matched_evidence)
+
+
+def test_cross_thread_failed_close_keeps_resources_and_allows_retry(
+    tmp_path: Path,
+) -> None:
+    index = SQLiteRetrievalIndex(tmp_path / "sedna.sqlite")
+    connection = index._connection
+    parent_fd = index._parent_fd
+    assert connection is not None
+    assert parent_fd is not None
+    connection_type = type(connection)
+    real_close = connection_type.close
+    failed = False
+
+    def fail_once(candidate: sqlite3.Connection) -> None:
+        nonlocal failed
+        if candidate is connection and not failed:
+            failed = True
+            raise RuntimeError("injected close failure")
+        real_close(candidate)
+
+    connection_type.close = fail_once
+    errors: list[BaseException] = []
+    try:
+        worker = threading.Thread(target=lambda: _capture_close_error(index, errors))
+        worker.start()
+        worker.join(timeout=3)
+
+        assert not worker.is_alive()
+        assert len(errors) == 1
+        assert "injected close failure" in str(errors[0])
+        assert index._connection is connection
+        assert index._parent_fd == parent_fd
+        assert index.audit().rebuild_required is False
+
+        index.close()
+        assert index._connection is None
+        assert index._parent_fd is None
+    finally:
+        connection_type.close = real_close
+
+
 @pytest.mark.parametrize("target_kind", ("symlink", "fifo", "directory"))
 def test_database_target_must_be_a_fixed_regular_file(
     tmp_path: Path,
@@ -493,3 +715,10 @@ def test_context_manager_and_close_are_strict_and_idempotent(tmp_path: Path) -> 
     ):
         with pytest.raises(RuntimeError, match="closed"):
             operation()
+
+
+def _capture_close_error(index: SQLiteRetrievalIndex, errors: list[BaseException]) -> None:
+    try:
+        index.close()
+    except BaseException as error:
+        errors.append(error)

@@ -1,16 +1,18 @@
-"""Disposable, source-scoped SQLite FTS5 projection of canonical knowledge."""
+"""Descriptor-confined, disposable SQLite FTS5 projection of canonical knowledge."""
 
 from __future__ import annotations
 
+import fcntl
 import json
 import math
 import os
-import re
 import secrets
 import sqlite3
 import stat
-from collections.abc import Iterable, Iterator
+import threading
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager, suppress
+from hashlib import sha256
 from pathlib import Path
 from types import TracebackType
 
@@ -31,7 +33,7 @@ from sedna.knowledge.schema import (
     SemanticKnowledgeBundle,
 )
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _MAX_LIMIT = 100
 _FTS_FIELDS = (
     "statement",
@@ -41,11 +43,10 @@ _FTS_FIELDS = (
     "expected_evidence",
     "exceptions",
 )
-_WORD = re.compile(r"\w+", flags=re.UNICODE)
 _ARTIFACT_ADAPTER = TypeAdapter(IndexedArtifact)
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS artifacts (
+CREATE TABLE artifacts (
     artifact_id TEXT PRIMARY KEY,
     owner_source_id TEXT NOT NULL,
     canonical_path TEXT NOT NULL,
@@ -62,10 +63,11 @@ CREATE TABLE IF NOT EXISTS artifacts (
     observed_at TEXT,
     freshness_observed_at TEXT,
     independence_group TEXT NOT NULL,
-    canonical_json TEXT NOT NULL
+    canonical_json TEXT NOT NULL,
+    projection_digest TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS facet_values (
+CREATE TABLE facet_values (
     artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
     facet_id TEXT NOT NULL,
     channel TEXT NOT NULL,
@@ -78,14 +80,14 @@ CREATE TABLE IF NOT EXISTS facet_values (
     PRIMARY KEY (artifact_id, facet_id)
 );
 
-CREATE TABLE IF NOT EXISTS artifact_links (
+CREATE TABLE artifact_links (
     from_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
     relation TEXT NOT NULL,
     to_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
     PRIMARY KEY (from_artifact_id, relation, to_artifact_id)
 );
 
-CREATE TABLE IF NOT EXISTS artifact_sources (
+CREATE TABLE artifact_sources (
     artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
     source_id TEXT NOT NULL,
     path TEXT NOT NULL,
@@ -97,7 +99,7 @@ CREATE TABLE IF NOT EXISTS artifact_sources (
     )
 );
 
-CREATE VIRTUAL TABLE IF NOT EXISTS artifact_fts USING fts5(
+CREATE VIRTUAL TABLE artifact_fts USING fts5(
     artifact_id UNINDEXED,
     statement,
     rationale,
@@ -108,35 +110,64 @@ CREATE VIRTUAL TABLE IF NOT EXISTS artifact_fts USING fts5(
     tokenize = 'unicode61'
 );
 
-CREATE INDEX IF NOT EXISTS artifacts_owner_source_idx ON artifacts(owner_source_id);
-CREATE INDEX IF NOT EXISTS artifacts_lane_idx
+CREATE INDEX artifacts_owner_source_idx ON artifacts(owner_source_id);
+CREATE INDEX artifacts_lane_idx
     ON artifacts(artifact_type, knowledge_role, observed_outcome, artifact_id);
-CREATE INDEX IF NOT EXISTS facet_values_lookup_idx
+CREATE INDEX facet_values_lookup_idx
     ON facet_values(namespace, key, value, artifact_id);
-CREATE INDEX IF NOT EXISTS artifact_links_target_idx
+CREATE INDEX artifact_links_target_idx
     ON artifact_links(to_artifact_id, relation, from_artifact_id);
-CREATE INDEX IF NOT EXISTS artifact_sources_source_idx
+CREATE INDEX artifact_sources_source_idx
     ON artifact_sources(source_id, artifact_id);
 """
 
 
+class _MemoryConnection(sqlite3.Connection):
+    """Patchable connection type used only for private in-memory snapshots."""
+
+
 class SQLiteRetrievalIndex:
-    """A fixed-path, rebuildable SQLite implementation of ``RetrievalIndex``."""
+    """A fixed-path retrieval index that never asks SQLite to open that path."""
 
     def __init__(self, path: str | Path) -> None:
-        self._connection: sqlite3.Connection | None = None
+        self._mutex = threading.RLock()
+        self._connection: _MemoryConnection | None = None
         self._parent_fd: int | None = None
+        self._lock_fd: int | None = None
         self._db_identity: tuple[int, int] | None = None
+        self._generation = 0
         self.path, self._filename = self._prepare_target(path)
+        self._lock_filename = f".{self._filename}.lock"
         try:
             self._open_parent()
-            self._open_connection()
+            self._open_lock()
+            with self._file_lock(exclusive=True):
+                generation = self._read_generation()
+                database_bytes, identity = self._read_database_bytes()
+                if database_bytes:
+                    connection = self._connection_from_bytes(database_bytes)
+                else:
+                    connection = self._new_schema_connection()
+                    try:
+                        identity, generation = self._persist_database(
+                            connection.serialize(),
+                            previous_bytes=database_bytes or b"",
+                            expected_identity=identity,
+                            generation=generation,
+                        )
+                    except BaseException:
+                        connection.close()
+                        raise
+                self._connection = connection
+                self._db_identity = identity
+                self._generation = generation
         except BaseException:
             self.close()
             raise
 
     def __enter__(self) -> SQLiteRetrievalIndex:
-        self._ensure_open()
+        with self._mutex:
+            self._ensure_open()
         return self
 
     def __exit__(
@@ -149,37 +180,69 @@ class SQLiteRetrievalIndex:
         self.close()
 
     def close(self) -> None:
-        """Close the database and retained parent descriptor; repeated calls are harmless."""
-        connection = self._connection
-        if connection is not None:
-            self._connection = None
-            connection.close()
-        parent_fd = self._parent_fd
-        if parent_fd is not None:
-            self._parent_fd = None
-            os.close(parent_fd)
+        """Close resources in dependency order without losing handles on failure."""
+        with self._mutex:
+            connection = self._connection
+            if connection is not None:
+                connection.close()
+                self._connection = None
+            lock_fd = self._lock_fd
+            if lock_fd is not None:
+                os.close(lock_fd)
+                self._lock_fd = None
+            parent_fd = self._parent_fd
+            if parent_fd is not None:
+                os.close(parent_fd)
+                self._parent_fd = None
 
     def upsert_bundle(self, bundle: SemanticKnowledgeBundle) -> None:
-        """Replace one source's entire validated projection in a single transaction."""
-        connection = self._ensure_open()
+        """Atomically replace one source projection after canonical validation."""
         projection = project_semantic_bundle(bundle)
         source_id = _validated_source_id(bundle.source_id)
-        with self._transaction(connection):
-            self._delete_source_rows(connection, source_id)
-            self._insert_projection_rows(connection, source_id, projection)
-        self._refresh_identity()
+        with self._mutex:
+            self._ensure_open()
+            with self._file_lock(exclusive=True):
+                candidate, previous_bytes, identity, generation = self._load_live_connection()
+                try:
+                    self._require_current_schema(candidate)
+                    with self._transaction(candidate):
+                        self._delete_source_rows(candidate, source_id)
+                        self._insert_projection_rows(candidate, source_id, projection)
+                    new_identity, new_generation = self._persist_database(
+                        candidate.serialize(),
+                        previous_bytes=previous_bytes,
+                        expected_identity=identity,
+                        generation=generation,
+                    )
+                except BaseException:
+                    candidate.close()
+                    raise
+                self._adopt_connection(candidate, new_identity, new_generation)
 
     def delete_source(self, source_id: str) -> None:
-        """Remove every derived row owned by one canonical source."""
-        connection = self._ensure_open()
+        """Atomically remove every row owned by one canonical source."""
         source_id = _validated_source_id(source_id)
-        with self._transaction(connection):
-            self._delete_source_rows(connection, source_id)
-        self._refresh_identity()
+        with self._mutex:
+            self._ensure_open()
+            with self._file_lock(exclusive=True):
+                candidate, previous_bytes, identity, generation = self._load_live_connection()
+                try:
+                    self._require_current_schema(candidate)
+                    with self._transaction(candidate):
+                        self._delete_source_rows(candidate, source_id)
+                    new_identity, new_generation = self._persist_database(
+                        candidate.serialize(),
+                        previous_bytes=previous_bytes,
+                        expected_identity=identity,
+                        generation=generation,
+                    )
+                except BaseException:
+                    candidate.close()
+                    raise
+                self._adopt_connection(candidate, new_identity, new_generation)
 
     def rebuild(self, bundles: Iterable[SemanticKnowledgeBundle]) -> IndexAudit:
-        """Build, verify, sync, and atomically install a complete sibling database."""
-        self._ensure_open()
+        """Serialize a checked fresh database and atomically install its synced bytes."""
         projected: list[tuple[str, tuple[ProjectedArtifact, ...]]] = []
         source_ids: set[str] = set()
         for bundle in bundles:
@@ -190,98 +253,41 @@ class SQLiteRetrievalIndex:
             source_ids.add(source_id)
             projected.append((source_id, rows))
 
-        temporary_name = f".{self._filename}.{secrets.token_hex(16)}.tmp"
-        backup_name = f".{self._filename}.{secrets.token_hex(16)}.backup"
-        temporary_path = self.path.with_name(temporary_name)
-        temporary: SQLiteRetrievalIndex | None = None
-        audit: IndexAudit | None = None
-        installed = False
-        backup_created = False
-        try:
-            temporary = SQLiteRetrievalIndex(temporary_path)
-            temporary_connection = temporary._ensure_open()
-            with temporary._transaction(temporary_connection):
-                for source_id, rows in projected:
-                    temporary._insert_projection_rows(temporary_connection, source_id, rows)
-            audit = temporary.audit()
-            if audit.rebuild_required:
-                raise ValueError(f"rebuilt index failed audit: {', '.join(audit.issues)}")
-            temporary._checkpoint_for_replace()
-            temporary.close()
-            temporary = None
-            self._fsync_named_file(temporary_name)
-
-            self._ensure_target_identity()
-            parent_fd = self._ensure_parent_open()
-            os.link(
-                self._filename,
-                backup_name,
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-            backup_created = True
-            self._close_connection()
-            try:
-                os.replace(
-                    temporary_name,
-                    self._filename,
-                    src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
-                )
-                installed = True
-                os.fsync(parent_fd)
-                self._open_connection()
-                os.unlink(backup_name, dir_fd=parent_fd)
-                backup_created = False
-                with suppress(OSError):
-                    os.fsync(parent_fd)
-            except BaseException as original_error:
-                self._close_connection()
-                if installed and backup_created:
-                    try:
-                        os.replace(
-                            backup_name,
-                            self._filename,
-                            src_dir_fd=parent_fd,
-                            dst_dir_fd=parent_fd,
-                        )
-                        backup_created = False
-                        installed = False
-                        os.fsync(parent_fd)
-                    except BaseException as rollback_error:
-                        original_error.add_note(
-                            "rebuild rollback failed: "
-                            f"{type(rollback_error).__name__}: {rollback_error}"
-                        )
+        with self._mutex:
+            self._ensure_open()
+            with self._file_lock(exclusive=True):
+                _, previous_bytes, identity, generation = self._load_live_connection(close=True)
+                candidate = self._new_schema_connection()
                 try:
-                    self._open_connection()
-                except BaseException as reopen_error:
-                    original_error.add_note(
-                        "rebuild database reopen failed: "
-                        f"{type(reopen_error).__name__}: {reopen_error}"
+                    with self._transaction(candidate):
+                        for source_id, rows in projected:
+                            self._insert_projection_rows(candidate, source_id, rows)
+                    audit = self._audit_snapshot(candidate)
+                    if audit.rebuild_required:
+                        raise ValueError(f"rebuilt index failed audit: {', '.join(audit.issues)}")
+                    new_identity, new_generation = self._persist_database(
+                        candidate.serialize(),
+                        previous_bytes=previous_bytes,
+                        expected_identity=identity,
+                        generation=generation,
                     )
-                raise
-            return audit
-        finally:
-            if temporary is not None:
-                temporary.close()
-            if not installed:
-                self._unlink_sidecars(temporary_name)
-            if backup_created and not installed:
-                self._unlink_sidecars(backup_name)
+                except BaseException:
+                    candidate.close()
+                    raise
+                self._adopt_connection(candidate, new_identity, new_generation)
+                return audit
 
     def get_artifact(self, artifact_id: str) -> IndexedArtifact | None:
         """Return one deeply reconstructed canonical artifact by exact identity."""
-        connection = self._ensure_open()
         artifact_id = _validated_identifier(artifact_id, "artifact_id")
-        row = connection.execute(
-            "SELECT artifact_id, canonical_json FROM artifacts WHERE artifact_id = ?",
-            (artifact_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return self._reconstruct_artifact(row["artifact_id"], row["canonical_json"])
+        with self._read_snapshot() as connection:
+            row = connection.execute(
+                "SELECT artifact_id, canonical_json FROM artifacts WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._reconstruct_artifact(row["artifact_id"], row["canonical_json"])
 
     def search_candidates(
         self,
@@ -290,8 +296,7 @@ class SQLiteRetrievalIndex:
         lane: EpistemicLane,
         limit: int,
     ) -> tuple[IndexCandidate, ...]:
-        """Return bounded, lane-scoped lexical candidates with exact match evidence."""
-        connection = self._ensure_open()
+        """Return bounded candidates and FTS5-native phrase explanations."""
         query = RetrievalQuery.model_validate(query.model_dump(mode="json"))
         try:
             lane = EpistemicLane(lane)
@@ -301,9 +306,8 @@ class SQLiteRetrievalIndex:
             raise ValueError(f"limit must be between 1 and {_MAX_LIMIT}")
         effective_limit = min(limit, query.max_candidates)
         terms = tuple(sorted({*query.situation.terms, *query.terms, *query.synonyms}))
-        fts_terms = tuple((term, _WORD.findall(term)) for term in terms)
-        searchable_terms = tuple((term, tokens) for term, tokens in fts_terms if tokens)
-        if not searchable_terms and not query.facets:
+        fts_terms = tuple((term, _fts_phrase(term)) for term in terms)
+        if not fts_terms and not query.facets:
             return ()
 
         clauses = [_lane_clause(lane)]
@@ -316,56 +320,63 @@ class SQLiteRetrievalIndex:
             )
             parameters.extend((facet.namespace, facet.key, facet.value))
 
-        if searchable_terms:
-            match = " OR ".join(
-                f'"{" ".join(token.replace(chr(34), chr(34) * 2) for token in tokens)}"'
-                for _, tokens in searchable_terms
-            )
+        if fts_terms:
             clauses.insert(0, "artifact_fts MATCH ?")
-            parameters.insert(0, match)
+            parameters.insert(0, " OR ".join(phrase for _, phrase in fts_terms))
             rank = "bm25(artifact_fts)"
             table = "artifact_fts JOIN artifacts AS a USING (artifact_id)"
         else:
             rank = "0.0"
             table = "artifacts AS a JOIN artifact_fts USING (artifact_id)"
-
         parameters.append(effective_limit)
-        fields = ", ".join(f"artifact_fts.{field} AS {field}" for field in _FTS_FIELDS)
-        rows = connection.execute(
-            f"""
-            SELECT a.artifact_id, a.canonical_json, {fields}, {rank} AS lexical_rank
-            FROM {table}
-            WHERE {" AND ".join(clauses)}
-            ORDER BY lexical_rank ASC, a.artifact_id ASC
-            LIMIT ?
-            """,
-            parameters,
-        ).fetchall()
 
-        max_quality = max((_rank_quality(row["lexical_rank"]) for row in rows), default=0.0)
-        candidates: list[IndexCandidate] = []
-        for row in rows:
-            artifact = self._reconstruct_artifact(row["artifact_id"], row["canonical_json"])
-            matched_terms, matched_fields, evidence = _match_evidence(row, searchable_terms)
-            candidates.append(
-                IndexCandidate(
-                    artifact_id=row["artifact_id"],
-                    artifact=artifact,
-                    lexical_relevance=_normalise_rank(row["lexical_rank"], max_quality),
-                    matched_terms=matched_terms,
-                    matched_fields=matched_fields,
-                    matched_evidence=evidence,
+        with self._read_snapshot() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT a.artifact_id, a.canonical_json, {rank} AS lexical_rank
+                FROM {table}
+                WHERE {" AND ".join(clauses)}
+                ORDER BY lexical_rank ASC, a.artifact_id ASC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+            max_quality = max((_rank_quality(row["lexical_rank"]) for row in rows), default=0.0)
+            candidates: list[IndexCandidate] = []
+            for row in rows:
+                artifact = self._reconstruct_artifact(row["artifact_id"], row["canonical_json"])
+                matched_terms, matched_fields, evidence = _fts_match_evidence(
+                    connection, row["artifact_id"], fts_terms
                 )
-            )
-        return tuple(candidates)
+                candidates.append(
+                    IndexCandidate(
+                        artifact_id=row["artifact_id"],
+                        artifact=artifact,
+                        lexical_relevance=_normalise_rank(row["lexical_rank"], max_quality),
+                        matched_terms=matched_terms,
+                        matched_fields=matched_fields,
+                        matched_evidence=evidence,
+                    )
+                )
+            return tuple(candidates)
 
     def audit(self) -> IndexAudit:
-        """Audit structural integrity, canonical reconstruction, provenance, and FTS parity."""
-        connection = self._ensure_open()
+        """Audit one explicit, lock-protected database snapshot."""
+        with self._read_snapshot() as connection:
+            return self._audit_snapshot(connection)
+
+    def _audit_snapshot(self, connection: sqlite3.Connection) -> IndexAudit:
+        connection.execute("BEGIN")
+        try:
+            return self._audit_connection(connection)
+        finally:
+            connection.rollback()
+
+    def _audit_connection(self, connection: sqlite3.Connection) -> IndexAudit:
         issues: set[str] = set()
         corruption_count = 0
-
-        if connection.execute("PRAGMA user_version").fetchone()[0] != _SCHEMA_VERSION:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version != _SCHEMA_VERSION:
             issues.add("schema_version_mismatch")
         integrity = tuple(row[0] for row in connection.execute("PRAGMA integrity_check"))
         bad_integrity = tuple(message for message in integrity if message != "ok")
@@ -379,7 +390,6 @@ class SQLiteRetrievalIndex:
         ).fetchone()[0]
         facet_count = connection.execute("SELECT COUNT(*) FROM facet_values").fetchone()[0]
         fts_count = connection.execute("SELECT COUNT(*) FROM artifact_fts").fetchone()[0]
-
         foreign_key_rows = tuple(connection.execute("PRAGMA foreign_key_check"))
         explicit_orphans = sum(
             connection.execute(statement).fetchone()[0]
@@ -402,7 +412,6 @@ class SQLiteRetrievalIndex:
             )
         )
         orphan_count = max(len(foreign_key_rows), explicit_orphans)
-
         duplicate_id_count = connection.execute(
             "SELECT COALESCE(SUM(count - 1), 0) FROM "
             "(SELECT COUNT(*) AS count FROM artifacts GROUP BY artifact_id HAVING count > 1)"
@@ -417,6 +426,9 @@ class SQLiteRetrievalIndex:
         if artifact_ids != fts_ids:
             issues.add("fts_artifact_mismatch")
 
+        has_digest = version == _SCHEMA_VERSION and _column_exists(
+            connection, "artifacts", "projection_digest"
+        )
         for row in connection.execute("SELECT * FROM artifacts ORDER BY artifact_id"):
             try:
                 artifact = self._reconstruct_artifact(row["artifact_id"], row["canonical_json"])
@@ -425,6 +437,9 @@ class SQLiteRetrievalIndex:
                 if row["canonical_json"] != _canonical_json(artifact):
                     raise ValueError("canonical artifact JSON is not canonical")
             except (TypeError, ValueError, ValidationError):
+                corruption_count += 1
+            if has_digest and row["projection_digest"] != _live_projection_digest(connection, row):
+                issues.add("projection_digest_mismatch")
                 corruption_count += 1
 
         uncovered = 0
@@ -440,13 +455,7 @@ class SQLiteRetrievalIndex:
                 (
                     source.source_id,
                     source.path,
-                    json.dumps(
-                        source.location.model_dump(mode="json"),
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                        allow_nan=False,
-                    ),
+                    _location_json(source.location.model_dump(mode="json")),
                     artifact.assessment.independence_group,
                 )
                 for source in artifact.source_refs
@@ -482,6 +491,17 @@ class SQLiteRetrievalIndex:
         )
 
     @contextmanager
+    def _read_snapshot(self) -> Iterator[_MemoryConnection]:
+        with self._mutex:
+            self._ensure_open()
+            with self._file_lock(exclusive=False):
+                connection, _, _, _ = self._load_live_connection(close=False)
+                try:
+                    yield connection
+                finally:
+                    connection.close()
+
+    @contextmanager
     def _transaction(self, connection: sqlite3.Connection) -> Iterator[None]:
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -514,13 +534,13 @@ class SQLiteRetrievalIndex:
                     verification_status, source_reliability, extraction_confidence,
                     generalizability, context_specificity, support_count,
                     contradiction_count, observed_outcome, observed_at,
-                    freshness_observed_at, independence_group, canonical_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    freshness_observed_at, independence_group, canonical_json, projection_digest
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     artifact.artifact_id,
                     source_id,
-                    f"semantic_bundles/{source_id}.json",
+                    _canonical_path(source_id),
                     artifact.artifact_type,
                     artifact.knowledge_role,
                     artifact.verification_status,
@@ -535,6 +555,7 @@ class SQLiteRetrievalIndex:
                     artifact.freshness_observed_at,
                     artifact.independence_group,
                     artifact.canonical_json,
+                    _projected_digest(source_id, artifact),
                 ),
             )
         for artifact in projection:
@@ -572,13 +593,7 @@ class SQLiteRetrievalIndex:
                         source.artifact_id,
                         source.source_id,
                         source.path,
-                        json.dumps(
-                            source.location.model_dump(mode="json"),
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                            allow_nan=False,
-                        ),
+                        _location_json(source.location.model_dump(mode="json")),
                         source.independence_group,
                         source.relation,
                     )
@@ -624,6 +639,79 @@ class SQLiteRetrievalIndex:
             raise ValueError(f"invalid canonical artifact identity for {artifact_id!r}")
         return artifact
 
+    def _load_live_connection(
+        self, *, close: bool = False
+    ) -> tuple[_MemoryConnection, bytes, tuple[int, int], int]:
+        generation = self._read_generation()
+        database_bytes, identity = self._read_database_bytes()
+        if not database_bytes or identity is None:
+            raise RuntimeError("database target changed after index open")
+        if (
+            self._db_identity is not None
+            and identity != self._db_identity
+            and generation == self._generation
+        ):
+            raise RuntimeError("database target changed after index open")
+        connection = self._connection_from_bytes(database_bytes)
+        if close:
+            connection.close()
+        return connection, database_bytes, identity, generation
+
+    def _adopt_connection(
+        self,
+        connection: _MemoryConnection,
+        identity: tuple[int, int],
+        generation: int,
+    ) -> None:
+        old_connection = self._connection
+        self._connection = connection
+        self._db_identity = identity
+        self._generation = generation
+        if old_connection is not None:
+            # Persistence has already succeeded at this point.  A best-effort
+            # disposal of the superseded private snapshot must not turn that
+            # success into a raised mutation with committed state.
+            with suppress(Exception):
+                old_connection.close()
+
+    def _new_schema_connection(self) -> _MemoryConnection:
+        connection = self._new_memory_connection()
+        try:
+            connection.executescript(_SCHEMA)
+            connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        except BaseException:
+            connection.close()
+            raise
+        return connection
+
+    def _connection_from_bytes(self, database_bytes: bytes) -> _MemoryConnection:
+        connection = self._new_memory_connection()
+        try:
+            connection.deserialize(database_bytes)
+            connection.execute("PRAGMA foreign_keys = ON")
+        except BaseException:
+            connection.close()
+            raise
+        return connection
+
+    @staticmethod
+    def _new_memory_connection() -> _MemoryConnection:
+        connection = sqlite3.connect(
+            ":memory:",
+            isolation_level=None,
+            check_same_thread=False,
+            factory=_MemoryConnection,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA synchronous = FULL")
+        return connection
+
+    @staticmethod
+    def _require_current_schema(connection: sqlite3.Connection) -> None:
+        if connection.execute("PRAGMA user_version").fetchone()[0] != _SCHEMA_VERSION:
+            raise RuntimeError("database schema version requires a full rebuild")
+
     def _prepare_target(self, path: str | Path) -> tuple[Path, str]:
         if not isinstance(path, (str, os.PathLike)):
             raise TypeError("database path must be a filesystem path")
@@ -654,8 +742,7 @@ class SQLiteRetrievalIndex:
                     child_fd = os.open(component, flags, dir_fd=directory_fd)
                 except OSError as error:
                     raise ValueError("database parent must not contain symlinks") from error
-                child_status = os.fstat(child_fd)
-                if not stat.S_ISDIR(child_status.st_mode):
+                if not stat.S_ISDIR(os.fstat(child_fd).st_mode):
                     os.close(child_fd)
                     raise ValueError("database parent must contain only directories")
                 os.close(directory_fd)
@@ -666,75 +753,237 @@ class SQLiteRetrievalIndex:
             if directory_fd >= 0:
                 os.close(directory_fd)
 
-    def _open_connection(self) -> None:
-        self._ensure_parent_identity()
-        before = self._target_status()
-        if before is not None and not stat.S_ISREG(before.st_mode):
-            raise ValueError("database target must be a regular file")
-        initialize_version = before is None or before.st_size == 0
-        connection = sqlite3.connect(self.path, isolation_level=None)
-        connection.row_factory = sqlite3.Row
-        try:
-            after = self._target_status()
-            if after is None or not stat.S_ISREG(after.st_mode):
-                raise ValueError("database target must be a regular file")
-            if before is not None and (before.st_dev, before.st_ino) != (
-                after.st_dev,
-                after.st_ino,
-            ):
-                raise ValueError("database target changed while being opened")
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("PRAGMA journal_mode = DELETE")
-            connection.execute("PRAGMA synchronous = FULL")
-            connection.executescript(_SCHEMA)
-            version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if initialize_version and version == 0:
-                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-            self._connection = connection
-            self._db_identity = (after.st_dev, after.st_ino)
-        except BaseException:
-            connection.close()
-            raise
-
-    def _close_connection(self) -> None:
-        connection = self._connection
-        if connection is not None:
-            self._connection = None
-            connection.close()
-
-    def _checkpoint_for_replace(self) -> None:
-        connection = self._ensure_open()
-        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-        connection.execute("PRAGMA journal_mode = DELETE").fetchone()
-        connection.commit()
-
-    def _fsync_named_file(self, filename: str) -> None:
+    def _open_lock(self) -> None:
         parent_fd = self._ensure_parent_open()
+        flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        try:
+            lock_fd = os.open(self._lock_filename, flags, 0o600, dir_fd=parent_fd)
+        except OSError as error:
+            raise ValueError("database lock target must be a regular file") from error
+        if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+            os.close(lock_fd)
+            raise ValueError("database lock target must be a regular file")
+        self._lock_fd = lock_fd
+
+    @contextmanager
+    def _file_lock(self, *, exclusive: bool) -> Iterator[None]:
+        lock_fd = self._ensure_lock_open()
+        fcntl.flock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            # A mutation can already be durably installed when this context
+            # unwinds.  An unlock error must not turn that success into a
+            # raised call; closing the retained descriptor remains a fallback
+            # lock release.
+            with suppress(OSError):
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
+    def _read_database_bytes(self) -> tuple[bytes | None, tuple[int, int] | None]:
+        self._ensure_parent_identity()
+        parent_fd = self._ensure_parent_open()
+        before = self._target_status()
+        if before is None:
+            return None, None
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("database target must be a regular file")
         descriptor = os.open(
-            filename,
+            self._filename,
             os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
             dir_fd=parent_fd,
         )
         try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                raise ValueError("rebuilt database target must be a regular file")
-            os.fsync(descriptor)
+            opened = os.fstat(descriptor)
+            identity = (opened.st_dev, opened.st_ino)
+            if not stat.S_ISREG(opened.st_mode) or identity != (before.st_dev, before.st_ino):
+                raise ValueError("database target changed while being read")
+            chunks: list[bytes] = []
+            while chunk := os.read(descriptor, 1024 * 1024):
+                chunks.append(chunk)
+            after = self._target_status()
+            if after is None or identity != (after.st_dev, after.st_ino):
+                raise ValueError("database target changed while being read")
+            return b"".join(chunks), identity
         finally:
             os.close(descriptor)
 
-    def _unlink_sidecars(self, filename: str) -> None:
-        parent_fd = self._parent_fd
-        if parent_fd is None:
-            return
-        for suffix in ("", "-journal", "-wal", "-shm"):
-            with suppress(FileNotFoundError):
-                os.unlink(f"{filename}{suffix}", dir_fd=parent_fd)
+    def _persist_database(
+        self,
+        database_bytes: bytes,
+        *,
+        previous_bytes: bytes,
+        expected_identity: tuple[int, int] | None,
+        generation: int,
+    ) -> tuple[tuple[int, int], int]:
+        parent_fd = self._ensure_parent_open()
+        temporary_name = f".{self._filename}.{secrets.token_hex(16)}.tmp"
+        backup_name = f".{self._filename}.{secrets.token_hex(16)}.backup"
+        temporary_identity: tuple[int, int] | None = None
+        backup_created = False
+        installed = False
+        generation_written = False
+        next_generation = generation + 1
+        try:
+            temporary_identity = self._write_named_bytes(temporary_name, database_bytes)
+            if expected_identity is not None:
+                self._write_named_bytes(backup_name, previous_bytes)
+                backup_created = True
+            self._verify_expected_target(expected_identity)
+            try:
+                os.replace(
+                    temporary_name,
+                    self._filename,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                installed = True
+                os.fsync(parent_fd)
+                current = self._target_status()
+                if current is None or temporary_identity != (current.st_dev, current.st_ino):
+                    raise OSError("database target changed during atomic persistence")
+                self._write_generation(next_generation)
+                generation_written = True
+                if backup_created:
+                    os.unlink(backup_name, dir_fd=parent_fd)
+                    backup_created = False
+                with suppress(OSError):
+                    os.fsync(parent_fd)
+            except BaseException as original_error:
+                rollback_errors = self._rollback_persistence(
+                    backup_name=backup_name,
+                    backup_created=backup_created,
+                    had_previous=expected_identity is not None,
+                    generation=generation,
+                    # A generation write can fail after a short/partial write,
+                    # so restore it whenever the database was installed.
+                    restore_generation=installed or generation_written,
+                )
+                if not rollback_errors:
+                    restored = self._target_status()
+                    if restored is not None and stat.S_ISREG(restored.st_mode):
+                        self._db_identity = (restored.st_dev, restored.st_ino)
+                        self._generation = generation
+                    installed = False
+                    backup_created = False
+                for rollback_error in rollback_errors:
+                    original_error.add_note(
+                        "database persistence rollback failed: "
+                        f"{type(rollback_error).__name__}: {rollback_error}"
+                    )
+                raise
+            return temporary_identity, next_generation
+        finally:
+            if not installed:
+                self._unlink_named(temporary_name)
+            if backup_created and not installed:
+                self._unlink_named(backup_name)
 
-    def _ensure_open(self) -> sqlite3.Connection:
+    def _rollback_persistence(
+        self,
+        *,
+        backup_name: str,
+        backup_created: bool,
+        had_previous: bool,
+        generation: int,
+        restore_generation: bool,
+    ) -> list[BaseException]:
+        errors: list[BaseException] = []
+        parent_fd = self._ensure_parent_open()
+        try:
+            if had_previous and backup_created:
+                os.replace(
+                    backup_name,
+                    self._filename,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+            elif not had_previous:
+                with suppress(FileNotFoundError):
+                    os.unlink(self._filename, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except BaseException as error:
+            errors.append(error)
+        if restore_generation:
+            try:
+                self._write_generation(generation)
+            except BaseException as error:
+                errors.append(error)
+        return errors
+
+    def _write_named_bytes(self, filename: str, payload: bytes) -> tuple[int, int]:
+        parent_fd = self._ensure_parent_open()
+        descriptor = os.open(
+            filename,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            try:
+                view = memoryview(payload)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("database temporary write made no progress")
+                    view = view[written:]
+                os.fsync(descriptor)
+                status = os.fstat(descriptor)
+                if not stat.S_ISREG(status.st_mode):
+                    raise ValueError("database temporary target must be a regular file")
+            finally:
+                os.close(descriptor)
+        except BaseException:
+            self._unlink_named(filename)
+            raise
+        return status.st_dev, status.st_ino
+
+    def _verify_expected_target(self, expected_identity: tuple[int, int] | None) -> None:
+        current = self._target_status()
+        if expected_identity is None:
+            if current is not None:
+                raise RuntimeError("database target changed before atomic persistence")
+            return
+        if (
+            current is None
+            or not stat.S_ISREG(current.st_mode)
+            or expected_identity != (current.st_dev, current.st_ino)
+        ):
+            raise RuntimeError("database target changed before atomic persistence")
+
+    def _read_generation(self) -> int:
+        lock_fd = self._ensure_lock_open()
+        os.lseek(lock_fd, 0, os.SEEK_SET)
+        raw = os.read(lock_fd, 64)
+        if not raw:
+            return 0
+        try:
+            text = raw.decode("ascii")
+            if not text.endswith("\n") or not text[:-1].isdigit():
+                raise ValueError
+            return int(text[:-1])
+        except (UnicodeError, ValueError) as error:
+            raise ValueError("database lock generation is invalid") from error
+
+    def _write_generation(self, generation: int) -> None:
+        lock_fd = self._ensure_lock_open()
+        payload = f"{generation}\n".encode("ascii")
+        os.lseek(lock_fd, 0, os.SEEK_SET)
+        written = os.write(lock_fd, payload)
+        if written != len(payload):
+            raise OSError("database generation write was incomplete")
+        os.ftruncate(lock_fd, len(payload))
+        os.fsync(lock_fd)
+
+    def _unlink_named(self, filename: str) -> None:
+        parent_fd = self._parent_fd
+        if parent_fd is not None:
+            with suppress(FileNotFoundError):
+                os.unlink(filename, dir_fd=parent_fd)
+
+    def _ensure_open(self) -> _MemoryConnection:
         connection = self._connection
         if connection is None:
             raise RuntimeError("retrieval index is closed")
-        self._ensure_target_identity()
         return connection
 
     def _ensure_parent_open(self) -> int:
@@ -742,6 +991,12 @@ class SQLiteRetrievalIndex:
         if parent_fd is None:
             raise RuntimeError("retrieval index is closed")
         return parent_fd
+
+    def _ensure_lock_open(self) -> int:
+        lock_fd = self._lock_fd
+        if lock_fd is None:
+            raise RuntimeError("retrieval index is closed")
+        return lock_fd
 
     def _ensure_parent_identity(self) -> None:
         parent_fd = self._ensure_parent_open()
@@ -755,20 +1010,6 @@ class SQLiteRetrievalIndex:
             expected.st_ino,
         ):
             raise RuntimeError("database parent changed after index open")
-
-    def _ensure_target_identity(self) -> None:
-        self._ensure_parent_identity()
-        status = self._target_status()
-        if status is None or not stat.S_ISREG(status.st_mode):
-            raise RuntimeError("database target changed after index open")
-        if self._db_identity != (status.st_dev, status.st_ino):
-            raise RuntimeError("database target changed after index open")
-
-    def _refresh_identity(self) -> None:
-        status = self._target_status()
-        if status is None or not stat.S_ISREG(status.st_mode):
-            raise RuntimeError("database target changed after index write")
-        self._db_identity = (status.st_dev, status.st_ino)
 
     def _target_status(self) -> os.stat_result | None:
         parent_fd = self._ensure_parent_open()
@@ -791,6 +1032,10 @@ def _validated_source_id(value: str) -> str:
     return value
 
 
+def _canonical_path(source_id: str) -> str:
+    return f"semantic_bundles/{source_id}.json"
+
+
 def _artifact_id(artifact: IndexedArtifact) -> str:
     if isinstance(artifact, ReferenceArtifact):
         return artifact.artifact_id
@@ -811,6 +1056,178 @@ def _canonical_json(artifact: IndexedArtifact) -> str:
     )
 
 
+def _location_json(location: object) -> str:
+    return json.dumps(
+        location,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _projected_digest(source_id: str, artifact: ProjectedArtifact) -> str:
+    artifact_row = {
+        "artifact_id": artifact.artifact_id,
+        "owner_source_id": source_id,
+        "canonical_path": _canonical_path(source_id),
+        "artifact_type": artifact.artifact_type,
+        "knowledge_role": artifact.knowledge_role,
+        "verification_status": artifact.verification_status,
+        "source_reliability": artifact.source_reliability,
+        "extraction_confidence": artifact.extraction_confidence,
+        "generalizability": artifact.generalizability,
+        "context_specificity": artifact.context_specificity,
+        "support_count": artifact.support_count,
+        "contradiction_count": artifact.contradiction_count,
+        "observed_outcome": artifact.observed_outcome,
+        "observed_at": artifact.observed_at,
+        "freshness_observed_at": artifact.freshness_observed_at,
+        "independence_group": artifact.independence_group,
+        "canonical_json": artifact.canonical_json,
+    }
+    facets = [
+        {
+            "artifact_id": facet.artifact_id,
+            "facet_id": facet.facet_id,
+            "channel": facet.channel,
+            "namespace": facet.namespace,
+            "key": facet.key,
+            "value": facet.value,
+            "relation": facet.relation,
+            "origin": facet.origin,
+            "confidence": facet.confidence,
+        }
+        for facet in artifact.facets
+    ]
+    links = [
+        {
+            "from_artifact_id": link.from_artifact_id,
+            "relation": link.relation,
+            "to_artifact_id": link.to_artifact_id,
+        }
+        for link in artifact.links
+    ]
+    sources = [
+        {
+            "artifact_id": source.artifact_id,
+            "source_id": source.source_id,
+            "path": source.path,
+            "location_json": _location_json(source.location.model_dump(mode="json")),
+            "independence_group": source.independence_group,
+            "relation": source.relation,
+        }
+        for source in artifact.sources
+    ]
+    fts = [
+        {
+            "artifact_id": artifact.artifact_id,
+            **{field: getattr(artifact, field) for field in _FTS_FIELDS},
+        }
+    ]
+    return _digest_payload(artifact_row, facets, links, sources, fts)
+
+
+def _live_projection_digest(connection: sqlite3.Connection, row: sqlite3.Row) -> str:
+    artifact_row = {
+        key: row[key]
+        for key in (
+            "artifact_id",
+            "owner_source_id",
+            "canonical_path",
+            "artifact_type",
+            "knowledge_role",
+            "verification_status",
+            "source_reliability",
+            "extraction_confidence",
+            "generalizability",
+            "context_specificity",
+            "support_count",
+            "contradiction_count",
+            "observed_outcome",
+            "observed_at",
+            "freshness_observed_at",
+            "independence_group",
+            "canonical_json",
+        )
+    }
+    facets = _rows_as_dicts(
+        connection.execute(
+            "SELECT artifact_id, facet_id, channel, namespace, key, value, relation, origin, "
+            "confidence FROM facet_values WHERE artifact_id = ? ORDER BY facet_id",
+            (row["artifact_id"],),
+        )
+    )
+    links = _rows_as_dicts(
+        connection.execute(
+            "SELECT from_artifact_id, relation, to_artifact_id FROM artifact_links "
+            "WHERE from_artifact_id = ? ORDER BY relation, to_artifact_id",
+            (row["artifact_id"],),
+        )
+    )
+    sources = _rows_as_dicts(
+        connection.execute(
+            "SELECT artifact_id, source_id, path, location_json, independence_group, relation "
+            "FROM artifact_sources WHERE artifact_id = ? "
+            "ORDER BY relation, independence_group, source_id, path, location_json",
+            (row["artifact_id"],),
+        )
+    )
+    fts = _rows_as_dicts(
+        connection.execute(
+            "SELECT artifact_id, statement, rationale, observations, action_intent, "
+            "expected_evidence, exceptions FROM artifact_fts WHERE artifact_id = ? "
+            "ORDER BY statement, rationale, observations, action_intent, "
+            "expected_evidence, exceptions",
+            (row["artifact_id"],),
+        )
+    )
+    return _digest_payload(artifact_row, facets, links, sources, fts)
+
+
+def _rows_as_dicts(rows: Iterable[sqlite3.Row]) -> list[dict[str, object]]:
+    return [dict(row) for row in rows]
+
+
+def _digest_payload(
+    artifact: dict[str, object],
+    facets: Sequence[dict[str, object]],
+    links: Sequence[dict[str, object]],
+    sources: Sequence[dict[str, object]],
+    fts: Sequence[dict[str, object]],
+) -> str:
+    payload = json.dumps(
+        {
+            "artifact": artifact,
+            "facets": _sorted_digest_rows(facets),
+            "links": _sorted_digest_rows(links),
+            "sources": _sorted_digest_rows(sources),
+            "fts": _sorted_digest_rows(fts),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _sorted_digest_rows(
+    rows: Sequence[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Canonicalize normalized row order independently of query/insertion order."""
+    return sorted(
+        rows,
+        key=lambda row: json.dumps(
+            row,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ),
+    )
+
+
 def _stored_metadata_matches(row: sqlite3.Row, artifact: IndexedArtifact) -> bool:
     try:
         owner_source_id = _validated_source_id(row["owner_source_id"])
@@ -819,7 +1236,7 @@ def _stored_metadata_matches(row: sqlite3.Row, artifact: IndexedArtifact) -> boo
     assessment = artifact.assessment
     observed_at = artifact.observed_at if isinstance(artifact, ReferenceArtifact) else None
     return (
-        row["canonical_path"] == f"semantic_bundles/{owner_source_id}.json"
+        row["canonical_path"] == _canonical_path(owner_source_id)
         and row["artifact_type"] == artifact.artifact_type
         and row["knowledge_role"] == artifact.knowledge_role
         and row["verification_status"] == assessment.verification_status
@@ -834,6 +1251,10 @@ def _stored_metadata_matches(row: sqlite3.Row, artifact: IndexedArtifact) -> boo
         and row["freshness_observed_at"] == assessment.freshness_observed_at
         and row["independence_group"] == assessment.independence_group
     )
+
+
+def _column_exists(connection: sqlite3.Connection, table: str, column: str) -> bool:
+    return any(row[1] == column for row in connection.execute(f"PRAGMA table_info({table})"))
 
 
 def _lane_clause(lane: EpistemicLane) -> str:
@@ -856,6 +1277,39 @@ def _lane_clause(lane: EpistemicLane) -> str:
     )
 
 
+def _fts_phrase(term: str) -> str:
+    return f'"{term.replace(chr(34), chr(34) * 2)}"'
+
+
+def _fts_match_evidence(
+    connection: sqlite3.Connection,
+    artifact_id: str,
+    terms: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    matched_terms: set[str] = set()
+    matched_fields: set[str] = set()
+    evidence: set[str] = set()
+    for term, phrase in terms:
+        term_match = connection.execute(
+            "SELECT 1 FROM artifact_fts WHERE artifact_id = ? AND artifact_fts MATCH ?",
+            (artifact_id, phrase),
+        ).fetchone()
+        if term_match is None:
+            continue
+        matched_terms.add(term)
+        for field_index, field in enumerate(_FTS_FIELDS, start=1):
+            field_query = f"{field} : {phrase}"
+            snippet = connection.execute(
+                "SELECT snippet(artifact_fts, ?, '[', ']', ' … ', 12) "
+                "FROM artifact_fts WHERE artifact_id = ? AND artifact_fts MATCH ?",
+                (field_index, artifact_id, field_query),
+            ).fetchone()
+            if snippet is not None:
+                matched_fields.add(field)
+                evidence.add(f"{field}: {snippet[0]}"[:2048])
+    return tuple(sorted(matched_terms)), tuple(sorted(matched_fields)), tuple(sorted(evidence))
+
+
 def _rank_quality(value: object) -> float:
     try:
         rank = -float(value)
@@ -871,24 +1325,6 @@ def _normalise_rank(value: object, max_quality: float) -> float:
     if max_quality <= 0.0:
         return 0.0
     return min(1.0, quality / max_quality)
-
-
-def _match_evidence(
-    row: sqlite3.Row,
-    terms: tuple[tuple[str, list[str]], ...],
-) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    matched_terms: set[str] = set()
-    matched_fields: set[str] = set()
-    evidence: set[str] = set()
-    for field in _FTS_FIELDS:
-        field_tokens = {token.casefold() for token in _WORD.findall(row[field])}
-        for term, tokens in terms:
-            normalized_tokens = {token.casefold() for token in tokens}
-            if normalized_tokens and normalized_tokens <= field_tokens:
-                matched_terms.add(term)
-                matched_fields.add(field)
-                evidence.add(f"{field}: {term}"[:2048])
-    return tuple(sorted(matched_terms)), tuple(sorted(matched_fields)), tuple(sorted(evidence))
 
 
 __all__ = ["SQLiteRetrievalIndex"]
