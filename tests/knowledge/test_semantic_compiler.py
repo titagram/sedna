@@ -180,6 +180,10 @@ def test_accepted_extraction_materializes_verified_bundle_with_exact_two_calls()
     assert result.bundle.compilation_manifest.emitted_artifact_ids == (
         result.bundle.references[0].artifact_id,
     )
+    assert (
+        result.bundle.references[0].assessment.independence_group
+        == _prepared_source().manifest.sha256
+    )
     assert result.verification is not None
     assert result.verification.findings == ()
     assert [call.purpose for call in result.calls] == [

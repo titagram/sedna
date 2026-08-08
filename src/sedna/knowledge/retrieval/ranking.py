@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from hashlib import sha256
 from types import MappingProxyType
 from typing import Any
 
@@ -41,6 +42,13 @@ from sedna.knowledge.schema import (
 _MAX_RANKING_CANDIDATES = 400
 _MAX_EXPLANATION_ITEMS = 32
 _MAX_GLOBAL_QUESTIONS = 128
+_MAX_OUTPUT_STRING_CHARS = 2048
+_MAX_EXPLANATION_VALUE_CHARS = 512
+_MAX_OUTPUT_PROVENANCE = 64
+_MAX_PROVENANCE_SCAN_ITEMS = 256
+_MAX_OUTPUT_SEQUENCE_ITEMS = 256
+_MAX_CANONICAL_FACETS = 256
+_MAX_CANONICAL_PAYLOAD_BYTES = 262_144
 _MIN_KNOWN_FACT_CONFIDENCE = 0.75
 _UNKNOWN_VALUES = frozenset({"", "unknown", "unspecified", "not established"})
 _HARD_OBSERVED_DIMENSIONS = frozenset(
@@ -49,6 +57,19 @@ _HARD_OBSERVED_DIMENSIONS = frozenset(
         ("typed", "execution_environment"),
         ("typed", "identity_context"),
         ("typed", "os_family"),
+    }
+)
+_SINGLETON_DIMENSIONS = frozenset(
+    {
+        ("typed", "cpu_architecture"),
+        ("typed", "execution_environment"),
+        ("typed", "identity_context"),
+        ("typed", "initial_access"),
+        ("typed", "network_position"),
+        ("typed", "observation_date"),
+        ("typed", "os_family"),
+        ("typed", "os_version"),
+        ("typed", "system_role"),
     }
 )
 
@@ -103,8 +124,10 @@ class RankedCandidates(BaseModel):
         for lane, hits in lanes:
             if any(hit.lane is not lane for hit in hits):
                 raise ValueError("ranked hit is in the wrong epistemic lane")
-            if hits != tuple(sorted(hits, key=lambda hit: (-hit.score.total, hit.artifact_id))):
-                raise ValueError("ranked hits must use stable lane-local ordering")
+            if hits != _diversified_lane_order(hits):
+                raise ValueError(
+                    "ranked hits must use stable lane-local independence-group ordering"
+                )
             for hit in hits:
                 if hit.artifact_id in all_hit_ids:
                     raise ValueError("an artifact can qualify in only one epistemic lane")
@@ -152,10 +175,17 @@ class _ApplicabilityResult:
 
 
 @dataclass(frozen=True, slots=True)
+class _SafeArtifactView:
+    artifact: IndexedArtifact
+    notes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _EvaluatedCandidate:
     candidate: IndexCandidate
     lane: EpistemicLane | None
     safe_artifact: IndexedArtifact
+    safe_view_notes: tuple[str, ...]
     applicability: _ApplicabilityResult
     rejection_reasons: tuple[str, ...]
 
@@ -188,15 +218,20 @@ def rank_candidates(
     for candidate in canonical_candidates:
         artifact = candidate.artifact
         lane = _lane_for(artifact)
-        safe_artifact = _safe_retrieval_artifact(artifact)
-        applicability = _assess_applicability(
-            artifact,
-            live_facets,
-            live_values,
-            observed_services=observed_services,
+        budget_reasons = _ranking_budget_reasons(artifact)
+        safe_view = _safe_retrieval_artifact(artifact)
+        applicability = (
+            _empty_applicability()
+            if budget_reasons
+            else _assess_applicability(
+                artifact,
+                live_facets,
+                live_values,
+                observed_services=observed_services,
+            )
         )
 
-        rejection_reasons = list(applicability.hard_rejections)
+        rejection_reasons = [*budget_reasons, *applicability.hard_rejections]
         if lane is None:
             rejection_reasons.append("parent case metadata is not a qualifying retrieval hit")
         if artifact.assessment.verification_status is VerificationStatus.REJECTED:
@@ -205,7 +240,8 @@ def rank_candidates(
             _EvaluatedCandidate(
                 candidate=candidate,
                 lane=lane,
-                safe_artifact=safe_artifact,
+                safe_artifact=safe_view.artifact,
+                safe_view_notes=safe_view.notes,
                 applicability=applicability,
                 rejection_reasons=tuple(rejection_reasons),
             )
@@ -216,9 +252,7 @@ def rank_candidates(
         for item in evaluated
         if item.lane is not None and not item.rejection_reasons
     )
-    as_of_by_lane = {
-        lane: _ranking_as_of(query, canonical_candidates, lane=lane) for lane in EpistemicLane
-    }
+    query_as_of = _query_observation_date(query)
     hits: dict[EpistemicLane, list[RetrievalHit]] = defaultdict(list)
     rejected: list[RejectedCandidate] = []
     for item in evaluated:
@@ -228,13 +262,14 @@ def rank_candidates(
         safe_artifact = item.safe_artifact
         applicability = item.applicability
         if item.rejection_reasons:
+            rejection_reasons = (*item.rejection_reasons, *item.safe_view_notes)
             rejected.append(
                 RejectedCandidate(
                     artifact_id=candidate.artifact_id,
                     artifact=safe_artifact,
                     lane=lane,
                     provenance=safe_artifact.source_refs,
-                    rejection_reasons=item.rejection_reasons[:_MAX_EXPLANATION_ITEMS],
+                    rejection_reasons=rejection_reasons[:_MAX_EXPLANATION_ITEMS],
                     missing_context=applicability.missing_context[:_MAX_EXPLANATION_ITEMS],
                 )
             )
@@ -245,7 +280,7 @@ def rank_candidates(
         score = _score_candidate(
             candidate,
             applicability,
-            as_of=as_of_by_lane[lane],
+            as_of=query_as_of,
             independence_group_frequency=group_counts[
                 (lane, artifact.assessment.independence_group)
             ],
@@ -272,8 +307,12 @@ def rank_candidates(
         ]
         if artifact.assessment.verification_status is VerificationStatus.CONTESTED:
             qualification_reasons.append("contested evidence retained with reduced confidence")
-        if artifact.assessment.verification_status is VerificationStatus.DEPRECATED:
+        if (
+            artifact.assessment.verification_status is VerificationStatus.DEPRECATED
+            and score.freshness < 1.0
+        ):
             qualification_reasons.append("deprecated evidence retained with reduced freshness")
+        qualification_reasons.extend(item.safe_view_notes)
         qualification_reasons.extend(applicability.matched_descriptions)
         hits[lane].append(
             RetrievalHit(
@@ -288,8 +327,8 @@ def rank_candidates(
             )
         )
 
-    for lane_hits in hits.values():
-        lane_hits.sort(key=lambda hit: (-hit.score.total, hit.artifact_id))
+    for lane, lane_hits in tuple(hits.items()):
+        hits[lane] = list(_diversified_lane_order(lane_hits))
     rejected.sort(key=lambda item: item.artifact_id)
     return RankedCandidates(
         references=tuple(hits[EpistemicLane.REFERENCE]),
@@ -299,6 +338,32 @@ def rank_candidates(
         rejected_candidates=tuple(rejected),
         missing_context_questions=tuple(sorted(all_questions))[:_MAX_GLOBAL_QUESTIONS],
     )
+
+
+def _diversified_lane_order(hits: Iterable[RetrievalHit]) -> tuple[RetrievalHit, ...]:
+    groups: dict[str, list[RetrievalHit]] = defaultdict(list)
+    for hit in hits:
+        groups[hit.artifact.assessment.independence_group].append(hit)
+    for group_hits in groups.values():
+        group_hits.sort(key=lambda hit: (-hit.score.total, hit.artifact_id))
+    group_order = tuple(
+        sorted(
+            groups,
+            key=lambda group: (
+                -groups[group][0].score.total,
+                groups[group][0].artifact_id,
+                group,
+            ),
+        )
+    )
+    ordered: list[RetrievalHit] = []
+    offset = 0
+    while any(offset < len(groups[group]) for group in group_order):
+        ordered.extend(
+            groups[group][offset] for group in group_order if offset < len(groups[group])
+        )
+        offset += 1
+    return tuple(ordered)
 
 
 def _bounded_candidates(candidates: Iterable[IndexCandidate]) -> tuple[IndexCandidate, ...]:
@@ -366,6 +431,60 @@ def _live_values(
     return {dimension: tuple(sorted(items)) for dimension, items in values.items()}
 
 
+def _ranking_budget_reasons(artifact: IndexedArtifact) -> tuple[str, ...]:
+    encoded = json.dumps(
+        artifact.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    reasons: list[str] = []
+    if len(encoded) > _MAX_CANONICAL_PAYLOAD_BYTES:
+        reasons.append(
+            "candidate canonical payload exceeds "
+            f"{_MAX_CANONICAL_PAYLOAD_BYTES}-byte ranking budget"
+        )
+    typed = artifact.applicability.typed_context
+    typed_scalar_count = sum(
+        getattr(typed, key) is not None
+        for key in (
+            "os_family",
+            "os_version",
+            "cpu_architecture",
+            "execution_environment",
+            "system_role",
+            "identity_context",
+            "initial_access",
+            "network_position",
+            "observation_date",
+        )
+    )
+    facet_count = (
+        typed_scalar_count
+        + len(typed.services)
+        + len(typed.privileges)
+        + len(typed.security_controls)
+        + len(artifact.applicability.facets)
+    )
+    if facet_count > _MAX_CANONICAL_FACETS:
+        reasons.append(
+            f"candidate applicability exceeds {_MAX_CANONICAL_FACETS}-facet ranking budget"
+        )
+    return tuple(reasons)
+
+
+def _empty_applicability() -> _ApplicabilityResult:
+    return _ApplicabilityResult(
+        hard_rejections=(),
+        matched_facets=(),
+        matched_descriptions=(),
+        missing_context=(),
+        required_coverage=0.0,
+        context_similarity=0.0,
+        unknown_penalty=0.0,
+    )
+
+
 def _assess_applicability(
     artifact: IndexedArtifact,
     live_facets: tuple[SituationFacet, ...],
@@ -392,6 +511,11 @@ def _assess_applicability(
     for facet in canonical_facets:
         weight = max(0.05, facet.confidence)
         value = _normalize(facet.value)
+        rendered_dimension = _truncate_text(
+            facet.rendered_dimension,
+            limit=_MAX_EXPLANATION_VALUE_CHARS,
+        )
+        rendered_value = _truncate_text(value, limit=_MAX_EXPLANATION_VALUE_CHARS)
         dimension_values = live_values.get(facet.dimension, ())
         exact = live_exact.get((*facet.dimension, value))
         service_type = (
@@ -403,19 +527,38 @@ def _assess_applicability(
         source_unknown = value in _UNKNOWN_VALUES or facet.relation is ContextRelation.UNKNOWN
         if source_unknown:
             unknown_weight += weight
-            missing.add(f"clarify {facet.rendered_dimension} left unknown by source evidence")
+            missing.add(f"clarify {rendered_dimension} left unknown by source evidence")
+            continue
+
+        if facet.dimension in _SINGLETON_DIMENSIONS and len(dimension_values) > 1:
+            rendered_conflict = _truncate_text(
+                ", ".join(dimension_values),
+                limit=_MAX_EXPLANATION_VALUE_CHARS,
+            )
+            unknown_weight += weight
+            missing.add(
+                f"resolve contradictory current {rendered_dimension} values: {rendered_conflict}"
+            )
+            if facet.relation is ContextRelation.REQUIRED:
+                required_total += weight
+                similarity_total += weight
+            elif facet.relation in {
+                ContextRelation.OBSERVED,
+                ContextRelation.COMPATIBLE,
+            }:
+                similarity_total += weight
             continue
 
         if facet.relation is ContextRelation.INCOMPATIBLE:
             if exact is not None:
                 hard_rejections.add(
-                    f"observed {facet.rendered_dimension}={value} is explicitly incompatible"
+                    f"observed {rendered_dimension}={rendered_value} is explicitly incompatible"
                 )
             elif not dimension_values:
                 unknown_weight += weight
                 missing.add(
-                    f"confirm whether current {facet.rendered_dimension} has incompatible value: "
-                    f"{value}"
+                    f"confirm whether current {rendered_dimension} has incompatible value: "
+                    f"{rendered_value}"
                 )
             continue
 
@@ -426,15 +569,21 @@ def _assess_applicability(
                 required_matched += weight
                 similarity_matched += weight
                 matched[(exact.namespace, exact.key, exact.value)] = exact
-                matched_descriptions.add(f"matched {facet.rendered_dimension}={value}")
+                matched_descriptions.add(f"matched {rendered_dimension}={rendered_value}")
             elif dimension_values:
+                rendered_observed = _truncate_text(
+                    ", ".join(dimension_values),
+                    limit=_MAX_EXPLANATION_VALUE_CHARS,
+                )
                 hard_rejections.add(
-                    f"required {facet.rendered_dimension}={value} conflicts with observed "
-                    f"{', '.join(dimension_values)}"
+                    f"required {rendered_dimension}={rendered_value} conflicts with observed "
+                    f"{rendered_observed}"
                 )
             else:
                 unknown_weight += weight
-                missing.add(f"confirm current {facet.rendered_dimension} (required value: {value})")
+                missing.add(
+                    f"confirm current {rendered_dimension} (required value: {rendered_value})"
+                )
             continue
 
         if facet.relation in {ContextRelation.OBSERVED, ContextRelation.COMPATIBLE}:
@@ -442,16 +591,20 @@ def _assess_applicability(
                 similarity_total += weight
                 similarity_matched += weight
                 matched[(exact.namespace, exact.key, exact.value)] = exact
-                matched_descriptions.add(f"matched {facet.rendered_dimension}={value}")
+                matched_descriptions.add(f"matched {rendered_dimension}={rendered_value}")
             elif dimension_values:
                 similarity_total += weight
                 if (
                     facet.relation is ContextRelation.OBSERVED
                     and facet.dimension in _HARD_OBSERVED_DIMENSIONS
                 ):
+                    rendered_observed = _truncate_text(
+                        ", ".join(dimension_values),
+                        limit=_MAX_EXPLANATION_VALUE_CHARS,
+                    )
                     hard_rejections.add(
-                        f"observed source context {facet.rendered_dimension}={value} conflicts "
-                        f"with current {', '.join(dimension_values)}"
+                        f"observed source context {rendered_dimension}={rendered_value} conflicts "
+                        f"with current {rendered_observed}"
                     )
             elif service_type_match:
                 similarity_total += weight
@@ -464,7 +617,8 @@ def _assess_applicability(
                 similarity_total += weight
                 unknown_weight += weight
                 missing.add(
-                    f"confirm current {facet.rendered_dimension} to assess observed value: {value}"
+                    f"confirm current {rendered_dimension} to assess observed value: "
+                    f"{rendered_value}"
                 )
 
     required_coverage = 1.0 if required_total == 0 else required_matched / required_total
@@ -595,11 +749,15 @@ def _source_diversity(
 
 
 def _freshness(artifact: IndexedArtifact, *, as_of: date | None) -> float:
+    if artifact.assessment.verification_status is VerificationStatus.DEPRECATED:
+        return 0.20
     if not _is_version_sensitive(artifact):
         return 1.0
     observed = _artifact_observed_date(artifact)
-    if observed is None or as_of is None:
+    if observed is None:
         return 0.25
+    if as_of is None:
+        return 0.60
     age_days = (as_of - observed).days
     if age_days < -30:
         return 0.25
@@ -614,13 +772,8 @@ def _freshness(artifact: IndexedArtifact, *, as_of: date | None) -> float:
     return 0.20
 
 
-def _ranking_as_of(
-    query: RetrievalQuery,
-    candidates: tuple[IndexCandidate, ...],
-    *,
-    lane: EpistemicLane,
-) -> date | None:
-    live_dates = tuple(
+def _query_observation_date(query: RetrievalQuery) -> date | None:
+    live_dates = frozenset(
         parsed
         for facet in (*query.situation.facts, *query.facets)
         if facet.namespace == "typed"
@@ -628,22 +781,20 @@ def _ranking_as_of(
         and facet.confidence >= _MIN_KNOWN_FACT_CONFIDENCE
         and (parsed := _parse_date(facet.value)) is not None
     )
-    if live_dates:
-        return max(live_dates)
-    candidate_dates = tuple(
-        parsed
-        for candidate in candidates
-        if _lane_for(candidate.artifact) is lane
-        and _is_version_sensitive(candidate.artifact)
-        and (parsed := _artifact_observed_date(candidate.artifact)) is not None
-    )
-    return max(candidate_dates, default=None)
+    return next(iter(live_dates)) if len(live_dates) == 1 else None
 
 
 def _artifact_observed_date(artifact: IndexedArtifact) -> date | None:
     observed = artifact.assessment.freshness_observed_at
     if observed is None and isinstance(artifact, ReferenceArtifact):
         observed = artifact.observed_at
+    if observed is None:
+        assertion = artifact.applicability.typed_context.observation_date
+        if assertion is not None and assertion.relation not in {
+            ContextRelation.INCOMPATIBLE,
+            ContextRelation.UNKNOWN,
+        }:
+            observed = assertion.value
     return _parse_date(observed)
 
 
@@ -697,21 +848,95 @@ def _lane_for(artifact: IndexedArtifact) -> EpistemicLane | None:
     return EpistemicLane.REFERENCE
 
 
-def _safe_retrieval_artifact(artifact: IndexedArtifact) -> IndexedArtifact:
-    if isinstance(artifact, CaseStep):
-        return CaseStep.model_validate(
-            artifact.model_copy(update={"case_specific_details": ()}).model_dump(mode="json")
-        )
-    if isinstance(artifact, KnowledgeCase):
-        safe_steps = tuple(_safe_retrieval_artifact(step) for step in artifact.steps)
-        return KnowledgeCase.model_validate(
-            artifact.model_copy(update={"steps": safe_steps}).model_dump(mode="json")
-        )
-    return artifact
+def _safe_retrieval_artifact(artifact: IndexedArtifact) -> _SafeArtifactView:
+    payload = artifact.model_dump(mode="json")
+    notes: set[str] = set()
+
+    def compact(value: Any, *, key: str | None = None, top_level: bool = False) -> Any:
+        if isinstance(value, dict):
+            return {
+                item_key: compact(
+                    item_value,
+                    key=item_key,
+                    top_level=top_level and item_key == "source_refs",
+                )
+                for item_key, item_value in value.items()
+                if item_key != "case_specific_details"
+            } | ({"case_specific_details": []} if "case_specific_details" in value else {})
+        if isinstance(value, list):
+            items = value
+            if key == "source_refs":
+                scanned_items = items[:_MAX_PROVENANCE_SCAN_ITEMS]
+                unique: list[Any] = []
+                identities: set[str] = set()
+                for item in scanned_items:
+                    identity = json.dumps(
+                        item,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    if identity not in identities:
+                        identities.add(identity)
+                        unique.append(item)
+                items = unique[:_MAX_OUTPUT_PROVENANCE]
+                if top_level:
+                    if len(unique) != len(scanned_items):
+                        entry_description = (
+                            f"{len(scanned_items)} inspected canonical entries"
+                            if len(value) > _MAX_PROVENANCE_SCAN_ITEMS
+                            else f"{len(value)} canonical entries"
+                        )
+                        notes.add(
+                            "provenance deduplicated: showing "
+                            f"{len(items)} unique source references from "
+                            f"{entry_description}"
+                        )
+                    if len(value) > _MAX_PROVENANCE_SCAN_ITEMS:
+                        notes.add(
+                            "provenance bounded: showing "
+                            f"{len(items)} of at least {len(unique)} unique source references; "
+                            f"{len(value) - _MAX_PROVENANCE_SCAN_ITEMS} canonical entries "
+                            "omitted from deduplication scan"
+                        )
+                    elif len(unique) > _MAX_OUTPUT_PROVENANCE:
+                        notes.add(
+                            "provenance bounded: showing "
+                            f"{len(items)} of {len(unique)} unique source references"
+                        )
+                elif (
+                    len(unique) != len(scanned_items)
+                    or len(unique) > _MAX_OUTPUT_PROVENANCE
+                    or len(value) > _MAX_PROVENANCE_SCAN_ITEMS
+                ):
+                    notes.add("nested provenance bounded in retrieval view")
+            elif len(items) > _MAX_OUTPUT_SEQUENCE_ITEMS:
+                items = items[:_MAX_OUTPUT_SEQUENCE_ITEMS]
+                notes.add(
+                    "artifact retrieval view sequences bounded to "
+                    f"{_MAX_OUTPUT_SEQUENCE_ITEMS} items"
+                )
+            return [compact(item) for item in items]
+        if isinstance(value, str) and len(value) > _MAX_OUTPUT_STRING_CHARS:
+            notes.add("artifact retrieval view compacted to bounded output")
+            return _truncate_text(value, limit=_MAX_OUTPUT_STRING_CHARS)
+        return value
+
+    safe_payload = compact(payload, top_level=True)
+    safe_artifact = type(artifact).model_validate(safe_payload)
+    return _SafeArtifactView(artifact=safe_artifact, notes=tuple(sorted(notes)))
 
 
 def _normalize(value: str) -> str:
     return " ".join(value.split()).casefold()
+
+
+def _truncate_text(value: str, *, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    digest = sha256(value.encode("utf-8")).hexdigest()[:16]
+    suffix = f" … [truncated sha256:{digest}]"
+    return f"{value[: limit - len(suffix)]}{suffix}"
 
 
 def _bounded(value: float) -> float:

@@ -30,9 +30,14 @@ from sedna.knowledge.semantic import (
 from sedna.knowledge.semantic.materialize import materialize_bundle
 
 
-def _prepared_source(*, path: str = "raw_src/material.md") -> PreparedSource:
+def _prepared_source(
+    *,
+    path: str = "raw_src/material.md",
+    source_id: str = "material-source",
+    sha256: str = "a" * 64,
+) -> PreparedSource:
     document = parse_markdown(
-        "material-source",
+        source_id,
         path,
         """# Discovery
 
@@ -44,9 +49,9 @@ Inspect the HTTP response before selecting an action.
 """,
     )
     manifest = DocumentManifest(
-        source_id="material-source",
+        source_id=source_id,
         path=path,
-        sha256="a" * 64,
+        sha256=sha256,
         title="Materialization notes",
         language="en",
         document_type=DocumentType.MACHINE_WALKTHROUGH,
@@ -113,6 +118,25 @@ def test_materialize_resolves_exact_segment_provenance_and_host_metadata():
     assert artifact.extraction.parser_id == "markdown-it"
     assert artifact.extraction.extractor_id == "sedna-semantic-extractor"
     assert artifact.extraction.model_id == "host-model"
+
+
+def test_byte_identical_sources_share_content_derived_independence_group():
+    first = materialize_bundle(
+        _prepared_source(path="raw_src/copy-a.md", source_id="copy-a", sha256="b" * 64),
+        _bundle(_reference(), ignored=(1,)),
+        _call_metadata(),
+        VerificationStatus.VERIFIED,
+    )[0]
+    second = materialize_bundle(
+        _prepared_source(path="raw_src/copy-b.md", source_id="copy-b", sha256="b" * 64),
+        _bundle(_reference(), ignored=(1,)),
+        _call_metadata(),
+        VerificationStatus.VERIFIED,
+    )[0]
+
+    assert first.source_refs[0].source_id == "copy-a"
+    assert second.source_refs[0].source_id == "copy-b"
+    assert first.assessment.independence_group == second.assessment.independence_group == "b" * 64
 
 
 @pytest.mark.parametrize(

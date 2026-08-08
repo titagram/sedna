@@ -926,10 +926,14 @@ class SQLiteRetrievalIndex:
         temporary_name = f".{self._filename}.{secrets.token_hex(16)}.tmp"
         backup_name = f".{self._filename}.{secrets.token_hex(16)}.backup"
         temporary_identity: tuple[int, int] | None = None
+        backup_identity: tuple[int, int] | None = None
         backup_created = False
         installed = False
         generation_written = False
         validated_descriptor: int | None = None
+        backup_descriptor: int | None = None
+        backup_digest: str | None = None
+        preserve_backup = False
         next_generation = generation + 1
         try:
             temporary_identity = self._write_named_bytes(temporary_name, database_bytes)
@@ -939,8 +943,13 @@ class SQLiteRetrievalIndex:
                 expected_generation=next_generation,
             )
             if expected_identity is not None:
-                self._write_named_bytes(backup_name, previous_bytes)
+                backup_identity = self._write_named_bytes(backup_name, previous_bytes)
                 backup_created = True
+                backup_descriptor, backup_digest = self._retain_exact_named_bytes(
+                    backup_name,
+                    backup_identity,
+                    previous_bytes,
+                )
             self._ensure_lock_identity()
             self._verify_expected_target(expected_identity)
             try:
@@ -976,27 +985,51 @@ class SQLiteRetrievalIndex:
                     self._write_generation(next_generation)
                 generation_written = True
                 if backup_created:
-                    os.unlink(backup_name, dir_fd=parent_fd)
+                    if backup_identity is None:
+                        raise RuntimeError("database backup identity was not retained")
+                    self._unlink_named_identity(backup_name, backup_identity)
                     backup_created = False
-                with suppress(OSError):
-                    os.fsync(parent_fd)
+                os.fsync(parent_fd)
+                # Backup deletion and its directory sync are part of the
+                # commit boundary. Recheck the exact installed inode and
+                # bytes afterwards while both retained readers are open.
+                self._verify_retained_bytes(
+                    validated_descriptor,
+                    self._filename,
+                    temporary_identity,
+                    validated_digest,
+                )
             except BaseException as original_error:
-                rollback_errors = self._rollback_persistence(
-                    backup_name=backup_name,
-                    backup_created=backup_created,
+                rollback_errors, restored_identity = self._rollback_persistence(
+                    backup_descriptor=backup_descriptor,
+                    backup_identity=backup_identity,
+                    backup_digest=backup_digest,
                     had_previous=expected_identity is not None,
+                    backup_is_database=bool(previous_bytes),
+                    installed_identity=temporary_identity,
                     generation=generation,
                     # A generation write can fail after a short/partial write,
                     # so restore it whenever the database was installed.
                     restore_generation=installed or generation_written,
                 )
-                if not rollback_errors:
-                    restored = self._target_status()
-                    if restored is not None and stat.S_ISREG(restored.st_mode):
-                        self._db_identity = (restored.st_dev, restored.st_ino)
-                        self._generation = generation
+                if restored_identity is not None:
+                    self._db_identity = restored_identity
+                    self._generation = generation
                     installed = False
+                if not rollback_errors:
+                    if backup_identity is not None:
+                        self._unlink_named_identity_if_present(backup_name, backup_identity)
                     backup_created = False
+                else:
+                    preserve_backup = True
+                    preservation_error = self._preserve_retained_backup(
+                        backup_name,
+                        backup_descriptor,
+                        backup_identity,
+                        backup_digest,
+                    )
+                    if preservation_error is not None:
+                        rollback_errors.append(preservation_error)
                 for rollback_error in rollback_errors:
                     original_error.add_note(
                         "database persistence rollback failed: "
@@ -1010,10 +1043,13 @@ class SQLiteRetrievalIndex:
                 # cannot turn that success into a raised mutation.
                 with suppress(OSError):
                     os.close(validated_descriptor)
-            if not installed:
-                self._unlink_named(temporary_name)
-            if backup_created and not installed:
-                self._unlink_named(backup_name)
+            if backup_descriptor is not None:
+                with suppress(OSError):
+                    os.close(backup_descriptor)
+            if not installed and temporary_identity is not None:
+                self._unlink_named_identity_if_present(temporary_name, temporary_identity)
+            if backup_created and not installed and not preserve_backup and backup_identity:
+                self._unlink_named_identity_if_present(backup_name, backup_identity)
 
     def _validate_serialized_sibling(
         self,
@@ -1062,25 +1098,70 @@ class SQLiteRetrievalIndex:
         *,
         expected_generation: int,
     ) -> None:
-        retained = os.fstat(descriptor)
-        current = os.stat(
+        database_bytes = self._verify_retained_bytes(
+            descriptor,
             filename,
-            dir_fd=self._ensure_parent_open(),
-            follow_symlinks=False,
+            expected_identity,
+            expected_digest,
         )
-        if (
-            not stat.S_ISREG(retained.st_mode)
-            or expected_identity != (retained.st_dev, retained.st_ino)
-            or expected_identity != (current.st_dev, current.st_ino)
-        ):
-            raise ValueError("serialized database sibling identity changed after validation")
-        database_bytes = self._read_descriptor_bytes(descriptor)
-        if sha256(database_bytes).hexdigest() != expected_digest:
-            raise ValueError("serialized database sibling bytes changed after validation")
         try:
             self._validate_database_bytes(database_bytes, expected_generation)
         except sqlite3.Error as error:
             raise sqlite3.DatabaseError("serialized database validation failed") from error
+        # The semantic audit above can be expensive. Bind its decision back
+        # to the live pathname and retained inode after it returns, so a path
+        # swap or in-place write during the audit cannot be committed.
+        self._verify_retained_bytes(
+            descriptor,
+            filename,
+            expected_identity,
+            expected_digest,
+        )
+
+    def _verify_retained_bytes(
+        self,
+        descriptor: int,
+        filename: str,
+        expected_identity: tuple[int, int],
+        expected_digest: str,
+    ) -> bytes:
+        parent_fd = self._ensure_parent_open()
+        retained_before = os.fstat(descriptor)
+        current_before = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+        database_bytes = self._read_descriptor_bytes(descriptor)
+        retained_after = os.fstat(descriptor)
+        current_after = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+        for status in (retained_before, current_before, retained_after, current_after):
+            if not stat.S_ISREG(status.st_mode) or expected_identity != (
+                status.st_dev,
+                status.st_ino,
+            ):
+                raise ValueError("serialized database sibling identity changed after validation")
+        if sha256(database_bytes).hexdigest() != expected_digest:
+            raise ValueError("serialized database sibling bytes changed after validation")
+        return database_bytes
+
+    def _retain_exact_named_bytes(
+        self,
+        filename: str,
+        expected_identity: tuple[int, int],
+        expected_bytes: bytes,
+    ) -> tuple[int, str]:
+        descriptor = self._open_named_reader(filename, expected_identity)
+        digest = sha256(expected_bytes).hexdigest()
+        try:
+            retained_bytes = self._verify_retained_bytes(
+                descriptor,
+                filename,
+                expected_identity,
+                digest,
+            )
+            if retained_bytes != expected_bytes:
+                raise ValueError("retained database backup differs from prior bytes")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor, digest
 
     def _open_named_reader(
         self,
@@ -1135,34 +1216,200 @@ class SQLiteRetrievalIndex:
     def _rollback_persistence(
         self,
         *,
-        backup_name: str,
-        backup_created: bool,
+        backup_descriptor: int | None,
+        backup_identity: tuple[int, int] | None,
+        backup_digest: str | None,
         had_previous: bool,
+        backup_is_database: bool,
+        installed_identity: tuple[int, int],
         generation: int,
         restore_generation: bool,
-    ) -> list[BaseException]:
+    ) -> tuple[list[BaseException], tuple[int, int] | None]:
         errors: list[BaseException] = []
         parent_fd = self._ensure_parent_open()
-        try:
-            if had_previous and backup_created:
+        restored_identity: tuple[int, int] | None = None
+        if had_previous:
+            rollback_name = f".{self._filename}.{secrets.token_hex(16)}.rollback"
+            rollback_identity: tuple[int, int] | None = None
+            rollback_descriptor: int | None = None
+            try:
+                if backup_descriptor is None or backup_identity is None or backup_digest is None:
+                    raise RuntimeError("database rollback backup was not retained")
+                previous_bytes = self._read_verified_descriptor_bytes(
+                    backup_descriptor,
+                    backup_identity,
+                    backup_digest,
+                )
+                rollback_identity = self._write_named_bytes(rollback_name, previous_bytes)
+                if backup_is_database:
+                    rollback_descriptor, rollback_digest = self._validate_serialized_sibling(
+                        rollback_name,
+                        rollback_identity,
+                        expected_generation=generation,
+                    )
+                else:
+                    rollback_descriptor, rollback_digest = self._retain_exact_named_bytes(
+                        rollback_name,
+                        rollback_identity,
+                        previous_bytes,
+                    )
+                if rollback_digest != backup_digest:
+                    raise ValueError("database rollback candidate differs from retained backup")
+                if backup_is_database:
+                    self._verify_retained_sibling(
+                        rollback_descriptor,
+                        rollback_name,
+                        rollback_identity,
+                        rollback_digest,
+                        expected_generation=generation,
+                    )
+                else:
+                    self._verify_retained_bytes(
+                        rollback_descriptor,
+                        rollback_name,
+                        rollback_identity,
+                        rollback_digest,
+                    )
                 os.replace(
-                    backup_name,
+                    rollback_name,
                     self._filename,
                     src_dir_fd=parent_fd,
                     dst_dir_fd=parent_fd,
                 )
-            elif not had_previous:
-                with suppress(FileNotFoundError):
-                    os.unlink(self._filename, dir_fd=parent_fd)
-            os.fsync(parent_fd)
-        except BaseException as error:
-            errors.append(error)
-        if restore_generation:
-            try:
-                self._write_generation(generation)
+                os.fsync(parent_fd)
+                if backup_is_database:
+                    self._verify_retained_sibling(
+                        rollback_descriptor,
+                        self._filename,
+                        rollback_identity,
+                        rollback_digest,
+                        expected_generation=generation,
+                    )
+                else:
+                    self._verify_retained_bytes(
+                        rollback_descriptor,
+                        self._filename,
+                        rollback_identity,
+                        rollback_digest,
+                    )
+                restored_identity = rollback_identity
             except BaseException as error:
                 errors.append(error)
-        return errors
+            finally:
+                if rollback_descriptor is not None:
+                    with suppress(OSError):
+                        os.close(rollback_descriptor)
+                if rollback_identity is not None and restored_identity != rollback_identity:
+                    self._unlink_named_identity_if_present(rollback_name, rollback_identity)
+        else:
+            try:
+                current = self._target_status()
+                if current is None:
+                    restored_identity = None
+                elif installed_identity != (current.st_dev, current.st_ino):
+                    raise RuntimeError("database target changed before empty-index rollback")
+                else:
+                    if not stat.S_ISREG(current.st_mode):
+                        raise RuntimeError("database target is not regular during rollback")
+                    os.unlink(self._filename, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+                    if self._target_status() is not None:
+                        raise RuntimeError("database target remained after empty-index rollback")
+            except BaseException as error:
+                errors.append(error)
+        if restore_generation and (not had_previous or restored_identity is not None):
+            try:
+                self._write_generation(generation)
+                if had_previous and restored_identity is not None:
+                    database_bytes, current_identity = self._read_database_bytes()
+                    if current_identity != restored_identity or database_bytes is None:
+                        raise RuntimeError("restored database identity changed after rollback")
+                    if sha256(database_bytes).hexdigest() != backup_digest:
+                        raise RuntimeError("restored database content changed after rollback")
+                    if backup_is_database:
+                        self._validate_database_bytes(database_bytes, generation)
+                    elif database_bytes:
+                        raise RuntimeError("restored empty database target gained content")
+            except BaseException as error:
+                errors.append(error)
+        return errors, restored_identity
+
+    def _read_verified_descriptor_bytes(
+        self,
+        descriptor: int,
+        expected_identity: tuple[int, int],
+        expected_digest: str,
+    ) -> bytes:
+        before = os.fstat(descriptor)
+        database_bytes = self._read_descriptor_bytes(descriptor)
+        after = os.fstat(descriptor)
+        for status in (before, after):
+            if not stat.S_ISREG(status.st_mode) or expected_identity != (
+                status.st_dev,
+                status.st_ino,
+            ):
+                raise ValueError("retained database backup identity changed")
+        if sha256(database_bytes).hexdigest() != expected_digest:
+            raise ValueError("retained database backup bytes changed")
+        return database_bytes
+
+    def _preserve_retained_backup(
+        self,
+        backup_name: str,
+        backup_descriptor: int | None,
+        backup_identity: tuple[int, int] | None,
+        backup_digest: str | None,
+    ) -> BaseException | None:
+        try:
+            if backup_descriptor is None or backup_identity is None or backup_digest is None:
+                raise RuntimeError("no retained database backup is available for recovery")
+            previous_bytes = self._read_verified_descriptor_bytes(
+                backup_descriptor,
+                backup_identity,
+                backup_digest,
+            )
+            current = self._named_status(backup_name)
+            if current is not None and backup_identity == (current.st_dev, current.st_ino):
+                os.fsync(self._ensure_parent_open())
+                return None
+            recovery_name = f"{backup_name}.{secrets.token_hex(8)}.recovery"
+            recovery_identity = self._write_named_bytes(recovery_name, previous_bytes)
+            recovery_bytes = self._read_named_bytes(recovery_name, recovery_identity)
+            if sha256(recovery_bytes).hexdigest() != backup_digest:
+                raise ValueError("preserved database backup content changed")
+            os.fsync(self._ensure_parent_open())
+        except BaseException as error:
+            return error
+        return None
+
+    def _unlink_named_identity(self, filename: str, identity: tuple[int, int]) -> None:
+        current = self._named_status(filename)
+        if current is None or identity != (current.st_dev, current.st_ino):
+            raise RuntimeError("database sibling path changed before cleanup")
+        os.unlink(filename, dir_fd=self._ensure_parent_open())
+
+    def _unlink_named_identity_if_present(
+        self,
+        filename: str,
+        identity: tuple[int, int],
+    ) -> None:
+        try:
+            current = self._named_status(filename)
+            if current is not None and identity == (current.st_dev, current.st_ino):
+                with suppress(FileNotFoundError):
+                    os.unlink(filename, dir_fd=self._ensure_parent_open())
+        except OSError:
+            pass
+
+    def _named_status(self, filename: str) -> os.stat_result | None:
+        try:
+            return os.stat(
+                filename,
+                dir_fd=self._ensure_parent_open(),
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return None
 
     def _write_named_bytes(self, filename: str, payload: bytes) -> tuple[int, int]:
         parent_fd = self._ensure_parent_open()
@@ -1172,8 +1419,12 @@ class SQLiteRetrievalIndex:
             0o600,
             dir_fd=parent_fd,
         )
+        opened = os.fstat(descriptor)
+        identity = (opened.st_dev, opened.st_ino)
         try:
             try:
+                if not stat.S_ISREG(opened.st_mode):
+                    raise ValueError("database temporary target must be a regular file")
                 view = memoryview(payload)
                 while view:
                     written = os.write(descriptor, view)
@@ -1182,14 +1433,17 @@ class SQLiteRetrievalIndex:
                     view = view[written:]
                 os.fsync(descriptor)
                 status = os.fstat(descriptor)
-                if not stat.S_ISREG(status.st_mode):
-                    raise ValueError("database temporary target must be a regular file")
+                if not stat.S_ISREG(status.st_mode) or identity != (
+                    status.st_dev,
+                    status.st_ino,
+                ):
+                    raise ValueError("database temporary target changed while being written")
             finally:
                 os.close(descriptor)
         except BaseException:
-            self._unlink_named(filename)
+            self._unlink_named_identity_if_present(filename, identity)
             raise
-        return status.st_dev, status.st_ino
+        return identity
 
     def _verify_expected_target(self, expected_identity: tuple[int, int] | None) -> None:
         current = self._target_status()
@@ -1231,12 +1485,6 @@ class SQLiteRetrievalIndex:
             raise OSError("database generation write was incomplete")
         os.ftruncate(lock_fd, len(payload))
         os.fsync(lock_fd)
-
-    def _unlink_named(self, filename: str) -> None:
-        parent_fd = self._parent_fd
-        if parent_fd is not None:
-            with suppress(FileNotFoundError):
-                os.unlink(filename, dir_fd=parent_fd)
 
     def _ensure_open(self) -> _MemoryConnection:
         connection = self._connection
@@ -1553,7 +1801,9 @@ def _required_schema_issues(connection: sqlite3.Connection) -> set[str]:
         if not required_columns <= columns:
             issues.add("schema_column_missing")
     expected_objects = dict(_expected_schema_objects())
-    actual_objects = dict(_schema_objects(connection, frozenset(expected_objects)))
+    actual_objects = dict(_schema_objects(connection))
+    if actual_objects.keys() - expected_objects.keys():
+        issues.add("schema_object_unexpected")
     for name, expected in expected_objects.items():
         actual = actual_objects.get(name)
         if actual is None:
@@ -1575,13 +1825,12 @@ def _expected_schema_objects() -> tuple[tuple[str, tuple[str, str, str]], ...]:
 
 def _schema_objects(
     connection: sqlite3.Connection,
-    names: frozenset[str] | None = None,
 ) -> tuple[tuple[str, tuple[str, str, str]], ...]:
     objects: list[tuple[str, tuple[str, str, str]]] = []
     for object_type, name, table_name, sql in connection.execute(
         "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE sql IS NOT NULL"
     ):
-        if name.startswith("sqlite_") or (names is not None and name not in names):
+        if name.startswith("sqlite_"):
             continue
         objects.append(
             (

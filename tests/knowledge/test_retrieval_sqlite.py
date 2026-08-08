@@ -152,6 +152,31 @@ def test_existing_empty_regular_target_is_initialized_as_a_new_index(tmp_path: P
         assert audit.issues == ()
 
 
+def test_failed_initialization_restores_an_existing_empty_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    path.touch()
+    real_fsync = os.fsync
+    failed = False
+
+    def fail_first_directory_sync(descriptor: int) -> None:
+        nonlocal failed
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode) and not failed:
+            failed = True
+            raise OSError("injected initialization sync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_first_directory_sync)
+    with pytest.raises(OSError, match="initialization sync failure"):
+        SQLiteRetrievalIndex(path)
+
+    assert failed
+    assert path.read_bytes() == b""
+    assert not list(tmp_path.glob(".*sedna.sqlite*.backup*"))
+
+
 def test_source_upsert_is_complete_and_rolls_back_after_injected_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -664,6 +689,36 @@ def test_corrupted_serialized_sibling_is_rejected_before_atomic_replace(
         assert index.get_artifact("reference-http-replacement") is None
 
 
+def test_failed_temporary_write_does_not_unlink_a_replacement_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    replacement = _renamed_bundle("source-replacement", "replacement")
+
+    with SQLiteRetrievalIndex(path) as index:
+        real_fsync = os.fsync
+        attacker_path: Path | None = None
+
+        def replace_temporary_then_fail(descriptor: int) -> None:
+            nonlocal attacker_path
+            temporary_paths = list(tmp_path.glob(".*sedna.sqlite*.tmp"))
+            if attacker_path is None and temporary_paths:
+                temporary_path = temporary_paths[0]
+                os.replace(temporary_path, tmp_path / "displaced-candidate.sqlite")
+                temporary_path.write_bytes(b"unrelated replacement path")
+                attacker_path = temporary_path
+                raise OSError("injected temporary sync failure")
+            real_fsync(descriptor)
+
+        monkeypatch.setattr(os, "fsync", replace_temporary_then_fail)
+        with pytest.raises(OSError, match="temporary sync failure"):
+            index.rebuild((replacement,))
+
+        assert attacker_path is not None
+        assert attacker_path.read_bytes() == b"unrelated replacement path"
+
+
 def test_semantically_poisoned_sibling_fails_full_projection_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -740,6 +795,140 @@ def test_post_validation_sibling_mutation_rolls_back_before_backup_removal(
         assert index.get_artifact("reference-http-replacement") is None
 
 
+@pytest.mark.parametrize("attack", ("replace_path", "mutate_inode"))
+def test_live_database_change_during_final_validation_restores_prior_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attack: str,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    original = _bundle()
+    replacement = _renamed_bundle("source-replacement", "replacement")
+
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(original)
+        before = path.read_bytes()
+        real_validate = index._validate_database_bytes
+        validation_count = 0
+
+        def attack_during_final_validation(
+            database_bytes: bytes,
+            expected_generation: int,
+        ) -> None:
+            nonlocal validation_count
+            validation_count += 1
+            if validation_count == 3:
+                if attack == "replace_path":
+                    attacker = tmp_path / "attacker.sqlite"
+                    attacker.write_bytes(b"attacker-controlled replacement")
+                    os.replace(attacker, path)
+                else:
+                    descriptor = os.open(path, os.O_WRONLY)
+                    try:
+                        os.write(descriptor, b"attacker-controlled mutation")
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+            real_validate(database_bytes, expected_generation)
+
+        monkeypatch.setattr(index, "_validate_database_bytes", attack_during_final_validation)
+        with pytest.raises((OSError, RuntimeError, ValueError), match="changed|rollback"):
+            index.rebuild((replacement,))
+
+        assert validation_count >= 3
+        assert path.read_bytes() == before
+        assert index.get_artifact("reference-http") == original.references[0]
+        assert index.get_artifact("reference-http-replacement") is None
+
+
+def test_rollback_restores_from_retained_backup_when_backup_path_is_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    original = _bundle()
+    replacement = _renamed_bundle("source-replacement", "replacement")
+
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(original)
+        before = path.read_bytes()
+        real_verify = index._verify_retained_sibling
+        verification_count = 0
+
+        def replace_backup_then_fail(*args: object, **kwargs: object) -> None:
+            nonlocal verification_count
+            verification_count += 1
+            real_verify(*args, **kwargs)
+            if verification_count == 2:
+                backups = list(tmp_path.glob(".*sedna.sqlite*.backup"))
+                assert len(backups) == 1
+                attacker = tmp_path / "attacker-backup.sqlite"
+                attacker.write_bytes(b"attacker-controlled backup")
+                os.replace(attacker, backups[0])
+                raise OSError("injected postinstall failure")
+
+        monkeypatch.setattr(index, "_verify_retained_sibling", replace_backup_then_fail)
+        with pytest.raises(OSError, match="postinstall failure"):
+            index.rebuild((replacement,))
+
+        assert verification_count >= 2
+        assert path.read_bytes() == before
+        assert index.get_artifact("reference-http") == original.references[0]
+        assert index.get_artifact("reference-http-replacement") is None
+
+
+def test_unprovable_rollback_surfaces_failure_and_preserves_exact_recovery_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    original = _bundle()
+    replacement = _renamed_bundle("source-replacement", "replacement")
+
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(original)
+        before = path.read_bytes()
+        real_verify = index._verify_retained_sibling
+        real_validate_sibling = index._validate_serialized_sibling
+        verification_count = 0
+
+        def replace_backup_then_fail(*args: object, **kwargs: object) -> None:
+            nonlocal verification_count
+            verification_count += 1
+            real_verify(*args, **kwargs)
+            if verification_count == 2:
+                backup = next(tmp_path.glob(".*sedna.sqlite*.backup"))
+                attacker = tmp_path / "attacker-backup.sqlite"
+                attacker.write_bytes(b"attacker-controlled backup")
+                os.replace(attacker, backup)
+                raise OSError("injected postinstall failure")
+
+        def fail_rollback_validation(
+            filename: str,
+            expected_identity: tuple[int, int],
+            *,
+            expected_generation: int,
+        ) -> tuple[int, str]:
+            if filename.endswith(".rollback"):
+                raise OSError("injected rollback validation failure")
+            return real_validate_sibling(
+                filename,
+                expected_identity,
+                expected_generation=expected_generation,
+            )
+
+        monkeypatch.setattr(index, "_verify_retained_sibling", replace_backup_then_fail)
+        monkeypatch.setattr(index, "_validate_serialized_sibling", fail_rollback_validation)
+        with pytest.raises(OSError, match="postinstall failure") as raised:
+            index.rebuild((replacement,))
+
+        notes = getattr(raised.value, "__notes__", ())
+        assert any("rollback failed" in note for note in notes)
+        recovery_paths = list(tmp_path.glob(".*sedna.sqlite*.backup.*.recovery"))
+        assert len(recovery_paths) == 1
+        assert recovery_paths[0].read_bytes() == before
+
+
 @pytest.mark.parametrize("generation_bytes", (b"", b"12", b"\xff\xfe"))
 def test_generation_sidecar_is_recovered_from_valid_database(
     tmp_path: Path,
@@ -799,6 +988,55 @@ def test_audit_rejects_ordinary_table_impersonating_fts5(tmp_path: Path) -> None
 
     assert audit.rebuild_required
     assert "schema_object_mismatch" in audit.issues
+
+
+@pytest.mark.parametrize(
+    "unexpected_schema_sql",
+    (
+        "CREATE TABLE unexpected_table(value TEXT)",
+        "CREATE VIEW unexpected_view AS SELECT artifact_id FROM artifacts",
+        "CREATE INDEX unexpected_index ON artifacts(verification_status)",
+    ),
+)
+def test_audit_rejects_every_unexpected_application_schema_object(
+    tmp_path: Path,
+    unexpected_schema_sql: str,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(_bundle())
+    with sqlite3.connect(path) as connection:
+        connection.execute(unexpected_schema_sql)
+
+    with SQLiteRetrievalIndex(path) as index:
+        audit = index.audit()
+
+    assert audit.rebuild_required
+    assert "schema_object_unexpected" in audit.issues
+
+
+def test_unexpected_trigger_blocks_upsert_before_it_can_delete_another_source(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    first = _renamed_bundle("source-first", "first")
+    second = _renamed_bundle("source-second", "second")
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(first)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TRIGGER delete_other_sources AFTER INSERT ON artifacts BEGIN "
+            "DELETE FROM artifacts WHERE owner_source_id != NEW.owner_source_id; END"
+        )
+
+    with SQLiteRetrievalIndex(path) as index:
+        audit = index.audit()
+        assert audit.rebuild_required
+        assert "schema_object_unexpected" in audit.issues
+        with pytest.raises(RuntimeError, match="full rebuild"):
+            index.upsert_bundle(second)
+        assert index.get_artifact("reference-http-first") == first.references[0]
+        assert index.get_artifact("reference-http-second") is None
 
 
 def test_audit_uses_one_snapshot_while_another_index_deletes(

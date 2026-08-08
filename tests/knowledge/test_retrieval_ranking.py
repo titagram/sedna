@@ -71,6 +71,7 @@ def _applicability(
     os_family: str | None = None,
     os_relation: ContextRelation = ContextRelation.REQUIRED,
     os_version: str | None = None,
+    observation_date: str | None = None,
     services: tuple[tuple[str, str, ContextRelation], ...] = (),
     facets: tuple[tuple[str, str, str, ContextRelation], ...] = (),
 ) -> ApplicabilityContext:
@@ -83,6 +84,15 @@ def _applicability(
             ),
             os_version=(
                 _assertion(os_version, source_id=source_id) if os_version is not None else None
+            ),
+            observation_date=(
+                _assertion(
+                    observation_date,
+                    source_id=source_id,
+                    relation=ContextRelation.OBSERVED,
+                )
+                if observation_date is not None
+                else None
             ),
             services=tuple(
                 ServiceContext(
@@ -352,6 +362,32 @@ def test_low_confidence_platform_conflict_remains_conditional_instead_of_hard_re
     )
 
 
+def test_contradictory_high_confidence_singleton_facts_cannot_rescue_an_exact_requirement():
+    artifact = _reference(
+        "windows-requires-resolved-platform",
+        applicability=_applicability(
+            source_id="source-windows-requires-resolved-platform",
+            os_family="windows",
+        ),
+    )
+
+    ranked = rank_candidates(
+        _query(
+            _fact("typed", "os_family", "linux"),
+            _fact("typed", "os_family", "windows"),
+        ),
+        (_candidate(artifact, lexical=1.0),),
+    )
+
+    assert ranked.rejected_candidates == ()
+    hit = ranked.references[0]
+    assert hit.matched_facets == ()
+    assert hit.score.unknown_condition_penalty > 0
+    assert hit.missing_context == (
+        "resolve contradictory current typed.os_family values: linux, windows",
+    )
+
+
 def test_matching_explicitly_incompatible_facet_is_always_rejected():
     artifact = _reference(
         "waf-incompatible",
@@ -537,6 +573,35 @@ def test_repeated_independence_groups_receive_less_diversity_than_independent_so
     assert scores["copied-a"] == scores["copied-b"]
 
 
+def test_lane_order_round_robins_independence_groups_before_repeating_copied_sources():
+    copied = tuple(
+        _reference(f"copied-{offset}", group="byte-identical-source") for offset in range(5)
+    )
+    independent_a = _reference("independent-a", group="independent-a")
+    independent_b = _reference("independent-b", group="independent-b")
+
+    ranked = rank_candidates(
+        _query(),
+        (
+            *(_candidate(item, lexical=1.0) for item in reversed(copied)),
+            _candidate(independent_b, lexical=0.8),
+            _candidate(independent_a, lexical=0.9),
+        ),
+    )
+
+    assert [hit.artifact_id for hit in ranked.references[:3]] == [
+        "copied-0",
+        "independent-a",
+        "independent-b",
+    ]
+    assert [hit.artifact_id for hit in ranked.references[3:]] == [
+        "copied-1",
+        "copied-2",
+        "copied-3",
+        "copied-4",
+    ]
+
+
 def test_source_diversity_is_lane_local_and_cannot_couple_unlike_evidence_scores():
     reference = _reference("lane-local-reference", group="shared-source")
     negative = _case_step("lane-local-negative", negative=True, group="shared-source")
@@ -576,6 +641,37 @@ def test_freshness_reference_date_is_lane_local_and_cannot_couple_unlike_evidenc
     assert mixed_lanes.references[0].score == reference_only.references[0].score
 
 
+def test_hard_rejected_future_candidate_cannot_change_same_lane_freshness_score():
+    current = _fact("typed", "os_version", "6.8")
+    applicable = _reference(
+        "dated-applicable-reference",
+        applicability=_applicability(
+            source_id="source-dated-applicable-reference",
+            os_version="6.8",
+        ),
+        freshness="2025-01-01",
+    )
+    unrelated_future = _reference(
+        "unrelated-future-reference",
+        applicability=_applicability(
+            source_id="source-unrelated-future-reference",
+            os_version="9.9",
+        ),
+        freshness="2999-01-01",
+    )
+
+    alone = rank_candidates(_query(current), (_candidate(applicable),))
+    with_unrelated = rank_candidates(
+        _query(current),
+        (_candidate(applicable), _candidate(unrelated_future)),
+    )
+
+    assert with_unrelated.references[0].score == alone.references[0].score
+    assert [item.artifact_id for item in with_unrelated.rejected_candidates] == [
+        "unrelated-future-reference"
+    ]
+
+
 def test_hard_rejected_copy_cannot_reduce_an_applicable_hit_diversity_score():
     applicable = _reference("applicable-copy", group="shared-source")
     incompatible = _reference(
@@ -602,10 +698,11 @@ def test_hard_rejected_copy_cannot_reduce_an_applicable_hit_diversity_score():
 
 def test_version_sensitive_freshness_distinguishes_recent_from_stale_evidence():
     current = _fact("typed", "os_version", "6.8")
+    as_of = _fact("typed", "observation_date", "2026-01-01")
     recent = _reference(
         "recent",
         applicability=_applicability(source_id="source-recent", os_version="6.8"),
-        freshness="2999-01-01",
+        freshness="2025-01-01",
     )
     stale = _reference(
         "stale",
@@ -614,13 +711,70 @@ def test_version_sensitive_freshness_distinguishes_recent_from_stale_evidence():
     )
 
     ranked = rank_candidates(
-        _query(current),
+        _query(current, as_of),
         (_candidate(stale), _candidate(recent)),
     )
     scores = {hit.artifact_id: hit.score.freshness for hit in ranked.references}
 
     assert scores["recent"] > scores["stale"]
     assert scores["recent"] == 1.0
+
+
+def test_case_and_guidance_use_canonical_typed_observation_date_without_peer_clock():
+    applicability = _applicability(
+        source_id="source-typed-observation-date",
+        os_version="6.8",
+        observation_date="2025-01-01",
+    )
+    case = _case_step("dated-case", applicability=applicability)
+    guidance = _guidance("dated-guidance", applicability=applicability)
+
+    ranked = rank_candidates(
+        _query(_fact("typed", "os_version", "6.8")),
+        (_candidate(case), _candidate(guidance)),
+    )
+
+    assert ranked.case_steps[0].score.freshness == 0.6
+    assert ranked.decision_guidance[0].score.freshness == 0.6
+
+
+def test_contradictory_query_observation_dates_do_not_become_an_arbitrary_freshness_clock():
+    artifact = _reference(
+        "dated-reference-with-conflicting-query-clock",
+        applicability=_applicability(
+            source_id="source-dated-reference-with-conflicting-query-clock",
+            os_version="6.8",
+            observation_date="2025-01-01",
+        ),
+    )
+
+    ranked = rank_candidates(
+        _query(
+            _fact("typed", "os_version", "6.8"),
+            _fact("typed", "observation_date", "2026-01-01"),
+            _fact("typed", "observation_date", "2999-01-01"),
+        ),
+        (_candidate(artifact),),
+    )
+
+    hit = ranked.references[0]
+    assert hit.score.freshness == 0.6
+    assert hit.missing_context == (
+        "resolve contradictory current typed.observation_date values: 2026-01-01, 2999-01-01",
+    )
+
+
+def test_deprecated_non_versioned_evidence_has_reduced_freshness_and_aligned_explanation():
+    deprecated = _reference("deprecated-non-versioned", status=VerificationStatus.DEPRECATED)
+
+    ranked = rank_candidates(
+        _query(),
+        (_candidate(deprecated, lexical=1.0),),
+    )
+
+    hit = ranked.references[0]
+    assert hit.score.freshness < 1.0
+    assert "deprecated evidence retained with reduced freshness" in hit.qualification_reasons
 
 
 def test_ranking_deeply_revalidates_query_and_candidates_before_using_them():
@@ -653,3 +807,117 @@ def test_explanations_are_deterministically_bounded_for_large_canonical_contexts
         sorted(ranked.references[0].missing_context)
     )
     assert len(ranked.missing_context_questions) == 40
+
+
+def test_valid_candidate_with_65_sources_returns_bounded_exact_provenance_instead_of_raising():
+    artifact = _reference("many-sources")
+    source_refs = tuple(_source_ref(f"source-{offset:02d}") for offset in range(65))
+    artifact = ReferenceArtifact.model_validate(
+        {**artifact.model_dump(mode="json"), "source_refs": source_refs}
+    )
+
+    ranked = rank_candidates(_query(), (_candidate(artifact),))
+
+    hit = ranked.references[0]
+    assert hit.provenance == source_refs[:64]
+    assert hit.artifact.source_refs == source_refs[:64]
+    assert "provenance bounded: showing 64 of 65 unique source references" in (
+        hit.qualification_reasons
+    )
+
+
+def test_provenance_deduplication_scan_has_an_explicit_deterministic_work_bound():
+    artifact = _reference("many-more-sources")
+    source_refs = tuple(_source_ref(f"source-{offset:03d}") for offset in range(300))
+    artifact = ReferenceArtifact.model_validate(
+        {**artifact.model_dump(mode="json"), "source_refs": source_refs}
+    )
+
+    ranked = rank_candidates(_query(), (_candidate(artifact),))
+
+    hit = ranked.references[0]
+    assert hit.provenance == source_refs[:64]
+    assert (
+        "provenance bounded: showing 64 of at least 256 unique source references; "
+        "44 canonical entries omitted from deduplication scan" in hit.qualification_reasons
+    )
+
+
+def test_duplicate_provenance_is_deduplicated_with_explicit_canonical_entry_count():
+    artifact = _reference("duplicate-sources")
+    first = _source_ref("source-first")
+    second = _source_ref("source-second")
+    artifact = ReferenceArtifact.model_validate(
+        {
+            **artifact.model_dump(mode="json"),
+            "source_refs": (first, first, second),
+        }
+    )
+
+    ranked = rank_candidates(_query(), (_candidate(artifact),))
+
+    hit = ranked.references[0]
+    assert hit.provenance == (first, second)
+    assert (
+        "provenance deduplicated: showing 2 unique source references from 3 canonical entries"
+        in (hit.qualification_reasons)
+    )
+
+
+def test_long_required_facet_is_digest_truncated_in_bounded_output_and_questions():
+    long_value = "very-long-context-" * 180
+    artifact = _reference(
+        "long-required-facet",
+        applicability=_applicability(
+            source_id="source-long-required-facet",
+            facets=(("domain", "long-condition", long_value, ContextRelation.REQUIRED),),
+        ),
+    )
+
+    ranked = rank_candidates(_query(), (_candidate(artifact, lexical=1.0),))
+
+    hit = ranked.references[0]
+    question = hit.missing_context[0]
+    assert len(question) <= 2048
+    assert "[truncated sha256:" in question
+    assert len(hit.artifact.applicability.facets[0].assertion.value) <= 2048
+    assert "artifact retrieval view compacted to bounded output" in hit.qualification_reasons
+
+
+def test_canonical_facet_work_budget_rejects_candidate_without_traversal_failure():
+    artifact = _reference(
+        "too-many-ranking-facets",
+        applicability=_applicability(
+            source_id="source-too-many-ranking-facets",
+            facets=tuple(
+                ("domain", f"condition-{offset:03d}", "present", ContextRelation.REQUIRED)
+                for offset in range(257)
+            ),
+        ),
+    )
+
+    ranked = rank_candidates(_query(), (_candidate(artifact),))
+
+    assert ranked.references == ()
+    rejected = ranked.rejected_candidates[0]
+    assert "candidate applicability exceeds 256-facet ranking budget" in (
+        rejected.rejection_reasons
+    )
+    assert "artifact retrieval view sequences bounded to 256 items" in (rejected.rejection_reasons)
+    assert len(rejected.artifact.applicability.facets) == 256
+
+
+def test_canonical_byte_budget_rejects_candidate_with_a_bounded_safe_view():
+    artifact = _reference("oversized-canonical-payload")
+    artifact = ReferenceArtifact.model_validate(
+        {**artifact.model_dump(mode="json"), "statement": "A" * 270_000}
+    )
+
+    ranked = rank_candidates(_query(), (_candidate(artifact),))
+
+    rejected = ranked.rejected_candidates[0]
+    assert "candidate canonical payload exceeds 262144-byte ranking budget" in (
+        rejected.rejection_reasons
+    )
+    assert len(rejected.artifact.statement) <= 2048
+    assert "artifact retrieval view compacted to bounded output" in (rejected.rejection_reasons)

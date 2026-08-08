@@ -448,7 +448,8 @@ def _assessment(
             if role is KnowledgeRole.NEGATIVE_CASE
             else ObservedOutcome.INFORMATIONAL
         ),
-        independence_group=prepared.manifest.source_id,
+        # Byte-identical imports share evidence independence without guessing at paraphrases.
+        independence_group=prepared.manifest.sha256,
     )
 
 

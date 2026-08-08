@@ -97,7 +97,7 @@ def _semantic_call(purpose: str, model: str) -> SemanticCallMetadata:
     )
 
 
-def _seed_verified_compiler_v1(
+def _seed_verified_compiler_v2(
     repository: CanonicalKnowledgeRepository,
     prepared: PreparedSource,
 ) -> None:
@@ -110,7 +110,7 @@ def _seed_verified_compiler_v1(
         foundation_schema_version=extraction.schema_version,
         foundation_parser_id=extraction.parser_id,
         foundation_parser_version=extraction.parser_version,
-        compiler_version="1",
+        compiler_version="2",
         extractor_prompt_version=EXTRACTOR_PROMPT_VERSION,
         critic_prompt_version=CRITIC_PROMPT_VERSION,
         repair_prompt_version=REPAIR_PROMPT_VERSION,
@@ -178,7 +178,7 @@ def test_extractor_v2_manifest_reprocesses_once_with_safe_asset_locator(
         assert hashlib.sha256(source_path.read_bytes()).hexdigest() == before_sha256
 
 
-def test_compiler_v1_bundle_recompiles_once_then_reuses_v2_without_host_calls(
+def test_compiler_v2_bundle_recompiles_once_then_reuses_v3_without_host_calls(
     tmp_path: Path,
 ) -> None:
     source_root, source_path, source_bytes, candidate = _source(tmp_path)
@@ -187,12 +187,24 @@ def test_compiler_v1_bundle_recompiles_once_then_reuses_v2_without_host_calls(
     with IngestionPipeline(source_root, tmp_path / "knowledge") as pipeline:
         prepared = pipeline.prepare(candidate)
         assert prepared is not None
-        _seed_verified_compiler_v1(pipeline.repository, prepared)
+        _seed_verified_compiler_v2(pipeline.repository, prepared)
         host = _ScriptedHost(
             [
                 {
-                    "artifacts": [],
-                    "ignored_segment_indexes": list(range(len(prepared.segments))),
+                    "artifacts": [
+                        {
+                            "draft_type": "reference",
+                            "local_id": "migration-reference",
+                            "artifact_type": "methodology",
+                            "subject": "Evidence comparison",
+                            "statement": (
+                                "Compare the observed response with the current hypothesis."
+                            ),
+                            "origin": "explicit",
+                            "citations": [{"segment_indexes": [0]}],
+                        }
+                    ],
+                    "ignored_segment_indexes": list(range(1, len(prepared.segments))),
                 },
                 {"accepted": True, "findings": []},
             ]
@@ -206,7 +218,10 @@ def test_compiler_v1_bundle_recompiles_once_then_reuses_v2_without_host_calls(
 
         assert recompiled.disposition == "verified"
         assert recompiled.bundle is not None
-        assert recompiled.bundle.compilation_manifest.compiler_version == "2"
+        assert recompiled.bundle.compilation_manifest.compiler_version == "3"
+        assert recompiled.bundle.references[0].assessment.independence_group == (
+            prepared.manifest.sha256
+        )
         assert [call["purpose"] for call in host.calls] == [
             "sedna.semantic.extract",
             "sedna.semantic.critic",
