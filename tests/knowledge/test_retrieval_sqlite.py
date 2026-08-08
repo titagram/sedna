@@ -104,14 +104,20 @@ def test_schema_uses_fts5_foreign_keys_indexes_and_a_version(tmp_path: Path) -> 
         connection = index._connection
         assert connection is not None
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         tables = {
             row[0]: row[1]
             for row in connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type IN ('table', 'view')"
             )
         }
-        assert {"artifacts", "facet_values", "artifact_links", "artifact_sources"} <= tables.keys()
+        assert {
+            "artifacts",
+            "facet_values",
+            "artifact_links",
+            "artifact_sources",
+            "indexed_sources",
+        } <= tables.keys()
         assert "USING fts5" in tables["artifact_fts"]
         indexes = {
             row[0]
@@ -140,6 +146,83 @@ def test_schema_uses_fts5_foreign_keys_indexes_and_a_version(tmp_path: Path) -> 
     assert len(_table_rows(path, "artifact_links")) == 2
     assert len(_table_rows(path, "artifact_sources")) >= 6
     assert len(_table_rows(path, "artifact_fts")) == 6
+
+
+def test_source_states_bind_hash_artifact_count_digest_and_support_bounded_paging(
+    tmp_path: Path,
+) -> None:
+    first = _renamed_bundle("source-first", "a")
+    second = _renamed_bundle("source-second", "b")
+
+    with SQLiteRetrievalIndex(tmp_path / "sedna.sqlite") as index:
+        index.rebuild((second, first))
+        first_page = index.list_source_states(after_source_id=None, limit=1)
+        second_page = index.list_source_states(
+            after_source_id=first_page[-1].source_id,
+            limit=1,
+        )
+
+        assert [state.source_id for state in first_page + second_page] == [
+            "source-first",
+            "source-second",
+        ]
+        assert all(state.artifact_count == 6 for state in first_page + second_page)
+        assert all(len(state.projection_digest) == 64 for state in first_page + second_page)
+        assert [state.source_sha256 for state in first_page + second_page] == [
+            first.source_sha256,
+            second.source_sha256,
+        ]
+        assert index.list_source_states(after_source_id="source-second", limit=1) == ()
+        with pytest.raises(ValueError, match="limit"):
+            index.list_source_states(after_source_id=None, limit=0)
+
+
+def test_hash_only_bundle_change_is_visible_in_source_state(tmp_path: Path) -> None:
+    original = _bundle()
+    payload = original.model_dump(mode="json")
+    payload["source_sha256"] = "b" * 64
+    payload["compilation_manifest"]["source_sha256"] = "b" * 64
+    changed = SemanticKnowledgeBundle.model_validate(payload)
+
+    with SQLiteRetrievalIndex(tmp_path / "sedna.sqlite") as index:
+        index.upsert_bundle(original)
+        before = index.list_source_states(after_source_id=None, limit=10)[0]
+        index.upsert_bundle(changed)
+        after = index.list_source_states(after_source_id=None, limit=10)[0]
+
+        assert index.get_artifact("reference-http") == original.references[0]
+        assert after.source_sha256 == "b" * 64
+        assert after.projection_digest != before.projection_digest
+
+
+def test_source_state_corruption_requires_rebuild_and_rebuild_replaces_old_schema(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    index = SQLiteRetrievalIndex(path)
+    index.upsert_bundle(_bundle())
+    index.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE indexed_sources SET source_sha256 = ? WHERE source_id = ?",
+            ("b" * 64, "source-retrieval"),
+        )
+
+    with SQLiteRetrievalIndex(path) as reopened:
+        audit = reopened.audit()
+        assert audit.rebuild_required
+        assert "source_projection_mismatch" in audit.issues
+        reopened.rebuild((_bundle(),))
+        assert reopened.audit().rebuild_required is False
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE indexed_sources")
+        connection.execute("PRAGMA user_version = 2")
+
+    with SQLiteRetrievalIndex(path) as old_schema:
+        assert old_schema.audit().rebuild_required
+        old_schema.rebuild((_bundle(),))
+        assert old_schema.audit().rebuild_required is False
 
 
 def test_existing_empty_regular_target_is_initialized_as_a_new_index(tmp_path: Path) -> None:

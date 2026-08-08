@@ -10,6 +10,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from sedna.knowledge.parsing.sanitize import sanitize_searchable_text
+from sedna.knowledge.retrieval.models import IndexedSourceState
 from sedna.knowledge.schema import (
     ArtifactType,
     CaseStep,
@@ -30,6 +31,7 @@ from sedna.knowledge.schema.common import SearchableNonEmptyString, SearchableSt
 from sedna.knowledge.schema.context import ContextRelation
 
 _MAX_FTS_COLUMN_CHARS = 8_192
+SOURCE_PROJECTION_VERSION = "canonical-projection-v1"
 
 
 class ProjectedFacet(BaseModel):
@@ -174,6 +176,36 @@ def project_semantic_bundle(bundle: SemanticKnowledgeBundle) -> tuple[ProjectedA
     if len({row.artifact_id for row in sorted_rows}) != len(sorted_rows):
         raise ValueError("projected artifact IDs must be unique")
     return sorted_rows
+
+
+def project_source_state(bundle: SemanticKnowledgeBundle) -> IndexedSourceState:
+    """Bind one canonical source hash to its deterministic complete artifact projection."""
+    projection = project_semantic_bundle(bundle)
+    payload = json.dumps(
+        {
+            "source_id": bundle.source_id,
+            "source_sha256": bundle.source_sha256,
+            "projection_version": SOURCE_PROJECTION_VERSION,
+            "artifacts": [
+                {
+                    "artifact_id": artifact.artifact_id,
+                    "canonical_json": artifact.canonical_json,
+                }
+                for artifact in projection
+            ],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return IndexedSourceState(
+        source_id=bundle.source_id,
+        source_sha256=bundle.source_sha256,
+        artifact_count=len(projection),
+        projection_version=SOURCE_PROJECTION_VERSION,
+        projection_digest=sha256(payload.encode("utf-8")).hexdigest(),
+    )
 
 
 def _deep_revalidate_bundle(bundle: SemanticKnowledgeBundle) -> SemanticKnowledgeBundle:

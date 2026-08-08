@@ -11,7 +11,7 @@ from types import TracebackType
 from typing import Annotated, Any, Protocol, TypeAlias, runtime_checkable
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from sedna.knowledge.parsing.sanitize import sanitize_searchable_text
 from sedna.knowledge.schema import (
@@ -26,6 +26,7 @@ from sedna.knowledge.schema import (
     SourceRef,
 )
 from sedna.knowledge.schema.common import SearchableNonEmptyString, SearchableString
+from sedna.knowledge.schema.manifest import Sha256
 
 Term: TypeAlias = Annotated[SearchableNonEmptyString, Field(max_length=512)]
 FacetNamespace: TypeAlias = Annotated[SearchableNonEmptyString, Field(max_length=128)]
@@ -850,6 +851,25 @@ class IndexAudit(BaseModel):
         return self
 
 
+class IndexedSourceState(BaseModel):
+    """Bounded, backend-neutral identity of one complete source projection."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    source_id: Annotated[SearchableNonEmptyString, Field(max_length=512)]
+    source_sha256: Sha256
+    artifact_count: int = Field(ge=0, le=10_000_000)
+    projection_version: Annotated[SearchableNonEmptyString, Field(max_length=128)]
+    projection_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+    @field_validator("source_id")
+    @classmethod
+    def require_safe_source_id(cls, value: str) -> str:
+        if value in {".", ".."} or "/" in value or "\\" in value or "\x00" in value:
+            raise ValueError("indexed source_id must be a safe path segment")
+        return value
+
+
 def _facet_text_size(facets: Iterable[SituationFacet]) -> int:
     return sum(
         len(value) for facet in facets for value in (facet.namespace, facet.key, facet.value)
@@ -915,6 +935,13 @@ class RetrievalIndex(Protocol):
     def rebuild(self, bundles: Iterable[SemanticKnowledgeBundle]) -> IndexAudit: ...
 
     def get_artifact(self, artifact_id: str) -> IndexedArtifact | None: ...
+
+    def list_source_states(
+        self,
+        *,
+        after_source_id: str | None,
+        limit: int,
+    ) -> tuple[IndexedSourceState, ...]: ...
 
     def search_candidates(
         self,

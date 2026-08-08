@@ -24,9 +24,15 @@ from sedna.knowledge.retrieval.models import (
     IndexAudit,
     IndexCandidate,
     IndexedArtifact,
+    IndexedSourceState,
     RetrievalQuery,
 )
-from sedna.knowledge.retrieval.projection import ProjectedArtifact, project_semantic_bundle
+from sedna.knowledge.retrieval.projection import (
+    SOURCE_PROJECTION_VERSION,
+    ProjectedArtifact,
+    project_semantic_bundle,
+    project_source_state,
+)
 from sedna.knowledge.schema import (
     CaseStep,
     KnowledgeCase,
@@ -34,7 +40,7 @@ from sedna.knowledge.schema import (
     SemanticKnowledgeBundle,
 )
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _MAX_LIMIT = 100
 _FTS_FIELDS = (
     "statement",
@@ -47,9 +53,17 @@ _FTS_FIELDS = (
 _ARTIFACT_ADAPTER = TypeAdapter(IndexedArtifact)
 
 _SCHEMA = """
+CREATE TABLE indexed_sources (
+    source_id TEXT PRIMARY KEY,
+    source_sha256 TEXT NOT NULL CHECK(length(source_sha256) = 64),
+    artifact_count INTEGER NOT NULL CHECK(artifact_count >= 0),
+    projection_version TEXT NOT NULL,
+    projection_digest TEXT NOT NULL CHECK(length(projection_digest) = 64)
+);
+
 CREATE TABLE artifacts (
     artifact_id TEXT PRIMARY KEY,
-    owner_source_id TEXT NOT NULL,
+    owner_source_id TEXT NOT NULL REFERENCES indexed_sources(source_id) ON DELETE CASCADE,
     canonical_path TEXT NOT NULL,
     artifact_type TEXT NOT NULL,
     knowledge_role TEXT NOT NULL,
@@ -130,6 +144,15 @@ CREATE INDEX artifact_sources_source_idx
 """
 
 _REQUIRED_SCHEMA_COLUMNS = {
+    "indexed_sources": frozenset(
+        {
+            "source_id",
+            "source_sha256",
+            "artifact_count",
+            "projection_version",
+            "projection_digest",
+        }
+    ),
     "artifacts": frozenset(
         {
             "artifact_id",
@@ -264,6 +287,8 @@ class SQLiteRetrievalIndex:
         """Atomically replace one source projection after canonical validation."""
         projection = project_semantic_bundle(bundle)
         source_id = _validated_source_id(bundle.source_id)
+        source_sha256 = _validated_source_hash(bundle.source_sha256)
+        source_state = project_source_state(bundle)
         with self._mutex:
             self._ensure_open()
             with self._file_lock(exclusive=True):
@@ -272,7 +297,13 @@ class SQLiteRetrievalIndex:
                     self._require_current_schema(candidate)
                     with self._transaction(candidate):
                         self._delete_source_rows(candidate, source_id)
-                        self._insert_projection_rows(candidate, source_id, projection)
+                        self._insert_projection_rows(
+                            candidate,
+                            source_id,
+                            source_sha256,
+                            source_state,
+                            projection,
+                        )
                     new_identity, new_generation = self._persist_database(
                         self._serialize_candidate(candidate, generation),
                         previous_bytes=previous_bytes,
@@ -308,15 +339,17 @@ class SQLiteRetrievalIndex:
 
     def rebuild(self, bundles: Iterable[SemanticKnowledgeBundle]) -> IndexAudit:
         """Serialize a checked fresh database and atomically install its synced bytes."""
-        projected: list[tuple[str, tuple[ProjectedArtifact, ...]]] = []
+        projected: list[tuple[str, str, IndexedSourceState, tuple[ProjectedArtifact, ...]]] = []
         source_ids: set[str] = set()
         for bundle in bundles:
             rows = project_semantic_bundle(bundle)
             source_id = _validated_source_id(bundle.source_id)
+            source_sha256 = _validated_source_hash(bundle.source_sha256)
+            source_state = project_source_state(bundle)
             if source_id in source_ids:
                 raise ValueError("rebuild source IDs must be unique")
             source_ids.add(source_id)
-            projected.append((source_id, rows))
+            projected.append((source_id, source_sha256, source_state, rows))
 
         with self._mutex:
             self._ensure_open()
@@ -325,8 +358,14 @@ class SQLiteRetrievalIndex:
                 candidate = self._new_schema_connection()
                 try:
                     with self._transaction(candidate):
-                        for source_id, rows in projected:
-                            self._insert_projection_rows(candidate, source_id, rows)
+                        for source_id, source_sha256, source_state, rows in projected:
+                            self._insert_projection_rows(
+                                candidate,
+                                source_id,
+                                source_sha256,
+                                source_state,
+                                rows,
+                            )
                     audit = self._audit_snapshot(candidate)
                     if audit.rebuild_required:
                         raise ValueError(f"rebuilt index failed audit: {', '.join(audit.issues)}")
@@ -353,6 +392,30 @@ class SQLiteRetrievalIndex:
             if row is None:
                 return None
             return self._reconstruct_artifact(row["artifact_id"], row["canonical_json"])
+
+    def list_source_states(
+        self,
+        *,
+        after_source_id: str | None,
+        limit: int,
+    ) -> tuple[IndexedSourceState, ...]:
+        """Return one bounded, source-ID ordered page of projection identities."""
+        if after_source_id is not None:
+            after_source_id = _validated_source_id(after_source_id)
+        if type(limit) is not int or not 1 <= limit <= _MAX_LIMIT:
+            raise ValueError(f"limit must be between 1 and {_MAX_LIMIT}")
+        with self._read_snapshot() as connection:
+            self._require_current_schema(connection)
+            rows = connection.execute(
+                "SELECT source_id, source_sha256, artifact_count, projection_version, "
+                "projection_digest FROM indexed_sources WHERE source_id > ? "
+                "ORDER BY source_id LIMIT ?",
+                (after_source_id or "", limit),
+            ).fetchall()
+        try:
+            return tuple(IndexedSourceState.model_validate(dict(row)) for row in rows)
+        except ValidationError as error:
+            raise ValueError("indexed source state is corrupt") from error
 
     def search_candidates(
         self,
@@ -454,7 +517,7 @@ class SQLiteRetrievalIndex:
         if schema_issues:
             return IndexAudit(
                 artifact_count=_safe_table_count(connection, "artifacts"),
-                source_count=_safe_distinct_count(connection, "artifacts", "owner_source_id"),
+                source_count=_safe_table_count(connection, "indexed_sources"),
                 facet_count=_safe_table_count(connection, "facet_values"),
                 fts_count=_safe_table_count(connection, "artifact_fts"),
                 corruption_count=corruption_count,
@@ -464,15 +527,17 @@ class SQLiteRetrievalIndex:
             issues.add("generation_metadata_invalid")
 
         artifact_count = connection.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0]
-        source_count = connection.execute(
-            "SELECT COUNT(DISTINCT owner_source_id) FROM artifacts"
-        ).fetchone()[0]
+        source_count = connection.execute("SELECT COUNT(*) FROM indexed_sources").fetchone()[0]
         facet_count = connection.execute("SELECT COUNT(*) FROM facet_values").fetchone()[0]
         fts_count = connection.execute("SELECT COUNT(*) FROM artifact_fts").fetchone()[0]
         foreign_key_rows = tuple(connection.execute("PRAGMA foreign_key_check"))
         explicit_orphans = sum(
             connection.execute(statement).fetchone()[0]
             for statement in (
+                "SELECT COUNT(*) FROM artifacts AS child "
+                "LEFT JOIN indexed_sources AS parent "
+                "ON parent.source_id = child.owner_source_id "
+                "WHERE parent.source_id IS NULL",
                 "SELECT COUNT(*) FROM facet_values AS child "
                 "LEFT JOIN artifacts AS parent USING (artifact_id) "
                 "WHERE parent.artifact_id IS NULL",
@@ -504,6 +569,40 @@ class SQLiteRetrievalIndex:
         fts_ids = {row[0] for row in connection.execute("SELECT artifact_id FROM artifact_fts")}
         if artifact_ids != fts_ids:
             issues.add("fts_artifact_mismatch")
+
+        for row in connection.execute(
+            "SELECT source_id, source_sha256, artifact_count, projection_version, "
+            "projection_digest FROM indexed_sources ORDER BY source_id"
+        ):
+            try:
+                state = IndexedSourceState.model_validate(dict(row))
+                artifact_digests = tuple(
+                    connection.execute(
+                        "SELECT artifact_id, projection_digest FROM artifacts "
+                        "WHERE owner_source_id = ? ORDER BY artifact_id",
+                        (state.source_id,),
+                    )
+                )
+                if (
+                    state.projection_version != SOURCE_PROJECTION_VERSION
+                    or state.artifact_count != len(artifact_digests)
+                    or state.projection_digest
+                    != _source_projection_digest(
+                        state.source_id,
+                        state.source_sha256,
+                        tuple(
+                            connection.execute(
+                                "SELECT artifact_id, canonical_json FROM artifacts "
+                                "WHERE owner_source_id = ? ORDER BY artifact_id",
+                                (state.source_id,),
+                            )
+                        ),
+                    )
+                ):
+                    raise ValueError("source projection metadata mismatch")
+            except (TypeError, ValueError, ValidationError):
+                issues.add("source_projection_mismatch")
+                corruption_count += 1
 
         has_digest = version == _SCHEMA_VERSION and _column_exists(
             connection, "artifacts", "projection_digest"
@@ -598,13 +697,43 @@ class SQLiteRetrievalIndex:
             (source_id,),
         )
         connection.execute("DELETE FROM artifacts WHERE owner_source_id = ?", (source_id,))
+        connection.execute("DELETE FROM indexed_sources WHERE source_id = ?", (source_id,))
 
     def _insert_projection_rows(
         self,
         connection: sqlite3.Connection,
         source_id: str,
+        source_sha256: str,
+        source_state: IndexedSourceState,
         projection: tuple[ProjectedArtifact, ...],
     ) -> None:
+        if (
+            source_state.source_id != source_id
+            or source_state.source_sha256 != source_sha256
+            or source_state.artifact_count != len(projection)
+            or source_state.projection_version != SOURCE_PROJECTION_VERSION
+        ):
+            raise ValueError("source state does not match its projected bundle")
+        artifact_digests = tuple(
+            (artifact.artifact_id, _projected_digest(source_id, artifact))
+            for artifact in projection
+        )
+        connection.execute(
+            """
+            INSERT INTO indexed_sources(
+                source_id, source_sha256, artifact_count,
+                projection_version, projection_digest
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                source_id,
+                source_sha256,
+                len(projection),
+                source_state.projection_version,
+                source_state.projection_digest,
+            ),
+        )
+        digest_by_artifact = dict(artifact_digests)
         for artifact in projection:
             connection.execute(
                 """
@@ -634,7 +763,7 @@ class SQLiteRetrievalIndex:
                     artifact.freshness_observed_at,
                     artifact.independence_group,
                     artifact.canonical_json,
-                    _projected_digest(source_id, artifact),
+                    digest_by_artifact[artifact.artifact_id],
                 ),
             )
         for artifact in projection:
@@ -1639,6 +1768,16 @@ def _validated_source_id(value: str) -> str:
     return value
 
 
+def _validated_source_hash(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError("source_sha256 must be a lowercase SHA-256 digest")
+    return value
+
+
 def _canonical_path(source_id: str) -> str:
     return f"semantic_bundles/{source_id}.json"
 
@@ -1733,6 +1872,28 @@ def _projected_digest(source_id: str, artifact: ProjectedArtifact) -> str:
         }
     ]
     return _digest_payload(artifact_row, facets, links, sources, fts)
+
+
+def _source_projection_digest(
+    source_id: str,
+    source_sha256: str,
+    artifacts: Iterable[Sequence[object]],
+) -> str:
+    payload = json.dumps(
+        {
+            "source_id": source_id,
+            "source_sha256": source_sha256,
+            "projection_version": SOURCE_PROJECTION_VERSION,
+            "artifacts": [
+                {"artifact_id": str(row[0]), "canonical_json": str(row[1])} for row in artifacts
+            ],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _live_projection_digest(connection: sqlite3.Connection, row: sqlite3.Row) -> str:

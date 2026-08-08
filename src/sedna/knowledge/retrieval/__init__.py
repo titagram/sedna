@@ -9,6 +9,7 @@ from sedna.knowledge.retrieval.models import (
     IndexCandidate,
     IndexAudit,
     IndexedArtifact,
+    IndexedSourceState,
     KnowledgeGap,
     KnowledgeGapCode,
     RejectedCandidate,
@@ -24,6 +25,12 @@ from sedna.knowledge.retrieval.models import (
     ValidatedTarget,
 )
 from sedna.knowledge.retrieval.service import KnowledgeRetrievalService
+from sedna.knowledge.retrieval.maintenance import (
+    MaintenanceIssue,
+    MaintenanceIssueCode,
+    RetrievalMaintenanceReport,
+    RetrievalMaintenanceService,
+)
 
 __all__ = [
     "AuthorizationScope",
@@ -34,12 +41,17 @@ __all__ = [
     "IndexCandidate",
     "IndexAudit",
     "IndexedArtifact",
+    "IndexedSourceState",
     "KnowledgeGap",
     "KnowledgeGapCode",
     "KnowledgeRetrievalService",
+    "MaintenanceIssue",
+    "MaintenanceIssueCode",
     "RejectedCandidate",
     "RetrievalHit",
     "RetrievalIndex",
+    "RetrievalMaintenanceReport",
+    "RetrievalMaintenanceService",
     "RetrievalQuery",
     "RetrievalResult",
     "RetrievableArtifact",

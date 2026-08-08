@@ -14,6 +14,7 @@ from sedna.knowledge.retrieval import (
     EpistemicLane,
     IndexAudit,
     IndexCandidate,
+    IndexedSourceState,
     KnowledgeGap,
     KnowledgeGapCode,
     RejectedCandidate,
@@ -833,6 +834,28 @@ def test_index_audit_derives_rebuild_requirement_for_every_integrity_failure():
     )
 
 
+def test_indexed_source_state_is_bounded_canonical_and_hash_bound() -> None:
+    state = IndexedSourceState(
+        source_id="source-a",
+        source_sha256="a" * 64,
+        artifact_count=2,
+        projection_version="sqlite-projection-v1",
+        projection_digest="b" * 64,
+    )
+
+    assert state.source_id == "source-a"
+    with pytest.raises(ValidationError):
+        IndexedSourceState(
+            source_id="source-a",
+            source_sha256="not-a-hash",
+            artifact_count=2,
+            projection_version="sqlite-projection-v1",
+            projection_digest="b" * 64,
+        )
+    with pytest.raises(ValidationError):
+        IndexedSourceState.model_validate(state.model_dump() | {"projection_digest": "B" * 64})
+
+
 class _IndexDouble:
     def upsert_bundle(self, bundle: object) -> None:
         return None
@@ -845,6 +868,14 @@ class _IndexDouble:
 
     def get_artifact(self, artifact_id: str) -> object | None:
         return None
+
+    def list_source_states(
+        self,
+        *,
+        after_source_id: str | None,
+        limit: int,
+    ) -> tuple[IndexedSourceState, ...]:
+        return ()
 
     def search_candidates(
         self,

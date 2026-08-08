@@ -70,6 +70,15 @@ def _sorted_unique(values: Iterable[str]) -> tuple[str, ...]:
     return normalized
 
 
+class SemanticBundleEnumerationError(ValueError):
+    """One canonical semantic source cannot safely participate in retrieval."""
+
+    def __init__(self, source_id: str, reason_code: str, message: str) -> None:
+        self.source_id = source_id
+        self.reason_code = reason_code
+        super().__init__(f"semantic source {source_id!r} {message}")
+
+
 class QuarantineRecord(BaseModel):
     """A reviewable explanation for why one source could not be prepared."""
 
@@ -329,6 +338,37 @@ class CanonicalKnowledgeRepository:
     def load_semantic_quarantine(self, source_id: str) -> SemanticQuarantineRecord:
         """Load a strictly validated semantic quarantine record."""
         return self._load_semantic_component(source_id, "quarantine")
+
+    def iter_semantic_bundles(self) -> Iterator[SemanticKnowledgeBundle]:
+        """Return a sorted snapshot iterator of current verified semantic bundles.
+
+        Enumeration and every record load remain descriptor-relative.  Valid quarantined
+        dispositions are omitted; any unsafe, incomplete, corrupt, or stale verified state
+        fails the complete enumeration before a caller can consume a partial corpus.
+        """
+        source_ids = self._semantic_enumeration_source_ids()
+        bundles: list[SemanticKnowledgeBundle] = []
+        for source_id in source_ids:
+            try:
+                with self._source_transition_lock(source_id):
+                    self._recover_source(source_id)
+                    bundle, verification, quarantine = self._load_semantic_state(source_id)
+                if bundle is None:
+                    # A complete quarantine pair is canonical but deliberately not retrievable.
+                    if verification is not None and quarantine is not None:
+                        continue
+                    raise ValueError("semantic state does not contain a verified bundle")
+                self._require_current_retrieval_bundle(bundle)
+            except SemanticBundleEnumerationError:
+                raise
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise SemanticBundleEnumerationError(
+                    source_id,
+                    "invalid_semantic_record",
+                    f"is invalid for retrieval: {exc}",
+                ) from exc
+            bundles.append(bundle)
+        return iter(tuple(bundles))
 
     def load_current_semantic_result(
         self,
@@ -674,6 +714,48 @@ class CanonicalKnowledgeRepository:
                 f"invalid semantic state for source_id {source_id!r}: orphan verification"
             )
         return bundle, verification, quarantine
+
+    def _semantic_enumeration_source_ids(self) -> tuple[str, ...]:
+        source_ids: set[str] = set()
+        for directory in ("semantic_bundles", "semantic_verification"):
+            try:
+                directory_fd = self._open_child_directory(directory, create=False)
+            except FileNotFoundError:
+                continue
+            try:
+                names = tuple(sorted(os.listdir(directory_fd)))
+            finally:
+                os.close(directory_fd)
+            for name in names:
+                if not name.endswith(".json"):
+                    continue
+                source_id = name[:-5]
+                try:
+                    _validate_stable_id(source_id)
+                except ValueError as exc:
+                    raise SemanticBundleEnumerationError(
+                        source_id or "<empty>",
+                        "unsafe_semantic_filename",
+                        "has an unsafe canonical filename",
+                    ) from exc
+                source_ids.add(source_id)
+        return tuple(sorted(source_ids))
+
+    @staticmethod
+    def _require_current_retrieval_bundle(bundle: SemanticKnowledgeBundle) -> None:
+        manifest = bundle.compilation_manifest
+        if (
+            bundle.schema_version != SEMANTIC_SCHEMA_VERSION
+            or manifest.compiler_version != SEMANTIC_COMPILER_VERSION
+            or manifest.extractor_prompt_version != EXTRACTOR_PROMPT_VERSION
+            or manifest.critic_prompt_version != CRITIC_PROMPT_VERSION
+            or manifest.repair_prompt_version != REPAIR_PROMPT_VERSION
+        ):
+            raise SemanticBundleEnumerationError(
+                bundle.source_id,
+                "stale_semantic_record",
+                "is not current and must be semantically recompiled",
+            )
 
     def _read_optional_model(
         self,
@@ -1299,4 +1381,5 @@ __all__ = [
     "IngestionFailure",
     "IngestionReport",
     "QuarantineRecord",
+    "SemanticBundleEnumerationError",
 ]
