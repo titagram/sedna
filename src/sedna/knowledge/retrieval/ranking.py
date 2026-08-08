@@ -38,6 +38,8 @@ from sedna.knowledge.schema import (
     KnowledgeRole,
     ObservedOutcome,
     ReferenceArtifact,
+    SourceLocation,
+    SourceRef,
     VerificationStatus,
 )
 
@@ -58,6 +60,54 @@ _MAX_CANONICAL_MODEL_FIELDS = 8192
 _MAX_CANONICAL_NODES = 16_384
 _MAX_CANONICAL_DEPTH = 64
 _PREFLIGHT_TEXT_CHUNK_CHARS = 1024
+_MAX_UTF8_BYTES_PER_CHAR = 4
+
+# A safe artifact is derived from a candidate that already satisfied the canonical byte budget.
+# Compaction can replace source characters with one UTF-8 ellipsis, whose encoding is at most two
+# bytes wider than one source character; the node cap conservatively bounds those replacements.
+_MAX_SAFE_ARTIFACT_PAYLOAD_BYTES = _MAX_CANONICAL_PAYLOAD_BYTES + _MAX_CANONICAL_NODES * (
+    len("…".encode()) - len("…")
+)
+
+# RetrievalHit intentionally repeats its artifact's provenance.  The remaining text is bounded by
+# the hit model: one artifact identity, one lane, matched facets drawn from the bounded query, and
+# two 32-item Reason collections.  This formula is deliberately separate from the candidate budget
+# so every rank-emitted hit is selector-valid without permitting unbounded caller-built hits.
+_MAX_RETRIEVAL_HIT_PAYLOAD_BYTES = (
+    2 * _MAX_SAFE_ARTIFACT_PAYLOAD_BYTES
+    + _MAX_OUTPUT_STRING_CHARS * _MAX_UTF8_BYTES_PER_CHAR
+    + max(len(lane.value.encode()) for lane in EpistemicLane)
+    + _MAX_CANONICAL_PAYLOAD_BYTES
+    + 2 * _MAX_EXPLANATION_ITEMS * _MAX_OUTPUT_STRING_CHARS * _MAX_UTF8_BYTES_PER_CHAR
+)
+_MAX_RETRIEVAL_HIT_COLLECTION_ITEMS = (
+    _MAX_CANONICAL_COLLECTION_ITEMS + _MAX_OUTPUT_PROVENANCE + 3 * _MAX_EXPLANATION_ITEMS
+)
+_MAX_RETRIEVAL_HIT_MODEL_FIELDS = (
+    _MAX_CANONICAL_MODEL_FIELDS
+    + len(RetrievalHit.model_fields)
+    + _MAX_OUTPUT_PROVENANCE * (len(SourceRef.model_fields) + len(SourceLocation.model_fields))
+    + len(ScoreComponents.model_fields)
+    + _MAX_EXPLANATION_ITEMS * len(SituationFacet.model_fields)
+)
+_MAX_SOURCE_REF_NODES = 1 + len(SourceRef.model_fields) + len(SourceLocation.model_fields)
+_MAX_RETRIEVAL_HIT_NODES = (
+    _MAX_CANONICAL_NODES
+    + 1  # RetrievalHit model
+    + 1  # artifact_id
+    + 2  # lane enum and its string value
+    + 1
+    + _MAX_OUTPUT_PROVENANCE * _MAX_SOURCE_REF_NODES
+    + 1
+    + len(ScoreComponents.model_fields)
+    + 1
+    + _MAX_EXPLANATION_ITEMS * (1 + len(SituationFacet.model_fields))
+    + 2 * (1 + _MAX_EXPLANATION_ITEMS)
+)
+# At most 400 selector inputs are consumed, so even adversarial accepted text work is finite.
+_MAX_DIVERSIFIED_PREFLIGHT_PAYLOAD_BYTES = (
+    _MAX_DIVERSIFIED_INPUT_HITS * _MAX_RETRIEVAL_HIT_PAYLOAD_BYTES
+)
 _MIN_KNOWN_FACT_CONFIDENCE = 0.75
 _UNKNOWN_VALUES = frozenset({"", "unknown", "unspecified", "not established"})
 _HARD_OBSERVED_DIMENSIONS = frozenset(
@@ -210,6 +260,34 @@ class _PreflightState:
     collection_items: int = 0
     model_fields: int = 0
     nodes: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _PreflightBudget:
+    payload_bytes: int
+    collection_items: int
+    model_fields: int
+    nodes: int
+    depth: int
+    purpose: str
+
+
+_CANONICAL_PREFLIGHT_BUDGET = _PreflightBudget(
+    payload_bytes=_MAX_CANONICAL_PAYLOAD_BYTES,
+    collection_items=_MAX_CANONICAL_COLLECTION_ITEMS,
+    model_fields=_MAX_CANONICAL_MODEL_FIELDS,
+    nodes=_MAX_CANONICAL_NODES,
+    depth=_MAX_CANONICAL_DEPTH,
+    purpose="ranking",
+)
+_RETRIEVAL_HIT_PREFLIGHT_BUDGET = _PreflightBudget(
+    payload_bytes=_MAX_RETRIEVAL_HIT_PAYLOAD_BYTES,
+    collection_items=_MAX_RETRIEVAL_HIT_COLLECTION_ITEMS,
+    model_fields=_MAX_RETRIEVAL_HIT_MODEL_FIELDS,
+    nodes=_MAX_RETRIEVAL_HIT_NODES,
+    depth=_MAX_CANONICAL_DEPTH,
+    purpose="retrieval-hit",
+)
 
 
 class _PreflightBudgetError(Exception):
@@ -421,7 +499,11 @@ def select_diversified_hits(
             raise ValueError("diversified selection exceeds 400-hit input budget")
         if not isinstance(hit, RetrievalHit):
             raise ValueError("diversified selection requires RetrievalHit values")
-        _preflight_or_raise(hit, label="retrieval hit")
+        _preflight_or_raise(
+            hit,
+            label="retrieval hit",
+            budget=_RETRIEVAL_HIT_PREFLIGHT_BUDGET,
+        )
         lane_hits.append(_strict_revalidate(hit, RetrievalHit))
     if len({hit.lane for hit in lane_hits}) > 1:
         raise ValueError("diversified selection cannot mix epistemic lanes")
@@ -532,14 +614,24 @@ def _untrusted_facet_count(artifact: IndexedArtifact) -> int | None:
     return scalar_count + len(facets) + sum(len(value) for value in collections)
 
 
-def _preflight_or_raise(value: object, *, label: str) -> None:
+def _preflight_or_raise(
+    value: object,
+    *,
+    label: str,
+    budget: _PreflightBudget = _CANONICAL_PREFLIGHT_BUDGET,
+) -> None:
     try:
-        _bounded_preflight(value, label=label)
+        _bounded_preflight(value, label=label, budget=budget)
     except _PreflightBudgetError as error:
         raise ValueError(error.reason) from None
 
 
-def _bounded_preflight(value: object, *, label: str) -> None:
+def _bounded_preflight(
+    value: object,
+    *,
+    label: str,
+    budget: _PreflightBudget = _CANONICAL_PREFLIGHT_BUDGET,
+) -> None:
     state = _PreflightState()
     active: set[int] = set()
     stack: list[tuple[object, int, bool]] = [(value, 0, False)]
@@ -549,13 +641,11 @@ def _bounded_preflight(value: object, *, label: str) -> None:
             active.remove(id(current))
             continue
         state.nodes += 1
-        if state.nodes > _MAX_CANONICAL_NODES:
+        if state.nodes > budget.nodes:
+            raise _PreflightBudgetError(f"{label} exceeds {budget.nodes}-node preflight budget")
+        if depth > budget.depth:
             raise _PreflightBudgetError(
-                f"{label} exceeds {_MAX_CANONICAL_NODES}-node preflight budget"
-            )
-        if depth > _MAX_CANONICAL_DEPTH:
-            raise _PreflightBudgetError(
-                f"{label} exceeds {_MAX_CANONICAL_DEPTH}-level preflight depth budget"
+                f"{label} exceeds {budget.depth}-level preflight depth budget"
             )
         if current is None or type(current) is bool:
             continue
@@ -568,7 +658,7 @@ def _bounded_preflight(value: object, *, label: str) -> None:
                 raise ValueError(f"{label} contains a non-finite number")
             continue
         if type(current) is str:
-            _consume_text_budget(current, state=state, label=label)
+            _consume_text_budget(current, state=state, label=label, budget=budget)
             continue
         if isinstance(current, Enum):
             enum_value = object.__getattribute__(current, "_value_")
@@ -594,25 +684,23 @@ def _bounded_preflight(value: object, *, label: str) -> None:
                 if field_name in current.__dict__
             )
             state.model_fields += len(present_fields)
-            if state.model_fields > _MAX_CANONICAL_MODEL_FIELDS:
+            if state.model_fields > budget.model_fields:
                 raise _PreflightBudgetError(
-                    f"{label} exceeds {_MAX_CANONICAL_MODEL_FIELDS}-field preflight budget"
+                    f"{label} exceeds {budget.model_fields}-field preflight budget"
                 )
             children = tuple(current.__dict__[field_name] for field_name in present_fields)
         elif type(current) in {tuple, list}:
             state.collection_items += len(current)
-            if state.collection_items > _MAX_CANONICAL_COLLECTION_ITEMS:
+            if state.collection_items > budget.collection_items:
                 raise _PreflightBudgetError(
-                    f"{label} exceeds "
-                    f"{_MAX_CANONICAL_COLLECTION_ITEMS}-item collection preflight budget"
+                    f"{label} exceeds {budget.collection_items}-item collection preflight budget"
                 )
             children = current
         elif type(current) is dict:
             state.collection_items += len(current)
-            if state.collection_items > _MAX_CANONICAL_COLLECTION_ITEMS:
+            if state.collection_items > budget.collection_items:
                 raise _PreflightBudgetError(
-                    f"{label} exceeds "
-                    f"{_MAX_CANONICAL_COLLECTION_ITEMS}-item collection preflight budget"
+                    f"{label} exceeds {budget.collection_items}-item collection preflight budget"
                 )
             children = tuple(part for pair in current.items() for part in pair)
         elif isinstance(current, (tuple, list, dict)):
@@ -625,13 +713,19 @@ def _bounded_preflight(value: object, *, label: str) -> None:
         stack.extend((child, depth + 1, False) for child in reversed(children))
 
 
-def _consume_text_budget(value: str, *, state: _PreflightState, label: str) -> None:
+def _consume_text_budget(
+    value: str,
+    *,
+    state: _PreflightState,
+    label: str,
+    budget: _PreflightBudget,
+) -> None:
     for offset in range(0, len(value), _PREFLIGHT_TEXT_CHUNK_CHARS):
         chunk = value[offset : offset + _PREFLIGHT_TEXT_CHUNK_CHARS]
         state.text_bytes += len(chunk.encode("utf-8"))
-        if state.text_bytes > _MAX_CANONICAL_PAYLOAD_BYTES:
+        if state.text_bytes > budget.payload_bytes:
             raise _PreflightBudgetError(
-                f"{label} payload exceeds {_MAX_CANONICAL_PAYLOAD_BYTES}-byte ranking budget"
+                f"{label} payload exceeds {budget.payload_bytes}-byte {budget.purpose} budget"
             )
 
 

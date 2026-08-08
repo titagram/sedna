@@ -749,6 +749,32 @@ def test_diversified_selection_canonicalizes_valid_model_construct_and_preserves
     assert result.references == selected
 
 
+def test_ranked_result_with_maximum_long_provenance_is_selector_valid():
+    artifact = _reference("selector-long-provenance")
+    source_refs = tuple(
+        SourceRef(
+            source_id=f"selector-long-provenance-{offset:02d}",
+            path="p" * 2049,
+            location=SourceLocation(start_line=1),
+        )
+        for offset in range(64)
+    )
+    artifact = ReferenceArtifact.model_validate(
+        {**artifact.model_dump(mode="json"), "source_refs": source_refs}
+    )
+    query = _query()
+
+    ranked = rank_candidates(query, (_candidate(artifact),))
+    result = RetrievalResult(
+        target=query.situation.target,
+        authorization=query.situation.authorization,
+        references=ranked.references,
+    )
+    selected = ranking_module.select_diversified_hits(result.references, limit=1)
+
+    assert selected == result.references
+
+
 @pytest.mark.parametrize("limit", (0, 65))
 def test_diversified_selection_requires_a_positive_retrieval_result_lane_limit(limit: int):
     hit = rank_candidates(
