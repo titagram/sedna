@@ -60,26 +60,25 @@ class KnowledgeRetrievalService:
                 ranked.decision_guidance,
                 limit=query.lane_limit,
             )
-        except Exception:
-            return _backend_failure_result(query)
-
-        rejected = ranked.rejected_candidates[:_RESULT_REJECTION_LIMIT]
-        if any((references, case_steps, negative_cases, decision_guidance)):
+            rejected = ranked.rejected_candidates[:_RESULT_REJECTION_LIMIT]
+            if any((references, case_steps, negative_cases, decision_guidance)):
+                return RetrievalResult(
+                    target=query.situation.target,
+                    authorization=query.situation.authorization,
+                    references=references,
+                    case_steps=case_steps,
+                    negative_cases=negative_cases,
+                    decision_guidance=decision_guidance,
+                    rejected_candidates=rejected,
+                )
             return RetrievalResult(
                 target=query.situation.target,
                 authorization=query.situation.authorization,
-                references=references,
-                case_steps=case_steps,
-                negative_cases=negative_cases,
-                decision_guidance=decision_guidance,
                 rejected_candidates=rejected,
+                knowledge_gap=_no_applicable_gap(query, ranked.missing_context_questions),
             )
-        return RetrievalResult(
-            target=query.situation.target,
-            authorization=query.situation.authorization,
-            rejected_candidates=rejected,
-            knowledge_gap=_no_applicable_gap(query, ranked.missing_context_questions),
-        )
+        except Exception:
+            return _backend_failure_result(query)
 
     def get_artifact(self, artifact_id: str) -> IndexedArtifact | None:
         """Return one exact canonical artifact without exposing backend failure details."""
@@ -188,7 +187,7 @@ def _backend_failure_result(query: RetrievalQuery) -> RetrievalResult:
         target=query.situation.target,
         authorization=query.situation.authorization,
         knowledge_gap=KnowledgeGap(
-            code=KnowledgeGapCode.NO_APPLICABLE_KNOWLEDGE,
+            code=KnowledgeGapCode.RETRIEVAL_UNAVAILABLE,
             summary="knowledge retrieval is temporarily unavailable",
             observed_domain=_observed_domain(query),
             missing_context=("retrieval index availability",),

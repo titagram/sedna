@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -20,7 +21,9 @@ from sedna.knowledge.retrieval import (
     SituationFacet,
     ValidatedTarget,
 )
-from sedna.knowledge.schema import SemanticKnowledgeBundle
+from sedna.knowledge.retrieval import service as service_module
+from sedna.knowledge.retrieval.sqlite import SQLiteRetrievalIndex
+from sedna.knowledge.schema import SemanticKnowledgeBundle, VerificationStatus
 from tests.knowledge.test_retrieval_ranking import (
     _applicability,
     _candidate,
@@ -290,10 +293,13 @@ def test_backend_failure_returns_a_safe_typed_gap_without_raw_error_text() -> No
     result = _service(index).retrieve(_authorized_query())
 
     assert result.knowledge_gap is not None
-    assert result.knowledge_gap.code is KnowledgeGapCode.NO_APPLICABLE_KNOWLEDGE
+    assert result.knowledge_gap.code is KnowledgeGapCode.RETRIEVAL_UNAVAILABLE
     rendered = result.model_dump_json()
     assert "secret backend filesystem details" not in rendered
+    assert result.knowledge_gap.summary == "knowledge retrieval is temporarily unavailable"
+    assert result.knowledge_gap.missing_context == ("retrieval index availability",)
     assert result.knowledge_gap.research_eligible is False
+    assert result.knowledge_gap.suggested_document_ingestion == ()
 
 
 def test_backend_over_return_is_not_ranked_or_consumed_as_unbounded_input() -> None:
@@ -304,8 +310,104 @@ def test_backend_over_return_is_not_ranked_or_consumed_as_unbounded_input() -> N
     result = _service(index).retrieve(query)
 
     assert result.knowledge_gap is not None
+    assert result.knowledge_gap.code is KnowledgeGapCode.RETRIEVAL_UNAVAILABLE
     assert result.knowledge_gap.research_eligible is False
     assert len(index.calls) == 1
+
+
+def test_corrupt_candidate_is_retrieval_unavailable_not_corpus_absence() -> None:
+    candidate = _candidate(_reference("corrupt-candidate"))
+    corrupt = candidate.model_copy(update={"hidden_backend_state": "private detail"})
+    index = _RecordingIndex({EpistemicLane.REFERENCE: (corrupt,)})
+
+    result = _service(index).retrieve(_authorized_query())
+
+    assert result.knowledge_gap is not None
+    assert result.knowledge_gap.code is KnowledgeGapCode.RETRIEVAL_UNAVAILABLE
+    assert "private detail" not in result.model_dump_json()
+
+
+def test_closed_sqlite_index_is_retrieval_unavailable_not_corpus_absence(
+    tmp_path: Path,
+) -> None:
+    index = SQLiteRetrievalIndex(tmp_path / "closed.sqlite")
+    index.close()
+
+    result = _service(cast(_RecordingIndex, index)).retrieve(_authorized_query())
+
+    assert result.knowledge_gap is not None
+    assert result.knowledge_gap.code is KnowledgeGapCode.RETRIEVAL_UNAVAILABLE
+    assert result.knowledge_gap.research_eligible is False
+
+
+@pytest.mark.parametrize("failure_stage", ("ranking", "selector"))
+def test_ranking_and_selector_failures_are_safe_retrieval_unavailable_gaps(
+    failure_stage: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index = _RecordingIndex(
+        {EpistemicLane.REFERENCE: (_candidate(_reference("pipeline-failure")),)}
+    )
+
+    def fail(*args: object, **kwargs: object):
+        del args, kwargs
+        raise RuntimeError("private pipeline exception")
+
+    monkeypatch.setattr(
+        service_module.ranking,
+        "rank_candidates" if failure_stage == "ranking" else "select_diversified_hits",
+        fail,
+    )
+
+    result = _service(index).retrieve(_authorized_query())
+
+    assert result.knowledge_gap is not None
+    assert result.knowledge_gap.code is KnowledgeGapCode.RETRIEVAL_UNAVAILABLE
+    assert "private pipeline exception" not in result.model_dump_json()
+
+
+def test_invalid_ranked_output_is_deeply_rejected_as_retrieval_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    query = _authorized_query()
+    candidate = _candidate(_reference("invalid-ranked-output"))
+    ranked = service_module.ranking.rank_candidates(query, (candidate,))
+    corrupt_hit = ranked.references[0].model_copy(update={"hidden_output": "private detail"})
+
+    monkeypatch.setattr(
+        service_module.ranking,
+        "select_diversified_hits",
+        lambda hits, *, limit: (corrupt_hit,) if hits else (),
+    )
+
+    result = _service(_RecordingIndex({EpistemicLane.REFERENCE: (candidate,)})).retrieve(query)
+
+    assert result.knowledge_gap is not None
+    assert result.knowledge_gap.code is KnowledgeGapCode.RETRIEVAL_UNAVAILABLE
+    assert "private detail" not in result.model_dump_json()
+
+
+def test_under_threshold_candidates_remain_a_real_no_applicable_knowledge_gap() -> None:
+    weak = _reference(
+        "under-threshold",
+        applicability=_applicability(
+            source_id="source-under-threshold",
+            os_family="windows",
+        ),
+        status=VerificationStatus.DEPRECATED,
+    )
+    index = _RecordingIndex({EpistemicLane.REFERENCE: (_candidate(weak, lexical=0.0),)})
+
+    result = _service(index).retrieve(_authorized_query())
+
+    assert result.knowledge_gap is not None
+    assert result.knowledge_gap.code is KnowledgeGapCode.NO_APPLICABLE_KNOWLEDGE
+    assert result.knowledge_gap.research_eligible is True
+    assert result.knowledge_gap.suggested_document_ingestion
+    assert any(
+        "below reference threshold" in reason
+        for reason in result.rejected_candidates[0].rejection_reasons
+    )
 
 
 def test_get_artifact_strictly_validates_identifier_and_canonical_output() -> None:

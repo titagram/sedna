@@ -16,6 +16,7 @@ from sedna.knowledge.retrieval import (
     IndexCandidate,
     KnowledgeGap,
     KnowledgeGapCode,
+    RejectedCandidate,
     RetrievalHit,
     RetrievalIndex,
     RetrievalQuery,
@@ -757,12 +758,61 @@ def test_knowledge_gap_codes_are_closed_and_index_protocol_is_runtime_checkable(
         "invalid_target",
         "no_applicable_knowledge",
         "missing_required_context",
+        "retrieval_unavailable",
         "unauthorized_scope",
     }
     assert isinstance(IndexAudit(), IndexAudit)
     assert isinstance(_IndexDouble(), RetrievalIndex)
     with pytest.raises(ValidationError):
         KnowledgeGap(code="invented", summary="Nope")
+
+
+def test_retrieval_unavailable_is_a_truthful_closed_gap_without_learning_advice():
+    target = ValidatedTarget.parse("10.10.10.10")
+    gap = KnowledgeGap(
+        code=KnowledgeGapCode.RETRIEVAL_UNAVAILABLE,
+        summary="Knowledge retrieval is temporarily unavailable.",
+        missing_context=("retrieval index availability",),
+    )
+
+    result = RetrievalResult(
+        target=target,
+        authorization=authorized_scope(target),
+        knowledge_gap=gap,
+    )
+
+    assert result.knowledge_gap == gap
+    assert gap.research_eligible is False
+    assert gap.suggested_document_ingestion == ()
+
+    with pytest.raises(ValidationError, match="retrieval_unavailable"):
+        KnowledgeGap(
+            code=KnowledgeGapCode.RETRIEVAL_UNAVAILABLE,
+            summary="Knowledge retrieval is temporarily unavailable.",
+            research_eligible=True,
+        )
+    with pytest.raises(ValidationError, match="retrieval_unavailable"):
+        KnowledgeGap(
+            code=KnowledgeGapCode.RETRIEVAL_UNAVAILABLE,
+            summary="Knowledge retrieval is temporarily unavailable.",
+            suggested_document_ingestion=("ingest more documents",),
+        )
+
+    artifact = reference()
+    rejection = RejectedCandidate(
+        artifact_id=artifact.artifact_id,
+        artifact=artifact,
+        lane=EpistemicLane.REFERENCE,
+        provenance=artifact.source_refs,
+        rejection_reasons=("partial backend output",),
+    )
+    with pytest.raises(ValidationError, match="retrieval_unavailable"):
+        RetrievalResult(
+            target=target,
+            authorization=authorized_scope(target),
+            rejected_candidates=(rejection,),
+            knowledge_gap=gap,
+        )
 
 
 def test_index_audit_derives_rebuild_requirement_for_every_integrity_failure():

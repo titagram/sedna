@@ -88,6 +88,7 @@ class KnowledgeGapCode(StrEnum):
     INVALID_TARGET = "invalid_target"
     NO_APPLICABLE_KNOWLEDGE = "no_applicable_knowledge"
     MISSING_REQUIRED_CONTEXT = "missing_required_context"
+    RETRIEVAL_UNAVAILABLE = "retrieval_unavailable"
     UNAUTHORIZED_SCOPE = "unauthorized_scope"
 
 
@@ -706,6 +707,16 @@ class KnowledgeGap(BaseModel):
                 payload[name] = _normalise_text(payload[name])
         return payload
 
+    @model_validator(mode="after")
+    def validate_unavailable_shape(self) -> KnowledgeGap:
+        if self.code is KnowledgeGapCode.RETRIEVAL_UNAVAILABLE and (
+            self.research_eligible or self.suggested_document_ingestion
+        ):
+            raise ValueError(
+                "retrieval_unavailable cannot recommend research or document ingestion"
+            )
+        return self
+
 
 class RetrievalResult(BaseModel):
     """Exclusive lane results ordered by rank, or exactly one pre-backend/knowledge gap."""
@@ -781,6 +792,13 @@ class RetrievalResult(BaseModel):
                 KnowledgeGapCode.UNAUTHORIZED_SCOPE,
             }:
                 raise ValueError("pre-backend knowledge gap does not match an authorized target")
+            if (
+                self.knowledge_gap.code is KnowledgeGapCode.RETRIEVAL_UNAVAILABLE
+                and self.rejected_candidates
+            ):
+                raise ValueError(
+                    "retrieval_unavailable results cannot retain untrusted partial candidates"
+                )
         elif not hits:
             raise ValueError("valid authorized results without lane hits require a knowledge gap")
         return self
