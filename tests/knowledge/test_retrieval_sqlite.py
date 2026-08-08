@@ -8,6 +8,8 @@ import os
 import sqlite3
 import stat
 import threading
+from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -467,6 +469,27 @@ def test_audit_digest_detects_every_normalized_projection_tamper(
     assert "projection_digest_mismatch" in audit.issues
 
 
+def test_audit_requires_projection_digest_column_even_when_schema_version_matches(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(_bundle())
+    with sqlite3.connect(path) as connection:
+        connection.execute("ALTER TABLE artifacts DROP COLUMN projection_digest")
+        connection.execute(
+            "UPDATE artifact_fts SET statement = 'poisoned without digest' "
+            "WHERE artifact_id = 'reference-http'"
+        )
+
+    with SQLiteRetrievalIndex(path) as index:
+        audit = index.audit()
+
+    assert audit.rebuild_required
+    assert "schema_column_missing" in audit.issues
+    assert (audit.artifact_count, audit.source_count, audit.fts_count) == (6, 1, 6)
+
+
 def test_connect_time_target_swap_cannot_write_through_symlink(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -499,6 +522,75 @@ def test_connect_time_target_swap_cannot_write_through_symlink(
 
     assert swapped
     assert outside.read_bytes() == outside_before
+
+
+def test_replaced_lock_path_cannot_create_independent_writer_domains(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    first_bundle = _renamed_bundle("source-first", "a")
+    old_writer_bundle = _renamed_bundle("source-old-writer", "old")
+    new_writer_bundle = _renamed_bundle("source-new-writer", "new")
+    first = SQLiteRetrievalIndex(path)
+    first.upsert_bundle(first_bundle)
+
+    lock_path = tmp_path / ".sedna.sqlite.lock"
+    displaced_lock = tmp_path / ".sedna.sqlite.lock.displaced"
+    os.replace(lock_path, displaced_lock)
+    second = SQLiteRetrievalIndex(path)
+    barrier = threading.Barrier(2)
+    first_verify = first._verify_expected_target
+    second_verify = second._verify_expected_target
+
+    def synchronized_verify(
+        verifier: Callable[[tuple[int, int] | None], None],
+        expected_identity: tuple[int, int] | None,
+    ) -> None:
+        verifier(expected_identity)
+        with suppress(threading.BrokenBarrierError):
+            barrier.wait(timeout=1)
+
+    monkeypatch.setattr(
+        first,
+        "_verify_expected_target",
+        lambda identity: synchronized_verify(first_verify, identity),
+    )
+    monkeypatch.setattr(
+        second,
+        "_verify_expected_target",
+        lambda identity: synchronized_verify(second_verify, identity),
+    )
+    succeeded: list[str] = []
+    errors: list[BaseException] = []
+
+    def write(index: SQLiteRetrievalIndex, bundle: SemanticKnowledgeBundle) -> None:
+        try:
+            index.upsert_bundle(bundle)
+            succeeded.append(bundle.source_id)
+        except BaseException as error:
+            errors.append(error)
+
+    old_worker = threading.Thread(target=write, args=(first, old_writer_bundle))
+    new_worker = threading.Thread(target=write, args=(second, new_writer_bundle))
+    try:
+        old_worker.start()
+        new_worker.start()
+        old_worker.join(timeout=4)
+        new_worker.join(timeout=4)
+    finally:
+        first.close()
+        second.close()
+
+    assert not old_worker.is_alive()
+    assert not new_worker.is_alive()
+    assert succeeded == ["source-new-writer"]
+    assert len(errors) == 1
+    assert "lock target changed" in str(errors[0])
+    with SQLiteRetrievalIndex(path) as index:
+        assert index.get_artifact("reference-http-a") == first_bundle.references[0]
+        assert index.get_artifact("reference-http-new") == new_writer_bundle.references[0]
+        assert index.get_artifact("reference-http-old") is None
 
 
 @pytest.mark.parametrize("operation", ("upsert", "delete"))
@@ -536,6 +628,75 @@ def test_mutation_failure_after_candidate_commit_preserves_prior_bytes_and_resul
         assert failed
         assert path.read_bytes() == before
         assert index.get_artifact("reference-http") == original.references[0]
+
+
+def test_corrupted_serialized_sibling_is_rejected_before_atomic_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    original = _bundle()
+    replacement = _renamed_bundle("source-replacement", "replacement")
+
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(original)
+        before = path.read_bytes()
+        real_write = index._write_named_bytes
+
+        def corrupt_temporary(filename: str, payload: bytes) -> tuple[int, int]:
+            identity = real_write(filename, payload)
+            if filename.endswith(".tmp"):
+                assert index._parent_fd is not None
+                descriptor = os.open(filename, os.O_WRONLY, dir_fd=index._parent_fd)
+                try:
+                    os.ftruncate(descriptor, 128)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            return identity
+
+        monkeypatch.setattr(index, "_write_named_bytes", corrupt_temporary)
+        with pytest.raises((sqlite3.DatabaseError, ValueError), match="database|integrity|schema"):
+            index.rebuild((replacement,))
+
+        assert path.read_bytes() == before
+        assert index.get_artifact("reference-http") == original.references[0]
+        assert index.get_artifact("reference-http-replacement") is None
+
+
+@pytest.mark.parametrize("generation_bytes", (b"", b"12", b"\xff\xfe"))
+def test_generation_sidecar_is_recovered_from_valid_database(
+    tmp_path: Path,
+    generation_bytes: bytes,
+) -> None:
+    path = tmp_path / "sedna.sqlite"
+    lock_path = tmp_path / ".sedna.sqlite.lock"
+    with SQLiteRetrievalIndex(path) as index:
+        index.upsert_bundle(_bundle())
+    lock_path.write_bytes(generation_bytes)
+
+    with SQLiteRetrievalIndex(path) as index:
+        assert index.audit().rebuild_required is False
+        rebuilt = index.rebuild((_renamed_bundle("source-rebuilt", "rebuilt"),))
+        assert rebuilt.rebuild_required is False
+
+    repaired = lock_path.read_bytes()
+    assert repaired.endswith(b"\n")
+    assert repaired[:-1].isdigit()
+
+
+def test_audit_requires_one_valid_embedded_generation_row(tmp_path: Path) -> None:
+    path = tmp_path / "sedna.sqlite"
+    with SQLiteRetrievalIndex(path):
+        pass
+    with sqlite3.connect(path) as connection:
+        connection.execute("DELETE FROM index_metadata")
+
+    with SQLiteRetrievalIndex(path) as index:
+        audit = index.audit()
+
+    assert audit.rebuild_required
+    assert "generation_metadata_invalid" in audit.issues
 
 
 def test_audit_uses_one_snapshot_while_another_index_deletes(

@@ -99,6 +99,13 @@ CREATE TABLE artifact_sources (
     )
 );
 
+CREATE TABLE index_metadata (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    generation INTEGER NOT NULL CHECK(generation >= 0)
+);
+
+INSERT INTO index_metadata(singleton, generation) VALUES (1, 0);
+
 CREATE VIRTUAL TABLE artifact_fts USING fts5(
     artifact_id UNINDEXED,
     statement,
@@ -121,6 +128,57 @@ CREATE INDEX artifact_sources_source_idx
     ON artifact_sources(source_id, artifact_id);
 """
 
+_REQUIRED_SCHEMA_COLUMNS = {
+    "artifacts": frozenset(
+        {
+            "artifact_id",
+            "owner_source_id",
+            "canonical_path",
+            "artifact_type",
+            "knowledge_role",
+            "verification_status",
+            "source_reliability",
+            "extraction_confidence",
+            "generalizability",
+            "context_specificity",
+            "support_count",
+            "contradiction_count",
+            "observed_outcome",
+            "observed_at",
+            "freshness_observed_at",
+            "independence_group",
+            "canonical_json",
+            "projection_digest",
+        }
+    ),
+    "facet_values": frozenset(
+        {
+            "artifact_id",
+            "facet_id",
+            "channel",
+            "namespace",
+            "key",
+            "value",
+            "relation",
+            "origin",
+            "confidence",
+        }
+    ),
+    "artifact_links": frozenset({"from_artifact_id", "relation", "to_artifact_id"}),
+    "artifact_sources": frozenset(
+        {
+            "artifact_id",
+            "source_id",
+            "path",
+            "location_json",
+            "independence_group",
+            "relation",
+        }
+    ),
+    "index_metadata": frozenset({"singleton", "generation"}),
+    "artifact_fts": frozenset({"artifact_id", *_FTS_FIELDS}),
+}
+
 
 class _MemoryConnection(sqlite3.Connection):
     """Patchable connection type used only for private in-memory snapshots."""
@@ -134,6 +192,7 @@ class SQLiteRetrievalIndex:
         self._connection: _MemoryConnection | None = None
         self._parent_fd: int | None = None
         self._lock_fd: int | None = None
+        self._lock_identity: tuple[int, int] | None = None
         self._db_identity: tuple[int, int] | None = None
         self._generation = 0
         self.path, self._filename = self._prepare_target(path)
@@ -142,15 +201,19 @@ class SQLiteRetrievalIndex:
             self._open_parent()
             self._open_lock()
             with self._file_lock(exclusive=True):
-                generation = self._read_generation()
                 database_bytes, identity = self._read_database_bytes()
                 if database_bytes:
                     connection = self._connection_from_bytes(database_bytes)
+                    generation = _database_generation(connection)
+                    if generation is None:
+                        generation = self._read_generation() or 0
+                    self._repair_generation(generation)
                 else:
                     connection = self._new_schema_connection()
+                    generation = 0
                     try:
                         identity, generation = self._persist_database(
-                            connection.serialize(),
+                            self._serialize_candidate(connection, generation),
                             previous_bytes=database_bytes or b"",
                             expected_identity=identity,
                             generation=generation,
@@ -190,6 +253,7 @@ class SQLiteRetrievalIndex:
             if lock_fd is not None:
                 os.close(lock_fd)
                 self._lock_fd = None
+                self._lock_identity = None
             parent_fd = self._parent_fd
             if parent_fd is not None:
                 os.close(parent_fd)
@@ -209,7 +273,7 @@ class SQLiteRetrievalIndex:
                         self._delete_source_rows(candidate, source_id)
                         self._insert_projection_rows(candidate, source_id, projection)
                     new_identity, new_generation = self._persist_database(
-                        candidate.serialize(),
+                        self._serialize_candidate(candidate, generation),
                         previous_bytes=previous_bytes,
                         expected_identity=identity,
                         generation=generation,
@@ -231,7 +295,7 @@ class SQLiteRetrievalIndex:
                     with self._transaction(candidate):
                         self._delete_source_rows(candidate, source_id)
                     new_identity, new_generation = self._persist_database(
-                        candidate.serialize(),
+                        self._serialize_candidate(candidate, generation),
                         previous_bytes=previous_bytes,
                         expected_identity=identity,
                         generation=generation,
@@ -266,7 +330,7 @@ class SQLiteRetrievalIndex:
                     if audit.rebuild_required:
                         raise ValueError(f"rebuilt index failed audit: {', '.join(audit.issues)}")
                     new_identity, new_generation = self._persist_database(
-                        candidate.serialize(),
+                        self._serialize_candidate(candidate, generation),
                         previous_bytes=previous_bytes,
                         expected_identity=identity,
                         generation=generation,
@@ -383,6 +447,20 @@ class SQLiteRetrievalIndex:
         if bad_integrity:
             issues.add("integrity_check_failed")
             corruption_count += len(bad_integrity)
+
+        schema_issues = _required_schema_issues(connection)
+        issues.update(schema_issues)
+        if schema_issues:
+            return IndexAudit(
+                artifact_count=_safe_table_count(connection, "artifacts"),
+                source_count=_safe_distinct_count(connection, "artifacts", "owner_source_id"),
+                facet_count=_safe_table_count(connection, "facet_values"),
+                fts_count=_safe_table_count(connection, "artifact_fts"),
+                corruption_count=corruption_count,
+                issues=tuple(sorted(issues)),
+            )
+        if _database_generation(connection) is None:
+            issues.add("generation_metadata_invalid")
 
         artifact_count = connection.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0]
         source_count = connection.execute(
@@ -642,20 +720,34 @@ class SQLiteRetrievalIndex:
     def _load_live_connection(
         self, *, close: bool = False
     ) -> tuple[_MemoryConnection, bytes, tuple[int, int], int]:
-        generation = self._read_generation()
         database_bytes, identity = self._read_database_bytes()
         if not database_bytes or identity is None:
             raise RuntimeError("database target changed after index open")
+        connection = self._connection_from_bytes(database_bytes)
+        generation = _database_generation(connection)
+        if generation is None:
+            generation = self._read_generation() or 0
         if (
             self._db_identity is not None
             and identity != self._db_identity
             and generation == self._generation
         ):
+            connection.close()
             raise RuntimeError("database target changed after index open")
-        connection = self._connection_from_bytes(database_bytes)
         if close:
             connection.close()
         return connection, database_bytes, identity, generation
+
+    @staticmethod
+    def _serialize_candidate(connection: sqlite3.Connection, generation: int) -> bytes:
+        next_generation = generation + 1
+        cursor = connection.execute(
+            "UPDATE index_metadata SET generation = ? WHERE singleton = 1",
+            (next_generation,),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("database generation metadata requires a full rebuild")
+        return connection.serialize()
 
     def _adopt_connection(
         self,
@@ -709,7 +801,12 @@ class SQLiteRetrievalIndex:
 
     @staticmethod
     def _require_current_schema(connection: sqlite3.Connection) -> None:
-        if connection.execute("PRAGMA user_version").fetchone()[0] != _SCHEMA_VERSION:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if (
+            version != _SCHEMA_VERSION
+            or _required_schema_issues(connection)
+            or _database_generation(connection) is None
+        ):
             raise RuntimeError("database schema version requires a full rebuild")
 
     def _prepare_target(self, path: str | Path) -> tuple[Path, str]:
@@ -760,16 +857,25 @@ class SQLiteRetrievalIndex:
             lock_fd = os.open(self._lock_filename, flags, 0o600, dir_fd=parent_fd)
         except OSError as error:
             raise ValueError("database lock target must be a regular file") from error
-        if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+        lock_status = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_status.st_mode):
             os.close(lock_fd)
             raise ValueError("database lock target must be a regular file")
         self._lock_fd = lock_fd
+        self._lock_identity = (lock_status.st_dev, lock_status.st_ino)
 
     @contextmanager
     def _file_lock(self, *, exclusive: bool) -> Iterator[None]:
-        lock_fd = self._ensure_lock_open()
+        self._ensure_parent_identity()
+        self._ensure_lock_identity()
+        # The stable parent-directory inode is the writer domain.  The
+        # generation sidecar remains independently replaceable/recoverable,
+        # but renaming it cannot create a second cooperative lock domain.
+        lock_fd = self._ensure_parent_open()
         fcntl.flock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
         try:
+            self._ensure_parent_identity()
+            self._ensure_lock_identity()
             yield
         finally:
             # A mutation can already be durably installed when this context
@@ -825,9 +931,15 @@ class SQLiteRetrievalIndex:
         next_generation = generation + 1
         try:
             temporary_identity = self._write_named_bytes(temporary_name, database_bytes)
+            self._validate_serialized_sibling(
+                temporary_name,
+                temporary_identity,
+                expected_generation=next_generation,
+            )
             if expected_identity is not None:
                 self._write_named_bytes(backup_name, previous_bytes)
                 backup_created = True
+            self._ensure_lock_identity()
             self._verify_expected_target(expected_identity)
             try:
                 os.replace(
@@ -841,7 +953,11 @@ class SQLiteRetrievalIndex:
                 current = self._target_status()
                 if current is None or temporary_identity != (current.st_dev, current.st_ino):
                     raise OSError("database target changed during atomic persistence")
-                self._write_generation(next_generation)
+                # The atomically installed database is authoritative.  The
+                # sidecar copy is recoverable and must never make a durable
+                # mutation report failure after installation.
+                with suppress(OSError):
+                    self._write_generation(next_generation)
                 generation_written = True
                 if backup_created:
                     os.unlink(backup_name, dir_fd=parent_fd)
@@ -877,6 +993,63 @@ class SQLiteRetrievalIndex:
                 self._unlink_named(temporary_name)
             if backup_created and not installed:
                 self._unlink_named(backup_name)
+
+    def _validate_serialized_sibling(
+        self,
+        filename: str,
+        expected_identity: tuple[int, int],
+        *,
+        expected_generation: int,
+    ) -> None:
+        """Reopen and validate the exact sibling inode before it can be installed."""
+        try:
+            database_bytes = self._read_named_bytes(filename, expected_identity)
+            connection = self._connection_from_bytes(database_bytes)
+            try:
+                self._require_current_schema(connection)
+                if _database_generation(connection) != expected_generation:
+                    raise ValueError("serialized database generation does not match candidate")
+                quick_check = tuple(row[0] for row in connection.execute("PRAGMA quick_check"))
+                integrity_check = tuple(
+                    row[0] for row in connection.execute("PRAGMA integrity_check")
+                )
+                if quick_check != ("ok",) or integrity_check != ("ok",):
+                    raise ValueError("serialized database integrity check failed")
+            finally:
+                connection.close()
+        except sqlite3.Error as error:
+            raise sqlite3.DatabaseError("serialized database validation failed") from error
+
+    def _read_named_bytes(
+        self,
+        filename: str,
+        expected_identity: tuple[int, int],
+    ) -> bytes:
+        parent_fd = self._ensure_parent_open()
+        before = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or expected_identity != (before.st_dev, before.st_ino):
+            raise ValueError("serialized database sibling changed before validation")
+        descriptor = os.open(
+            filename,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or expected_identity != (
+                opened.st_dev,
+                opened.st_ino,
+            ):
+                raise ValueError("serialized database sibling changed during validation")
+            chunks: list[bytes] = []
+            while chunk := os.read(descriptor, 1024 * 1024):
+                chunks.append(chunk)
+            after = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+            if expected_identity != (after.st_dev, after.st_ino):
+                raise ValueError("serialized database sibling changed during validation")
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
 
     def _rollback_persistence(
         self,
@@ -950,19 +1123,23 @@ class SQLiteRetrievalIndex:
         ):
             raise RuntimeError("database target changed before atomic persistence")
 
-    def _read_generation(self) -> int:
+    def _read_generation(self) -> int | None:
         lock_fd = self._ensure_lock_open()
         os.lseek(lock_fd, 0, os.SEEK_SET)
         raw = os.read(lock_fd, 64)
         if not raw:
-            return 0
+            return None
         try:
             text = raw.decode("ascii")
             if not text.endswith("\n") or not text[:-1].isdigit():
                 raise ValueError
             return int(text[:-1])
-        except (UnicodeError, ValueError) as error:
-            raise ValueError("database lock generation is invalid") from error
+        except (UnicodeError, ValueError):
+            return None
+
+    def _repair_generation(self, generation: int) -> None:
+        if self._read_generation() != generation:
+            self._write_generation(generation)
 
     def _write_generation(self, generation: int) -> None:
         lock_fd = self._ensure_lock_open()
@@ -997,6 +1174,28 @@ class SQLiteRetrievalIndex:
         if lock_fd is None:
             raise RuntimeError("retrieval index is closed")
         return lock_fd
+
+    def _ensure_lock_identity(self) -> None:
+        lock_fd = self._ensure_lock_open()
+        expected = self._lock_identity
+        retained = os.fstat(lock_fd)
+        try:
+            current = os.stat(
+                self._lock_filename,
+                dir_fd=self._ensure_parent_open(),
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as error:
+            raise RuntimeError("database lock target changed after index open") from error
+        identity = (retained.st_dev, retained.st_ino)
+        if (
+            expected is None
+            or identity != expected
+            or identity != (current.st_dev, current.st_ino)
+            or not stat.S_ISREG(retained.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+        ):
+            raise RuntimeError("database lock target changed after index open")
 
     def _ensure_parent_identity(self) -> None:
         parent_fd = self._ensure_parent_open()
@@ -1255,6 +1454,50 @@ def _stored_metadata_matches(row: sqlite3.Row, artifact: IndexedArtifact) -> boo
 
 def _column_exists(connection: sqlite3.Connection, table: str, column: str) -> bool:
     return any(row[1] == column for row in connection.execute(f"PRAGMA table_info({table})"))
+
+
+def _required_schema_issues(connection: sqlite3.Connection) -> set[str]:
+    tables = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+        )
+    }
+    issues: set[str] = set()
+    for table, required_columns in _REQUIRED_SCHEMA_COLUMNS.items():
+        if table not in tables:
+            issues.add("schema_table_missing")
+            continue
+        columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+        if not required_columns <= columns:
+            issues.add("schema_column_missing")
+    return issues
+
+
+def _safe_table_count(connection: sqlite3.Connection, table: str) -> int:
+    try:
+        return connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    except sqlite3.Error:
+        return 0
+
+
+def _safe_distinct_count(connection: sqlite3.Connection, table: str, column: str) -> int:
+    if not _column_exists(connection, table, column):
+        return 0
+    return connection.execute(f"SELECT COUNT(DISTINCT {column}) FROM {table}").fetchone()[0]
+
+
+def _database_generation(connection: sqlite3.Connection) -> int | None:
+    try:
+        rows = connection.execute("SELECT singleton, generation FROM index_metadata").fetchall()
+    except sqlite3.Error:
+        return None
+    if len(rows) != 1 or rows[0][0] != 1:
+        return None
+    generation = rows[0][1]
+    if type(generation) is not int or generation < 0:
+        return None
+    return generation
 
 
 def _lane_clause(lane: EpistemicLane) -> str:
