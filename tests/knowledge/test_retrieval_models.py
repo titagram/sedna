@@ -297,6 +297,47 @@ def test_ipv6_shaped_generic_bypasses_remain_invalid(value: str):
     assert not target.is_valid
 
 
+@pytest.mark.parametrize(
+    "value",
+    (
+        "2001:db8:zzzzz",
+        "2001:db8:garbage",
+        "1:2:3:4:5:6:7:zzzzz",
+        "2001:garbage:item",
+        "2001:Db8:GaRbAgE",
+        "org:project:item:layer:scope:unit:asset:detail",
+    ),
+)
+def test_leading_hex_or_eight_component_ipv6_shapes_cannot_be_generic(value: str):
+    parsed = ValidatedTarget.parse(value)
+    explicit_generic = ValidatedTarget(value=value, kind=TargetKind.GENERIC)
+
+    assert parsed.kind is TargetKind.INVALID
+    assert explicit_generic.kind is TargetKind.INVALID
+    assert not explicit_generic.is_valid
+
+
+@pytest.mark.parametrize(
+    ("value", "normalized"),
+    (
+        (
+            "org:project:item:layer:scope:unit:asset",
+            "org:project:item:layer:scope:unit:asset",
+        ),
+        ("Project Notes:Alpha Beta:Release Item", "project notes:alpha beta:release item"),
+    ),
+)
+def test_non_address_seven_component_and_whitespace_generic_prose_remain_available(
+    value: str,
+    normalized: str,
+):
+    target = ValidatedTarget(value=value, kind=TargetKind.GENERIC)
+
+    assert target.is_valid
+    assert target.kind is TargetKind.GENERIC
+    assert target.normalized == normalized
+
+
 @pytest.mark.parametrize("value", ("http-server", "http2.example", "https-worker"))
 def test_malformed_scheme_detection_does_not_reject_valid_http_prefixed_hostnames(value: str):
     assert ValidatedTarget.parse(value).kind is TargetKind.HOSTNAME

@@ -170,9 +170,14 @@ def _looks_ipv6_like(value: str) -> bool:
     if "::" in value:
         return True
     components = value.split(":")
+    if len(components) == 8:
+        return True
+    if len(components) < 3:
+        return False
+    if _IPV6_COMPONENT.fullmatch(components[0]):
+        return True
     return bool(
-        len(components) >= 3
-        and all(component and len(component) <= 4 for component in components)
+        all(component and len(component) <= 4 for component in components)
         and (
             any(_IPV6_COMPONENT.fullmatch(component) for component in components)
             or any(character in "0123456789" for component in components for character in component)
