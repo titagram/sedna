@@ -34,7 +34,7 @@ SCHEMA_VERSION = "1.1.0"
 PARSER_ID = "markdown-it-commonmark"
 PARSER_VERSION = "1"
 EXTRACTOR_ID = "deterministic-foundation"
-EXTRACTOR_VERSION = "2"
+EXTRACTOR_VERSION = "3"
 DEFAULT_LANGUAGE = "en"
 
 _ATX_TITLE_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
