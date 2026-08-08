@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from enum import Enum
 from hashlib import sha256
+from itertools import islice
 from types import MappingProxyType
 from typing import Any
 
@@ -41,6 +42,8 @@ from sedna.knowledge.schema import (
 )
 
 _MAX_RANKING_CANDIDATES = 400
+_MAX_DIVERSIFIED_INPUT_HITS = _MAX_RANKING_CANDIDATES
+_MAX_RESULT_LANE_HITS = 64
 _MAX_EXPLANATION_ITEMS = 32
 _MAX_GLOBAL_QUESTIONS = 128
 _MAX_OUTPUT_STRING_CHARS = 2048
@@ -53,6 +56,7 @@ _MAX_CANONICAL_PAYLOAD_BYTES = 262_144
 _MAX_CANONICAL_COLLECTION_ITEMS = 4096
 _MAX_CANONICAL_MODEL_FIELDS = 8192
 _MAX_CANONICAL_NODES = 16_384
+_MAX_CANONICAL_DEPTH = 64
 _PREFLIGHT_TEXT_CHUNK_CHARS = 1024
 _MIN_KNOWN_FACT_CONFIDENCE = 0.75
 _UNKNOWN_VALUES = frozenset({"", "unknown", "unspecified", "not established"})
@@ -409,13 +413,19 @@ def select_diversified_hits(
 ) -> tuple[RetrievalHit, ...]:
     """Select lane-local independent evidence, then restore the public score-order contract."""
 
-    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
-        raise ValueError("diversified hit limit must be a non-negative integer")
-    lane_hits = tuple(hits)
-    if any(not isinstance(hit, RetrievalHit) for hit in lane_hits):
-        raise ValueError("diversified selection requires RetrievalHit values")
+    if type(limit) is not int or not 1 <= limit <= _MAX_RESULT_LANE_HITS:
+        raise ValueError("diversified hit limit must be between 1 and 64")
+    lane_hits: list[RetrievalHit] = []
+    for offset, hit in enumerate(hits):
+        if offset >= _MAX_DIVERSIFIED_INPUT_HITS:
+            raise ValueError("diversified selection exceeds 400-hit input budget")
+        if not isinstance(hit, RetrievalHit):
+            raise ValueError("diversified selection requires RetrievalHit values")
+        lane_hits.append(hit)
     if len({hit.lane for hit in lane_hits}) > 1:
         raise ValueError("diversified selection cannot mix epistemic lanes")
+    if len({hit.artifact_id for hit in lane_hits}) != len(lane_hits):
+        raise ValueError("diversified selection requires unique artifact identities")
     selected = _diversified_lane_order(lane_hits)[:limit]
     return _score_order(selected)
 
@@ -530,87 +540,88 @@ def _preflight_or_raise(value: object, *, label: str) -> None:
 
 def _bounded_preflight(value: object, *, label: str) -> None:
     state = _PreflightState()
-    _preflight_value(value, state=state, label=label, seen=set())
-
-
-def _preflight_value(
-    value: object,
-    *,
-    state: _PreflightState,
-    label: str,
-    seen: set[int],
-) -> None:
-    state.nodes += 1
-    if state.nodes > _MAX_CANONICAL_NODES:
-        raise _PreflightBudgetError(f"{label} exceeds {_MAX_CANONICAL_NODES}-node preflight budget")
-    if value is None or isinstance(value, bool):
-        return
-    if isinstance(value, int):
-        if value.bit_length() > 256:
-            raise ValueError(f"{label} contains an oversized integer")
-        return
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError(f"{label} contains a non-finite number")
-        return
-    if isinstance(value, Enum):
-        _preflight_value(value.value, state=state, label=label, seen=seen)
-        return
-    if isinstance(value, str):
-        if type(value) is not str:
+    active: set[int] = set()
+    stack: list[tuple[object, int, bool]] = [(value, 0, False)]
+    while stack:
+        current, depth, leaving = stack.pop()
+        if leaving:
+            active.remove(id(current))
+            continue
+        state.nodes += 1
+        if state.nodes > _MAX_CANONICAL_NODES:
+            raise _PreflightBudgetError(
+                f"{label} exceeds {_MAX_CANONICAL_NODES}-node preflight budget"
+            )
+        if depth > _MAX_CANONICAL_DEPTH:
+            raise _PreflightBudgetError(
+                f"{label} exceeds {_MAX_CANONICAL_DEPTH}-level preflight depth budget"
+            )
+        if current is None or type(current) is bool:
+            continue
+        if type(current) is int:
+            if current.bit_length() > 256:
+                raise ValueError(f"{label} contains an oversized integer")
+            continue
+        if type(current) is float:
+            if not math.isfinite(current):
+                raise ValueError(f"{label} contains a non-finite number")
+            continue
+        if type(current) is str:
+            _consume_text_budget(current, state=state, label=label)
+            continue
+        if isinstance(current, Enum):
+            enum_value = object.__getattribute__(current, "_value_")
+            stack.append((enum_value, depth + 1, False))
+            continue
+        if isinstance(current, bool):
+            raise ValueError(f"{label} contains an unsafe boolean subtype")
+        if isinstance(current, int):
+            raise ValueError(f"{label} contains an unsafe integer subtype")
+        if isinstance(current, float):
+            raise ValueError(f"{label} contains an unsafe float subtype")
+        if isinstance(current, str):
             raise ValueError(f"{label} contains an unsafe string subtype")
-        _consume_text_budget(value, state=state, label=label)
-        return
 
-    identity = id(value)
-    if identity in seen:
-        raise ValueError(f"{label} contains a recursive value")
-    seen.add(identity)
-    try:
-        if isinstance(value, BaseModel):
-            _check_model_shape(value)
+        identity = id(current)
+        if identity in active:
+            raise ValueError(f"{label} contains a recursive value")
+        if isinstance(current, BaseModel):
+            _check_model_shape(current)
             present_fields = tuple(
                 field_name
-                for field_name in type(value).model_fields
-                if field_name in value.__dict__
+                for field_name in type(current).model_fields
+                if field_name in current.__dict__
             )
             state.model_fields += len(present_fields)
             if state.model_fields > _MAX_CANONICAL_MODEL_FIELDS:
                 raise _PreflightBudgetError(
                     f"{label} exceeds {_MAX_CANONICAL_MODEL_FIELDS}-field preflight budget"
                 )
-            for field_name in present_fields:
-                _preflight_value(
-                    value.__dict__[field_name],
-                    state=state,
-                    label=label,
-                    seen=seen,
-                )
-            return
-        if type(value) in {tuple, list}:
-            state.collection_items += len(value)
+            children = tuple(current.__dict__[field_name] for field_name in present_fields)
+        elif type(current) in {tuple, list}:
+            state.collection_items += len(current)
             if state.collection_items > _MAX_CANONICAL_COLLECTION_ITEMS:
                 raise _PreflightBudgetError(
                     f"{label} exceeds "
                     f"{_MAX_CANONICAL_COLLECTION_ITEMS}-item collection preflight budget"
                 )
-            for item in value:
-                _preflight_value(item, state=state, label=label, seen=seen)
-            return
-        if type(value) is dict:
-            state.collection_items += len(value)
+            children = current
+        elif type(current) is dict:
+            state.collection_items += len(current)
             if state.collection_items > _MAX_CANONICAL_COLLECTION_ITEMS:
                 raise _PreflightBudgetError(
                     f"{label} exceeds "
                     f"{_MAX_CANONICAL_COLLECTION_ITEMS}-item collection preflight budget"
                 )
-            for key, item in value.items():
-                _preflight_value(key, state=state, label=label, seen=seen)
-                _preflight_value(item, state=state, label=label, seen=seen)
-            return
-        raise ValueError(f"{label} contains an unsupported value type")
-    finally:
-        seen.remove(identity)
+            children = tuple(part for pair in current.items() for part in pair)
+        elif isinstance(current, (tuple, list, dict)):
+            raise ValueError(f"{label} contains an unsafe container subtype")
+        else:
+            raise ValueError(f"{label} contains an unsupported value type")
+
+        active.add(identity)
+        stack.append((current, depth, True))
+        stack.extend((child, depth + 1, False) for child in reversed(children))
 
 
 def _consume_text_budget(value: str, *, state: _PreflightState, label: str) -> None:
@@ -1072,14 +1083,32 @@ def _safe_retrieval_artifact(
     notes: set[str] = set()
     active: set[int] = set()
 
-    def compact(value: Any, *, key: str | None = None, top_level: bool = False) -> Any:
-        if value is None or isinstance(value, (bool, int, float)):
+    def compact(
+        value: Any,
+        *,
+        key: str | None = None,
+        top_level: bool = False,
+        depth: int = 0,
+    ) -> Any:
+        if depth > _MAX_CANONICAL_DEPTH:
+            raise ValueError("canonical artifact exceeds safe retrieval view depth budget")
+        if value is None or type(value) in {bool, int, float}:
             return value
         if isinstance(value, Enum):
-            return compact(value.value, key=key, top_level=top_level)
-        if isinstance(value, str):
-            if type(value) is not str:
-                raise ValueError("canonical artifact contains an unsafe string subtype")
+            enum_value = object.__getattribute__(value, "_value_")
+            return compact(
+                enum_value,
+                key=key,
+                top_level=top_level,
+                depth=depth + 1,
+            )
+        if isinstance(value, bool):
+            raise ValueError("canonical artifact contains an unsafe boolean subtype")
+        if isinstance(value, int):
+            raise ValueError("canonical artifact contains an unsafe integer subtype")
+        if isinstance(value, float):
+            raise ValueError("canonical artifact contains an unsafe float subtype")
+        if type(value) is str:
             if len(value) > _MAX_OUTPUT_STRING_CHARS:
                 notes.add("artifact retrieval view compacted to bounded output")
                 return _truncate_text(
@@ -1088,6 +1117,8 @@ def _safe_retrieval_artifact(
                     include_full_digest=allow_full_digest,
                 )
             return value
+        if isinstance(value, str):
+            raise ValueError("canonical artifact contains an unsafe string subtype")
 
         active_identity = id(value)
         if active_identity in active:
@@ -1107,23 +1138,31 @@ def _safe_retrieval_artifact(
                         value.__dict__[field_name],
                         key=field_name,
                         top_level=top_level and field_name == "source_refs",
+                        depth=depth + 1,
                     )
                 return payload
             if type(value) is dict:
-                items = tuple(value.items())
-                if len(items) > _MAX_OUTPUT_SEQUENCE_ITEMS:
-                    items = items[:_MAX_OUTPUT_SEQUENCE_ITEMS]
+                if len(value) > _MAX_OUTPUT_SEQUENCE_ITEMS:
                     notes.add(
                         "artifact retrieval view mappings bounded to "
                         f"{_MAX_OUTPUT_SEQUENCE_ITEMS} items"
                     )
                 payload = {}
-                for item_key, item_value in items:
+                for item_key, item_value in islice(
+                    value.items(),
+                    _MAX_OUTPUT_SEQUENCE_ITEMS,
+                ):
                     if type(item_key) is not str:
                         raise ValueError("canonical artifact mapping keys must be strings")
-                    payload[item_key] = compact(item_value, key=item_key)
+                    payload[item_key] = compact(
+                        item_value,
+                        key=item_key,
+                        depth=depth + 1,
+                    )
                 return payload
             if type(value) not in {tuple, list}:
+                if isinstance(value, (tuple, list, dict)):
+                    raise ValueError("canonical artifact contains an unsafe container subtype")
                 raise ValueError("canonical artifact contains an unsupported value type")
 
             items = value
@@ -1132,7 +1171,7 @@ def _safe_retrieval_artifact(
                 unique: list[Any] = []
                 identities: set[str] = set()
                 for item in scanned_items:
-                    compacted_item = compact(item)
+                    compacted_item = compact(item, depth=depth + 1)
                     reference_identity = json.dumps(
                         compacted_item,
                         ensure_ascii=False,
@@ -1180,7 +1219,7 @@ def _safe_retrieval_artifact(
                     "artifact retrieval view sequences bounded to "
                     f"{_MAX_OUTPUT_SEQUENCE_ITEMS} items"
                 )
-            return [compact(item) for item in items]
+            return [compact(item, depth=depth + 1) for item in items]
         finally:
             active.remove(active_identity)
 

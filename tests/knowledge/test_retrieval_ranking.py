@@ -685,6 +685,87 @@ def test_diversified_top_k_selection_is_score_sorted_and_composes_with_retrieval
     assert "limited-copy-2" not in {hit.artifact_id for hit in result.references}
 
 
+@pytest.mark.parametrize("limit", (0, 65))
+def test_diversified_selection_requires_a_positive_retrieval_result_lane_limit(limit: int):
+    hit = rank_candidates(
+        _query(),
+        (_candidate(_reference("selector-limit")),),
+    ).references[0]
+
+    with pytest.raises(ValueError, match="between 1 and 64"):
+        ranking_module.select_diversified_hits((hit,), limit=limit)
+
+
+def test_diversified_selection_rejects_401_hits_before_materializing_unbounded_input():
+    hit = rank_candidates(
+        _query(),
+        (_candidate(_reference("selector-401")),),
+    ).references[0]
+
+    with pytest.raises(ValueError, match="exceeds 400-hit input budget"):
+        ranking_module.select_diversified_hits((hit for _ in range(401)), limit=1)
+
+
+def test_diversified_selection_does_not_overconsume_a_guarded_5000_hit_generator():
+    hit = rank_candidates(
+        _query(),
+        (_candidate(_reference("selector-guarded-5000")),),
+    ).references[0]
+    consumed = 0
+
+    def guarded_hits():
+        nonlocal consumed
+        for offset in range(5000):
+            if offset > 400:
+                raise AssertionError("selector consumed beyond its max-plus-one boundary")
+            consumed += 1
+            yield hit
+
+    with pytest.raises(ValueError, match="exceeds 400-hit input budget"):
+        ranking_module.select_diversified_hits(guarded_hits(), limit=1)
+    assert consumed == 401
+
+
+def test_diversified_selection_accepts_a_finite_generator_and_rejects_duplicate_hits():
+    first = _reference("selector-generator-first", group="selector-generator-first")
+    second = _reference("selector-generator-second", group="selector-generator-second")
+    ranked = rank_candidates(
+        _query(),
+        (_candidate(first), _candidate(second)),
+    )
+
+    selected = ranking_module.select_diversified_hits(
+        (hit for hit in ranked.references),
+        limit=2,
+    )
+
+    assert selected == ranked.references
+    with pytest.raises(ValueError, match="unique artifact identities"):
+        ranking_module.select_diversified_hits((selected[0], selected[0]), limit=1)
+
+
+def test_diversified_selection_never_returns_more_than_64_hits():
+    artifacts = tuple(_reference(f"selector-output-bound-{offset:03d}") for offset in range(100))
+    query = _query()
+    ranked = rank_candidates(
+        query,
+        tuple(_candidate(artifact) for artifact in artifacts),
+    )
+
+    selected = ranking_module.select_diversified_hits(
+        (hit for hit in ranked.references),
+        limit=64,
+    )
+
+    result = RetrievalResult(
+        target=query.situation.target,
+        authorization=query.situation.authorization,
+        references=selected,
+    )
+
+    assert len(result.references) == 64
+
+
 def test_source_diversity_is_lane_local_and_cannot_couple_unlike_evidence_scores():
     reference = _reference("lane-local-reference", group="shared-source")
     negative = _case_step("lane-local-negative", negative=True, group="shared-source")
@@ -1145,3 +1226,69 @@ def test_preflight_rejects_string_subclasses_without_invoking_untrusted_override
 
     with pytest.raises(ValueError, match="unsafe string subtype"):
         rank_candidates(_query(), (unsafe_candidate,))
+
+
+def test_preflight_rejects_integer_subclasses_without_invoking_untrusted_overrides():
+    class UnsafeInteger(int):
+        def bit_length(self):
+            raise AssertionError("untrusted integer override was invoked")
+
+    artifact = _reference("unsafe-integer-subclass")
+    unsafe_assessment = artifact.assessment.model_copy(update={"support_count": UnsafeInteger(1)})
+    unsafe_artifact = artifact.model_copy(update={"assessment": unsafe_assessment})
+    unsafe_candidate = _candidate(artifact).model_copy(update={"artifact": unsafe_artifact})
+
+    with pytest.raises(ValueError, match="unsafe integer subtype"):
+        rank_candidates(_query(), (unsafe_candidate,))
+
+
+def test_iterative_preflight_depth_rejects_1200_nested_exact_dicts_without_recursion_error():
+    nested: dict[str, object] = {}
+    for _ in range(1200):
+        nested = {"next": nested}
+    candidate = _candidate(_reference("deep-candidate-context")).model_copy(
+        update={"matched_evidence": (nested,)}
+    )
+
+    ranked = rank_candidates(_query(), (candidate,))
+
+    rejected = ranked.rejected_candidates[0]
+    assert "candidate canonical exceeds 64-level preflight depth budget" in (
+        rejected.rejection_reasons
+    )
+
+
+def test_preflight_rejects_float_and_container_subclasses_without_invoking_magic_methods():
+    class UnsafeFloat(float):
+        def __float__(self):
+            raise AssertionError("untrusted float override was invoked")
+
+    class UnsafeList(list):
+        def __len__(self):
+            raise AssertionError("untrusted list override was invoked")
+
+    artifact = _reference("unsafe-float-and-list-subclasses")
+    unsafe_assessment = artifact.assessment.model_copy(
+        update={"source_reliability": UnsafeFloat(0.9)}
+    )
+    unsafe_artifact = artifact.model_copy(update={"assessment": unsafe_assessment})
+    unsafe_float_candidate = _candidate(artifact).model_copy(update={"artifact": unsafe_artifact})
+    unsafe_list_candidate = _candidate(artifact).model_copy(
+        update={"matched_evidence": UnsafeList(["bounded"])}
+    )
+
+    with pytest.raises(ValueError, match="unsafe float subtype"):
+        rank_candidates(_query(), (unsafe_float_candidate,))
+    with pytest.raises(ValueError, match="unsafe container subtype"):
+        rank_candidates(_query(), (unsafe_list_candidate,))
+
+
+def test_iterative_preflight_rejects_recursive_exact_dict_deterministically():
+    recursive: dict[str, object] = {}
+    recursive["self"] = recursive
+    candidate = _candidate(_reference("recursive-candidate-context")).model_copy(
+        update={"matched_evidence": (recursive,)}
+    )
+
+    with pytest.raises(ValueError, match="contains a recursive value"):
+        rank_candidates(_query(), (candidate,))
