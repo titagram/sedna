@@ -25,14 +25,7 @@ from sedna.models import (
 )
 
 SednaRecord = (
-    Machine
-    | Finding
-    | Credential
-    | Loot
-    | Engagement
-    | KnowledgeChunk
-    | Technique
-    | ToolRef
+    Machine | Finding | Credential | Loot | Engagement | KnowledgeChunk | Technique | ToolRef
 )
 RecordT = TypeVar("RecordT", bound=BaseModel)
 _SUPPORTED_TYPES = {
@@ -127,9 +120,7 @@ class SednaStore:
                     now,
                 ),
             )
-            self.connection.execute(
-                "DELETE FROM records_fts WHERE record_id = ?", (record_id,)
-            )
+            self.connection.execute("DELETE FROM records_fts WHERE record_id = ?", (record_id,))
             self.connection.execute(
                 "INSERT INTO records_fts(record_id, title, content) VALUES (?, ?, ?)",
                 (record_id, title, content),
@@ -181,7 +172,7 @@ class SednaStore:
                 bm25(records_fts) AS rank
             FROM records_fts
             JOIN records ON records.id = records_fts.record_id
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
             ORDER BY rank
             LIMIT ?
             """,
@@ -226,9 +217,7 @@ def _search_document(record: SednaRecord) -> tuple[str, str]:
     """Build searchable text while deliberately excluding credential/loot secrets."""
     if isinstance(record, Machine):
         return record.name, " ".join(
-            value
-            for value in (record.ip, record.platform, record.os, *record.tags)
-            if value
+            value for value in (record.ip, record.platform, record.os, *record.tags) if value
         )
     if isinstance(record, Finding):
         return record.title, " ".join(
@@ -247,9 +236,7 @@ def _search_document(record: SednaRecord) -> tuple[str, str]:
             value for value in (record.source, record.hash_type) if value
         )
     if isinstance(record, Loot):
-        return record.kind, " ".join(
-            value for value in (record.description, record.path) if value
-        )
+        return record.kind, " ".join(value for value in (record.description, record.path) if value)
     if isinstance(record, Engagement):
         return f"engagement:{record.id}", " ".join(
             (record.notes, *record.objectives, *record.completed_objectives)

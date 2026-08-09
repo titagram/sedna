@@ -80,9 +80,7 @@ def parse_markdown(source_id: str, path: str, markdown: str) -> ParsedDocument:
     tokens = MarkdownIt("commonmark").enable("table").parse(markdown)
     parsed_blocks = _parse_scope(tokens, 0, len(tokens), level=0)
 
-    relationships = _unique_in_order(
-        link for parsed in parsed_blocks for link in parsed.links
-    )
+    relationships = _unique_in_order(link for parsed in parsed_blocks for link in parsed.links)
     return ParsedDocument(
         source_id=source_id,
         path=path,
@@ -119,9 +117,7 @@ def _parse_scope(
         if token.type == "paragraph_open":
             close_index = _matching_close(tokens, index)
             if index != skip_paragraph_index:
-                parsed_blocks.append(
-                    _paragraph_block(token, tokens[index + 1 : close_index])
-                )
+                parsed_blocks.append(_paragraph_block(token, tokens[index + 1 : close_index]))
             index = close_index + 1
             continue
 
@@ -251,13 +247,10 @@ def _table_block(open_token: Token, inner_tokens: list[Token]) -> _BlockPayload:
             cell_start = row_start
             for cell in current_cells:
                 links.extend(cell.links)
-                link_offsets.extend(
-                    cell_start + offset for offset in cell.link_offsets
-                )
+                link_offsets.extend(cell_start + offset for offset in cell.link_offsets)
                 assets.extend(cell.assets)
                 code_spans.extend(
-                    (cell_start + start, cell_start + end)
-                    for start, end in cell.code_spans
+                    (cell_start + start, cell_start + end) for start, end in cell.code_spans
                 )
                 cell_start += len(cell.text) + 3
             rows.append(" | ".join(cell.text for cell in current_cells))
@@ -393,15 +386,12 @@ def _tokens_payload(tokens: list[Token]) -> _InlinePayload:
                 output_length += 1
             payload_start = output_length
             code_spans.extend(
-                (output_length + start, output_length + end)
-                for start, end in payload.code_spans
+                (output_length + start, output_length + end) for start, end in payload.code_spans
             )
             text_parts.append(payload.text)
             output_length += len(payload.text)
         links.extend(payload.links)
-        link_offsets.extend(
-            payload_start + offset for offset in payload.link_offsets
-        )
+        link_offsets.extend(payload_start + offset for offset in payload.link_offsets)
         assets.extend(payload.assets)
     return _InlinePayload(
         "\n".join(text_parts),
@@ -454,9 +444,7 @@ def _inline_payload(children: list[Token], span: tuple[int, int]) -> _InlinePayl
             output_length += len(alt_text)
         elif child.type == "html_inline":
             html_payload = _raw_html_payload(child.content, span)
-            link_offsets.extend(
-                output_length + offset for offset in html_payload.link_offsets
-            )
+            link_offsets.extend(output_length + offset for offset in html_payload.link_offsets)
             text_parts.append(html_payload.text)
             output_length += len(html_payload.text)
             links.extend(html_payload.links)

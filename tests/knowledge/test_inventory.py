@@ -58,9 +58,7 @@ def test_discovery_includes_pdf_and_nested_assets_but_excludes_ds_store(tmp_path
     candidate = discover_sources(root)[0]
 
     assert candidate.suffix == ".pdf"
-    assert [asset.relative_path for asset in candidate.assets] == [
-        "Courses/images/diagram.png"
-    ]
+    assert [asset.relative_path for asset in candidate.assets] == ["Courses/images/diagram.png"]
     assert candidate.assets[0].sha256 == sha256_file(root / "Courses" / "images" / "diagram.png")
 
 

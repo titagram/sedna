@@ -39,12 +39,8 @@ _NOTE_METADATA_RE = re.compile(
     re.IGNORECASE,
 )
 _WIKI_LINK_RE = re.compile(r"(?<!!)\[\[(?P<target>[^\]|]+)(?:\|[^\]]*)?\]\]")
-_OBSIDIAN_EMBED_RE = re.compile(
-    r"!\[\[(?P<target>[^\]|]+)(?:\|(?P<alias>[^\]]*))?\]\]"
-)
-_CLOSING_PRESENTATION_WRAPPER_RE = re.compile(
-    r"\s*</(?:div|p)>\s*", re.IGNORECASE
-)
+_OBSIDIAN_EMBED_RE = re.compile(r"!\[\[(?P<target>[^\]|]+)(?:\|(?P<alias>[^\]]*))?\]\]")
+_CLOSING_PRESENTATION_WRAPPER_RE = re.compile(r"\s*</(?:div|p)>\s*", re.IGNORECASE)
 _RELATIONSHIP_BLOCK_KINDS = frozenset(
     {
         BlockKind.BLOCKQUOTE,
@@ -113,9 +109,7 @@ _VOID_HTML_TAGS = frozenset(
 )
 _GITHUB_PROFILE_MARKER_KEY = "profile_cleanup"
 _GITHUB_PROFILE_MARKER_VALUE = "github_centered_unwrapped_v1"
-_PARSER_POSITIONAL_METADATA_KEYS = frozenset(
-    {"url_offsets", "inline_code_spans"}
-)
+_PARSER_POSITIONAL_METADATA_KEYS = frozenset({"url_offsets", "inline_code_spans"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,9 +154,7 @@ class _PresentationHTMLParser(HTMLParser):
         attributes = {name.casefold(): (value or "") for name, value in attrs}
         if normalized_tag == "img" and attributes.get("src"):
             self.asset_labels.append(attributes.get("alt") or attributes["src"])
-        if normalized_tag == "br" or (
-            normalized_tag in _BLOCK_BOUNDARY_TAGS and not is_root
-        ):
+        if normalized_tag == "br" or (normalized_tag in _BLOCK_BOUNDARY_TAGS and not is_root):
             self._append_boundary()
 
         if normalized_tag not in _VOID_HTML_TAGS:
@@ -354,10 +346,7 @@ def _convert_obsidian_embeds(
     inline_code_spans = _inline_code_spans(block)
 
     for match in _OBSIDIAN_EMBED_RE.finditer(block.text):
-        if any(
-            start <= match.start() and match.end() <= end
-            for start, end in inline_code_spans
-        ):
+        if any(start <= match.start() and match.end() <= end for start, end in inline_code_spans):
             continue
         target = match.group("target").strip()
         alias = (match.group("alias") or "").strip() or None
@@ -371,9 +360,7 @@ def _convert_obsidian_embeds(
                 metadata={"source": "obsidian_embed"},
             )
         )
-        replacements.append(
-            _TextReplacement(match.start(), match.end(), alias or target)
-        )
+        replacements.append(_TextReplacement(match.start(), match.end(), alias or target))
 
     if not assets:
         return block, ()
@@ -398,10 +385,7 @@ def _clean_github_walkthrough(document: ParsedDocument) -> ParsedDocument:
     open_centered_wrappers = 0
 
     for block in document.blocks:
-        if (
-            block.metadata.get(_GITHUB_PROFILE_MARKER_KEY)
-            == _GITHUB_PROFILE_MARKER_VALUE
-        ):
+        if block.metadata.get(_GITHUB_PROFILE_MARKER_KEY) == _GITHUB_PROFILE_MARKER_VALUE:
             blocks.append(block)
             continue
         if block.kind not in {
@@ -452,9 +436,7 @@ def _unwrap_centered_block(
     if not visible_text and not assets:
         return None
 
-    text = visible_text or " ".join(asset_labels) or " ".join(
-        asset.target for asset in assets
-    )
+    text = visible_text or " ".join(asset_labels) or " ".join(asset.target for asset in assets)
     kind = block.kind
     if block.kind is BlockKind.HTML:
         kind = BlockKind.IMAGE if assets and not visible_text else BlockKind.PARAGRAPH
@@ -751,10 +733,7 @@ def _wiki_events_from_text(
     events: list[_RelationshipEvent] = []
     sequence = starting_sequence
     for match in _WIKI_LINK_RE.finditer(text):
-        if any(
-            start <= match.start() and match.end() <= end
-            for start, end in excluded_spans
-        ):
+        if any(start <= match.start() and match.end() <= end for start, end in excluded_spans):
             continue
         raw_target = match.group("target")
         target = raw_target.strip()
@@ -814,9 +793,7 @@ def _url_relationship_events(
                 index,
                 literal_offsets,
             )
-        events.append(
-            _RelationshipEvent(line, column, starting_sequence + index, target)
-        )
+        events.append(_RelationshipEvent(line, column, starting_sequence + index, target))
     return tuple(events)
 
 
@@ -825,9 +802,7 @@ def _url_offsets(block: ParsedBlock) -> tuple[int, ...]:
     if serialized is None:
         return ()
     values = json.loads(serialized)
-    if not isinstance(values, list) or not all(
-        isinstance(value, int) for value in values
-    ):
+    if not isinstance(values, list) or not all(isinstance(value, int) for value in values):
         return ()
     return tuple(values)
 
@@ -846,11 +821,7 @@ def _best_effort_url_position(
         return line, column - 1
 
     previous_offset = next(
-        (
-            offset
-            for offset in reversed(literal_offsets[:index])
-            if offset is not None
-        ),
+        (offset for offset in reversed(literal_offsets[:index]) if offset is not None),
         None,
     )
     if previous_offset is not None:
@@ -873,8 +844,7 @@ def _has_center_alignment(attrs: list[tuple[str, str | None]]) -> bool:
         return True
     style = attributes.get("style", "")
     return any(
-        name.strip().casefold() == "text-align"
-        and value.strip().casefold() == "center"
+        name.strip().casefold() == "text-align" and value.strip().casefold() == "center"
         for declaration in style.split(";")
         if ":" in declaration
         for name, value in (declaration.split(":", maxsplit=1),)

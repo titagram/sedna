@@ -1,4 +1,5 @@
 """Sedna data models — Pydantic v2."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -37,6 +38,7 @@ class Phase(StrEnum):
 
 class Machine(BaseModel):
     """Target machine (HTB, CTF, lab, etc.)."""
+
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     id: UUID = Field(default_factory=uuid4)
@@ -52,6 +54,7 @@ class Machine(BaseModel):
 
 class Finding(BaseModel):
     """A single finding/evidence item."""
+
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     id: UUID = Field(default_factory=uuid4)
@@ -72,6 +75,7 @@ class Finding(BaseModel):
 
 class Credential(BaseModel):
     """Discovered credential."""
+
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     id: UUID = Field(default_factory=uuid4)
@@ -89,6 +93,7 @@ class Credential(BaseModel):
 
 class Loot(BaseModel):
     """Flag, file, or high-value data."""
+
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     id: UUID = Field(default_factory=uuid4)
@@ -102,6 +107,7 @@ class Loot(BaseModel):
 
 class Engagement(BaseModel):
     """Active engagement session."""
+
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     id: UUID = Field(default_factory=uuid4)
@@ -117,6 +123,7 @@ class Engagement(BaseModel):
 
 class KnowledgeChunk(BaseModel):
     """Processed knowledge base chunk for retrieval."""
+
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     id: UUID = Field(default_factory=uuid4)
@@ -134,6 +141,7 @@ class KnowledgeChunk(BaseModel):
 
 class Technique(BaseModel):
     """Attack technique with MITRE mapping."""
+
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     id: UUID = Field(default_factory=uuid4)
@@ -150,6 +158,7 @@ class Technique(BaseModel):
 
 class ToolRef(BaseModel):
     """Tool reference card."""
+
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     id: UUID = Field(default_factory=uuid4)
@@ -165,6 +174,7 @@ class ToolRef(BaseModel):
 
 class SearchHit(BaseModel):
     """Compact result returned by the local full-text index."""
+
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     id: UUID

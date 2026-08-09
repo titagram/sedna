@@ -54,10 +54,7 @@ def sha256_file(path: Path) -> str:
     """Return the SHA-256 digest of a regular, non-symlink file."""
     file_fd = os.open(
         path,
-        os.O_RDONLY
-        | os.O_NONBLOCK
-        | os.O_NOFOLLOW
-        | getattr(os, "O_CLOEXEC", 0),
+        os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
     )
     try:
         if not stat.S_ISREG(os.fstat(file_fd).st_mode):
@@ -202,12 +199,7 @@ def _directory_open_flags() -> int:
 
 
 def _file_read_flags() -> int:
-    return (
-        os.O_RDONLY
-        | os.O_NONBLOCK
-        | os.O_NOFOLLOW
-        | getattr(os, "O_CLOEXEC", 0)
-    )
+    return os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
 
 def _entry_became_unsafe(exc: OSError) -> bool:

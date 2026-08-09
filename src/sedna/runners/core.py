@@ -23,8 +23,7 @@ class ToolRunner:
 
     def __init__(self, allowed_tools: Mapping[str, str | Path]) -> None:
         self._allowed_tools = {
-            name: str(Path(executable).resolve())
-            for name, executable in allowed_tools.items()
+            name: str(Path(executable).resolve()) for name, executable in allowed_tools.items()
         }
         if any(not Path(executable).is_file() for executable in self._allowed_tools.values()):
             raise ValueError("allowed tool paths must exist and be regular files")
@@ -38,9 +37,7 @@ class ToolRunner:
     def available_tools(self) -> tuple[str, ...]:
         return tuple(sorted(self._allowed_tools))
 
-    def run(
-        self, tool: str, arguments: Sequence[str], *, timeout: float = 120
-    ) -> ToolResult:
+    def run(self, tool: str, arguments: Sequence[str], *, timeout: float = 120) -> ToolResult:
         if tool not in self._allowed_tools:
             raise ValueError(f"tool is not allowed: {tool}")
         if timeout <= 0:

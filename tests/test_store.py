@@ -73,9 +73,7 @@ def test_search_can_be_scoped_by_kind_and_machine(tmp_path):
         description="OpenSSH detected",
         tool="nmap",
     )
-    second_finding = first_finding.model_copy(
-        update={"id": uuid4(), "machine_id": second.id}
-    )
+    second_finding = first_finding.model_copy(update={"id": uuid4(), "machine_id": second.id})
     knowledge = KnowledgeChunk(
         source_path="academy/ssh.md",
         source_type="markdown",
@@ -96,7 +94,5 @@ def test_search_can_be_scoped_by_kind_and_machine(tmp_path):
 
 
 def test_search_rejects_empty_queries(tmp_path):
-    with SednaStore(tmp_path / "sedna.db") as store, pytest.raises(
-        ValueError, match="query"
-    ):
+    with SednaStore(tmp_path / "sedna.db") as store, pytest.raises(ValueError, match="query"):
         store.search("  ")

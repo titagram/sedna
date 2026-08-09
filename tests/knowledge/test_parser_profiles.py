@@ -29,14 +29,10 @@ def assert_text_coordinate_metadata_is_valid(document) -> None:
     for block in document.blocks:
         for key, serialized in block.metadata.items():
             if key.endswith("_offsets"):
-                assert all(
-                    0 <= offset <= len(block.text)
-                    for offset in json.loads(serialized)
-                )
+                assert all(0 <= offset <= len(block.text) for offset in json.loads(serialized))
             elif key.endswith("_spans"):
                 assert all(
-                    0 <= start <= end <= len(block.text)
-                    for start, end in json.loads(serialized)
+                    0 <= start <= end <= len(block.text) for start, end in json.loads(serialized)
                 )
 
 
@@ -127,9 +123,7 @@ def test_obsidian_profile_keeps_non_metadata_prose_in_same_paragraph():
     source = parse_markdown(
         "source-note",
         "note.md",
-        "Tags: #academy\n"
-        "Related to: [[DNS]]\n"
-        "This procedural line must remain.\n",
+        "Tags: #academy\nRelated to: [[DNS]]\nThis procedural line must remain.\n",
     )
 
     cleaned = apply_profile(source, "academy_obsidian")
@@ -190,9 +184,7 @@ def test_obsidian_profile_rebases_inline_code_after_metadata_and_embed_rewrites(
     body = cleaned.blocks[0]
     spans = json.loads(body.metadata["inline_code_spans"])
 
-    assert body.text == (
-        "Keep Proof then [[Literal Code]] and open [[Folder/Actual Note|actual]]."
-    )
+    assert body.text == ("Keep Proof then [[Literal Code]] and open [[Folder/Actual Note|actual]].")
     assert body.text[slice(*spans[0])] == "[[Literal Code]]"
     assert cleaned.relationships == ("DNS", "Folder/Actual Note")
     assert [asset.target for asset in cleaned.assets] == ["proof.png"]
@@ -260,7 +252,7 @@ def test_github_profile_unwraps_centered_presentation_without_losing_content():
         BlockKind.PARAGRAPH,
         BlockKind.IMAGE,
     ]
-    assert "align=\"center\"" not in joined_text(cleaned)
+    assert 'align="center"' not in joined_text(cleaned)
     assert "Run the initial scan" in joined_text(cleaned)
     assert "Use the observed Samba version" in joined_text(cleaned)
     assert cleaned.relationships == ("https://example.test/machine",)
@@ -287,7 +279,7 @@ def test_github_profile_does_not_rewrite_centered_html_inside_procedural_code():
     source = parse_markdown(
         "source-github",
         "walkthrough.md",
-        "```html\n<div align=\"center\">payload text</div>\n```\n",
+        '```html\n<div align="center">payload text</div>\n```\n',
     )
 
     assert apply_profile(source, "github_walkthrough") == source
@@ -309,8 +301,7 @@ def test_github_profile_ignores_centered_descendant_of_technical_outer_wrapper()
     source = parse_markdown(
         "source-github",
         "walkthrough.md",
-        '<div class="technical"><div align="center">Title</div>'
-        '<code>curl TARGET_IP</code></div>\n',
+        '<div class="technical"><div align="center">Title</div><code>curl TARGET_IP</code></div>\n',
     )
 
     assert apply_profile(source, "github_walkthrough") == source
@@ -321,15 +312,13 @@ def test_github_profile_keeps_nested_and_sibling_content_inside_centered_root():
         "source-github",
         "walkthrough.md",
         '<div align="center"><span>Host</span><br>'
-        '<code>curl TARGET_IP</code><p>Observed output</p>'
+        "<code>curl TARGET_IP</code><p>Observed output</p>"
         '<a href="https://reference.test">Reference</a></div>\n',
     )
 
     cleaned = apply_profile(source, "github_walkthrough")
 
-    assert cleaned.blocks[0].text == (
-        "Host\ncurl TARGET_IP\nObserved output\nReference"
-    )
+    assert cleaned.blocks[0].text == ("Host\ncurl TARGET_IP\nObserved output\nReference")
     assert cleaned.relationships == ("https://reference.test",)
 
 
@@ -408,8 +397,7 @@ def test_github_profile_drops_only_parser_owned_positional_metadata():
     parsed = parse_markdown(
         "source-github",
         "walkthrough.md",
-        '# <div align="center">Title `code` '
-        '<a href="https://reference.test">reference</a></div>\n',
+        '# <div align="center">Title `code` <a href="https://reference.test">reference</a></div>\n',
     )
     original = parsed.blocks[0]
     enriched = ParsedBlock(

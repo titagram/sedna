@@ -448,8 +448,7 @@ def test_parse_markdown_supports_setext_headings_and_thematic_breaks():
     )
 
     structure = [
-        (block.kind, block.level, block.start_line, block.end_line)
-        for block in parsed.blocks
+        (block.kind, block.level, block.start_line, block.end_line) for block in parsed.blocks
     ]
     assert structure == [
         (BlockKind.HEADING, 1, 1, 2),
@@ -470,12 +469,8 @@ def test_parse_markdown_preserves_tables_and_inline_links():
     table = parsed.blocks[0]
     assert table.kind is BlockKind.TABLE
     assert (table.start_line, table.end_line) == (1, 4)
-    assert table.text == (
-        "Service | Reference\nHTTP | guide\nSSH | notes"
-    )
-    assert table.metadata["urls"] == (
-        '["https://example.test/one","https://example.test/two"]'
-    )
+    assert table.text == ("Service | Reference\nHTTP | guide\nSSH | notes")
+    assert table.metadata["urls"] == ('["https://example.test/one","https://example.test/two"]')
     assert parsed.relationships == (
         "https://example.test/one",
         "https://example.test/two",
@@ -518,7 +513,7 @@ def test_parse_markdown_preserves_blockquotes_and_html_blocks():
     parsed = parse_markdown(
         "source-test",
         "sample.md",
-        "> Observation\n> continued\n\n<div class=\"note\">Keep this wrapper.</div>\n",
+        '> Observation\n> continued\n\n<div class="note">Keep this wrapper.</div>\n',
     )
 
     assert [block.kind for block in parsed.blocks] == [
@@ -535,7 +530,7 @@ def test_parse_markdown_keeps_multiple_inline_links_and_images_without_losing_al
         "source-test",
         "sample.md",
         "Read [one](https://one.test) and [two](https://two.test), then compare "
-        "![first **view**](one.png \"One\") with ![second](two.png).\n",
+        '![first **view**](one.png "One") with ![second](two.png).\n',
     )
 
     paragraph = parsed.blocks[0]
@@ -555,16 +550,15 @@ def test_parse_markdown_emits_image_blocks_and_extracts_html_images_in_order():
         "source-test",
         "sample.md",
         "![scan](scan.png)\n\n"
-        "<figure>\n<img src=\"before.png\" alt=\"Before\" title=\"Initial\">\n"
-        "<img alt=\"After\" src=\"after.png\">\n</figure>\n",
+        '<figure>\n<img src="before.png" alt="Before" title="Initial">\n'
+        '<img alt="After" src="after.png">\n</figure>\n',
     )
 
     assert [block.kind for block in parsed.blocks] == [BlockKind.IMAGE, BlockKind.HTML]
     assert parsed.blocks[0].metadata["asset_target"] == "scan.png"
     assert parsed.blocks[1].metadata["asset_targets"] == '["before.png","after.png"]'
     asset_details = [
-        (asset.target, asset.alt_text, asset.start_line, asset.end_line)
-        for asset in parsed.assets
+        (asset.target, asset.alt_text, asset.start_line, asset.end_line) for asset in parsed.assets
     ]
     assert asset_details == [
         ("scan.png", "scan", 1, 1),
@@ -630,8 +624,7 @@ def test_parse_markdown_classifies_linked_and_formatted_image_only_paragraphs_as
     parsed = parse_markdown(
         "source-test",
         "sample.md",
-        "[![linked](linked.png)](https://example.test/full)\n\n"
-        "**![formatted](formatted.png)**\n",
+        "[![linked](linked.png)](https://example.test/full)\n\n**![formatted](formatted.png)**\n",
     )
 
     assert [block.kind for block in parsed.blocks] == [BlockKind.IMAGE, BlockKind.IMAGE]
@@ -657,8 +650,7 @@ def test_parse_markdown_extracts_html_anchor_relationships_and_preserves_raw_htm
         '<a href="https://two.test">Two</a></div>'
     )
     assert parsed.blocks[1].text == (
-        'Inspect <a href="https://three.test">three</a> beside '
-        '<img src="inline.png" alt="Inline">.'
+        'Inspect <a href="https://three.test">three</a> beside <img src="inline.png" alt="Inline">.'
     )
     assert parsed.blocks[0].metadata["urls"] == '["https://one.test","https://two.test"]'
     assert parsed.blocks[1].metadata["url"] == "https://three.test"
