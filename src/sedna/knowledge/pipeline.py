@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import threading
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path, PurePosixPath
 
@@ -85,6 +86,7 @@ class IngestionPipeline:
         knowledge_root: Path,
         *,
         repository: CanonicalKnowledgeRepository | None = None,
+        before_same_content_revision_change: Callable[[str], object] | None = None,
     ) -> None:
         requested_source_root = Path(source_root)
         self.source_root = requested_source_root.resolve(strict=True)
@@ -105,6 +107,11 @@ class IngestionPipeline:
 
         self._descriptor_lock = threading.Lock()
         self._owns_repository = repository is None
+        if before_same_content_revision_change is not None and not callable(
+            before_same_content_revision_change
+        ):
+            raise TypeError("before_same_content_revision_change must be callable")
+        self._before_same_content_revision_change = before_same_content_revision_change
         self.source_namespace = stable_source_namespace(self.source_root)
         self._source_fd: int | None = os.open(
             self.source_root,
@@ -226,7 +233,11 @@ class IngestionPipeline:
                 asset_refs,
                 title=preliminary_title,
             )
-            self.repository.transition_source(manifest, None)
+            self.repository.transition_source(
+                manifest,
+                None,
+                before_same_content_revision_change=self._before_same_content_revision_change,
+            )
             self.last_outcome = "excluded"
             return None
 
@@ -311,7 +322,11 @@ class IngestionPipeline:
                 "prepared source violated the canonical consistency contract",
             ) from exc
 
-        self.repository.transition_source(manifest, None)
+        self.repository.transition_source(
+            manifest,
+            None,
+            before_same_content_revision_change=self._before_same_content_revision_change,
+        )
         self.last_outcome = "accepted"
         return prepared
 
@@ -686,7 +701,11 @@ class IngestionPipeline:
             parser_profile=manifest.parser_profile,
             extraction=self.extraction,
         )
-        self.repository.transition_source(manifest, record)
+        self.repository.transition_source(
+            manifest,
+            record,
+            before_same_content_revision_change=self._before_same_content_revision_change,
+        )
 
     def _manifest(
         self,

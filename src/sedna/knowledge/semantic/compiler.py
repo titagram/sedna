@@ -12,6 +12,7 @@ from sedna.knowledge.schema import (
     KnowledgeCase,
     ReferenceArtifact,
     VerificationStatus,
+    foundation_manifest_digest,
 )
 from sedna.knowledge.schema.semantic import (
     CANONICAL_FINDING_MESSAGES,
@@ -52,8 +53,8 @@ from sedna.knowledge.semantic.prompts import (
     REPAIR_PROMPT_VERSION,
 )
 
-SEMANTIC_SCHEMA_VERSION = "2.3.0"
-SEMANTIC_COMPILER_VERSION = "6"
+SEMANTIC_SCHEMA_VERSION = "2.4.0"
+SEMANTIC_COMPILER_VERSION = "7"
 
 
 class SemanticCompiler:
@@ -253,6 +254,7 @@ class SemanticCompiler:
                         foundation_parser_id=prepared.manifest.extraction.parser_id,
                         foundation_parser_version=prepared.manifest.extraction.parser_version,
                         foundation_extraction=prepared.manifest.extraction,
+                        foundation_manifest_sha256=foundation_manifest_digest(prepared.manifest),
                         compiler_version=SEMANTIC_COMPILER_VERSION,
                         extractor_prompt_version=EXTRACTOR_PROMPT_VERSION,
                         critic_prompt_version=CRITIC_PROMPT_VERSION,
@@ -311,6 +313,7 @@ class SemanticCompiler:
                         foundation_parser_id=prepared.manifest.extraction.parser_id,
                         foundation_parser_version=prepared.manifest.extraction.parser_version,
                         foundation_extraction=prepared.manifest.extraction,
+                        foundation_manifest_sha256=foundation_manifest_digest(prepared.manifest),
                         compiler_version=SEMANTIC_COMPILER_VERSION,
                         extractor_prompt_version=EXTRACTOR_PROMPT_VERSION,
                         critic_prompt_version=CRITIC_PROMPT_VERSION,
@@ -394,6 +397,7 @@ class SemanticCompiler:
                 foundation_parser_id=prepared.manifest.extraction.parser_id,
                 foundation_parser_version=prepared.manifest.extraction.parser_version,
                 foundation_extraction=prepared.manifest.extraction,
+                foundation_manifest_sha256=foundation_manifest_digest(prepared.manifest),
                 compiler_version=SEMANTIC_COMPILER_VERSION,
                 extractor_prompt_version=EXTRACTOR_PROMPT_VERSION,
                 critic_prompt_version=CRITIC_PROMPT_VERSION,

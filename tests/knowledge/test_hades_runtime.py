@@ -41,6 +41,21 @@ def _responses(*, count: int = 1) -> list[object]:
     return _load_responses(SOURCE_CASES["reference"].fixture_name) * count
 
 
+class _BlockAfterTwoCallsHost(_ScriptedHost):
+    """Pause the second compilation after the foundation transition commits."""
+
+    def __init__(self, responses: list[object], entered: Event, release: Event) -> None:
+        super().__init__(responses)
+        self._entered = entered
+        self._release = release
+
+    def complete_structured(self, **kwargs: Any) -> object:
+        if len(self.calls) == 2:
+            self._entered.set()
+            assert self._release.wait(5)
+        return super().complete_structured(**kwargs)
+
+
 def test_runtime_uses_host_structured_facade_without_provider_configuration(tmp_path: Path) -> None:
     """Removing the adapter composition would stop a valid source from being verified."""
     host = _ScriptedHost(_responses())
@@ -108,6 +123,82 @@ def test_runtime_second_learn_reuses_current_semantics_without_host_calls(tmp_pa
         assert second.unchanged_source_count == 1
         assert len(host.calls) == calls_after_first == 2
     finally:
+        runtime.close()
+
+
+def test_runtime_asset_only_change_recompiles_once_then_is_unchanged(tmp_path: Path) -> None:
+    """Ignoring foundation assets would reuse semantics after their evidence set changed."""
+    source_root = _source_root(tmp_path)
+    source_path = source_root / SOURCE_CASES["reference"].relative_path
+    asset_path = source_path.parent / "evidence.bin"
+    asset_path.write_bytes(b"asset revision one")
+    host = _ScriptedHost(_responses(count=2))
+    runtime = HadesKnowledgeRuntime.create(host, tmp_path / "knowledge")
+
+    try:
+        first = runtime.learning.learn(source_root)
+        first_bundle = runtime._repository.load_semantic_bundle(first.outcomes[0].source_id)
+        calls_after_first = len(host.calls)
+        source_sha256 = runtime._repository.load_manifest(first.outcomes[0].source_id).sha256
+
+        asset_path.write_bytes(b"asset revision two")
+        changed = runtime.learning.learn(source_root)
+        calls_after_change = len(host.calls)
+        unchanged = runtime.learning.learn(source_root)
+        changed_bundle = runtime._repository.load_semantic_bundle(first.outcomes[0].source_id)
+
+        assert first.verified_source_count == changed.verified_source_count == 1
+        assert calls_after_first == 2
+        assert calls_after_change == 4
+        assert unchanged.unchanged_source_count == 1
+        assert len(host.calls) == calls_after_change
+        assert changed_bundle.compilation_manifest.foundation_manifest_sha256 != (
+            first_bundle.compilation_manifest.foundation_manifest_sha256
+        )
+        assert (
+            runtime._repository.load_manifest(first.outcomes[0].source_id).sha256 == source_sha256
+        )
+    finally:
+        runtime.close()
+
+
+def test_fresh_runtime_blocks_old_projection_during_asset_only_recompile(
+    tmp_path: Path,
+) -> None:
+    """A fresh runtime must not serve the old projection after an asset-only transition."""
+    knowledge_root = tmp_path / "knowledge"
+    source_root = _source_root(tmp_path)
+    source_path = source_root / SOURCE_CASES["reference"].relative_path
+    asset_path = source_path.parent / "evidence.bin"
+    asset_path.write_bytes(b"asset revision one")
+    entered = Event()
+    release = Event()
+    host = _BlockAfterTwoCallsHost(_responses(count=2), entered, release)
+    runtime = HadesKnowledgeRuntime.create(host, knowledge_root)
+    learning_result: list[object] = []
+
+    try:
+        first = runtime.learning.learn(source_root)
+        source_id = first.outcomes[0].source_id
+        artifact_id = runtime._repository.load_semantic_bundle(source_id).references[0].artifact_id
+        asset_path.write_bytes(b"asset revision two")
+
+        worker = Thread(target=lambda: learning_result.append(runtime.learning.learn(source_root)))
+        worker.start()
+        assert entered.wait(5)
+
+        fresh = HadesKnowledgeRuntime.create(_ScriptedHost([]), knowledge_root)
+        try:
+            assert fresh.retrieval.get_artifact(artifact_id) is None
+        finally:
+            fresh.close()
+
+        release.set()
+        worker.join(5)
+        assert not worker.is_alive()
+        assert learning_result and learning_result[0].verified_source_count == 1
+    finally:
+        release.set()
         runtime.close()
 
 

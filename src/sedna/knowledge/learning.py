@@ -203,11 +203,15 @@ class DocumentLearningService:
 
         outcomes: list[LearningSourceOutcome] = []
         failure_codes: list[str] = []
+        transition_barrier = getattr(self._maintenance, "invalidate_source_projection", None)
         try:
             with IngestionPipeline(
                 root,
                 self.knowledge_root,
                 repository=self._repository,
+                before_same_content_revision_change=(
+                    transition_barrier if callable(transition_barrier) else None
+                ),
             ) as pipeline:
                 try:
                     candidates = _select_candidates(discover_sources(root), only_relative_path)

@@ -34,7 +34,11 @@ from sedna.knowledge.schema.case import (
     CaseStep,
     KnowledgeCase,
 )
-from sedna.knowledge.schema.manifest import AssetRef, DocumentManifest
+from sedna.knowledge.schema.manifest import (
+    AssetRef,
+    DocumentManifest,
+    foundation_manifest_digest,
+)
 from sedna.knowledge.schema.reference import ReferenceArtifact
 from sedna.knowledge.schema.rule import DecisionRule
 from sedna.knowledge.schema.semantic import (
@@ -79,6 +83,7 @@ __all__ = [
     "EpistemicAssessment",
     "DocumentManifest",
     "ExtractionMetadata",
+    "foundation_manifest_digest",
     "Generalizability",
     "IngestionStatus",
     "KnowledgeRole",

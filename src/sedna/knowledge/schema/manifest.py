@@ -1,5 +1,7 @@
 """Immutable contracts describing ingested source documents and their assets."""
 
+import hashlib
+import json
 from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -47,3 +49,16 @@ class DocumentManifest(BaseModel):
     emitted_artifact_ids: tuple[NonEmptyString, ...] = ()
     warnings: tuple[NonEmptyString, ...] = ()
     quarantine_reasons: tuple[NonEmptyString, ...] = ()
+
+
+def foundation_manifest_digest(manifest: DocumentManifest) -> str:
+    """Return the canonical digest of one complete deterministic foundation revision."""
+    manifest = DocumentManifest.model_validate(manifest.model_dump(mode="json", warnings="error"))
+    payload = json.dumps(
+        manifest.model_dump(mode="json", warnings="error"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()

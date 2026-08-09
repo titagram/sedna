@@ -9,7 +9,7 @@ import os
 import secrets
 import stat
 import threading
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from hashlib import sha256
@@ -33,6 +33,7 @@ from sedna.knowledge.schema import (
     SemanticKnowledgeBundle,
     SemanticQuarantineRecord,
     SemanticVerificationRecord,
+    foundation_manifest_digest,
 )
 from sedna.knowledge.semantic.compiler import (
     SEMANTIC_COMPILER_VERSION,
@@ -797,17 +798,37 @@ class CanonicalKnowledgeRepository:
         self,
         manifest: DocumentManifest,
         quarantine: QuarantineRecord | None,
+        *,
+        before_same_content_revision_change: Callable[[str], object] | None = None,
     ) -> None:
         """Durably commit one source disposition or recover its previous bytes."""
         self.validate_source_state(manifest, quarantine)
+        if before_same_content_revision_change is not None and not callable(
+            before_same_content_revision_change
+        ):
+            raise TypeError("before_same_content_revision_change must be callable")
         with (
             self.semantic_compilation_guard(manifest.source_id),
             self._semantic_inventory_lock(exclusive=True),
             self._source_transition_lock(manifest.source_id),
         ):
             self._recover_source(manifest.source_id)
+            try:
+                current_manifest = self.load_manifest(manifest.source_id)
+            except FileNotFoundError:
+                current_manifest = None
+            old_manifest = self._read_optional_bytes("manifests", manifest.source_id)
+            old_quarantine = self._read_optional_bytes("quarantine", manifest.source_id)
+            foundation_changed = current_manifest != manifest
             semantic_snapshots: dict[str, bytes | None] | None = None
-            if manifest.ingestion_status.value != "accepted":
+            if manifest.ingestion_status.value != "accepted" or foundation_changed:
+                if (
+                    before_same_content_revision_change is not None
+                    and current_manifest is not None
+                    and current_manifest.sha256 == manifest.sha256
+                    and foundation_changed
+                ):
+                    before_same_content_revision_change(manifest.source_id)
                 semantic_snapshots = {
                     directory: self._read_optional_bytes(directory, manifest.source_id)
                     for directory in self._SEMANTIC_DIRECTORIES
@@ -831,8 +852,6 @@ class CanonicalKnowledgeRepository:
                     else:
                         self._delete_semantic_transition_journal(manifest.source_id)
                     raise
-            old_manifest = self._read_optional_bytes("manifests", manifest.source_id)
-            old_quarantine = self._read_optional_bytes("quarantine", manifest.source_id)
             self._write_transition_journal(
                 manifest.source_id,
                 old_manifest,
@@ -1074,6 +1093,8 @@ class CanonicalKnowledgeRepository:
             or semantic_manifest.foundation_parser_id != extraction.parser_id
             or semantic_manifest.foundation_parser_version != extraction.parser_version
             or semantic_manifest.foundation_extraction != extraction
+            or semantic_manifest.foundation_manifest_sha256
+            != foundation_manifest_digest(foundation)
         ):
             raise ValueError("semantic state does not match its current foundation manifest")
 

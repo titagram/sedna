@@ -27,6 +27,7 @@ from sedna.knowledge.schema import (
     SemanticVerificationRecord,
     SourceQuality,
     VerificationFinding,
+    foundation_manifest_digest,
 )
 from sedna.knowledge.semantic import SemanticCompilationResult
 from sedna.knowledge.semantic.compiler import (
@@ -101,6 +102,7 @@ def _verified_result(
         foundation_parser_id=extraction.parser_id,
         foundation_parser_version=extraction.parser_version,
         foundation_extraction=extraction,
+        foundation_manifest_sha256=foundation_manifest_digest(prepared.manifest),
         compiler_version=SEMANTIC_COMPILER_VERSION,
         extractor_prompt_version=EXTRACTOR_PROMPT_VERSION,
         critic_prompt_version=CRITIC_PROMPT_VERSION,

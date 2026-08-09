@@ -38,6 +38,7 @@ from sedna.knowledge.schema import (
     SemanticVerificationRecord,
     SourceQuality,
     VerificationFinding,
+    foundation_manifest_digest,
 )
 from sedna.knowledge.semantic import SemanticCompilationResult
 from sedna.knowledge.semantic.compiler import (
@@ -81,6 +82,10 @@ def _current_bundle(
         extractor_prompt_version=EXTRACTOR_PROMPT_VERSION,
         critic_prompt_version=CRITIC_PROMPT_VERSION,
         repair_prompt_version=REPAIR_PROMPT_VERSION,
+    )
+    current_manifest = SemanticCompilationManifest.model_validate(manifest)
+    manifest["foundation_manifest_sha256"] = foundation_manifest_digest(
+        _foundation_manifest(source_id, source_hash, current_manifest)
     )
     return SemanticKnowledgeBundle.model_validate(payload)
 

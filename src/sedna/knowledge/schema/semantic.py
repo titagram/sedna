@@ -90,6 +90,7 @@ class SemanticCompilationManifest(BaseModel):
     foundation_parser_id: NonEmptyString
     foundation_parser_version: NonEmptyString
     foundation_extraction: ExtractionMetadata | None = None
+    foundation_manifest_sha256: Sha256 | None = None
     compiler_version: NonEmptyString
     extractor_prompt_version: NonEmptyString
     critic_prompt_version: NonEmptyString
