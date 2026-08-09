@@ -86,7 +86,7 @@ class IngestionPipeline:
         knowledge_root: Path,
         *,
         repository: CanonicalKnowledgeRepository | None = None,
-        before_same_content_revision_change: Callable[[str], object] | None = None,
+        before_foundation_revision_change: Callable[[str], object] | None = None,
     ) -> None:
         requested_source_root = Path(source_root)
         self.source_root = requested_source_root.resolve(strict=True)
@@ -107,11 +107,11 @@ class IngestionPipeline:
 
         self._descriptor_lock = threading.Lock()
         self._owns_repository = repository is None
-        if before_same_content_revision_change is not None and not callable(
-            before_same_content_revision_change
+        if before_foundation_revision_change is not None and not callable(
+            before_foundation_revision_change
         ):
-            raise TypeError("before_same_content_revision_change must be callable")
-        self._before_same_content_revision_change = before_same_content_revision_change
+            raise TypeError("before_foundation_revision_change must be callable")
+        self._before_foundation_revision_change = before_foundation_revision_change
         self.source_namespace = stable_source_namespace(self.source_root)
         self._source_fd: int | None = os.open(
             self.source_root,
@@ -198,6 +198,11 @@ class IngestionPipeline:
             self._require_compatible_source_namespace(existing, candidate)
         if existing is not None and self._is_unchanged(existing, candidate, asset_refs):
             self._validate_incremental_state(existing)
+            if existing.ingestion_status is not IngestionStatus.ACCEPTED:
+                self.repository.resume_nonaccepted_projection_revision(
+                    existing.source_id,
+                    before_barrier_clear=self._before_foundation_revision_change,
+                )
             if not force_reprepare or existing.ingestion_status is not IngestionStatus.ACCEPTED:
                 self.last_outcome = "unchanged"
                 return None
@@ -236,7 +241,7 @@ class IngestionPipeline:
             self.repository.transition_source(
                 manifest,
                 None,
-                before_same_content_revision_change=self._before_same_content_revision_change,
+                before_foundation_revision_change=self._before_foundation_revision_change,
             )
             self.last_outcome = "excluded"
             return None
@@ -325,7 +330,7 @@ class IngestionPipeline:
         self.repository.transition_source(
             manifest,
             None,
-            before_same_content_revision_change=self._before_same_content_revision_change,
+            before_foundation_revision_change=self._before_foundation_revision_change,
         )
         self.last_outcome = "accepted"
         return prepared
@@ -704,7 +709,7 @@ class IngestionPipeline:
         self.repository.transition_source(
             manifest,
             record,
-            before_same_content_revision_change=self._before_same_content_revision_change,
+            before_foundation_revision_change=self._before_foundation_revision_change,
         )
 
     def _manifest(

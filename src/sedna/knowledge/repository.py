@@ -449,6 +449,19 @@ class CanonicalKnowledgeRepository:
         with self._semantic_inventory_lock(exclusive=False):
             return self._semantic_bundle_snapshot_locked()
 
+    def retrieval_read_revision(self) -> str:
+        """Return a lock-free-from-index token that rejects transitional reads.
+
+        Callers must not retain an index lock while invoking this method.  Comparing
+        tokens around one index read catches a complete canonical transition, while
+        the pending-journal checks reject every still-open projection barrier.
+        """
+        with self._semantic_inventory_lock(exclusive=False):
+            self._require_no_pending_semantic_transactions()
+            entries, _ = self._semantic_inventory_entries()
+            self._require_no_pending_semantic_transactions()
+            return self._semantic_inventory_revision(entries)
+
     @contextmanager
     def semantic_snapshot_guard(self, expected_revision: str) -> Iterator[None]:
         """Verify and hold one semantic revision stable through an external commit."""
@@ -810,14 +823,14 @@ class CanonicalKnowledgeRepository:
         manifest: DocumentManifest,
         quarantine: QuarantineRecord | None,
         *,
-        before_same_content_revision_change: Callable[[str], object] | None = None,
+        before_foundation_revision_change: Callable[[str], object] | None = None,
     ) -> None:
         """Durably commit one source disposition or recover its previous bytes."""
         self.validate_source_state(manifest, quarantine)
-        if before_same_content_revision_change is not None and not callable(
-            before_same_content_revision_change
+        if before_foundation_revision_change is not None and not callable(
+            before_foundation_revision_change
         ):
-            raise TypeError("before_same_content_revision_change must be callable")
+            raise TypeError("before_foundation_revision_change must be callable")
         source_id = manifest.source_id
         target_revision = foundation_manifest_digest(manifest)
         barrier_expected_revision: str | None = None
@@ -836,7 +849,7 @@ class CanonicalKnowledgeRepository:
             )
             pending_barrier = self._read_projection_revision_barrier(source_id)
             if pending_barrier is not None:
-                if before_same_content_revision_change is None:
+                if before_foundation_revision_change is None:
                     raise RuntimeError("pending projection revision requires index invalidation")
                 if current_revision is None or current_revision not in {
                     pending_barrier.previous_foundation_sha256,
@@ -855,9 +868,8 @@ class CanonicalKnowledgeRepository:
                         )
                     )
             elif (
-                before_same_content_revision_change is not None
+                before_foundation_revision_change is not None
                 and current_manifest is not None
-                and current_manifest.sha256 == manifest.sha256
                 and current_manifest != manifest
             ):
                 barrier_expected_revision = foundation_manifest_digest(current_manifest)
@@ -876,10 +888,11 @@ class CanonicalKnowledgeRepository:
         # after every repository lock, including the compilation guard, is released.
         # The durable marker makes every concurrent canonical snapshot and rebuild
         # fail closed until the source transition commits.
-        barrier_callback = before_same_content_revision_change
+        barrier_callback = before_foundation_revision_change
         if barrier_callback is None:
             raise RuntimeError("pending projection revision requires index invalidation")
-        barrier_callback(source_id)
+        if barrier_callback(source_id) is not True:
+            raise RuntimeError("source projection absence could not be proven")
 
         with (
             self.semantic_compilation_guard(source_id),
@@ -902,6 +915,82 @@ class CanonicalKnowledgeRepository:
                 raise RuntimeError("canonical foundation changed during projection invalidation")
             self._transition_source_locked(manifest, quarantine)
             self._delete_projection_revision_barrier(source_id)
+
+    def resume_nonaccepted_projection_revision(
+        self,
+        source_id: str,
+        *,
+        before_barrier_clear: Callable[[str], object] | None,
+    ) -> bool:
+        """Finish a committed terminal revision only after fencing its projection safely.
+
+        A nonaccepted source has no semantic compilation to force on an unchanged
+        learning run.  This explicit recovery path therefore consumes only a marker
+        whose exact target is already canonical, while retaining the marker across
+        every failed validation or index-invalidation attempt.
+        """
+        _validate_stable_id(source_id)
+        if before_barrier_clear is not None and not callable(before_barrier_clear):
+            raise TypeError("before_barrier_clear must be callable")
+        with (
+            self.semantic_compilation_guard(source_id),
+            self._semantic_inventory_lock(exclusive=True),
+            self._source_transition_lock(source_id),
+        ):
+            self._recover_source(source_id)
+            pending_barrier = self._read_projection_revision_barrier(source_id)
+            if pending_barrier is None:
+                return False
+            self._require_current_nonaccepted_projection_target(
+                source_id,
+                pending_barrier,
+            )
+        if before_barrier_clear is None:
+            raise RuntimeError("pending projection revision requires index invalidation")
+
+        # The disposable index must never be acquired beneath repository locks.
+        # True proves either source absence or a durable global rebuild barrier.
+        if before_barrier_clear(source_id) is not True:
+            raise RuntimeError("source projection absence could not be proven")
+
+        with (
+            self.semantic_compilation_guard(source_id),
+            self._semantic_inventory_lock(exclusive=True),
+            self._source_transition_lock(source_id),
+        ):
+            self._recover_source(source_id)
+            current_barrier = self._read_projection_revision_barrier(source_id)
+            if current_barrier != pending_barrier:
+                raise RuntimeError("projection revision changed during index invalidation")
+            self._require_current_nonaccepted_projection_target(
+                source_id,
+                pending_barrier,
+            )
+            self._delete_projection_revision_barrier(source_id)
+        return True
+
+    def _require_current_nonaccepted_projection_target(
+        self,
+        source_id: str,
+        barrier: _ProjectionRevisionBarrier,
+    ) -> None:
+        """Validate the canonical terminal target while its repository locks are held."""
+        try:
+            manifest = self.load_manifest(source_id)
+        except FileNotFoundError as error:
+            raise RuntimeError("projection revision target foundation is missing") from error
+        if (
+            manifest.ingestion_status.value == "accepted"
+            or foundation_manifest_digest(manifest) != barrier.target_foundation_sha256
+        ):
+            raise RuntimeError("projection revision is not at its canonical terminal target")
+        try:
+            quarantine = self.load_quarantine(source_id)
+        except FileNotFoundError:
+            quarantine = None
+        self.validate_source_state(manifest, quarantine)
+        if self._load_semantic_state(source_id) != (None, None, None):
+            raise RuntimeError("nonaccepted projection revision retains semantic state")
 
     def _transition_source_locked(
         self,

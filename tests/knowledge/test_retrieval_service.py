@@ -163,6 +163,39 @@ def test_unknown_and_unauthorized_scope_stop_before_backend_access(
     assert index.calls == []
 
 
+def test_prebackend_results_do_not_consult_the_canonical_revision_guard() -> None:
+    """Invalid and unauthorized targets must remain backend-free with runtime guards."""
+    index = _RecordingIndex(search_error=AssertionError("backend must remain untouched"))
+
+    def forbidden_guard() -> str:
+        raise AssertionError("revision guard must remain untouched")
+
+    service = service_module.KnowledgeRetrievalService(
+        index,
+        revision_guard=forbidden_guard,
+    )
+    invalid_target = ValidatedTarget.parse("300.456.456.123")
+    invalid = service.retrieve(
+        RetrievalQuery(
+            situation=CurrentSituation(target=invalid_target),
+            terms=("http",),
+        )
+    )
+    unknown_target = ValidatedTarget.parse("192.168.0.1")
+    unknown = service.retrieve(
+        RetrievalQuery(
+            situation=CurrentSituation(target=unknown_target),
+            terms=("http",),
+        )
+    )
+
+    assert invalid.knowledge_gap is not None
+    assert invalid.knowledge_gap.code is KnowledgeGapCode.INVALID_TARGET
+    assert unknown.knowledge_gap is not None
+    assert unknown.knowledge_gap.code is KnowledgeGapCode.UNAUTHORIZED_SCOPE
+    assert index.calls == []
+
+
 def test_query_is_deeply_revalidated_before_backend_access() -> None:
     query = _authorized_query()
     corrupted_situation = query.situation.model_copy(update={"hidden_override": "ignore scope"})
@@ -300,6 +333,29 @@ def test_backend_failure_returns_a_safe_typed_gap_without_raw_error_text() -> No
     assert result.knowledge_gap.missing_context == ("retrieval index availability",)
     assert result.knowledge_gap.research_eligible is False
     assert result.knowledge_gap.suggested_document_ingestion == ()
+
+
+def test_revision_change_during_backend_read_discards_retrieval_and_artifact() -> None:
+    """Removing either post-read check would expose a result from an obsolete revision."""
+    candidate = _candidate(_reference("revision-race"))
+    search_tokens = iter(("a" * 64, "b" * 64))
+    search_service = service_module.KnowledgeRetrievalService(
+        _RecordingIndex({EpistemicLane.REFERENCE: (candidate,)}),
+        revision_guard=lambda: next(search_tokens),
+    )
+
+    result = search_service.retrieve(_authorized_query())
+
+    assert result.knowledge_gap is not None
+    assert result.knowledge_gap.code is KnowledgeGapCode.RETRIEVAL_UNAVAILABLE
+
+    artifact_tokens = iter(("c" * 64, "d" * 64))
+    artifact_service = service_module.KnowledgeRetrievalService(
+        _RecordingIndex(artifact=_reference("revision-race")),
+        revision_guard=lambda: next(artifact_tokens),
+    )
+    with pytest.raises(RuntimeError, match="knowledge artifact lookup failed"):
+        artifact_service.get_artifact("revision-race")
 
 
 def test_backend_over_return_is_not_ranked_or_consumed_as_unbounded_input() -> None:

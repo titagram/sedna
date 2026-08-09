@@ -215,7 +215,7 @@ class DocumentLearningService:
                 root,
                 self.knowledge_root,
                 repository=self._repository,
-                before_same_content_revision_change=(
+                before_foundation_revision_change=(
                     transition_barrier if callable(transition_barrier) else None
                 ),
             ) as pipeline:

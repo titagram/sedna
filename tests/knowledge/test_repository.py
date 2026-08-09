@@ -19,6 +19,7 @@ from sedna.knowledge.repository import (
     QuarantineRecord,
 )
 from sedna.knowledge.schema import (
+    AssetRef,
     DocumentManifest,
     DocumentType,
     ExtractionMetadata,
@@ -219,6 +220,28 @@ def test_quarantined_transition_rolls_back_if_manifest_write_fails(
 
     assert repository.load_manifest("source-123") == old_manifest
     assert repository.quarantine_exists("source-123") is False
+
+
+def test_same_content_revision_does_not_commit_without_projection_safety_proof(
+    tmp_path: Path,
+) -> None:
+    """A false callback must retain the old canonical revision and durable marker."""
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    original = complete_manifest()
+    revised = original.model_copy(
+        update={"assets": (AssetRef(path="evidence.bin", sha256="b" * 64),)}
+    )
+    repository.transition_source(original, None)
+
+    with pytest.raises(RuntimeError, match="projection absence could not be proven"):
+        repository.transition_source(
+            revised,
+            None,
+            before_foundation_revision_change=lambda _: False,
+        )
+
+    assert repository.load_manifest(original.source_id) == original
+    assert list((repository.root / "transactions").glob("*.projection-revision.json"))
 
 
 def test_transition_rollback_restores_non_utf8_bytes_and_original_error(

@@ -204,6 +204,44 @@ def test_fresh_runtime_blocks_old_projection_during_asset_only_recompile(
         runtime.close()
 
 
+def test_live_peer_blocks_old_projection_during_changed_content_recompile(
+    tmp_path: Path,
+) -> None:
+    """A content revision must remove v1 before host-backed v2 compilation starts."""
+    knowledge_root = tmp_path / "knowledge"
+    source_root = _source_root(tmp_path)
+    source_path = source_root / SOURCE_CASES["reference"].relative_path
+    entered = Event()
+    release = Event()
+    host = _BlockAfterTwoCallsHost(_responses(count=2), entered, release)
+    runtime = HadesKnowledgeRuntime.create(host, knowledge_root)
+    peer: HadesKnowledgeRuntime | None = None
+
+    try:
+        first = runtime.learning.learn(source_root)
+        source_id = first.outcomes[0].source_id
+        artifact_id = runtime._repository.load_semantic_bundle(source_id).references[0].artifact_id
+        peer = HadesKnowledgeRuntime.create(_ScriptedHost([]), knowledge_root)
+        source_path.write_text(
+            source_path.read_text(encoding="utf-8") + "\nChanged source evidence.\n",
+            encoding="utf-8",
+        )
+        worker = Thread(target=lambda: runtime.learning.learn(source_root))
+        worker.start()
+        assert entered.wait(5)
+
+        assert peer.retrieval.get_artifact(artifact_id) is None
+
+        release.set()
+        worker.join(5)
+        assert not worker.is_alive()
+    finally:
+        release.set()
+        if peer is not None:
+            peer.close()
+        runtime.close()
+
+
 def test_asset_revision_barrier_resumes_after_interrupted_index_invalidation(
     tmp_path: Path,
 ) -> None:
@@ -227,7 +265,7 @@ def test_asset_revision_barrier_resumes_after_interrupted_index_invalidation(
             source_root,
             knowledge_root,
             repository=initial._repository,
-            before_same_content_revision_change=interrupt_before_index_invalidation,
+            before_foundation_revision_change=interrupt_before_index_invalidation,
         ) as pipeline:
             candidate = discover_sources(source_root)[0]
             with pytest.raises(OSError, match="simulated process interruption"):
@@ -285,7 +323,7 @@ def test_asset_revision_barrier_resumes_after_canonical_commit_crash(
             source_root,
             knowledge_root,
             repository=initial._repository,
-            before_same_content_revision_change=initial.maintenance.barrier_source_revision,
+            before_foundation_revision_change=initial.maintenance.barrier_source_revision,
         ) as pipeline:
             candidate = discover_sources(source_root)[0]
             with pytest.raises(OSError, match="post-commit process interruption"):
@@ -306,6 +344,134 @@ def test_asset_revision_barrier_resumes_after_canonical_commit_crash(
         assert report.index_report is not None and report.index_report.succeeded
         assert resumed.retrieval.get_artifact(artifact_id) is not None
         assert not list((knowledge_root / "transactions").glob("*.projection-revision.json"))
+    finally:
+        resumed.close()
+
+
+def test_live_peer_blocks_reads_after_revision_marker_precedes_index_invalidation(
+    tmp_path: Path,
+) -> None:
+    """A peer opened before the marker must not serve the old source projection."""
+    knowledge_root = tmp_path / "knowledge"
+    source_root = _source_root(tmp_path)
+    source_path = source_root / SOURCE_CASES["reference"].relative_path
+    asset_path = source_path.parent / "evidence.bin"
+    asset_path.write_bytes(b"asset revision one")
+    initial = HadesKnowledgeRuntime.create(_ScriptedHost(_responses()), knowledge_root)
+    first = initial.learning.learn(source_root)
+    source_id = first.outcomes[0].source_id
+    artifact_id = initial._repository.load_semantic_bundle(source_id).references[0].artifact_id
+    peer = HadesKnowledgeRuntime.create(_ScriptedHost([]), knowledge_root)
+    asset_path.write_bytes(b"asset revision two")
+
+    def interrupt_before_index_invalidation(_: str) -> None:
+        raise OSError("simulated pre-invalidation interruption")
+
+    try:
+        with (
+            IngestionPipeline(
+                source_root,
+                knowledge_root,
+                repository=initial._repository,
+                before_foundation_revision_change=interrupt_before_index_invalidation,
+            ) as pipeline,
+            pytest.raises(OSError, match="pre-invalidation interruption"),
+        ):
+            pipeline.prepare(discover_sources(source_root)[0])
+
+        assert list((knowledge_root / "transactions").glob("*.projection-revision.json"))
+        target = ValidatedTarget.parse("10.10.10.10")
+        unavailable = peer.retrieval.retrieve(
+            RetrievalQuery(
+                situation=CurrentSituation(
+                    target=target,
+                    authorization=AuthorizationScope(
+                        state=AuthorizationState.AUTHORIZED,
+                        exact_targets=(target,),
+                    ),
+                ),
+                terms=("evidence",),
+            )
+        )
+        assert unavailable.knowledge_gap is not None
+        assert unavailable.knowledge_gap.code is KnowledgeGapCode.RETRIEVAL_UNAVAILABLE
+        with pytest.raises(RuntimeError, match="knowledge artifact lookup failed"):
+            peer.retrieval.get_artifact(artifact_id)
+    finally:
+        peer.close()
+        initial.close()
+
+
+@pytest.mark.parametrize(
+    ("source_bytes", "terminal_count"),
+    (
+        (b"", "excluded_source_count"),
+        (b"\xff", "foundation_quarantined_source_count"),
+    ),
+    ids=("excluded", "foundation-quarantined"),
+)
+def test_nonaccepted_asset_revision_barrier_resumes_after_canonical_commit_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_bytes: bytes,
+    terminal_count: str,
+) -> None:
+    """An unchanged terminal source must clear its committed-target revision barrier."""
+    knowledge_root = tmp_path / "knowledge"
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    (source_root / "bad.md").write_bytes(source_bytes)
+    asset_path = source_root / "evidence.bin"
+    asset_path.write_bytes(b"asset revision one")
+    initial = HadesKnowledgeRuntime.create(_ScriptedHost([]), knowledge_root)
+    first = initial.learning.learn(source_root)
+    assert getattr(first, terminal_count) == 1
+    source_id = first.outcomes[0].source_id
+    first_asset_sha256 = initial._repository.load_manifest(source_id).assets[0].sha256
+    asset_path.write_bytes(b"asset revision two")
+    real_delete = initial._repository._delete_projection_revision_barrier
+    delete_calls = 0
+
+    def interrupt_before_barrier_delete(failed_source_id: str) -> None:
+        nonlocal delete_calls
+        delete_calls += 1
+        if delete_calls == 1:
+            raise OSError("simulated terminal post-commit interruption")
+        real_delete(failed_source_id)
+
+    monkeypatch.setattr(
+        initial._repository,
+        "_delete_projection_revision_barrier",
+        interrupt_before_barrier_delete,
+    )
+    try:
+        interrupted = initial.learning.learn(source_root)
+
+        assert interrupted.failed_source_count == 1
+        assert delete_calls == 1
+        assert initial._repository.load_manifest(source_id).assets[0].sha256 != (first_asset_sha256)
+        assert list((knowledge_root / "transactions").glob("*.projection-revision.json"))
+        with pytest.raises(RuntimeError, match="projection absence could not be proven"):
+            initial._repository.resume_nonaccepted_projection_revision(
+                source_id,
+                before_barrier_clear=lambda _: False,
+            )
+        assert list((knowledge_root / "transactions").glob("*.projection-revision.json"))
+    finally:
+        initial.close()
+
+    resumed = HadesKnowledgeRuntime.create(_ScriptedHost([]), knowledge_root)
+    try:
+        with pytest.raises(RuntimeError, match="knowledge artifact lookup failed"):
+            resumed.retrieval.get_artifact("reference-stale")
+
+        report = resumed.learning.learn(source_root)
+
+        assert report.unchanged_source_count == 1
+        assert report.index_report is not None and report.index_report.succeeded
+        assert not list((knowledge_root / "transactions").glob("*.projection-revision.json"))
+        assert resumed._index.snapshot_state().source_states == ()
+        assert resumed.retrieval.get_artifact("reference-stale") is None
     finally:
         resumed.close()
 
@@ -709,7 +875,8 @@ def test_runtime_poisoned_index_masks_combined_invalidation_delete_and_close_fai
         assert failed.failed_source_count == 1
         assert failed.index_report is not None and not failed.index_report.succeeded
         assert journal.exists()
-        assert journal_delete_calls == source_delete_calls == close_calls == 1
+        assert journal_delete_calls == close_calls == 1
+        assert source_delete_calls == 2
         assert unavailable.knowledge_gap is not None
         assert unavailable.knowledge_gap.code is KnowledgeGapCode.RETRIEVAL_UNAVAILABLE
         rendered = unavailable.model_dump_json()

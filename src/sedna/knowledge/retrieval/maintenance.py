@@ -214,7 +214,7 @@ class RetrievalMaintenanceService:
             return False
 
     def barrier_source_revision(self, source_id: str) -> bool:
-        """Remove one old revision or retain a rebuildable global read barrier."""
+        """Prove absence or persist a rebuildable global read barrier."""
         try:
             self.index.delete_source(source_id)
             snapshot = _strict_index_snapshot(self.index.snapshot_state())
@@ -224,6 +224,7 @@ class RetrievalMaintenanceService:
         except Exception:
             try:
                 self.index.mark_rebuild_required()
+                return True
             except Exception:
                 with suppress(Exception):
                     self.index.mark_unavailable()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
@@ -33,6 +34,7 @@ class KnowledgeRetrievalService:
     """Validate once, query bounded lanes, rank, and return a closed retrieval result."""
 
     index: RetrievalIndex
+    revision_guard: Callable[[], str] | None = None
 
     def retrieve(self, query: RetrievalQuery) -> RetrievalResult:
         """Return lane-local knowledge or an explicit pre-backend/knowledge gap."""
@@ -84,7 +86,9 @@ class KnowledgeRetrievalService:
         """Return one exact canonical artifact without exposing backend failure details."""
         canonical_id = _strict_artifact_id(artifact_id)
         try:
+            revision = self._read_revision()
             artifact = self.index.get_artifact(canonical_id)
+            self._require_revision(revision)
             if artifact is None:
                 return None
             if type(artifact) not in _ARTIFACT_TYPES:
@@ -99,6 +103,7 @@ class KnowledgeRetrievalService:
 
     def _search_lanes(self, query: RetrievalQuery) -> tuple[IndexCandidate, ...]:
         candidates: list[IndexCandidate] = []
+        revision = self._read_revision()
         for lane in EpistemicLane:
             lane_candidates = self.index.search_candidates(
                 query,
@@ -112,7 +117,27 @@ class KnowledgeRetrievalService:
             if any(not isinstance(candidate, IndexCandidate) for candidate in lane_candidates):
                 raise ValueError("retrieval index returned a non-canonical candidate")
             candidates.extend(lane_candidates)
+        self._require_revision(revision)
         return tuple(candidates)
+
+    def _read_revision(self) -> str | None:
+        guard = self.revision_guard
+        if guard is None:
+            return None
+        revision = guard()
+        if (
+            type(revision) is not str
+            or len(revision) != 64
+            or any(character not in "0123456789abcdef" for character in revision)
+        ):
+            raise ValueError("retrieval revision guard returned an invalid token")
+        return revision
+
+    def _require_revision(self, expected: str | None) -> None:
+        if expected is None:
+            return
+        if self._read_revision() != expected:
+            raise RuntimeError("canonical knowledge changed during retrieval")
 
 
 def _strict_query(query: RetrievalQuery) -> RetrievalQuery:

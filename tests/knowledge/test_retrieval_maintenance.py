@@ -93,7 +93,7 @@ def _run_revision_transition_against_guarded_rebuild(root: Path, path: Path) -> 
         target=lambda: repository.transition_source(
             revised_manifest,
             None,
-            before_same_content_revision_change=observed_invalidation,
+            before_foundation_revision_change=observed_invalidation,
         ),
         daemon=True,
     )

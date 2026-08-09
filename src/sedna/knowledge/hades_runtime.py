@@ -96,7 +96,10 @@ class HadesKnowledgeRuntime:
                 maintenance=maintenance,
                 repository=repository,
             )
-            retrieval = KnowledgeRetrievalService(index)
+            retrieval = KnowledgeRetrievalService(
+                index,
+                revision_guard=repository.retrieval_read_revision,
+            )
             return cls(
                 learning=learning,
                 retrieval=retrieval,
