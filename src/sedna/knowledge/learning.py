@@ -203,7 +203,13 @@ class DocumentLearningService:
 
         outcomes: list[LearningSourceOutcome] = []
         failure_codes: list[str] = []
-        transition_barrier = getattr(self._maintenance, "invalidate_source_projection", None)
+        transition_barrier = getattr(self._maintenance, "barrier_source_revision", None)
+        if not callable(transition_barrier):
+            transition_barrier = getattr(
+                self._maintenance,
+                "invalidate_source_projection",
+                None,
+            )
         try:
             with IngestionPipeline(
                 root,

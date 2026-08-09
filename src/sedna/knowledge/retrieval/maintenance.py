@@ -213,6 +213,24 @@ class RetrievalMaintenanceService:
                 self.index.close()
             return False
 
+    def barrier_source_revision(self, source_id: str) -> bool:
+        """Remove one old revision or retain a rebuildable global read barrier."""
+        try:
+            self.index.delete_source(source_id)
+            snapshot = _strict_index_snapshot(self.index.snapshot_state())
+            if any(state.source_id == source_id for state in snapshot.source_states):
+                raise ValueError("source projection remained after revision barrier")
+            return True
+        except Exception:
+            try:
+                self.index.mark_rebuild_required()
+            except Exception:
+                with suppress(Exception):
+                    self.index.mark_unavailable()
+                with suppress(Exception):
+                    self.index.close()
+            return False
+
     def _poison_failed_rebuild(
         self,
         report: RetrievalMaintenanceReport,

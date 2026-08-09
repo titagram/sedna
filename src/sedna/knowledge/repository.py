@@ -96,6 +96,15 @@ class SemanticRepositorySnapshot:
     revision: str
 
 
+@dataclass(frozen=True, slots=True)
+class _ProjectionRevisionBarrier:
+    """Durable proof that an index barrier must precede one foundation revision."""
+
+    source_id: str
+    previous_foundation_sha256: str
+    target_foundation_sha256: str
+
+
 class QuarantineRecord(BaseModel):
     """A reviewable explanation for why one source could not be prepared."""
 
@@ -545,6 +554,8 @@ class CanonicalKnowledgeRepository:
                         source_id = entry.name[: -len(".semantic-transaction.json")]
                     elif entry.name.endswith(".semantic-invalidation.json"):
                         source_id = entry.name[: -len(".semantic-invalidation.json")]
+                    elif entry.name.endswith(".projection-revision.json"):
+                        source_id = entry.name[: -len(".projection-revision.json")]
                     elif entry.name.endswith(".transaction.json"):
                         source_id = entry.name[: -len(".transaction.json")]
                     if source_id is not None:
@@ -807,97 +818,169 @@ class CanonicalKnowledgeRepository:
             before_same_content_revision_change
         ):
             raise TypeError("before_same_content_revision_change must be callable")
+        source_id = manifest.source_id
+        target_revision = foundation_manifest_digest(manifest)
+        barrier_expected_revision: str | None = None
         with (
-            self.semantic_compilation_guard(manifest.source_id),
+            self.semantic_compilation_guard(source_id),
             self._semantic_inventory_lock(exclusive=True),
-            self._source_transition_lock(manifest.source_id),
+            self._source_transition_lock(source_id),
         ):
-            self._recover_source(manifest.source_id)
+            self._recover_source(source_id)
             try:
-                current_manifest = self.load_manifest(manifest.source_id)
+                current_manifest = self.load_manifest(source_id)
             except FileNotFoundError:
                 current_manifest = None
-            old_manifest = self._read_optional_bytes("manifests", manifest.source_id)
-            old_quarantine = self._read_optional_bytes("quarantine", manifest.source_id)
-            foundation_changed = current_manifest != manifest
-            semantic_snapshots: dict[str, bytes | None] | None = None
-            if manifest.ingestion_status.value != "accepted" or foundation_changed:
-                if (
-                    before_same_content_revision_change is not None
-                    and current_manifest is not None
-                    and current_manifest.sha256 == manifest.sha256
-                    and foundation_changed
-                ):
-                    before_same_content_revision_change(manifest.source_id)
-                semantic_snapshots = {
-                    directory: self._read_optional_bytes(directory, manifest.source_id)
-                    for directory in self._SEMANTIC_DIRECTORIES
-                }
-                self._write_semantic_transition_journal(manifest.source_id, semantic_snapshots)
-                try:
-                    for directory in self._SEMANTIC_DIRECTORIES:
-                        self._delete_record(directory, manifest.source_id)
-                    self._fsync_directories(self._SEMANTIC_DIRECTORIES)
-                except BaseException as original_error:
-                    rollback_errors = self._restore_semantic_snapshots(
-                        manifest.source_id,
-                        semantic_snapshots,
-                    )
-                    if rollback_errors:
-                        for rollback_error in rollback_errors:
-                            original_error.add_note(
-                                "semantic invalidation rollback remains recoverable: "
-                                f"{type(rollback_error).__name__}: {rollback_error}"
-                            )
-                    else:
-                        self._delete_semantic_transition_journal(manifest.source_id)
-                    raise
-            self._write_transition_journal(
-                manifest.source_id,
-                old_manifest,
-                old_quarantine,
+            current_revision = (
+                None if current_manifest is None else foundation_manifest_digest(current_manifest)
             )
-            try:
-                if quarantine is None:
-                    self.delete_quarantine(manifest.source_id)
-                else:
-                    self.write_quarantine(quarantine)
-                self.write_manifest(manifest)
-            except BaseException as original_error:
-                rollback_errors: list[BaseException] = []
-                if semantic_snapshots is not None:
-                    rollback_errors.extend(
-                        self._restore_semantic_snapshots(
-                            manifest.source_id,
-                            semantic_snapshots,
+            pending_barrier = self._read_projection_revision_barrier(source_id)
+            if pending_barrier is not None:
+                if before_same_content_revision_change is None:
+                    raise RuntimeError("pending projection revision requires index invalidation")
+                if current_revision is None or current_revision not in {
+                    pending_barrier.previous_foundation_sha256,
+                    pending_barrier.target_foundation_sha256,
+                }:
+                    raise RuntimeError(
+                        "pending projection revision does not match canonical foundation"
+                    )
+                barrier_expected_revision = current_revision
+                if pending_barrier.target_foundation_sha256 != target_revision:
+                    self._write_projection_revision_barrier(
+                        _ProjectionRevisionBarrier(
+                            source_id=source_id,
+                            previous_foundation_sha256=current_revision,
+                            target_foundation_sha256=target_revision,
                         )
                     )
-                    if not rollback_errors:
-                        try:
-                            self._delete_semantic_transition_journal(manifest.source_id)
-                        except BaseException as rollback_error:
-                            rollback_errors.append(rollback_error)
-                rollback_errors.extend(
-                    self._restore_source_snapshots(
-                        manifest.source_id,
-                        old_manifest,
-                        old_quarantine,
+            elif (
+                before_same_content_revision_change is not None
+                and current_manifest is not None
+                and current_manifest.sha256 == manifest.sha256
+                and current_manifest != manifest
+            ):
+                barrier_expected_revision = foundation_manifest_digest(current_manifest)
+                self._write_projection_revision_barrier(
+                    _ProjectionRevisionBarrier(
+                        source_id=source_id,
+                        previous_foundation_sha256=barrier_expected_revision,
+                        target_foundation_sha256=target_revision,
                     )
+                )
+            if barrier_expected_revision is None:
+                self._transition_source_locked(manifest, quarantine)
+                return
+
+        # Lock order is deliberate: the external disposable index is acquired only
+        # after every repository lock, including the compilation guard, is released.
+        # The durable marker makes every concurrent canonical snapshot and rebuild
+        # fail closed until the source transition commits.
+        barrier_callback = before_same_content_revision_change
+        if barrier_callback is None:
+            raise RuntimeError("pending projection revision requires index invalidation")
+        barrier_callback(source_id)
+
+        with (
+            self.semantic_compilation_guard(source_id),
+            self._semantic_inventory_lock(exclusive=True),
+            self._source_transition_lock(source_id),
+        ):
+            self._recover_source(source_id)
+            pending_barrier = self._read_projection_revision_barrier(source_id)
+            try:
+                current_manifest = self.load_manifest(source_id)
+            except FileNotFoundError as error:
+                raise RuntimeError(
+                    "canonical foundation disappeared during projection invalidation"
+                ) from error
+            if (
+                pending_barrier is None
+                or pending_barrier.target_foundation_sha256 != target_revision
+                or foundation_manifest_digest(current_manifest) != barrier_expected_revision
+            ):
+                raise RuntimeError("canonical foundation changed during projection invalidation")
+            self._transition_source_locked(manifest, quarantine)
+            self._delete_projection_revision_barrier(source_id)
+
+    def _transition_source_locked(
+        self,
+        manifest: DocumentManifest,
+        quarantine: QuarantineRecord | None,
+    ) -> None:
+        """Apply one source transition while inventory and source locks are held."""
+        source_id = manifest.source_id
+        try:
+            current_manifest = self.load_manifest(source_id)
+        except FileNotFoundError:
+            current_manifest = None
+        old_manifest = self._read_optional_bytes("manifests", source_id)
+        old_quarantine = self._read_optional_bytes("quarantine", source_id)
+        foundation_changed = current_manifest != manifest
+        semantic_snapshots: dict[str, bytes | None] | None = None
+        if manifest.ingestion_status.value != "accepted" or foundation_changed:
+            semantic_snapshots = {
+                directory: self._read_optional_bytes(directory, source_id)
+                for directory in self._SEMANTIC_DIRECTORIES
+            }
+            self._write_semantic_transition_journal(source_id, semantic_snapshots)
+            try:
+                for directory in self._SEMANTIC_DIRECTORIES:
+                    self._delete_record(directory, source_id)
+                self._fsync_directories(self._SEMANTIC_DIRECTORIES)
+            except BaseException as original_error:
+                rollback_errors = self._restore_semantic_snapshots(
+                    source_id,
+                    semantic_snapshots,
+                )
+                if rollback_errors:
+                    for rollback_error in rollback_errors:
+                        original_error.add_note(
+                            "semantic invalidation rollback remains recoverable: "
+                            f"{type(rollback_error).__name__}: {rollback_error}"
+                        )
+                else:
+                    self._delete_semantic_transition_journal(source_id)
+                raise
+        self._write_transition_journal(source_id, old_manifest, old_quarantine)
+        try:
+            if quarantine is None:
+                self.delete_quarantine(source_id)
+            else:
+                self.write_quarantine(quarantine)
+            self.write_manifest(manifest)
+        except BaseException as original_error:
+            rollback_errors: list[BaseException] = []
+            if semantic_snapshots is not None:
+                rollback_errors.extend(
+                    self._restore_semantic_snapshots(source_id, semantic_snapshots)
                 )
                 if not rollback_errors:
                     try:
-                        self._delete_transition_journal(manifest.source_id)
+                        self._delete_semantic_transition_journal(source_id)
                     except BaseException as rollback_error:
                         rollback_errors.append(rollback_error)
-                for rollback_error in rollback_errors:
-                    original_error.add_note(
-                        "transition rollback remains recoverable: "
-                        f"{type(rollback_error).__name__}: {rollback_error}"
-                    )
-                raise
-            if semantic_snapshots is not None:
-                self._delete_semantic_transition_journal(manifest.source_id)
-            self._delete_transition_journal(manifest.source_id)
+            rollback_errors.extend(
+                self._restore_source_snapshots(
+                    source_id,
+                    old_manifest,
+                    old_quarantine,
+                )
+            )
+            if not rollback_errors:
+                try:
+                    self._delete_transition_journal(source_id)
+                except BaseException as rollback_error:
+                    rollback_errors.append(rollback_error)
+            for rollback_error in rollback_errors:
+                original_error.add_note(
+                    "transition rollback remains recoverable: "
+                    f"{type(rollback_error).__name__}: {rollback_error}"
+                )
+            raise
+        if semantic_snapshots is not None:
+            self._delete_semantic_transition_journal(source_id)
+        self._delete_transition_journal(source_id)
 
     def load_manifest(self, source_id: str) -> DocumentManifest:
         """Load and validate one manifest, with path-specific errors."""
@@ -1873,6 +1956,129 @@ class CanonicalKnowledgeRepository:
             try:
                 os.unlink(
                     f"{source_id}.semantic-invalidation.json",
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                return
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def _write_projection_revision_barrier(
+        self,
+        barrier: _ProjectionRevisionBarrier,
+    ) -> None:
+        """Persist the rebuild-visible barrier before touching the disposable index."""
+        _validate_stable_id(barrier.source_id)
+        for revision in (
+            barrier.previous_foundation_sha256,
+            barrier.target_foundation_sha256,
+        ):
+            if (
+                not isinstance(revision, str)
+                or len(revision) != 64
+                or any(character not in "0123456789abcdef" for character in revision)
+            ):
+                raise ValueError("projection revision barrier requires foundation digests")
+        payload = (
+            json.dumps(
+                {
+                    "kind": "projection_revision",
+                    "previous_foundation_sha256": barrier.previous_foundation_sha256,
+                    "source_id": barrier.source_id,
+                    "target_foundation_sha256": barrier.target_foundation_sha256,
+                    "version": 1,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                indent=2,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("ascii")
+        directory_fd = self._open_child_directory("transactions", create=True)
+        try:
+            self._atomic_write_bytes(
+                directory_fd,
+                f"{barrier.source_id}.projection-revision.json",
+                payload,
+            )
+        finally:
+            os.close(directory_fd)
+
+    def _read_projection_revision_barrier(
+        self,
+        source_id: str,
+    ) -> _ProjectionRevisionBarrier | None:
+        """Load one exact pending foundation/index ordering barrier."""
+        _validate_stable_id(source_id)
+        try:
+            directory_fd = self._open_child_directory("transactions", create=False)
+        except FileNotFoundError:
+            return None
+        filename = f"{source_id}.projection-revision.json"
+        try:
+            try:
+                file_fd = os.open(filename, self._file_read_flags(), dir_fd=directory_fd)
+            except FileNotFoundError:
+                return None
+            try:
+                if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                    raise ValueError("projection revision barrier is not a regular file")
+                with os.fdopen(file_fd, mode="rb") as stream:
+                    file_fd = -1
+                    raw = stream.read()
+            finally:
+                if file_fd >= 0:
+                    os.close(file_fd)
+        finally:
+            os.close(directory_fd)
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or set(payload) != {
+                "kind",
+                "previous_foundation_sha256",
+                "source_id",
+                "target_foundation_sha256",
+                "version",
+            }:
+                raise ValueError("unexpected projection revision barrier fields")
+            barrier = _ProjectionRevisionBarrier(
+                source_id=payload["source_id"],
+                previous_foundation_sha256=payload["previous_foundation_sha256"],
+                target_foundation_sha256=payload["target_foundation_sha256"],
+            )
+            if (
+                payload["kind"] != "projection_revision"
+                or barrier.source_id != source_id
+                or type(payload["version"]) is not int
+                or payload["version"] != 1
+            ):
+                raise ValueError("projection revision barrier identity or version mismatch")
+            for revision in (
+                barrier.previous_foundation_sha256,
+                barrier.target_foundation_sha256,
+            ):
+                if (
+                    not isinstance(revision, str)
+                    or len(revision) != 64
+                    or any(character not in "0123456789abcdef" for character in revision)
+                ):
+                    raise ValueError("projection revision barrier digest is invalid")
+            return barrier
+        except (KeyError, TypeError, UnicodeError, ValueError) as exc:
+            raise ValueError(f"invalid projection revision barrier for {source_id!r}") from exc
+
+    def _delete_projection_revision_barrier(self, source_id: str) -> None:
+        """Remove the barrier only after both index invalidation and canonical commit."""
+        try:
+            directory_fd = self._open_child_directory("transactions", create=False)
+        except FileNotFoundError:
+            return
+        try:
+            try:
+                os.unlink(
+                    f"{source_id}.projection-revision.json",
                     dir_fd=directory_fd,
                 )
             except FileNotFoundError:

@@ -8,8 +8,9 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from multiprocessing import get_context
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 
 import pytest
 
@@ -26,6 +27,7 @@ from sedna.knowledge.retrieval.maintenance import (
 from sedna.knowledge.retrieval.projection import project_semantic_bundle, project_source_state
 from sedna.knowledge.retrieval.sqlite import SQLiteRetrievalIndex
 from sedna.knowledge.schema import (
+    AssetRef,
     DocumentManifest,
     DocumentType,
     ExtractionMetadata,
@@ -53,6 +55,65 @@ from sedna.knowledge.semantic.prompts import (
 from tests.knowledge.test_retrieval_sqlite import _query, _renamed_bundle
 
 _NOW = datetime(2026, 8, 8, tzinfo=UTC)
+
+
+def _run_revision_transition_against_guarded_rebuild(root: Path, path: Path) -> None:
+    """Exercise the real repository/index lock graph in two bounded daemon threads."""
+    repository = CanonicalKnowledgeRepository(root)
+    original = _current_bundle("source-a", "a", source_hash="a" * 64)
+    _write_verified(repository, original)
+    current_manifest = repository.load_manifest(original.source_id)
+    revised_manifest = current_manifest.model_copy(
+        update={"assets": (AssetRef(path="fixtures/evidence.bin", sha256="b" * 64),)}
+    )
+    index = SQLiteRetrievalIndex(path)
+    index.rebuild((original,))
+    maintenance = RetrievalMaintenanceService(repository=repository, index=index)
+    rebuild_at_precommit = Event()
+    allow_precommit = Event()
+    invalidation_entered = Event()
+    real_snapshot_guard = repository.semantic_snapshot_guard
+
+    @contextmanager
+    def paused_snapshot_guard(expected_revision: str):
+        rebuild_at_precommit.set()
+        if not allow_precommit.wait(5):
+            raise TimeoutError("test did not release the rebuild precommit guard")
+        with real_snapshot_guard(expected_revision):
+            yield
+
+    def observed_invalidation(source_id: str) -> bool:
+        with repository.semantic_compilation_guard(source_id):
+            invalidation_entered.set()
+        return maintenance.barrier_source_revision(source_id)
+
+    repository.semantic_snapshot_guard = paused_snapshot_guard  # type: ignore[method-assign]
+    rebuild = Thread(target=maintenance.rebuild, daemon=True)
+    transition = Thread(
+        target=lambda: repository.transition_source(
+            revised_manifest,
+            None,
+            before_same_content_revision_change=observed_invalidation,
+        ),
+        daemon=True,
+    )
+    rebuild.start()
+    if not rebuild_at_precommit.wait(5):
+        raise AssertionError("rebuild never reached its guarded index precommit")
+    transition.start()
+    if not invalidation_entered.wait(5):
+        raise AssertionError("revision transition never requested projection invalidation")
+    allow_precommit.set()
+    transition.join(5)
+    rebuild.join(5)
+    if transition.is_alive() or rebuild.is_alive():
+        raise AssertionError("revision transition and index rebuild deadlocked")
+
+    assert repository.load_manifest(original.source_id) == revised_manifest
+    with pytest.raises(RuntimeError, match="retrieval index is unavailable"):
+        index.get_artifact(original.references[0].artifact_id)
+    index.close()
+    repository.close()
 
 
 def _current_bundle(
@@ -394,7 +455,11 @@ def test_rebuild_fails_closed_on_pending_semantic_crash_state_then_recovers(
 
 @pytest.mark.parametrize(
     "journal_name",
-    ("source-a.transaction.json", "source-a.semantic-transaction.json"),
+    (
+        "source-a.transaction.json",
+        "source-a.semantic-transaction.json",
+        "source-a.projection-revision.json",
+    ),
 )
 def test_repository_snapshot_rejects_each_pending_transaction_journal_type(
     tmp_path: Path,
@@ -677,6 +742,26 @@ def test_repository_root_lock_cannot_be_split_by_replacing_obsolete_sidecar(
     )
     first.close()
     second.close()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="repository requires POSIX locking")
+def test_same_content_revision_transition_does_not_deadlock_guarded_rebuild(
+    tmp_path: Path,
+) -> None:
+    """Acquiring the index while repository locks are held creates an AB/BA deadlock."""
+    process = get_context("fork").Process(
+        target=_run_revision_transition_against_guarded_rebuild,
+        args=(tmp_path / "knowledge", tmp_path / "sedna.sqlite"),
+    )
+
+    process.start()
+    process.join(15)
+    if process.is_alive():
+        process.terminate()
+        process.join(5)
+        pytest.fail("deadlock regression child did not terminate")
+
+    assert process.exitcode == 0
 
 
 def test_startup_semantic_recovery_waits_for_repository_snapshot_guard(tmp_path: Path) -> None:

@@ -11,6 +11,8 @@ import pytest
 import sedna.knowledge.semantic.compiler as compiler_module
 import sedna.knowledge.semantic.service as semantic_service_module
 from sedna.knowledge.hades_runtime import HadesKnowledgeRuntime
+from sedna.knowledge.inventory import discover_sources
+from sedna.knowledge.pipeline import IngestionPipeline
 from sedna.knowledge.repository import CanonicalKnowledgeRepository
 from sedna.knowledge.retrieval import (
     AuthorizationScope,
@@ -200,6 +202,112 @@ def test_fresh_runtime_blocks_old_projection_during_asset_only_recompile(
     finally:
         release.set()
         runtime.close()
+
+
+def test_asset_revision_barrier_resumes_after_interrupted_index_invalidation(
+    tmp_path: Path,
+) -> None:
+    """A crash marker must be resumable without leaving the learned index unavailable."""
+    knowledge_root = tmp_path / "knowledge"
+    source_root = _source_root(tmp_path)
+    source_path = source_root / SOURCE_CASES["reference"].relative_path
+    asset_path = source_path.parent / "evidence.bin"
+    asset_path.write_bytes(b"asset revision one")
+    initial = HadesKnowledgeRuntime.create(_ScriptedHost(_responses()), knowledge_root)
+    first = initial.learning.learn(source_root)
+    source_id = first.outcomes[0].source_id
+    artifact_id = initial._repository.load_semantic_bundle(source_id).references[0].artifact_id
+    asset_path.write_bytes(b"asset revision two")
+
+    def interrupt_before_index_invalidation(_: str) -> None:
+        raise OSError("simulated process interruption")
+
+    try:
+        with IngestionPipeline(
+            source_root,
+            knowledge_root,
+            repository=initial._repository,
+            before_same_content_revision_change=interrupt_before_index_invalidation,
+        ) as pipeline:
+            candidate = discover_sources(source_root)[0]
+            with pytest.raises(OSError, match="simulated process interruption"):
+                pipeline.prepare(candidate)
+    finally:
+        initial.close()
+
+    resumed = HadesKnowledgeRuntime.create(_ScriptedHost(_responses()), knowledge_root)
+    try:
+        with pytest.raises(RuntimeError, match="knowledge artifact lookup failed"):
+            resumed.retrieval.get_artifact(artifact_id)
+
+        report = resumed.learning.learn(source_root)
+
+        assert report.verified_source_count == 1
+        assert report.index_report is not None and report.index_report.succeeded
+        assert resumed.retrieval.get_artifact(artifact_id) is not None
+        assert not list((knowledge_root / "transactions").glob("*.projection-revision.json"))
+    finally:
+        resumed.close()
+
+
+def test_asset_revision_barrier_resumes_after_canonical_commit_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash before barrier deletion must resume from the committed target revision."""
+    knowledge_root = tmp_path / "knowledge"
+    source_root = _source_root(tmp_path)
+    source_path = source_root / SOURCE_CASES["reference"].relative_path
+    asset_path = source_path.parent / "evidence.bin"
+    asset_path.write_bytes(b"asset revision one")
+    initial = HadesKnowledgeRuntime.create(_ScriptedHost(_responses()), knowledge_root)
+    first = initial.learning.learn(source_root)
+    source_id = first.outcomes[0].source_id
+    artifact_id = initial._repository.load_semantic_bundle(source_id).references[0].artifact_id
+    asset_path.write_bytes(b"asset revision two")
+    real_delete = initial._repository._delete_projection_revision_barrier
+    delete_calls = 0
+
+    def interrupt_before_barrier_delete(failed_source_id: str) -> None:
+        nonlocal delete_calls
+        delete_calls += 1
+        if delete_calls == 1:
+            raise OSError("simulated post-commit process interruption")
+        real_delete(failed_source_id)
+
+    monkeypatch.setattr(
+        initial._repository,
+        "_delete_projection_revision_barrier",
+        interrupt_before_barrier_delete,
+    )
+    try:
+        with IngestionPipeline(
+            source_root,
+            knowledge_root,
+            repository=initial._repository,
+            before_same_content_revision_change=initial.maintenance.barrier_source_revision,
+        ) as pipeline:
+            candidate = discover_sources(source_root)[0]
+            with pytest.raises(OSError, match="post-commit process interruption"):
+                pipeline.prepare(candidate)
+        assert initial._repository.load_manifest(source_id).assets[0].sha256 == (
+            "b2d1dc2bf0d5158905751e117c0ae7a4d3ec6facc2454c0e1e6f5a18627a94e8"
+        )
+        with pytest.raises(FileNotFoundError):
+            initial._repository.load_semantic_bundle(source_id)
+    finally:
+        initial.close()
+
+    resumed = HadesKnowledgeRuntime.create(_ScriptedHost(_responses()), knowledge_root)
+    try:
+        report = resumed.learning.learn(source_root)
+
+        assert report.verified_source_count == 1
+        assert report.index_report is not None and report.index_report.succeeded
+        assert resumed.retrieval.get_artifact(artifact_id) is not None
+        assert not list((knowledge_root / "transactions").glob("*.projection-revision.json"))
+    finally:
+        resumed.close()
 
 
 def test_runtime_compiler_version_change_reinvokes_host_once(
