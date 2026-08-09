@@ -184,7 +184,7 @@ class SemanticCompiler:
                 VerificationStatus.VERIFIED,
             )
         except (TypeError, ValueError):
-            return self._canonical_material_quarantine(prepared, critic, calls)
+            return self._canonical_material_quarantine(prepared, critic, started_at, calls)
         except Exception:
             return self._failed("materialization_failure", calls)
         try:
@@ -257,9 +257,12 @@ class SemanticCompiler:
         self,
         prepared: PreparedSource,
         critic: StructuredResult[CriticVerdict],
+        started_at: datetime,
         calls: tuple[SemanticCallMetadata, ...],
     ) -> SemanticCompilationResult:
         try:
+            extractor = calls[0]
+            completed_at = self._now()
             finding = VerificationFinding(
                 code="unsafe_material",
                 severity="material",
@@ -273,14 +276,32 @@ class SemanticCompiler:
                     critic_call=self._call_metadata(critic, "sedna.semantic.critic"),
                     findings=(*critic.parsed.findings, finding),
                     adjudication="quarantined",
-                    recorded_at=self._now(),
+                    recorded_at=completed_at,
                 ),
                 quarantine=SemanticQuarantineRecord(
                     source_id=prepared.manifest.source_id,
                     source_sha256=prepared.manifest.sha256,
                     reason_codes=("unsafe_material",),
                     messages=(CANONICAL_FINDING_MESSAGES["unsafe_material"],),
-                    recorded_at=self._now(),
+                    recorded_at=completed_at,
+                    semantic_schema_version=SEMANTIC_SCHEMA_VERSION,
+                    compilation_manifest=SemanticCompilationManifest(
+                        source_id=prepared.manifest.source_id,
+                        source_sha256=prepared.manifest.sha256,
+                        foundation_schema_version=prepared.manifest.extraction.schema_version,
+                        foundation_parser_id=prepared.manifest.extraction.parser_id,
+                        foundation_parser_version=prepared.manifest.extraction.parser_version,
+                        compiler_version=SEMANTIC_COMPILER_VERSION,
+                        extractor_prompt_version=EXTRACTOR_PROMPT_VERSION,
+                        critic_prompt_version=CRITIC_PROMPT_VERSION,
+                        repair_prompt_version=REPAIR_PROMPT_VERSION,
+                        extractor_model_id=extractor.model,
+                        critic_model_id=critic.model,
+                        disposition="quarantined",
+                        repair_count=0,
+                        started_at=started_at,
+                        completed_at=completed_at,
+                    ),
                 ),
                 calls=calls,
             )

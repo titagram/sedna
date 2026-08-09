@@ -429,6 +429,13 @@ def test_unsafe_canonical_material_is_quarantined(monkeypatch: pytest.MonkeyPatc
     assert result.bundle is None
     assert result.quarantine is not None
     assert result.quarantine.reason_codes == ("unsafe_material",)
+    assert result.quarantine.compilation_manifest is not None
+    assert result.quarantine.compilation_manifest.started_at == datetime(
+        2026, 8, 7, 12, 0, tzinfo=UTC
+    )
+    assert result.quarantine.compilation_manifest.completed_at == datetime(
+        2026, 8, 7, 12, 0, tzinfo=UTC
+    )
     assert _purposes(host) == ["sedna.semantic.extract", "sedna.semantic.critic"]
 
 

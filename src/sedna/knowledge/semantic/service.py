@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from sedna.knowledge.parsing import PreparedSource
 from sedna.knowledge.parsing.models import validate_prepared_source
-from sedna.knowledge.schema import SemanticCompilationManifest
 from sedna.knowledge.semantic.compiler import (
     SEMANTIC_COMPILER_VERSION,
     SEMANTIC_SCHEMA_VERSION,
@@ -106,42 +104,12 @@ class SemanticIngestionService:
         result: SemanticCompilationResult,
     ) -> SemanticCompilationResult:
         quarantine = result.quarantine
-        verification = result.verification
         if quarantine is not None and quarantine.compilation_manifest is not None:
             return result
-        extractor = next(
-            (call for call in result.calls if call.purpose == "sedna.semantic.extract"),
-            None,
-        )
-        if quarantine is None or verification is None or extractor is None:
-            return result
-        now = datetime.now(UTC)
-        manifest = SemanticCompilationManifest(
-            source_id=prepared.manifest.source_id,
-            source_sha256=prepared.manifest.sha256,
-            foundation_schema_version=prepared.manifest.extraction.schema_version,
-            foundation_parser_id=prepared.manifest.extraction.parser_id,
-            foundation_parser_version=prepared.manifest.extraction.parser_version,
-            compiler_version=SEMANTIC_COMPILER_VERSION,
-            extractor_prompt_version=EXTRACTOR_PROMPT_VERSION,
-            critic_prompt_version=CRITIC_PROMPT_VERSION,
-            repair_prompt_version=REPAIR_PROMPT_VERSION,
-            extractor_model_id=extractor.model,
-            critic_model_id=verification.critic_call.model,
-            disposition="quarantined",
-            repair_count=1 if len(result.calls) == 4 else 0,
-            started_at=now,
-            completed_at=now,
-        )
-        return result.model_copy(
-            update={
-                "quarantine": quarantine.model_copy(
-                    update={
-                        "compilation_manifest": manifest,
-                        "semantic_schema_version": SEMANTIC_SCHEMA_VERSION,
-                    }
-                )
-            }
+        return SemanticCompilationResult(
+            disposition="failed",
+            failure_code="internal_failure",
+            failure_message=CANONICAL_COMPILATION_FAILURE_MESSAGES["internal_failure"],
         )
 
 

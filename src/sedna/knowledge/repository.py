@@ -731,9 +731,19 @@ class CanonicalKnowledgeRepository:
                     for directory in self._SEMANTIC_DIRECTORIES:
                         self._delete_record(directory, manifest.source_id)
                     self._fsync_directories(self._SEMANTIC_DIRECTORIES)
-                except BaseException:
-                    self._restore_semantic_snapshots(manifest.source_id, semantic_snapshots)
-                    self._delete_semantic_transition_journal(manifest.source_id)
+                except BaseException as original_error:
+                    rollback_errors = self._restore_semantic_snapshots(
+                        manifest.source_id,
+                        semantic_snapshots,
+                    )
+                    if rollback_errors:
+                        for rollback_error in rollback_errors:
+                            original_error.add_note(
+                                "semantic invalidation rollback remains recoverable: "
+                                f"{type(rollback_error).__name__}: {rollback_error}"
+                            )
+                    else:
+                        self._delete_semantic_transition_journal(manifest.source_id)
                     raise
             old_manifest = self._read_optional_bytes("manifests", manifest.source_id)
             old_quarantine = self._read_optional_bytes("quarantine", manifest.source_id)
