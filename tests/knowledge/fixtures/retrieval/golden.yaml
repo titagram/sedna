@@ -1,0 +1,421 @@
+suite_version: retrieval-golden-v1
+k: 8
+baselines:
+  minimum_recall_at_k: 0.90
+  minimum_precision_at_k: 0.70
+  maximum_incompatibility_violations: 0
+  require_reproducibility: true
+  maximum_scenario_latency_seconds: 5.0
+  maximum_total_latency_seconds: 30.0
+  maximum_index_size_bytes: 5242880
+  minimum_material_vector_recall_gain: 0.05
+  minimum_vector_precision_at_k: 0.70
+  maximum_vector_incompatibility_violations: 0
+
+templates:
+  extraction: &extraction
+    schema_version: 2.0.0
+    parser_id: markdown
+    parser_version: "1"
+    extractor_id: semantic
+    extractor_version: "3"
+  core_source: &core_source
+    source_id: golden-core
+    path: raw_src/golden-core.md
+    location: {start_line: 10, end_line: 12, section: Golden retrieval case}
+  core_context_source: &core_context_source
+    source_id: golden-core
+    path: raw_src/golden-core.md
+    location: {start_line: 14, end_line: 16, section: Applicability}
+  core_assessment: &core_assessment
+    source_reliability: 0.95
+    extraction_confidence: 0.95
+    generalizability: high
+    context_specificity: 0.25
+    verification_status: verified
+    support_count: 1
+    contradiction_count: 0
+    observed_outcome: informational
+    freshness_observed_at: "2026-08-01"
+    independence_group: "1111111111111111111111111111111111111111111111111111111111111111"
+  success_assessment: &success_assessment
+    <<: *core_assessment
+    observed_outcome: success
+  failure_assessment: &failure_assessment
+    <<: *core_assessment
+    observed_outcome: failure
+  private_context: &private_context
+    typed_context:
+      network_position:
+        value: private lan
+        relation: compatible
+        origin: explicit
+        confidence: 0.95
+        source_refs: [*core_context_source]
+    facets:
+      - namespace: network
+        key: exposure
+        assertion:
+          value: private
+          relation: required
+          origin: explicit
+          confidence: 0.95
+          source_refs: [*core_context_source]
+  linux_context: &linux_context
+    typed_context:
+      os_family:
+        value: linux
+        relation: required
+        origin: explicit
+        confidence: 0.95
+        source_refs: [*core_context_source]
+      network_position:
+        value: private lan
+        relation: compatible
+        origin: explicit
+        confidence: 0.95
+        source_refs: [*core_context_source]
+    facets:
+      - namespace: network
+        key: exposure
+        assertion:
+          value: private
+          relation: required
+          origin: explicit
+          confidence: 0.95
+          source_refs: [*core_context_source]
+  windows_context: &windows_context
+    typed_context:
+      os_family:
+        value: windows
+        relation: required
+        origin: explicit
+        confidence: 0.95
+        source_refs: [*core_context_source]
+    facets: []
+  core_base: &core_base
+    origin: explicit
+    assessment: *core_assessment
+    source_refs: [*core_source]
+    extraction: *extraction
+
+bundles:
+  - schema_version: 2.0.0
+    source_id: golden-core
+    source_sha256: "1111111111111111111111111111111111111111111111111111111111111111"
+    compilation_manifest:
+      source_id: golden-core
+      source_sha256: "1111111111111111111111111111111111111111111111111111111111111111"
+      foundation_schema_version: "1"
+      foundation_parser_id: markdown
+      foundation_parser_version: "1"
+      compiler_version: "3"
+      extractor_prompt_version: "1"
+      critic_prompt_version: "1"
+      repair_prompt_version: "1"
+      extractor_model_id: golden-model
+      critic_model_id: golden-model
+      disposition: verified
+      repair_count: 0
+      emitted_artifact_ids:
+        - case-http-failed
+        - case-http-failed-step
+        - case-http-success
+        - case-http-success-step
+        - ref-independent-enumeration
+        - ref-private-enumeration
+        - ref-windows-management
+        - rule-private-enumeration
+      started_at: 2026-08-08T00:00:00Z
+      completed_at: 2026-08-08T00:01:00Z
+    references:
+      - <<: *core_base
+        artifact_type: methodology
+        knowledge_role: reference
+        artifact_id: ref-independent-enumeration
+        subject: Independent baseline enumeration evidence
+        statement: Baseline enumeration and service discovery should maximize information gain.
+        applicable_situations: [A newly observed network target needs information gathering]
+        prerequisites: [Authorized access to the target]
+        action_intent: Compare independent observations before selecting a deeper hypothesis.
+        expected_information_gain: Identify independently supported exposed service hypotheses.
+        expected_evidence: [Service identities and response behavior]
+        evidence_interpretation: Independent observations reduce dependence on copied experience.
+        applicability: {typed_context: {}, facets: []}
+      - <<: *core_base
+        artifact_type: methodology
+        knowledge_role: reference
+        artifact_id: ref-private-enumeration
+        subject: Private network information gathering
+        statement: A private LAN address may be a gateway or host; enumerate exposed services before committing to a path.
+        applicable_situations: [An authorized private IPv4 target has unknown services]
+        prerequisites: [Valid authorized private network target]
+        action_intent: Gather broad service and HTTP behavior evidence before choosing a focused path.
+        expected_information_gain: Distinguish gateway, web service, and other exposed service roles.
+        expected_evidence: [Open service identities, HTTP response behavior, neighboring host context]
+        evidence_interpretation: Treat each observation as evidence, not proof of a universal strategy.
+        success_implications: [Prioritize hypotheses supported by observed services]
+        failure_implications: [Lower paths that produced no differentiating evidence]
+        applicability: *private_context
+      - <<: *core_base
+        artifact_type: methodology
+        knowledge_role: reference
+        artifact_id: ref-windows-management
+        subject: Windows management information gathering
+        statement: Windows management exposure can guide information gathering when the operating system is confirmed.
+        applicable_situations: [A Windows target exposes management services]
+        prerequisites: [Confirmed Windows operating system]
+        action_intent: Correlate Windows management service identity with other observations.
+        expected_information_gain: Confirm whether a Windows-specific investigation path is applicable.
+        expected_evidence: [Windows management service behavior]
+        evidence_interpretation: Unknown operating system makes this conditional; confirmed Linux excludes it.
+        applicability: *windows_context
+    cases:
+      - <<: *core_base
+        artifact_type: case
+        knowledge_role: negative_case
+        case_id: case-http-failed
+        title: Repeated HTTP guess produced no new evidence
+        starting_access: Authorized private network access
+        outcome: The repeated guess was deprioritized after it failed to change the state.
+        source_quality: complete
+        transferable_properties: [Record negative evidence and lower a path that adds no information]
+        non_transferable_properties: [The source host identity and its exact local response]
+        applicability: *linux_context
+        assessment: *failure_assessment
+        steps:
+          - <<: *core_base
+            artifact_type: case_step
+            knowledge_role: negative_case
+            step_id: case-http-failed-step
+            ordinal: 1
+            state_before: {access: Authorized network access, environment: [Private LAN], privileges: []}
+            observations: [A Linux host exposed HTTP but a repeated default-page guess added no evidence]
+            hypotheses:
+              - {statement: Repeating the same HTTP guess is unlikely to change the current state, origin: explicit}
+            selected_action:
+              intent: Preserve the failed HTTP hypothesis as negative evidence and compare another service.
+            expected_information_gain: Avoid looping on a path that produced no differentiating evidence.
+            evidence:
+              - {summary: The repeated request reproduced the same non-differentiating response, origin: explicit, category: negative HTTP evidence}
+            state_after: {access: Authorized network access, environment: [Private LAN, HTTP observed], privileges: []}
+            negative_evidence: [No new route, identity, or state transition was observed]
+            transfer_conditions: [Apply only when the current request reproduces the same evidence]
+            case_specific_details: [Historical example value only; not a credential or current-target fact]
+            requires_validation: true
+            applicability: *linux_context
+            assessment: *failure_assessment
+      - <<: *core_base
+        artifact_type: case
+        knowledge_role: case_study
+        case_id: case-http-success
+        title: HTTP behavior differentiated the service role
+        starting_access: Authorized private network access
+        outcome: Comparing HTTP behavior produced a more specific service hypothesis.
+        source_quality: complete
+        transferable_properties: [Use response differences to update the service hypothesis]
+        non_transferable_properties: [The exact route and host from the historical case]
+        applicability: *linux_context
+        assessment: *success_assessment
+        steps:
+          - <<: *core_base
+            artifact_type: case_step
+            knowledge_role: case_study
+            step_id: case-http-success-step
+            ordinal: 1
+            state_before: {access: Authorized network access, environment: [Private LAN], privileges: []}
+            observations: [A Linux private host exposed an HTTP service with distinguishable response behavior]
+            hypotheses:
+              - {statement: Comparing HTTP behavior can distinguish the service role, origin: explicit}
+            selected_action:
+              intent: Compare HTTP response behavior before selecting a deeper service hypothesis.
+            expected_information_gain: Identify a more specific service role without assuming the historical case repeats.
+            evidence:
+              - {summary: Response differences identified a distinct service behavior, origin: explicit, category: HTTP information gain}
+            state_after: {access: Authorized network access, environment: [Private LAN, HTTP characterized], privileges: []}
+            transfer_conditions: [Require comparable HTTP observations on the current target]
+            case_specific_details: [Historical route example only; validate every current-target detail]
+            requires_validation: true
+            applicability: *linux_context
+            assessment: *success_assessment
+    guidance:
+      - <<: *core_base
+        artifact_type: decision_rule
+        knowledge_role: reference
+        rule_id: rule-private-enumeration
+        trigger_observations: [A valid authorized private target has incomplete service context]
+        rationale: Broad evidence reduces premature commitment to one historical path.
+        action_intent: Prefer the next observation with high information gain and record its effect.
+        prerequisites: [Current authorization, Valid target syntax]
+        expected_evidence: [Service identity, response behavior, or an explicit negative result]
+        success_transitions: [Reweight supported hypotheses]
+        failure_transitions: [Lower the attempted path without declaring a universal dead end]
+        stop_conditions: [Target becomes unauthorized or invalid]
+        exceptions: [Do not infer a platform-specific action while the platform is unknown]
+        alternative_hypotheses: [Gateway role, Web service role, Non-HTTP service role]
+        applicability: *private_context
+
+  - schema_version: 2.0.0
+    source_id: golden-copy-a
+    source_sha256: "2222222222222222222222222222222222222222222222222222222222222222"
+    compilation_manifest:
+      source_id: golden-copy-a
+      source_sha256: "2222222222222222222222222222222222222222222222222222222222222222"
+      foundation_schema_version: "1"
+      foundation_parser_id: markdown
+      foundation_parser_version: "1"
+      compiler_version: "3"
+      extractor_prompt_version: "1"
+      critic_prompt_version: "1"
+      repair_prompt_version: "1"
+      extractor_model_id: golden-model
+      critic_model_id: golden-model
+      disposition: verified
+      repair_count: 0
+      emitted_artifact_ids: [ref-copied-enumeration-a]
+      started_at: 2026-08-08T00:00:00Z
+      completed_at: 2026-08-08T00:01:00Z
+    references:
+      - artifact_type: methodology
+        knowledge_role: reference
+        artifact_id: ref-copied-enumeration-a
+        subject: Copied baseline enumeration evidence
+        statement: Baseline enumeration and service discovery should maximize information gain.
+        applicable_situations: [A newly observed network target needs information gathering]
+        action_intent: Compare observations before selecting a deeper hypothesis.
+        expected_information_gain: Identify exposed service hypotheses.
+        expected_evidence: [Service identities and response behavior]
+        evidence_interpretation: This evidence shares a byte-identical source group with another import.
+        origin: explicit
+        applicability: {typed_context: {}, facets: []}
+        assessment:
+          <<: *core_assessment
+          independence_group: "2222222222222222222222222222222222222222222222222222222222222222"
+        source_refs:
+          - source_id: golden-copy-a
+            path: raw_src/copied-a.md
+            location: {start_line: 1, end_line: 4, section: Copied enumeration}
+        extraction: *extraction
+    cases: []
+    guidance: []
+
+  - schema_version: 2.0.0
+    source_id: golden-copy-b
+    source_sha256: "2222222222222222222222222222222222222222222222222222222222222222"
+    compilation_manifest:
+      source_id: golden-copy-b
+      source_sha256: "2222222222222222222222222222222222222222222222222222222222222222"
+      foundation_schema_version: "1"
+      foundation_parser_id: markdown
+      foundation_parser_version: "1"
+      compiler_version: "3"
+      extractor_prompt_version: "1"
+      critic_prompt_version: "1"
+      repair_prompt_version: "1"
+      extractor_model_id: golden-model
+      critic_model_id: golden-model
+      disposition: verified
+      repair_count: 0
+      emitted_artifact_ids: [ref-copied-enumeration-b]
+      started_at: 2026-08-08T00:00:00Z
+      completed_at: 2026-08-08T00:01:00Z
+    references:
+      - artifact_type: methodology
+        knowledge_role: reference
+        artifact_id: ref-copied-enumeration-b
+        subject: Copied baseline enumeration evidence
+        statement: Baseline enumeration and service discovery should maximize information gain.
+        applicable_situations: [A newly observed network target needs information gathering]
+        action_intent: Compare observations before selecting a deeper hypothesis.
+        expected_information_gain: Identify exposed service hypotheses.
+        expected_evidence: [Service identities and response behavior]
+        evidence_interpretation: This evidence shares a byte-identical source group with another import.
+        origin: explicit
+        applicability: {typed_context: {}, facets: []}
+        assessment:
+          <<: *core_assessment
+          independence_group: "2222222222222222222222222222222222222222222222222222222222222222"
+        source_refs:
+          - source_id: golden-copy-b
+            path: raw_src/copied-b.md
+            location: {start_line: 1, end_line: 4, section: Copied enumeration}
+        extraction: *extraction
+    cases: []
+    guidance: []
+
+scenarios:
+  - scenario_id: private-ip-information-gathering
+    target: 192.168.0.1
+    terms: [private, lan, information gathering, http, service]
+    facts:
+      - {namespace: network, key: exposure, value: private, confidence: 1.0}
+      - {namespace: typed, key: os_family, value: linux, confidence: 1.0}
+    expected_lanes:
+      reference: [ref-private-enumeration]
+      case_step: [case-http-success-step]
+      negative_evidence: [case-http-failed-step]
+      guidance: [rule-private-enumeration]
+    relevant_artifact_ids:
+      - ref-private-enumeration
+      - ref-independent-enumeration
+      - ref-copied-enumeration-a
+      - ref-copied-enumeration-b
+      - case-http-success-step
+      - case-http-failed-step
+      - rule-private-enumeration
+    incompatible_artifact_ids: [ref-windows-management]
+  - scenario_id: unknown-os-conditional-windows
+    target: 10.123.123.123
+    terms: [windows, management, information gathering]
+    facts: []
+    expected_lanes:
+      reference: [ref-windows-management]
+    expected_missing_context_contains: [typed.os_family]
+    relevant_artifact_ids:
+      - ref-windows-management
+      - ref-independent-enumeration
+      - ref-copied-enumeration-a
+      - ref-copied-enumeration-b
+    incompatible_artifact_ids: []
+  - scenario_id: confirmed-linux-excludes-windows
+    target: 10.123.123.123
+    terms: [windows, management, information gathering]
+    facts:
+      - {namespace: typed, key: os_family, value: linux, confidence: 1.0}
+    expected_absent_artifact_ids: [ref-windows-management]
+    expected_rejected_artifact_ids: [ref-windows-management]
+    expected_lanes:
+      reference: [ref-independent-enumeration]
+    relevant_artifact_ids:
+      - ref-independent-enumeration
+      - ref-copied-enumeration-a
+      - ref-copied-enumeration-b
+    incompatible_artifact_ids: [ref-windows-management]
+  - scenario_id: copied-source-diversity
+    target: 10.10.10.10
+    terms: [baseline, enumeration, service discovery, information gain]
+    facts: []
+    lane_limit: 2
+    expected_lanes:
+      reference: [ref-independent-enumeration]
+    expected_copy_group_maximum: 1
+    relevant_artifact_ids:
+      - ref-independent-enumeration
+      - ref-copied-enumeration-a
+      - ref-copied-enumeration-b
+      - case-http-success-step
+      - rule-private-enumeration
+    incompatible_artifact_ids: []
+  - scenario_id: invalid-ip-prebackend
+    target: 300.456.456.123
+    terms: [information gathering]
+    facts: []
+    expected_gap: invalid_target
+    expected_backend_calls: 0
+  - scenario_id: android-adb-no-knowledge
+    target: android-lab-device
+    terms: [android, adb, connected device]
+    facts: []
+    expected_gap: no_applicable_knowledge
+    expected_research_eligible: true
+    expected_document_offer: true

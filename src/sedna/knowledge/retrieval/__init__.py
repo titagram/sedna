@@ -1,5 +1,9 @@
 """Public backend-neutral contracts for Sedna's local knowledge retrieval."""
 
+from sedna.knowledge.retrieval.evaluation import (
+    RetrievalEvaluationReport,
+    RetrievalScenarioEvaluation,
+)
 from sedna.knowledge.retrieval.models import (
     AuthorizationScope,
     AuthorizationState,
@@ -53,11 +57,13 @@ __all__ = [
     "MaintenanceIssueCode",
     "RejectedCandidate",
     "RetrievalHit",
+    "RetrievalEvaluationReport",
     "RetrievalIndex",
     "RetrievalMaintenanceReport",
     "RetrievalMaintenanceService",
     "RetrievalQuery",
     "RetrievalResult",
+    "RetrievalScenarioEvaluation",
     "RetrievableArtifact",
     "SearchCandidate",
     "ScoreComponents",

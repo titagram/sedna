@@ -2,7 +2,11 @@
 
 from sedna.knowledge.ingest import ingest_markdown
 from sedna.knowledge.pipeline import CandidateIngestionError, IngestionPipeline
-from sedna.knowledge.retrieval import KnowledgeRetrievalService, RetrievalMaintenanceService
+from sedna.knowledge.retrieval import (
+    KnowledgeRetrievalService,
+    RetrievalEvaluationReport,
+    RetrievalMaintenanceService,
+)
 from sedna.knowledge.schema import (
     ArtifactType,
     ApplicabilityContext,
@@ -70,6 +74,7 @@ __all__ = [
     "KnowledgeCase",
     "KnowledgeRole",
     "KnowledgeRetrievalService",
+    "RetrievalEvaluationReport",
     "RetrievalMaintenanceService",
     "Origin",
     "ObservedOutcome",
