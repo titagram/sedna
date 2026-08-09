@@ -52,8 +52,8 @@ from sedna.knowledge.semantic.prompts import (
     REPAIR_PROMPT_VERSION,
 )
 
-SEMANTIC_SCHEMA_VERSION = "2.1.0"
-SEMANTIC_COMPILER_VERSION = "4"
+SEMANTIC_SCHEMA_VERSION = "2.2.0"
+SEMANTIC_COMPILER_VERSION = "5"
 
 
 class SemanticCompiler:
@@ -184,11 +184,22 @@ class SemanticCompiler:
                 VerificationStatus.VERIFIED,
             )
         except (TypeError, ValueError):
-            return self._canonical_material_quarantine(prepared, critic, started_at, calls)
+            return self._canonical_material_quarantine(
+                prepared,
+                critic,
+                repair_count,
+                started_at,
+                calls,
+            )
         except Exception:
             return self._failed("materialization_failure", calls)
         try:
-            verification = self._verification(prepared, critic, "verified")
+            verification = self._verification(
+                prepared,
+                critic,
+                "verified",
+                repair_count,
+            )
             bundle = self._bundle(
                 prepared,
                 extraction,
@@ -221,7 +232,12 @@ class SemanticCompiler:
             completed_at = self._now()
             return SemanticCompilationResult(
                 disposition="quarantined",
-                verification=self._verification(prepared, critic, "quarantined"),
+                verification=self._verification(
+                    prepared,
+                    critic,
+                    "quarantined",
+                    repair_count,
+                ),
                 quarantine=SemanticQuarantineRecord(
                     source_id=prepared.manifest.source_id,
                     source_sha256=prepared.manifest.sha256,
@@ -257,6 +273,7 @@ class SemanticCompiler:
         self,
         prepared: PreparedSource,
         critic: StructuredResult[CriticVerdict],
+        repair_count: int,
         started_at: datetime,
         calls: tuple[SemanticCallMetadata, ...],
     ) -> SemanticCompilationResult:
@@ -274,6 +291,7 @@ class SemanticCompiler:
                     source_id=prepared.manifest.source_id,
                     source_sha256=prepared.manifest.sha256,
                     critic_call=self._call_metadata(critic, "sedna.semantic.critic"),
+                    repair_count=repair_count,
                     findings=(*critic.parsed.findings, finding),
                     adjudication="quarantined",
                     recorded_at=completed_at,
@@ -298,7 +316,7 @@ class SemanticCompiler:
                         extractor_model_id=extractor.model,
                         critic_model_id=critic.model,
                         disposition="quarantined",
-                        repair_count=0,
+                        repair_count=repair_count,
                         started_at=started_at,
                         completed_at=completed_at,
                     ),
@@ -313,11 +331,13 @@ class SemanticCompiler:
         prepared: PreparedSource,
         critic: StructuredResult[CriticVerdict],
         adjudication: str,
+        repair_count: int,
     ) -> SemanticVerificationRecord:
         return SemanticVerificationRecord(
             source_id=prepared.manifest.source_id,
             source_sha256=prepared.manifest.sha256,
             critic_call=self._call_metadata(critic, "sedna.semantic.critic"),
+            repair_count=repair_count,
             findings=critic.parsed.findings,
             adjudication=adjudication,  # type: ignore[arg-type]
             recorded_at=self._now(),

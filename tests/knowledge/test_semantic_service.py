@@ -605,6 +605,41 @@ def test_tampered_quarantine_compilation_attribution_is_not_current(
         assert service.is_current(prepared) is False
 
 
+def test_repaired_unsafe_material_quarantine_rejects_repair_count_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = _load_responses(SOURCE_CASES["repair"].fixture_name)
+    with _prepared_case(tmp_path, "repair") as (pipeline, prepared, _, _):
+        service, host = _service(pipeline.repository, responses)
+
+        def reject_unsafe(*args: object, **kwargs: object) -> tuple[object, ...]:
+            raise ValueError("unsafe canonical material")
+
+        monkeypatch.setattr(compiler_module, "materialize_bundle", reject_unsafe)
+        quarantined = service.compile_and_store(prepared)
+        unchanged = service.compile_and_store(prepared)
+
+        assert quarantined.disposition == "quarantined"
+        assert quarantined.verification is not None
+        assert quarantined.verification.repair_count == 1
+        assert quarantined.quarantine is not None
+        assert quarantined.quarantine.compilation_manifest is not None
+        assert quarantined.quarantine.compilation_manifest.repair_count == 1
+        assert unchanged.disposition == "unchanged"
+        assert unchanged.quarantine == quarantined.quarantine
+        assert len(host.calls) == 4
+
+        path = (
+            pipeline.repository.root / "semantic_quarantine" / f"{prepared.manifest.source_id}.json"
+        )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["compilation_manifest"]["repair_count"] = 0
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert service.is_current(prepared) is False
+
+
 def test_exclusion_waits_for_blocked_compile_then_invalidates_its_bundle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

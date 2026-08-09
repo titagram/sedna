@@ -121,6 +121,7 @@ class SemanticVerificationRecord(BaseModel):
     source_id: NonEmptyString
     source_sha256: Sha256
     critic_call: SemanticCallMetadata
+    repair_count: int = Field(default=0, ge=0, le=1)
     findings: tuple[VerificationFinding, ...] = ()
     adjudication: CompilationDisposition
     recorded_at: datetime

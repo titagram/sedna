@@ -923,6 +923,11 @@ class CanonicalKnowledgeRepository:
                     f"invalid semantic state for source_id {source_id!r}: "
                     "critic model identity mismatch"
                 )
+            if verification.repair_count != bundle.compilation_manifest.repair_count:
+                raise ValueError(
+                    f"invalid semantic state for source_id {source_id!r}: "
+                    "repair count attribution mismatch"
+                )
         elif quarantine is not None:
             if verification is None or verification.adjudication != "quarantined":
                 raise ValueError(
@@ -934,6 +939,7 @@ class CanonicalKnowledgeRepository:
                 manifest.source_id != source_id
                 or manifest.source_sha256 != quarantine.source_sha256
                 or manifest.critic_model_id != verification.critic_call.model
+                or manifest.repair_count != verification.repair_count
                 or manifest.disposition != "quarantined"
             ):
                 raise ValueError(

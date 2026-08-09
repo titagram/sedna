@@ -37,7 +37,11 @@ def draft_reference(local_id: str = "reference-http") -> DraftReference:
     )
 
 
-def verification(adjudication: str = "verified") -> SemanticVerificationRecord:
+def verification(
+    adjudication: str = "verified",
+    *,
+    repair_count: int = 0,
+) -> SemanticVerificationRecord:
     return SemanticVerificationRecord(
         source_id="htb-lame",
         source_sha256="a" * 64,
@@ -49,6 +53,7 @@ def verification(adjudication: str = "verified") -> SemanticVerificationRecord:
             input_tokens=100,
             output_tokens=50,
         ),
+        repair_count=repair_count,
         adjudication=adjudication,
         recorded_at=datetime(2026, 8, 7, tzinfo=UTC),
     )
@@ -393,4 +398,64 @@ def test_verified_result_rejects_manifest_models_that_do_not_bind_to_call_metada
             bundle=bundle_value,
             verification=record,
             calls=semantic_calls(record.critic_call),
+        )
+
+
+@pytest.mark.parametrize(
+    ("verification_repair_count", "manifest_repair_count", "calls"),
+    [
+        (1, 1, "two"),
+        (0, 0, "four"),
+        (1, 0, "four"),
+    ],
+)
+def test_quarantined_result_rejects_repair_count_disagreement(
+    verification_repair_count: int,
+    manifest_repair_count: int,
+    calls: str,
+):
+    record = verification(
+        "quarantined",
+        repair_count=verification_repair_count,
+    )
+    manifest = bundle().compilation_manifest.model_copy(
+        update={
+            "disposition": "quarantined",
+            "repair_count": manifest_repair_count,
+        }
+    )
+    quarantine_value = quarantine().model_copy(
+        update={
+            "compilation_manifest": manifest,
+        }
+    )
+    call_metadata = semantic_calls(record.critic_call)
+    if calls == "four":
+        call_metadata = (
+            call_metadata[0],
+            SemanticCallMetadata(
+                purpose="sedna.semantic.critic",
+                provider="host",
+                model="initial-critic",
+                agent_id="agent-7",
+                input_tokens=100,
+                output_tokens=50,
+            ),
+            SemanticCallMetadata(
+                purpose="sedna.semantic.repair",
+                provider="host",
+                model="repair-model",
+                agent_id="agent-7",
+                input_tokens=100,
+                output_tokens=50,
+            ),
+            record.critic_call,
+        )
+
+    with pytest.raises(ValidationError, match="repair_count"):
+        SemanticCompilationResult(
+            disposition="quarantined",
+            verification=record,
+            quarantine=quarantine_value,
+            calls=call_metadata,
         )

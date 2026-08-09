@@ -430,6 +430,8 @@ def test_unsafe_canonical_material_is_quarantined(monkeypatch: pytest.MonkeyPatc
     assert result.quarantine is not None
     assert result.quarantine.reason_codes == ("unsafe_material",)
     assert result.quarantine.compilation_manifest is not None
+    assert result.verification is not None
+    assert result.verification.repair_count == 0
     assert result.quarantine.compilation_manifest.started_at == datetime(
         2026, 8, 7, 12, 0, tzinfo=UTC
     )
@@ -437,6 +439,40 @@ def test_unsafe_canonical_material_is_quarantined(monkeypatch: pytest.MonkeyPatc
         2026, 8, 7, 12, 0, tzinfo=UTC
     )
     assert _purposes(host) == ["sedna.semantic.extract", "sedna.semantic.critic"]
+
+
+def test_unsafe_canonical_material_after_repair_records_the_four_call_path(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import sedna.knowledge.semantic.compiler as compiler_module
+
+    compiler, host = _compiler(
+        [
+            _HostResult(_draft().model_dump(mode="json")),
+            _HostResult({"accepted": False, "findings": [_finding()]}),
+            _HostResult(_draft(architecture=True).model_dump(mode="json")),
+            _HostResult({"accepted": True}),
+        ]
+    )
+
+    def reject_unsafe(*args: object, **kwargs: object) -> tuple[object, ...]:
+        raise ValueError("unsafe canonical material")
+
+    monkeypatch.setattr(compiler_module, "materialize_bundle", reject_unsafe)
+    result = compiler.compile(_prepared_source())
+
+    assert result.disposition == "quarantined"
+    assert result.quarantine is not None
+    assert result.quarantine.compilation_manifest is not None
+    assert result.quarantine.compilation_manifest.repair_count == 1
+    assert result.verification is not None
+    assert result.verification.repair_count == 1
+    assert _purposes(host) == [
+        "sedna.semantic.extract",
+        "sedna.semantic.critic",
+        "sedna.semantic.repair",
+        "sedna.semantic.critic",
+    ]
 
 
 @pytest.mark.parametrize(

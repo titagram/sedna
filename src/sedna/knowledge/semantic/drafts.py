@@ -392,6 +392,7 @@ class SemanticCompilationResult(BaseModel):
             if self.quarantine is not None and self.bundle is None:
                 if self.verification.adjudication != "quarantined":
                     raise ValueError("unchanged quarantine results must retain a quarantined audit")
+                self._validate_quarantine()
                 return self
             raise ValueError(
                 "unchanged results require a bundle and verification or a quarantine "
@@ -408,6 +409,7 @@ class SemanticCompilationResult(BaseModel):
                     "quarantined result verification adjudication must agree with disposition"
                 )
             self._validate_final_critic_call(purposes)
+            self._validate_quarantine()
             return self
 
         if (
@@ -440,13 +442,41 @@ class SemanticCompilationResult(BaseModel):
         if self.disposition == "unchanged":
             if manifest.disposition != "verified":
                 raise ValueError("unchanged results must retain a verified compilation manifest")
+            if manifest.repair_count != self.verification.repair_count:
+                raise ValueError("manifest repair_count must match verification repair_count")
             return
         if manifest.disposition != "verified":
             raise ValueError("verified result manifest disposition must be verified")
         expected_repair_count = 0 if len(self.calls) == 2 else 1
-        if manifest.repair_count != expected_repair_count:
+        if (
+            manifest.repair_count != expected_repair_count
+            or self.verification.repair_count != expected_repair_count
+        ):
             raise ValueError("manifest repair_count must match the semantic call path")
         if (
+            manifest.extractor_model_id != self.calls[0].model
+            or manifest.critic_model_id != self.calls[-1].model
+        ):
+            raise ValueError("manifest model IDs must match extractor and final critic calls")
+
+    def _validate_quarantine(self) -> None:
+        if self.quarantine is None or self.verification is None:
+            raise ValueError("quarantined results require quarantine and verification")
+        if (
+            self.quarantine.source_id != self.verification.source_id
+            or self.quarantine.source_sha256 != self.verification.source_sha256
+        ):
+            raise ValueError("quarantine and verification source identity must match")
+        manifest = self.quarantine.compilation_manifest
+        if self.disposition == "quarantined":
+            expected_repair_count = 0 if len(self.calls) == 2 else 1
+            if self.verification.repair_count != expected_repair_count:
+                raise ValueError("verification repair_count must match the semantic call path")
+        if manifest is None:
+            return
+        if manifest.repair_count != self.verification.repair_count:
+            raise ValueError("manifest repair_count must match verification repair_count")
+        if self.disposition == "quarantined" and (
             manifest.extractor_model_id != self.calls[0].model
             or manifest.critic_model_id != self.calls[-1].model
         ):
