@@ -365,6 +365,45 @@ def test_delete_source_removes_only_its_complete_projection(tmp_path: Path) -> N
         assert audit.rebuild_required is False
 
 
+def test_mark_unavailable_irreversibly_rejects_all_live_index_operations(
+    tmp_path: Path,
+) -> None:
+    """A logical fail-closed latch must gate reads and mutations without relying on close."""
+    index = SQLiteRetrievalIndex(tmp_path / "sedna.sqlite")
+    bundle = _bundle()
+    index.upsert_bundle(bundle)
+    assert index.get_artifact("reference-http") == bundle.references[0]
+
+    index.mark_unavailable()
+    index.mark_unavailable()
+
+    operations: tuple[Callable[[], object], ...] = (
+        lambda: index.upsert_bundle(bundle),
+        lambda: index.delete_source(bundle.source_id),
+        lambda: index.rebuild((bundle,)),
+        lambda: index.get_artifact("reference-http"),
+        lambda: index.list_source_states(after_source_id=None, limit=1),
+        index.snapshot_state,
+        lambda: index.search_candidates(
+            _query("http"),
+            lane=EpistemicLane.REFERENCE,
+            limit=10,
+        ),
+        lambda: index.search_candidates(
+            _query(),
+            lane=EpistemicLane.REFERENCE,
+            limit=10,
+        ),
+        index.audit,
+    )
+    for operation in operations:
+        with pytest.raises(RuntimeError, match="^retrieval index is unavailable$"):
+            operation()
+
+    index.close()
+    index.close()
+
+
 def test_get_artifact_revalidates_canonical_json_and_identity(tmp_path: Path) -> None:
     path = tmp_path / "sedna.sqlite"
     index = SQLiteRetrievalIndex(path)

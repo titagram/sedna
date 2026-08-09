@@ -898,6 +898,9 @@ def test_index_state_snapshot_is_generation_bound_sorted_and_cumulatively_bounde
 
 
 class _IndexDouble:
+    def mark_unavailable(self) -> None:
+        return None
+
     def upsert_bundle(self, bundle: object) -> None:
         return None
 

@@ -199,6 +199,7 @@ class RetrievalMaintenanceService:
                 raise ValueError("source projection remained after invalidation")
             return True
         except Exception:
+            self.index.mark_unavailable()
             with suppress(Exception):
                 self.index.close()
             return False

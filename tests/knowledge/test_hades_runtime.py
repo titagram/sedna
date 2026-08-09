@@ -12,6 +12,14 @@ import sedna.knowledge.semantic.compiler as compiler_module
 import sedna.knowledge.semantic.service as semantic_service_module
 from sedna.knowledge.hades_runtime import HadesKnowledgeRuntime
 from sedna.knowledge.repository import CanonicalKnowledgeRepository
+from sedna.knowledge.retrieval import (
+    AuthorizationScope,
+    AuthorizationState,
+    CurrentSituation,
+    KnowledgeGapCode,
+    RetrievalQuery,
+    ValidatedTarget,
+)
 from sedna.knowledge.retrieval.sqlite import SQLiteRetrievalIndex
 from tests.knowledge.test_semantic_service import (
     SOURCE_CASES,
@@ -236,34 +244,95 @@ def test_runtime_failed_relearn_rolls_forward_after_invalidation_journal_cleanup
         recovered.close()
 
 
-def test_runtime_poisoned_index_cannot_serve_stale_artifact_after_projection_invalidation_fault(
+def test_runtime_poisoned_index_masks_combined_invalidation_delete_and_close_failures(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failed source-projection deletion must make retrieval unavailable rather than stale."""
+    """Logical poisoning must not rely on successful deletion or physical index cleanup."""
+    knowledge_root = tmp_path / "knowledge"
     source_root = _source_root(tmp_path)
     host = _ScriptedHost([*_responses(), OSError("changed-source transport failure")])
-    runtime = HadesKnowledgeRuntime.create(host, tmp_path / "knowledge")
+    runtime = HadesKnowledgeRuntime.create(host, knowledge_root)
     try:
         first = runtime.learning.learn(source_root)
         source_id = first.outcomes[0].source_id
         artifact_id = runtime._repository.load_semantic_bundle(source_id).references[0].artifact_id
+        target = ValidatedTarget.parse("10.10.10.10")
+        query = RetrievalQuery(
+            situation=CurrentSituation(
+                target=target,
+                authorization=AuthorizationScope(
+                    state=AuthorizationState.AUTHORIZED,
+                    exact_targets=(target,),
+                ),
+            ),
+            terms=("evidence",),
+        )
+        assert runtime.retrieval.get_artifact(artifact_id) is not None
+        assert any(
+            hit.artifact_id == artifact_id for hit in runtime.retrieval.retrieve(query).references
+        )
         source_path = source_root / SOURCE_CASES["reference"].relative_path
         source_path.write_text(source_path.read_text(encoding="utf-8") + "\nChanged evidence.\n")
+        real_delete_journal = runtime._repository._delete_semantic_invalidation_journal
+        real_delete_source = runtime._index.delete_source
+        real_close = runtime._index.close
+        journal_delete_calls = 0
+        source_delete_calls = 0
+        close_calls = 0
 
-        def fail_delete_source(_: str) -> None:
-            raise OSError("injected projection deletion failure")
+        def fail_journal_delete_once(failed_source_id: str) -> None:
+            nonlocal journal_delete_calls
+            journal_delete_calls += 1
+            if journal_delete_calls == 1:
+                raise OSError("private invalidation journal unlink failure")
+            real_delete_journal(failed_source_id)
 
-        monkeypatch.setattr(runtime._index, "delete_source", fail_delete_source)
+        def fail_source_delete_once(failed_source_id: str) -> None:
+            nonlocal source_delete_calls
+            source_delete_calls += 1
+            if source_delete_calls == 1:
+                raise OSError("private projection deletion failure")
+            real_delete_source(failed_source_id)
+
+        def fail_physical_close_once() -> None:
+            nonlocal close_calls
+            close_calls += 1
+            if close_calls == 1:
+                raise OSError("private physical close failure")
+            real_close()
+
+        monkeypatch.setattr(
+            runtime._repository,
+            "_delete_semantic_invalidation_journal",
+            fail_journal_delete_once,
+        )
+        monkeypatch.setattr(runtime._index, "delete_source", fail_source_delete_once)
+        monkeypatch.setattr(runtime._index, "close", fail_physical_close_once)
 
         failed = runtime.learning.learn(source_root)
+        journal = knowledge_root / "transactions" / f"{source_id}.semantic-invalidation.json"
+        unavailable = runtime.retrieval.retrieve(query)
 
         assert failed.failed_source_count == 1
         assert failed.index_report is not None and not failed.index_report.succeeded
-        with pytest.raises(RuntimeError, match="knowledge artifact lookup failed"):
+        assert journal.exists()
+        assert journal_delete_calls == source_delete_calls == close_calls == 1
+        assert unavailable.knowledge_gap is not None
+        assert unavailable.knowledge_gap.code is KnowledgeGapCode.RETRIEVAL_UNAVAILABLE
+        rendered = unavailable.model_dump_json()
+        assert "private invalidation journal unlink failure" not in rendered
+        assert "private projection deletion failure" not in rendered
+        assert "private physical close failure" not in rendered
+        with pytest.raises(RuntimeError, match="^knowledge artifact lookup failed$") as failure:
             runtime.retrieval.get_artifact(artifact_id)
-        with pytest.raises(RuntimeError, match="retrieval index is closed"):
+        assert "private" not in str(failure.value)
+        with pytest.raises(RuntimeError, match="retrieval index is unavailable"):
+            runtime._index.get_artifact(artifact_id)
+        with pytest.raises(RuntimeError, match="retrieval index is unavailable"):
             runtime._index.snapshot_state()
+        with pytest.raises(RuntimeError, match="retrieval index is unavailable"):
+            runtime._index.rebuild(())
     finally:
         runtime.close()
 

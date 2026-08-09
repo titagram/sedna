@@ -216,6 +216,7 @@ class SQLiteRetrievalIndex:
 
     def __init__(self, path: str | Path, *, parent_fd: int | None = None) -> None:
         self._mutex = threading.RLock()
+        self._unavailable = False
         self._connection: _MemoryConnection | None = None
         self._parent_fd: int | None = None
         self._lock_fd: int | None = None
@@ -289,8 +290,14 @@ class SQLiteRetrievalIndex:
                 os.close(parent_fd)
                 self._parent_fd = None
 
+    def mark_unavailable(self) -> None:
+        """Irreversibly reject index operations before best-effort resource cleanup."""
+        with self._mutex:
+            self._unavailable = True
+
     def upsert_bundle(self, bundle: SemanticKnowledgeBundle) -> None:
         """Atomically replace one source projection after canonical validation."""
+        self._require_available()
         projection = project_semantic_bundle(bundle)
         source_id = _validated_source_id(bundle.source_id)
         source_sha256 = _validated_source_hash(bundle.source_sha256)
@@ -323,6 +330,7 @@ class SQLiteRetrievalIndex:
 
     def delete_source(self, source_id: str) -> None:
         """Atomically remove every row owned by one canonical source."""
+        self._require_available()
         source_id = _validated_source_id(source_id)
         with self._mutex:
             self._ensure_open()
@@ -350,6 +358,7 @@ class SQLiteRetrievalIndex:
         precommit_guard: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> IndexAudit:
         """Serialize a checked fresh database and atomically install its synced bytes."""
+        self._require_available()
         if precommit_guard is not None and not callable(precommit_guard):
             raise TypeError("precommit_guard must be callable")
         projected: list[tuple[str, str, IndexedSourceState, tuple[ProjectedArtifact, ...]]] = []
@@ -397,6 +406,7 @@ class SQLiteRetrievalIndex:
 
     def get_artifact(self, artifact_id: str) -> IndexedArtifact | None:
         """Return one deeply reconstructed canonical artifact by exact identity."""
+        self._require_available()
         artifact_id = _validated_identifier(artifact_id, "artifact_id")
         with self._read_snapshot() as connection:
             row = connection.execute(
@@ -414,6 +424,7 @@ class SQLiteRetrievalIndex:
         limit: int,
     ) -> tuple[IndexedSourceState, ...]:
         """Return one bounded, source-ID ordered page of projection identities."""
+        self._require_available()
         if after_source_id is not None:
             after_source_id = _validated_source_id(after_source_id)
         if type(limit) is not int or not 1 <= limit <= _MAX_LIMIT:
@@ -446,6 +457,7 @@ class SQLiteRetrievalIndex:
 
     def snapshot_state(self) -> IndexStateSnapshot:
         """Return audit and exact source/artifact states from one locked generation."""
+        self._require_available()
         with self._read_snapshot() as connection:
             connection.execute("BEGIN")
             try:
@@ -479,6 +491,7 @@ class SQLiteRetrievalIndex:
         limit: int,
     ) -> tuple[IndexCandidate, ...]:
         """Return bounded candidates and FTS5-native phrase explanations."""
+        self._require_available()
         query = RetrievalQuery.model_validate(query.model_dump(mode="json"))
         try:
             lane = EpistemicLane(lane)
@@ -544,6 +557,7 @@ class SQLiteRetrievalIndex:
 
     def audit(self) -> IndexAudit:
         """Audit one explicit, lock-protected database snapshot."""
+        self._require_available()
         with self._read_snapshot() as connection:
             return self._audit_snapshot(connection)
 
@@ -1797,10 +1811,16 @@ class SQLiteRetrievalIndex:
         os.fsync(lock_fd)
 
     def _ensure_open(self) -> _MemoryConnection:
+        if self._unavailable:
+            raise RuntimeError("retrieval index is unavailable")
         connection = self._connection
         if connection is None:
             raise RuntimeError("retrieval index is closed")
         return connection
+
+    def _require_available(self) -> None:
+        with self._mutex:
+            self._ensure_open()
 
     def _ensure_parent_open(self) -> int:
         parent_fd = self._parent_fd
