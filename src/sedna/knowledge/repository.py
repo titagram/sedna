@@ -543,18 +543,31 @@ class CanonicalKnowledgeRepository:
                 bundle, verification, quarantine = self._load_semantic_state(source_id)
             except ValueError:
                 return None
-            if bundle is None or verification is None or quarantine is not None:
+            if verification is None:
                 return None
 
             foundation = prepared.manifest.extraction
-            manifest = bundle.compilation_manifest
+            manifest = (
+                bundle.compilation_manifest
+                if bundle is not None
+                else quarantine.compilation_manifest
+                if quarantine is not None
+                else None
+            )
+            if manifest is None:
+                return None
             current = (
-                bundle.source_id == source_id
-                and bundle.source_sha256 == prepared.manifest.sha256
+                verification.source_id == source_id
+                and verification.source_sha256 == prepared.manifest.sha256
                 and manifest.foundation_schema_version == foundation.schema_version
                 and manifest.foundation_parser_id == foundation.parser_id
                 and manifest.foundation_parser_version == foundation.parser_version
-                and bundle.schema_version == semantic_schema_version
+                and (
+                    bundle.schema_version == semantic_schema_version
+                    if bundle is not None
+                    else quarantine is not None
+                    and quarantine.semantic_schema_version == semantic_schema_version
+                )
                 and manifest.extractor_prompt_version == extractor_prompt_version
                 and manifest.critic_prompt_version == critic_prompt_version
                 and manifest.repair_prompt_version == repair_prompt_version
@@ -566,6 +579,16 @@ class CanonicalKnowledgeRepository:
                     and manifest.critic_model_id == critic_model_id
                 )
             if not current:
+                return None
+            if bundle is None:
+                if quarantine is None or verification.adjudication != "quarantined":
+                    return None
+                return SemanticCompilationResult(
+                    disposition="unchanged",
+                    verification=verification,
+                    quarantine=quarantine,
+                )
+            if quarantine is not None or verification.adjudication != "verified":
                 return None
             return SemanticCompilationResult(
                 disposition="unchanged",
@@ -696,6 +719,21 @@ class CanonicalKnowledgeRepository:
             self._source_transition_lock(manifest.source_id),
         ):
             self._recover_source(manifest.source_id)
+            semantic_snapshots: dict[str, bytes | None] | None = None
+            if manifest.ingestion_status.value != "accepted":
+                semantic_snapshots = {
+                    directory: self._read_optional_bytes(directory, manifest.source_id)
+                    for directory in self._SEMANTIC_DIRECTORIES
+                }
+                self._write_semantic_transition_journal(manifest.source_id, semantic_snapshots)
+                try:
+                    for directory in self._SEMANTIC_DIRECTORIES:
+                        self._delete_record(directory, manifest.source_id)
+                    self._fsync_directories(self._SEMANTIC_DIRECTORIES)
+                except BaseException:
+                    self._restore_semantic_snapshots(manifest.source_id, semantic_snapshots)
+                    self._delete_semantic_transition_journal(manifest.source_id)
+                    raise
             old_manifest = self._read_optional_bytes("manifests", manifest.source_id)
             old_quarantine = self._read_optional_bytes("quarantine", manifest.source_id)
             self._write_transition_journal(
@@ -710,10 +748,25 @@ class CanonicalKnowledgeRepository:
                     self.write_quarantine(quarantine)
                 self.write_manifest(manifest)
             except BaseException as original_error:
-                rollback_errors = self._restore_source_snapshots(
-                    manifest.source_id,
-                    old_manifest,
-                    old_quarantine,
+                rollback_errors: list[BaseException] = []
+                if semantic_snapshots is not None:
+                    rollback_errors.extend(
+                        self._restore_semantic_snapshots(
+                            manifest.source_id,
+                            semantic_snapshots,
+                        )
+                    )
+                    if not rollback_errors:
+                        try:
+                            self._delete_semantic_transition_journal(manifest.source_id)
+                        except BaseException as rollback_error:
+                            rollback_errors.append(rollback_error)
+                rollback_errors.extend(
+                    self._restore_source_snapshots(
+                        manifest.source_id,
+                        old_manifest,
+                        old_quarantine,
+                    )
                 )
                 if not rollback_errors:
                     try:
@@ -727,6 +780,8 @@ class CanonicalKnowledgeRepository:
                     )
                 raise
             self._delete_transition_journal(manifest.source_id)
+            if semantic_snapshots is not None:
+                self._delete_semantic_transition_journal(manifest.source_id)
 
     def load_manifest(self, source_id: str) -> DocumentManifest:
         """Load and validate one manifest, with path-specific errors."""

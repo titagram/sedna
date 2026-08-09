@@ -147,6 +147,8 @@ class SemanticQuarantineRecord(BaseModel):
     messages: tuple[NonEmptyString, ...] = Field(min_length=1)
     segment_indexes: tuple[int, ...] = ()
     recorded_at: datetime
+    compilation_manifest: SemanticCompilationManifest | None = None
+    semantic_schema_version: NonEmptyString | None = None
 
     @model_validator(mode="after")
     def validate_quarantine_citations(self) -> SemanticQuarantineRecord:
@@ -159,6 +161,12 @@ class SemanticQuarantineRecord(BaseModel):
             raise ValueError("segment indexes must be unique")
         if tuple(sorted(self.segment_indexes)) != self.segment_indexes:
             raise ValueError("segment indexes must be sorted")
+        if self.compilation_manifest is not None and (
+            self.compilation_manifest.source_id != self.source_id
+            or self.compilation_manifest.source_sha256 != self.source_sha256
+            or self.compilation_manifest.disposition != "quarantined"
+        ):
+            raise ValueError("quarantine compilation manifest must match its quarantined source")
         return self
 
 

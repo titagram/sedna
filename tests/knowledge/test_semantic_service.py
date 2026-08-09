@@ -567,6 +567,23 @@ def test_quarantined_result_is_persisted_without_a_bundle(tmp_path: Path) -> Non
             pipeline.repository.load_semantic_bundle(prepared.manifest.source_id)
 
 
+def test_current_quarantine_is_reused_without_host_calls(tmp_path: Path) -> None:
+    responses = _load_responses(SOURCE_CASES["repair"].fixture_name)
+    responses[-1] = copy.deepcopy(responses[1])
+    with _prepared_case(tmp_path, "repair") as (pipeline, prepared, _, _):
+        service, host = _service(pipeline.repository, responses)
+
+        quarantined = service.compile_and_store(prepared)
+        unchanged = service.compile_and_store(prepared)
+
+        assert quarantined.disposition == "quarantined"
+        assert quarantined.quarantine is not None
+        assert quarantined.quarantine.compilation_manifest is not None
+        assert unchanged.disposition == "unchanged"
+        assert unchanged.quarantine == quarantined.quarantine
+        assert len(host.calls) == 4
+
+
 def test_failed_result_remains_run_local_and_is_retried_by_another_instance(
     tmp_path: Path,
 ) -> None:

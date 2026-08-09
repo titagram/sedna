@@ -23,7 +23,7 @@ from sedna.knowledge.semantic import (
     SemanticCompiler,
     SemanticIngestionService,
 )
-from sedna.knowledge.semantic.compiler import SEMANTIC_SCHEMA_VERSION
+from sedna.knowledge.semantic.compiler import SEMANTIC_COMPILER_VERSION, SEMANTIC_SCHEMA_VERSION
 from sedna.knowledge.semantic.llm import HadesLlmAdapter
 from sedna.knowledge.semantic.prompts import (
     CRITIC_PROMPT_VERSION,
@@ -218,7 +218,7 @@ def test_compiler_v2_bundle_recompiles_once_then_reuses_v3_without_host_calls(
 
         assert recompiled.disposition == "verified"
         assert recompiled.bundle is not None
-        assert recompiled.bundle.compilation_manifest.compiler_version == "3"
+        assert recompiled.bundle.compilation_manifest.compiler_version == SEMANTIC_COMPILER_VERSION
         assert recompiled.bundle.references[0].assessment.independence_group == (
             prepared.manifest.sha256
         )

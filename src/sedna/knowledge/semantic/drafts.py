@@ -368,26 +368,35 @@ class SemanticCompilationResult(BaseModel):
         purposes = tuple(call.purpose for call in self.calls)
         if purposes not in _VALID_CALL_SEQUENCES:
             raise ValueError("semantic call metadata must follow the bounded purpose sequence")
-        if self.disposition in {"verified", "unchanged"}:
+        if self.disposition == "verified":
             if self.bundle is None or self.verification is None:
                 raise ValueError("verified and unchanged results require a bundle and verification")
             if any((self.quarantine, self.failure_code, self.failure_message)):
                 raise ValueError("verified and unchanged results cannot contain other payloads")
-            if self.disposition == "verified":
-                if self.verification.adjudication != "verified":
-                    raise ValueError(
-                        "verified result verification adjudication must agree with disposition"
-                    )
-                self._validate_final_critic_call(purposes)
-            else:
-                if purposes:
-                    raise ValueError(
-                        "unchanged results cannot contain a new semantic call sequence"
-                    )
-                if self.verification.adjudication != "verified":
-                    raise ValueError("unchanged results must retain a verified audit")
+            if self.verification.adjudication != "verified":
+                raise ValueError(
+                    "verified result verification adjudication must agree with disposition"
+                )
+            self._validate_final_critic_call(purposes)
             self._validate_normal_bundle()
             return self
+
+        if self.disposition == "unchanged":
+            if purposes or self.verification is None or self.failure_code or self.failure_message:
+                raise ValueError("unchanged results cannot contain a new semantic call or failure")
+            if self.bundle is not None and self.quarantine is None:
+                if self.verification.adjudication != "verified":
+                    raise ValueError("unchanged bundle results must retain a verified audit")
+                self._validate_normal_bundle()
+                return self
+            if self.quarantine is not None and self.bundle is None:
+                if self.verification.adjudication != "quarantined":
+                    raise ValueError("unchanged quarantine results must retain a quarantined audit")
+                return self
+            raise ValueError(
+                "unchanged results require a bundle and verification or a quarantine "
+                "and verification"
+            )
 
         if self.disposition == "quarantined":
             if self.verification is None or self.quarantine is None:

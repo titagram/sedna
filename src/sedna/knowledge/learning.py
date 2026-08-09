@@ -11,7 +11,7 @@ from typing import Annotated, Any, Self
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from sedna.knowledge.inventory import SourceCandidate, discover_sources
-from sedna.knowledge.pipeline import CandidateIngestionError, IngestionPipeline
+from sedna.knowledge.pipeline import IngestionPipeline
 from sedna.knowledge.retrieval.maintenance import (
     MaintenanceIssue,
     MaintenanceIssueCode,
@@ -29,6 +29,7 @@ _MAX_MESSAGES = 32
 _MAX_FAILURE_CODES = 16
 _MAX_SOURCE_ID_LENGTH = 512
 _MAX_SOURCE_PATH_LENGTH = 4096
+_MAX_SOURCES = 100_000
 _SAFE_REASON_CODES = frozenset(CANONICAL_COMPILATION_FAILURE_MESSAGES)
 
 BoundedSourceId = Annotated[str, Field(min_length=1, max_length=_MAX_SOURCE_ID_LENGTH)]
@@ -179,7 +180,13 @@ class DocumentLearningService:
     def learn(self, source_path: Path) -> LearningRunReport:
         """Learn a confined local source selection without exposing exceptions or source text."""
         requested = Path(source_path)
-        report_path = str(requested.resolve(strict=False))
+        try:
+            report_path = str(requested.resolve(strict=False))
+        except (OSError, ValueError):
+            return LearningRunReport(
+                source_path="<invalid-source-path>",
+                failure_codes=("invalid_source_path",),
+            )
         try:
             root, only_relative_path = _resolve_learning_root(requested)
         except (OSError, ValueError):
@@ -197,9 +204,25 @@ class DocumentLearningService:
                 except (OSError, ValueError):
                     failure_codes.append("source_inventory_failed")
                 else:
+                    if len(candidates) > _MAX_SOURCES:
+                        return LearningRunReport(
+                            source_path=report_path,
+                            failure_codes=("source_count_exceeded",),
+                        )
+                    if not candidates:
+                        try:
+                            root_status = os.stat(root, follow_symlinks=False)
+                        except OSError:
+                            failure_codes.append("source_inventory_failed")
+                        else:
+                            failure_codes.append(
+                                "no_sources"
+                                if stat.S_ISDIR(root_status.st_mode)
+                                else "source_inventory_failed"
+                            )
                     for candidate in candidates:
                         self._learn_candidate(pipeline, candidate, outcomes)
-        except (OSError, ValueError):
+        except Exception:
             failure_codes.append("source_root_unavailable")
 
         return LearningRunReport(
@@ -236,7 +259,7 @@ class DocumentLearningService:
                 return
             semantic = self.semantic_service.compile_and_store(prepared)
             outcomes.append(_semantic_outcome(candidate, semantic))
-        except (CandidateIngestionError, OSError, ValueError):
+        except Exception:
             outcomes.append(_failed_outcome(candidate, "source_processing_failed"))
 
     def _reprepare_if_semantic_stale(

@@ -82,7 +82,11 @@ class IngestionPipeline:
             raise ValueError(f"source root is not a directory: {self.source_root}")
 
         resolved_knowledge = Path(knowledge_root).resolve(strict=False)
-        if resolved_knowledge == self.source_root or self.source_root in resolved_knowledge.parents:
+        if (
+            resolved_knowledge == self.source_root
+            or self.source_root in resolved_knowledge.parents
+            or resolved_knowledge in self.source_root.parents
+        ):
             raise ValueError("knowledge root must be outside the immutable source root")
 
         self._descriptor_lock = threading.Lock()

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import sedna.knowledge.learning as learning_module
 from sedna.knowledge.inventory import discover_sources
 from sedna.knowledge.learning import (
     DocumentLearningService,
@@ -50,6 +51,8 @@ class _ScriptedSemanticService:
         source_id = prepared.manifest.source_id  # type: ignore[attr-defined]
         self.calls.append(source_id)
         result = self.dispositions.get(source_id, _SemanticResult("verified"))
+        if isinstance(result, BaseException):
+            raise result
         if result.disposition == "verified":
             self.current_source_ids.add(source_id)
         return result
@@ -175,6 +178,38 @@ def test_compiler_v2_semantics_recompile_once_through_learning_service(tmp_path:
     repository.close()
 
 
+@pytest.mark.parametrize(
+    ("replacement", "expected"),
+    ((b"", LearningDisposition.EXCLUDED), (b"\xff", LearningDisposition.FOUNDATION_QUARANTINED)),
+)
+def test_foundation_terminal_transition_invalidates_old_verified_semantics(
+    tmp_path: Path,
+    replacement: bytes,
+    expected: LearningDisposition,
+) -> None:
+    case = SOURCE_CASES["reference"]
+    source_root = _source_root(tmp_path, {case.relative_path: case.markdown.encode("utf-8")})
+    knowledge_root = tmp_path / "knowledge"
+    repository = CanonicalKnowledgeRepository(knowledge_root)
+    semantic, _ = _semantic_service(repository, _load_responses(case.fixture_name))
+    service = DocumentLearningService(
+        knowledge_root=knowledge_root,
+        semantic_service=semantic,
+        maintenance=_Maintenance(),  # type: ignore[arg-type]
+    )
+    first = service.learn(source_root)
+    assert first.verified_source_count == 1
+    source_path = source_root / case.relative_path
+    source_path.write_bytes(replacement)
+
+    report = service.learn(source_root)
+
+    assert [item.disposition for item in report.outcomes] == [expected]
+    with pytest.raises(FileNotFoundError):
+        repository.load_semantic_bundle(discover_sources(source_root)[0].source_id)
+    repository.close()
+
+
 def test_force_reprepare_refreshes_only_an_unchanged_accepted_source(tmp_path: Path) -> None:
     source_root = _source_root(
         tmp_path,
@@ -193,6 +228,92 @@ def test_force_reprepare_refreshes_only_an_unchanged_accepted_source(tmp_path: P
         assert pipeline.last_outcome == "excluded"
         assert pipeline.prepare(excluded, force_reprepare=True) is None
         assert pipeline.last_outcome == "unchanged"
+
+
+def test_pipeline_rejects_source_root_nested_under_knowledge_root(tmp_path: Path) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    source_root = knowledge_root / "manifests"
+    source_root.mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="outside the immutable source root"):
+        IngestionPipeline(source_root, knowledge_root)
+
+
+def test_learning_rejects_source_inside_knowledge_root_without_canonical_writes(
+    tmp_path: Path,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    source_root = knowledge_root / "manifests"
+    source_root.mkdir(parents=True)
+    (source_root / "lesson.md").write_bytes(_lesson())
+    service, semantic, maintenance = _service(tmp_path)
+
+    report = service.learn(source_root)
+
+    assert report.failed and report.failure_codes == ("source_root_unavailable",)
+    assert not semantic.calls
+    assert maintenance.calls == 1
+    assert not tuple(knowledge_root.rglob("*.json"))
+
+
+def test_runtime_semantic_exception_is_one_safe_failed_candidate(tmp_path: Path) -> None:
+    source_root = _source_root(
+        tmp_path,
+        {"Write-ups/Academy/a.md": _lesson(), "Write-ups/Academy/z.md": _lesson()},
+    )
+    service, semantic, maintenance = _service(tmp_path)
+    failed_id = discover_sources(source_root)[0].source_id
+    semantic.dispositions[failed_id] = RuntimeError("provider secret leaked")  # type: ignore[assignment]
+
+    report = service.learn(source_root)
+
+    assert {item.disposition for item in report.outcomes} == {
+        LearningDisposition.FAILED,
+        LearningDisposition.VERIFIED,
+    }
+    assert report.failed_source_count == 1
+    assert all("secret" not in message for item in report.outcomes for message in item.messages)
+    assert maintenance.calls == 1
+
+
+def test_empty_directory_is_a_safe_no_sources_failure(tmp_path: Path) -> None:
+    source_root = tmp_path / "empty"
+    source_root.mkdir()
+    service, semantic, maintenance = _service(tmp_path)
+
+    report = service.learn(source_root)
+
+    assert report.failure_codes == ("no_sources",)
+    assert report.failed
+    assert not semantic.calls
+    assert maintenance.calls == 1
+
+
+def test_nul_path_returns_typed_failed_report_without_raw_path(tmp_path: Path) -> None:
+    service, semantic, maintenance = _service(tmp_path)
+
+    report = service.learn(Path("\x00untrusted"))
+
+    assert report.failure_codes == ("invalid_source_path",)
+    assert "\x00" not in report.source_path
+    assert not semantic.calls
+    assert maintenance.calls == 0
+
+
+def test_source_count_limit_stops_before_processing_or_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = _source_root(tmp_path, {"Write-ups/Academy/lesson.md": _lesson()})
+    candidate = discover_sources(source_root)[0]
+    service, semantic, maintenance = _service(tmp_path)
+    monkeypatch.setattr(learning_module, "discover_sources", lambda _: (candidate,) * 100_001)
+
+    report = service.learn(source_root)
+
+    assert report.failure_codes == ("source_count_exceeded",)
+    assert not report.outcomes
+    assert not semantic.calls
+    assert maintenance.calls == 0
 
 
 def test_one_semantic_failure_does_not_abort_other_documents(tmp_path: Path) -> None:
