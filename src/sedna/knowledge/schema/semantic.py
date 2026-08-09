@@ -8,7 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from sedna.knowledge.schema.case import KnowledgeCase
-from sedna.knowledge.schema.common import SearchableNonEmptyString, SourceRef
+from sedna.knowledge.schema.common import ExtractionMetadata, SearchableNonEmptyString, SourceRef
 from sedna.knowledge.schema.manifest import Sha256
 from sedna.knowledge.schema.reference import ReferenceArtifact
 from sedna.knowledge.schema.rule import DecisionRule
@@ -89,6 +89,7 @@ class SemanticCompilationManifest(BaseModel):
     foundation_schema_version: NonEmptyString
     foundation_parser_id: NonEmptyString
     foundation_parser_version: NonEmptyString
+    foundation_extraction: ExtractionMetadata | None = None
     compiler_version: NonEmptyString
     extractor_prompt_version: NonEmptyString
     critic_prompt_version: NonEmptyString

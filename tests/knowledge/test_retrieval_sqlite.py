@@ -404,6 +404,52 @@ def test_mark_unavailable_irreversibly_rejects_all_live_index_operations(
     index.close()
 
 
+def test_durable_unavailable_marker_blocks_reopen_until_fresh_rebuild(tmp_path: Path) -> None:
+    """Per-call runtimes must inherit poison while a fresh rebuild can reconcile it."""
+    path = tmp_path / "sedna.sqlite"
+    bundle = _bundle()
+    index = SQLiteRetrievalIndex(path)
+    index.upsert_bundle(bundle)
+    index.mark_unavailable()
+    index.close()
+
+    reopened = SQLiteRetrievalIndex(path)
+    try:
+        with pytest.raises(RuntimeError, match="^retrieval index is unavailable$"):
+            reopened.get_artifact("reference-http")
+
+        rebuilt = reopened.rebuild((bundle,))
+
+        assert not rebuilt.rebuild_required
+        assert reopened.get_artifact("reference-http") == bundle.references[0]
+    finally:
+        reopened.close()
+
+    with SQLiteRetrievalIndex(path) as final:
+        assert final.get_artifact("reference-http") == bundle.references[0]
+
+
+def test_durable_unavailable_marker_blocks_an_already_open_peer(tmp_path: Path) -> None:
+    """A peer opened before poison must observe the barrier after the writer returns."""
+    path = tmp_path / "sedna.sqlite"
+    bundle = _bundle()
+    writer = SQLiteRetrievalIndex(path)
+    writer.upsert_bundle(bundle)
+    peer = SQLiteRetrievalIndex(path)
+    try:
+        assert peer.get_artifact("reference-http") == bundle.references[0]
+
+        writer.mark_unavailable()
+
+        with pytest.raises(RuntimeError, match="^retrieval index is unavailable$"):
+            peer.get_artifact("reference-http")
+        with pytest.raises(RuntimeError, match="^retrieval index is unavailable$"):
+            peer.delete_source(bundle.source_id)
+    finally:
+        writer.close()
+        peer.close()
+
+
 def test_get_artifact_revalidates_canonical_json_and_identity(tmp_path: Path) -> None:
     path = tmp_path / "sedna.sqlite"
     index = SQLiteRetrievalIndex(path)

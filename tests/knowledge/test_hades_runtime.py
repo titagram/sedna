@@ -181,6 +181,197 @@ def test_runtime_failed_relearn_removes_stale_canonical_and_indexed_knowledge(
         runtime.close()
 
 
+def test_runtime_semantic_write_failure_invalidates_old_canonical_and_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persistence exception after a source change must never leave v1 queryable."""
+    host = _ScriptedHost(_responses(count=2))
+    runtime = HadesKnowledgeRuntime.create(host, tmp_path / "knowledge")
+
+    try:
+        source_root = _source_root(tmp_path)
+        first = runtime.learning.learn(source_root)
+        source_id = first.outcomes[0].source_id
+        artifact_id = runtime._repository.load_semantic_bundle(source_id).references[0].artifact_id
+        source_path = source_root / SOURCE_CASES["reference"].relative_path
+        source_path.write_text(source_path.read_text(encoding="utf-8") + "\nChanged evidence.\n")
+
+        def fail_semantic_write(_: object) -> None:
+            raise OSError("private semantic persistence failure")
+
+        monkeypatch.setattr(runtime._repository, "write_semantic_result", fail_semantic_write)
+
+        failed = runtime.learning.learn(source_root)
+
+        assert failed.failed_source_count == 1
+        with pytest.raises(FileNotFoundError):
+            runtime._repository.load_semantic_bundle(source_id)
+        assert runtime.retrieval.get_artifact(artifact_id) is None
+        assert runtime._index.snapshot_state().source_states == ()
+        assert "private semantic persistence failure" not in failed.model_dump_json()
+    finally:
+        runtime.close()
+
+
+def test_document_learning_unexpected_semantic_exception_invalidates_old_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The learning boundary must fail closed even if semantic orchestration raises."""
+    runtime = HadesKnowledgeRuntime.create(_ScriptedHost(_responses()), tmp_path / "knowledge")
+
+    try:
+        source_root = _source_root(tmp_path)
+        first = runtime.learning.learn(source_root)
+        source_id = first.outcomes[0].source_id
+        artifact_id = runtime._repository.load_semantic_bundle(source_id).references[0].artifact_id
+        source_path = source_root / SOURCE_CASES["reference"].relative_path
+        source_path.write_text(source_path.read_text(encoding="utf-8") + "\nChanged again.\n")
+
+        def fail_semantic_orchestration(_: object) -> object:
+            raise RuntimeError("private unexpected semantic failure")
+
+        monkeypatch.setattr(
+            runtime.learning.semantic_service,
+            "compile_and_store",
+            fail_semantic_orchestration,
+        )
+
+        failed = runtime.learning.learn(source_root)
+
+        assert failed.failed_source_count == 1
+        with pytest.raises(FileNotFoundError):
+            runtime._repository.load_semantic_bundle(source_id)
+        assert runtime.retrieval.get_artifact(artifact_id) is None
+        assert runtime._index.snapshot_state().source_states == ()
+        assert "private unexpected semantic failure" not in failed.model_dump_json()
+    finally:
+        runtime.close()
+
+
+def test_runtime_failed_rebuild_persists_unavailable_across_fresh_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh plugin-style runtime must not trust v1 after canonical v2 failed to rebuild."""
+    knowledge_root = tmp_path / "knowledge"
+    source_root = _source_root(tmp_path)
+    runtime = HadesKnowledgeRuntime.create(_ScriptedHost(_responses(count=2)), knowledge_root)
+    artifact_id = ""
+    try:
+        first = runtime.learning.learn(source_root)
+        source_id = first.outcomes[0].source_id
+        artifact_id = runtime._repository.load_semantic_bundle(source_id).references[0].artifact_id
+        source_path = source_root / SOURCE_CASES["reference"].relative_path
+        source_path.write_text(source_path.read_text(encoding="utf-8") + "\nCanonical v2.\n")
+
+        def fail_rebuild(*_: object, **__: object) -> object:
+            raise OSError("private rebuild failure")
+
+        monkeypatch.setattr(runtime._index, "rebuild", fail_rebuild)
+        changed = runtime.learning.learn(source_root)
+
+        assert changed.verified_source_count == 1
+        assert changed.index_report is not None and not changed.index_report.succeeded
+        with pytest.raises(RuntimeError, match="retrieval index is unavailable"):
+            runtime._index.get_artifact(artifact_id)
+    finally:
+        runtime.close()
+
+    reopened = HadesKnowledgeRuntime.create(_ScriptedHost([]), knowledge_root)
+    try:
+        target = ValidatedTarget.parse("10.10.10.10")
+        query = RetrievalQuery(
+            situation=CurrentSituation(
+                target=target,
+                authorization=AuthorizationScope(
+                    state=AuthorizationState.AUTHORIZED,
+                    exact_targets=(target,),
+                ),
+            ),
+            terms=("evidence",),
+        )
+        unavailable = reopened.retrieval.retrieve(query)
+
+        assert unavailable.knowledge_gap is not None
+        assert unavailable.knowledge_gap.code is KnowledgeGapCode.RETRIEVAL_UNAVAILABLE
+        with pytest.raises(RuntimeError, match="^knowledge artifact lookup failed$"):
+            reopened.retrieval.get_artifact(artifact_id)
+
+        repaired = reopened.maintenance.rebuild()
+        assert repaired.succeeded
+        current_artifact_id = (
+            reopened._repository.load_semantic_bundle(source_id).references[0].artifact_id
+        )
+        assert reopened.retrieval.get_artifact(current_artifact_id) is not None
+        if current_artifact_id != artifact_id:
+            assert reopened.retrieval.get_artifact(artifact_id) is None
+    finally:
+        reopened.close()
+
+
+def test_runtime_rejects_same_relative_source_from_a_different_learning_root(
+    tmp_path: Path,
+) -> None:
+    """Two roots containing lesson.md must not silently share one canonical source identity."""
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    relative_path = SOURCE_CASES["reference"].relative_path
+    source = SOURCE_CASES["reference"].markdown
+    (first_root / relative_path).parent.mkdir(parents=True)
+    (second_root / relative_path).parent.mkdir(parents=True)
+    (first_root / relative_path).write_text(source, encoding="utf-8")
+    (second_root / relative_path).write_text(source, encoding="utf-8")
+    host = _ScriptedHost(_responses())
+    runtime = HadesKnowledgeRuntime.create(host, tmp_path / "knowledge")
+
+    try:
+        first = runtime.learning.learn(first_root)
+        source_id = first.outcomes[0].source_id
+        first_manifest = runtime._repository.load_manifest(source_id)
+        second = runtime.learning.learn(second_root)
+
+        assert first.verified_source_count == 1
+        assert second.failed_source_count == 1
+        assert len(host.calls) == 2
+        assert runtime._repository.load_manifest(source_id) == first_manifest
+        assert first_manifest.source_namespace is not None
+    finally:
+        runtime.close()
+
+
+def test_runtime_learning_uses_retained_repository_after_nominal_root_redirect(
+    tmp_path: Path,
+) -> None:
+    """Learning must write through the retained repository, never a redirected pathname."""
+    source_root = _source_root(tmp_path)
+    knowledge_root = tmp_path / "external" / "knowledge"
+    runtime = HadesKnowledgeRuntime.create(
+        _ScriptedHost(_responses()),
+        knowledge_root,
+        external_source_path=source_root,
+    )
+    detached = tmp_path / "knowledge-detached"
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    knowledge_root.rename(detached)
+    knowledge_root.symlink_to(attacker, target_is_directory=True)
+
+    try:
+        report = runtime.learning.learn(source_root)
+
+        assert report.verified_source_count == 1
+        assert list((detached / "manifests").glob("*.json"))
+        assert not (attacker / "manifests").exists()
+        assert not (attacker / "semantic_bundles").exists()
+        assert not (attacker / "indexes").exists()
+    finally:
+        runtime.close()
+
+
 def test_runtime_failed_relearn_rolls_forward_after_invalidation_journal_cleanup_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -225,8 +416,10 @@ def test_runtime_failed_relearn_rolls_forward_after_invalidation_journal_cleanup
         assert journal.exists()
         with pytest.raises(FileNotFoundError):
             runtime._repository.load_semantic_bundle(source_id)
-        assert runtime._index.snapshot_state().source_states == ()
-        assert runtime.retrieval.get_artifact(artifact_id) is None
+        with pytest.raises(RuntimeError, match="retrieval index is unavailable"):
+            runtime._index.snapshot_state()
+        with pytest.raises(RuntimeError, match="^knowledge artifact lookup failed$"):
+            runtime.retrieval.get_artifact(artifact_id)
     finally:
         runtime.close()
 
@@ -335,6 +528,22 @@ def test_runtime_poisoned_index_masks_combined_invalidation_delete_and_close_fai
             runtime._index.rebuild(())
     finally:
         runtime.close()
+
+    reopened = HadesKnowledgeRuntime.create(_ScriptedHost([]), knowledge_root)
+    try:
+        unavailable = reopened.retrieval.retrieve(query)
+
+        assert unavailable.knowledge_gap is not None
+        assert unavailable.knowledge_gap.code is KnowledgeGapCode.RETRIEVAL_UNAVAILABLE
+        with pytest.raises(RuntimeError, match="^knowledge artifact lookup failed$"):
+            reopened.retrieval.get_artifact(artifact_id)
+
+        repaired = reopened.maintenance.rebuild()
+
+        assert repaired.succeeded
+        assert reopened.retrieval.get_artifact(artifact_id) is None
+    finally:
+        reopened.close()
 
 
 def test_runtime_rebuilds_a_disposed_index_from_canonical_records(tmp_path: Path) -> None:

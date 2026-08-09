@@ -155,9 +155,10 @@ def test_extractor_v2_manifest_reprocesses_once_with_safe_asset_locator(
         assert seeded is not None
         legacy_manifest = seeded.manifest.model_copy(
             update={
+                "source_namespace": None,
                 "extraction": seeded.manifest.extraction.model_copy(
                     update={"extractor_version": "2"}
-                )
+                ),
             }
         )
         pipeline.repository.transition_source(legacy_manifest, None)
@@ -167,7 +168,8 @@ def test_extractor_v2_manifest_reprocesses_once_with_safe_asset_locator(
         assert migrated is not None
         safe_assets = tuple(asset for segment in migrated.segments for asset in segment.assets)
         assert [asset.target for asset in safe_assets] == ["https://example.test/proof.png"]
-        assert migrated.manifest.extraction.extractor_version == "3"
+        assert migrated.manifest.source_namespace == candidate.source_namespace
+        assert migrated.manifest.extraction.extractor_version == "4"
         assert pipeline.repository.load_manifest(candidate.source_id) == migrated.manifest
         assert source_path.read_bytes() == source_bytes
         assert hashlib.sha256(source_path.read_bytes()).hexdigest() == before_sha256

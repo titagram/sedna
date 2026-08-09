@@ -11,7 +11,11 @@ from contextlib import suppress
 from pathlib import Path, PurePosixPath
 
 from sedna.knowledge.classifier import ClassificationResult, classify_document
-from sedna.knowledge.inventory import SourceCandidate, stable_source_id
+from sedna.knowledge.inventory import (
+    SourceCandidate,
+    stable_source_id,
+    stable_source_namespace,
+)
 from sedna.knowledge.parsing import BlockKind, PreparedSource, parse_markdown
 from sedna.knowledge.parsing.profiles import apply_profile
 from sedna.knowledge.parsing.sanitize import EXCLUDED_FLAG, sanitize_searchable_text
@@ -30,11 +34,11 @@ from sedna.knowledge.schema import (
     SourceQuality,
 )
 
-SCHEMA_VERSION = "1.1.0"
+SCHEMA_VERSION = "1.2.0"
 PARSER_ID = "markdown-it-commonmark"
 PARSER_VERSION = "1"
 EXTRACTOR_ID = "deterministic-foundation"
-EXTRACTOR_VERSION = "3"
+EXTRACTOR_VERSION = "4"
 DEFAULT_LANGUAGE = "en"
 
 _ATX_TITLE_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
@@ -75,13 +79,23 @@ class IngestionPipeline:
     failures so implementation defects are never disguised as bad input.
     """
 
-    def __init__(self, source_root: Path, knowledge_root: Path) -> None:
+    def __init__(
+        self,
+        source_root: Path,
+        knowledge_root: Path,
+        *,
+        repository: CanonicalKnowledgeRepository | None = None,
+    ) -> None:
         requested_source_root = Path(source_root)
         self.source_root = requested_source_root.resolve(strict=True)
         if not self.source_root.is_dir():
             raise ValueError(f"source root is not a directory: {self.source_root}")
 
-        resolved_knowledge = Path(knowledge_root).resolve(strict=False)
+        resolved_knowledge = (
+            Path(knowledge_root).resolve(strict=False)
+            if repository is None
+            else Path(repository.root)
+        )
         if (
             resolved_knowledge == self.source_root
             or self.source_root in resolved_knowledge.parents
@@ -90,6 +104,8 @@ class IngestionPipeline:
             raise ValueError("knowledge root must be outside the immutable source root")
 
         self._descriptor_lock = threading.Lock()
+        self._owns_repository = repository is None
+        self.source_namespace = stable_source_namespace(self.source_root)
         self._source_fd: int | None = os.open(
             self.source_root,
             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
@@ -102,7 +118,11 @@ class IngestionPipeline:
                 source_status.st_ino,
             ) != (expected_status.st_dev, expected_status.st_ino):
                 raise ValueError("source root changed while it was being opened")
-            self.repository = CanonicalKnowledgeRepository(resolved_knowledge)
+            self.repository = (
+                CanonicalKnowledgeRepository(resolved_knowledge)
+                if repository is None
+                else repository
+            )
         except Exception:
             os.close(self._source_fd)
             self._source_fd = None
@@ -134,7 +154,7 @@ class IngestionPipeline:
                 self._source_fd = None
                 os.close(source_fd)
         repository = getattr(self, "repository", None)
-        if repository is not None:
+        if repository is not None and getattr(self, "_owns_repository", False):
             repository.close()
 
     def prepare(
@@ -167,6 +187,8 @@ class IngestionPipeline:
         self._verify_current_asset_path_set(candidate)
         asset_refs = self._verified_asset_refs(candidate)
         existing = self._load_existing_manifest(candidate.source_id)
+        if existing is not None:
+            self._require_compatible_source_namespace(existing, candidate)
         if existing is not None and self._is_unchanged(existing, candidate, asset_refs):
             self._validate_incremental_state(existing)
             if not force_reprepare or existing.ingestion_status is not IngestionStatus.ACCEPTED:
@@ -303,6 +325,12 @@ class IngestionPipeline:
                 candidate.source_id,
                 "candidate_identity_mismatch",
                 "source identity does not match its relative path",
+            )
+        if candidate.source_namespace not in {None, self.source_namespace}:
+            raise CandidateIngestionError(
+                candidate.source_id,
+                "candidate_namespace_mismatch",
+                "source namespace does not match its retained source root",
             )
         expected_path = self.source_root.joinpath(*PurePosixPath(relative_path).parts)
         if Path(candidate.path).resolve(strict=False) != expected_path.resolve(strict=False):
@@ -543,12 +571,34 @@ class IngestionPipeline:
         asset_refs: tuple[AssetRef, ...],
     ) -> bool:
         return (
-            manifest.path == candidate.relative_path
+            manifest.source_namespace == self.source_namespace
+            and manifest.path == candidate.relative_path
             and manifest.sha256 == candidate.sha256
             and manifest.assets == asset_refs
             and manifest.extraction == self.extraction
             and self._sanitize_title(manifest.title) == manifest.title
         )
+
+    def _require_compatible_source_namespace(
+        self,
+        manifest: DocumentManifest,
+        candidate: SourceCandidate,
+    ) -> None:
+        """Reject a relative-path identity already owned by another source root."""
+        if manifest.source_namespace is None:
+            if manifest.path == candidate.relative_path and manifest.sha256 == candidate.sha256:
+                return
+            raise CandidateIngestionError(
+                candidate.source_id,
+                "legacy_source_namespace_collision",
+                "legacy source ownership cannot be migrated from different content",
+            )
+        if manifest.source_namespace != self.source_namespace:
+            raise CandidateIngestionError(
+                candidate.source_id,
+                "source_namespace_collision",
+                "source identity is already owned by another source root",
+            )
 
     def _validate_incremental_state(self, manifest: DocumentManifest) -> None:
         try:
@@ -581,6 +631,7 @@ class IngestionPipeline:
     ) -> None:
         manifest = DocumentManifest(
             source_id=candidate.source_id,
+            source_namespace=self.source_namespace,
             path=candidate.relative_path,
             sha256=candidate.sha256,
             title=title,
@@ -649,6 +700,7 @@ class IngestionPipeline:
     ) -> DocumentManifest:
         return DocumentManifest(
             source_id=candidate.source_id,
+            source_namespace=self.source_namespace,
             path=candidate.relative_path,
             sha256=candidate.sha256,
             title=self._sanitize_title(title),

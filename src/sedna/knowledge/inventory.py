@@ -35,6 +35,7 @@ class SourceCandidate:
     sha256: str
     size_bytes: int
     assets: tuple[AssetCandidate, ...]
+    source_namespace: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +49,14 @@ class _DiscoveredFile:
 def stable_source_id(relative_path: str) -> str:
     """Build a content-independent source identifier from a POSIX path."""
     return f"source-{uuid5(NAMESPACE_URL, f'sedna:{relative_path}')}"
+
+
+def stable_source_namespace(source_root: Path) -> str:
+    """Return an opaque stable namespace for one resolved source-root origin."""
+    resolved = Path(source_root).resolve(strict=True)
+    if not resolved.is_dir():
+        raise ValueError("source namespace root must be a directory")
+    return f"source-root-{uuid5(NAMESPACE_URL, f'sedna-root:{resolved.as_posix()}')}"
 
 
 def sha256_file(path: Path) -> str:
@@ -93,6 +102,7 @@ def discover_sources(source_root: Path) -> tuple[SourceCandidate, ...]:
 
     source_files = tuple(item for item in files if item.suffix in _SOURCE_SUFFIXES)
     source_paths = frozenset(item.relative_path for item in source_files)
+    source_namespace = stable_source_namespace(resolved_root)
     return tuple(
         SourceCandidate(
             source_id=stable_source_id(item.relative_path),
@@ -102,6 +112,7 @@ def discover_sources(source_root: Path) -> tuple[SourceCandidate, ...]:
             sha256=item.sha256,
             size_bytes=item.size_bytes,
             assets=_assets_for(item, files, source_paths, requested_root),
+            source_namespace=source_namespace,
         )
         for item in source_files
     )

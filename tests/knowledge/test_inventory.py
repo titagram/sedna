@@ -48,6 +48,23 @@ def test_discovery_keeps_identity_stable_when_content_changes(tmp_path: Path) ->
     assert before.sha256 != after.sha256
 
 
+def test_discovery_namespaces_same_relative_path_by_resolved_source_root(tmp_path: Path) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    relative_path = Path("Machines") / "Lame" / "walkthrough.md"
+    write_source(first_root / relative_path, "# First origin\n")
+    write_source(second_root / relative_path, "# Second origin\n")
+
+    first = discover_sources(first_root)[0]
+    repeated = discover_sources(first_root)[0]
+    second = discover_sources(second_root)[0]
+
+    assert first.source_id == repeated.source_id == second.source_id
+    assert first.source_namespace == repeated.source_namespace
+    assert first.source_namespace is not None
+    assert first.source_namespace != second.source_namespace
+
+
 def test_discovery_includes_pdf_and_nested_assets_but_excludes_ds_store(tmp_path: Path) -> None:
     root = tmp_path / "raw_src"
     write_source(root / "Courses" / "lesson.pdf", b"pdf", binary=True)

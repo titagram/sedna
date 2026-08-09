@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from typing import TYPE_CHECKING
 
 from sedna.knowledge.parsing import PreparedSource
@@ -69,10 +70,7 @@ class SemanticIngestionService:
                         failure_code="internal_failure",
                         failure_message=CANONICAL_COMPILATION_FAILURE_MESSAGES["internal_failure"],
                     )
-                if (
-                    manifest.ingestion_status.value != "accepted"
-                    or manifest.sha256 != prepared.manifest.sha256
-                ):
+                if manifest.ingestion_status.value != "accepted" or manifest != prepared.manifest:
                     return SemanticCompilationResult(
                         disposition="failed",
                         failure_code="internal_failure",
@@ -80,7 +78,16 @@ class SemanticIngestionService:
                     )
                 if result.disposition == "quarantined":
                     result = self._with_quarantine_manifest(prepared, result)
-                self._repository.write_semantic_result(result)
+                try:
+                    self._repository.write_semantic_result(result)
+                except Exception:
+                    with suppress(Exception):
+                        self._repository.invalidate_failed_semantic_result(prepared)
+                    return SemanticCompilationResult(
+                        disposition="failed",
+                        failure_code="internal_failure",
+                        failure_message=CANONICAL_COMPILATION_FAILURE_MESSAGES["internal_failure"],
+                    )
             elif result.disposition == "failed":
                 try:
                     self._repository.invalidate_failed_semantic_result(prepared)
@@ -106,6 +113,12 @@ class SemanticIngestionService:
             repair_prompt_version=REPAIR_PROMPT_VERSION,
             compiler_version=SEMANTIC_COMPILER_VERSION,
         )
+
+    def invalidate_failed_result(self, prepared: PreparedSource) -> bool:
+        """Fail closed after an unexpected caller-visible semantic processing exception."""
+        prepared = validate_prepared_source(prepared)
+        with self._repository.semantic_compilation_guard(prepared.manifest.source_id):
+            return self._repository.invalidate_failed_semantic_result(prepared)
 
     @staticmethod
     def _with_quarantine_manifest(

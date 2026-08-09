@@ -31,6 +31,7 @@ class DocumentManifest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     source_id: NonEmptyString
+    source_namespace: NonEmptyString | None = None
     path: NonEmptyString
     sha256: Sha256
     title: NonEmptyString

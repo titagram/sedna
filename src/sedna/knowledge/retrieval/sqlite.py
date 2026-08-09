@@ -216,7 +216,8 @@ class SQLiteRetrievalIndex:
 
     def __init__(self, path: str | Path, *, parent_fd: int | None = None) -> None:
         self._mutex = threading.RLock()
-        self._unavailable = False
+        self._poisoned = False
+        self._durable_unavailable = False
         self._connection: _MemoryConnection | None = None
         self._parent_fd: int | None = None
         self._lock_fd: int | None = None
@@ -225,6 +226,7 @@ class SQLiteRetrievalIndex:
         self._generation = 0
         self.path, self._filename = self._prepare_target(path)
         self._lock_filename = f".{self._filename}.lock"
+        self._unavailable_filename = f".{self._filename}.unavailable"
         try:
             if parent_fd is None:
                 self._open_parent()
@@ -232,6 +234,7 @@ class SQLiteRetrievalIndex:
                 self._open_parent_descriptor(parent_fd)
             self._open_lock()
             with self._file_lock(exclusive=True):
+                self._durable_unavailable = self._unavailable_marker_exists()
                 database_bytes, identity = self._read_database_bytes()
                 if database_bytes:
                     connection = self._connection_from_bytes(database_bytes)
@@ -291,9 +294,19 @@ class SQLiteRetrievalIndex:
                 self._parent_fd = None
 
     def mark_unavailable(self) -> None:
-        """Irreversibly reject index operations before best-effort resource cleanup."""
+        """Irreversibly poison this object and persist a rebuild requirement for reopen."""
         with self._mutex:
-            self._unavailable = True
+            self._poisoned = True
+            self._durable_unavailable = True
+            with self._file_lock(exclusive=True):
+                self._persist_unavailable_marker()
+
+    def mark_rebuild_required(self) -> None:
+        """Persist a soft read barrier that a fresh successful rebuild may clear."""
+        with self._mutex:
+            self._durable_unavailable = True
+            with self._file_lock(exclusive=True):
+                self._persist_unavailable_marker()
 
     def upsert_bundle(self, bundle: SemanticKnowledgeBundle) -> None:
         """Atomically replace one source projection after canonical validation."""
@@ -305,6 +318,7 @@ class SQLiteRetrievalIndex:
         with self._mutex:
             self._ensure_open()
             with self._file_lock(exclusive=True):
+                self._require_no_durable_unavailable_marker()
                 candidate, previous_bytes, identity, generation = self._load_live_connection()
                 try:
                     self._require_current_schema(candidate)
@@ -335,6 +349,7 @@ class SQLiteRetrievalIndex:
         with self._mutex:
             self._ensure_open()
             with self._file_lock(exclusive=True):
+                self._require_no_durable_unavailable_marker()
                 candidate, previous_bytes, identity, generation = self._load_live_connection()
                 try:
                     self._require_current_schema(candidate)
@@ -358,7 +373,7 @@ class SQLiteRetrievalIndex:
         precommit_guard: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> IndexAudit:
         """Serialize a checked fresh database and atomically install its synced bytes."""
-        self._require_available()
+        self._require_rebuildable()
         if precommit_guard is not None and not callable(precommit_guard):
             raise TypeError("precommit_guard must be callable")
         projected: list[tuple[str, str, IndexedSourceState, tuple[ProjectedArtifact, ...]]] = []
@@ -374,7 +389,7 @@ class SQLiteRetrievalIndex:
             projected.append((source_id, source_sha256, source_state, rows))
 
         with self._mutex:
-            self._ensure_open()
+            self._ensure_rebuildable_open()
             with self._file_lock(exclusive=True):
                 _, previous_bytes, identity, generation = self._load_live_connection(close=True)
                 candidate = self._new_schema_connection()
@@ -402,6 +417,8 @@ class SQLiteRetrievalIndex:
                     candidate.close()
                     raise
                 self._adopt_connection(candidate, new_identity, new_generation)
+                self._clear_unavailable_marker()
+                self._durable_unavailable = False
                 return audit
 
     def get_artifact(self, artifact_id: str) -> IndexedArtifact | None:
@@ -782,6 +799,7 @@ class SQLiteRetrievalIndex:
         with self._mutex:
             self._ensure_open()
             with self._file_lock(exclusive=False):
+                self._require_no_durable_unavailable_marker()
                 connection, _, _, _ = self._load_live_connection(close=False)
                 try:
                     yield connection
@@ -1810,8 +1828,59 @@ class SQLiteRetrievalIndex:
         os.ftruncate(lock_fd, len(payload))
         os.fsync(lock_fd)
 
+    def _unavailable_marker_exists(self) -> bool:
+        try:
+            status = os.stat(
+                self._unavailable_filename,
+                dir_fd=self._ensure_parent_open(),
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(status.st_mode):
+            raise ValueError("retrieval unavailable marker is not a regular file")
+        return True
+
+    def _persist_unavailable_marker(self) -> None:
+        parent_fd = self._ensure_parent_open()
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        try:
+            marker_fd = os.open(
+                self._unavailable_filename,
+                flags,
+                0o600,
+                dir_fd=parent_fd,
+            )
+        except FileExistsError:
+            if not self._unavailable_marker_exists():
+                raise RuntimeError("retrieval unavailable marker changed") from None
+            return
+        try:
+            if not stat.S_ISREG(os.fstat(marker_fd).st_mode):
+                raise ValueError("retrieval unavailable marker is not a regular file")
+            payload = b"sedna-retrieval-rebuild-required-v1\n"
+            if os.write(marker_fd, payload) != len(payload):
+                raise OSError("retrieval unavailable marker write was incomplete")
+            os.fsync(marker_fd)
+        finally:
+            os.close(marker_fd)
+        os.fsync(parent_fd)
+
+    def _clear_unavailable_marker(self) -> None:
+        parent_fd = self._ensure_parent_open()
+        if not self._unavailable_marker_exists():
+            return
+        os.unlink(self._unavailable_filename, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+
+    def _require_no_durable_unavailable_marker(self) -> None:
+        """Observe barriers written by already-open cooperative peer processes."""
+        if self._unavailable_marker_exists():
+            self._durable_unavailable = True
+            raise RuntimeError("retrieval index is unavailable")
+
     def _ensure_open(self) -> _MemoryConnection:
-        if self._unavailable:
+        if self._poisoned or self._durable_unavailable:
             raise RuntimeError("retrieval index is unavailable")
         connection = self._connection
         if connection is None:
@@ -1821,6 +1890,18 @@ class SQLiteRetrievalIndex:
     def _require_available(self) -> None:
         with self._mutex:
             self._ensure_open()
+
+    def _require_rebuildable(self) -> None:
+        with self._mutex:
+            self._ensure_rebuildable_open()
+
+    def _ensure_rebuildable_open(self) -> _MemoryConnection:
+        if self._poisoned:
+            raise RuntimeError("retrieval index is unavailable")
+        connection = self._connection
+        if connection is None:
+            raise RuntimeError("retrieval index is closed")
+        return connection
 
     def _ensure_parent_open(self) -> int:
         parent_fd = self._parent_fd

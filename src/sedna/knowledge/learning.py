@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
+from contextlib import suppress
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Self
@@ -12,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from sedna.knowledge.inventory import SourceCandidate, discover_sources
 from sedna.knowledge.pipeline import IngestionPipeline
+from sedna.knowledge.repository import CanonicalKnowledgeRepository
 from sedna.knowledge.retrieval.maintenance import (
     MaintenanceIssue,
     MaintenanceIssueCode,
@@ -172,10 +174,12 @@ class DocumentLearningService:
         knowledge_root: Path,
         semantic_service: SemanticIngestionService,
         maintenance: RetrievalMaintenanceService,
+        repository: CanonicalKnowledgeRepository | None = None,
     ) -> None:
         self.knowledge_root = Path(knowledge_root)
         self.semantic_service = semantic_service
         self._maintenance = maintenance
+        self._repository = repository
 
     def learn(self, source_path: Path) -> LearningRunReport:
         """Learn a confined local source selection without exposing exceptions or source text."""
@@ -200,7 +204,11 @@ class DocumentLearningService:
         outcomes: list[LearningSourceOutcome] = []
         failure_codes: list[str] = []
         try:
-            with IngestionPipeline(root, self.knowledge_root) as pipeline:
+            with IngestionPipeline(
+                root,
+                self.knowledge_root,
+                repository=self._repository,
+            ) as pipeline:
                 try:
                     candidates = _select_candidates(discover_sources(root), only_relative_path)
                 except (OSError, ValueError):
@@ -240,6 +248,7 @@ class DocumentLearningService:
         candidate: SourceCandidate,
         outcomes: list[LearningSourceOutcome],
     ) -> None:
+        prepared: object | None = None
         try:
             prepared = pipeline.prepare(candidate)
             if prepared is None:
@@ -264,6 +273,12 @@ class DocumentLearningService:
             self._invalidate_failed_source_projection(candidate, semantic)
             outcomes.append(_semantic_outcome(candidate, semantic))
         except Exception:
+            if prepared is not None:
+                invalidate = getattr(self.semantic_service, "invalidate_failed_result", None)
+                if callable(invalidate):
+                    with suppress(Exception):
+                        invalidate(prepared)
+                self._invalidate_source_projection(candidate)
             outcomes.append(_failed_outcome(candidate, "source_processing_failed"))
 
     def _reprepare_if_semantic_stale(
@@ -306,6 +321,10 @@ class DocumentLearningService:
         """Remove a failed source from the live disposable projection before rebuilding."""
         if getattr(semantic, "disposition", None) != "failed":
             return
+        self._invalidate_source_projection(candidate)
+
+    def _invalidate_source_projection(self, candidate: SourceCandidate) -> None:
+        """Fail closed the source's disposable projection after semantic uncertainty."""
         invalidate = getattr(self._maintenance, "invalidate_source_projection", None)
         if not callable(invalidate):
             return

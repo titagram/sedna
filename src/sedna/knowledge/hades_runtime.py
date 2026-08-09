@@ -87,10 +87,14 @@ class HadesKnowledgeRuntime:
                 os.close(source_root_fd)
                 source_root_fd = -1
             maintenance = RetrievalMaintenanceService(repository, index)
+            opening_audit = maintenance.audit()
+            if not opening_audit.succeeded or opening_audit.rebuild_required:
+                index.mark_rebuild_required()
             learning = DocumentLearningService(
                 knowledge_root=repository.root,
                 semantic_service=semantic,
                 maintenance=maintenance,
+                repository=repository,
             )
             retrieval = KnowledgeRetrievalService(index)
             return cls(

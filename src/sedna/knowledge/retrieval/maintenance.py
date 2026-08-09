@@ -148,13 +148,15 @@ class RetrievalMaintenanceService:
         try:
             bundles, canonical_states, revision = self._canonical_snapshot()
         except SemanticBundleEnumerationError as error:
-            return self._canonical_failure("rebuild", started, error)
+            return self._poison_failed_rebuild(self._canonical_failure("rebuild", started, error))
         except Exception:
-            return self._failure(
-                "rebuild",
-                started,
-                MaintenanceIssueCode.CANONICAL_REPOSITORY_INVALID,
-                "canonical semantic repository enumeration failed",
+            return self._poison_failed_rebuild(
+                self._failure(
+                    "rebuild",
+                    started,
+                    MaintenanceIssueCode.CANONICAL_REPOSITORY_INVALID,
+                    "canonical semantic repository enumeration failed",
+                )
             )
 
         try:
@@ -163,28 +165,35 @@ class RetrievalMaintenanceService:
                 precommit_guard=lambda: self.repository.semantic_snapshot_guard(revision),
             )
         except SemanticSnapshotChangedError:
-            return self._failure(
-                "rebuild",
-                started,
-                MaintenanceIssueCode.CANONICAL_REPOSITORY_CHANGED,
-                "canonical semantic sources changed before index commit; prior index retained",
-                canonical_source_count=len(canonical_states),
-                canonical_artifact_count=sum(
-                    state.artifact_count for state in canonical_states.values()
-                ),
+            return self._poison_failed_rebuild(
+                self._failure(
+                    "rebuild",
+                    started,
+                    MaintenanceIssueCode.CANONICAL_REPOSITORY_CHANGED,
+                    "canonical semantic sources changed before index commit; prior index retained",
+                    canonical_source_count=len(canonical_states),
+                    canonical_artifact_count=sum(
+                        state.artifact_count for state in canonical_states.values()
+                    ),
+                )
             )
         except Exception:
-            return self._failure(
-                "rebuild",
-                started,
-                MaintenanceIssueCode.INDEX_REBUILD_FAILED,
-                "retrieval index rebuild failed and the previous projection was retained",
-                canonical_source_count=len(canonical_states),
-                canonical_artifact_count=sum(
-                    state.artifact_count for state in canonical_states.values()
-                ),
+            return self._poison_failed_rebuild(
+                self._failure(
+                    "rebuild",
+                    started,
+                    MaintenanceIssueCode.INDEX_REBUILD_FAILED,
+                    "retrieval index rebuild failed and the previous projection was retained",
+                    canonical_source_count=len(canonical_states),
+                    canonical_artifact_count=sum(
+                        state.artifact_count for state in canonical_states.values()
+                    ),
+                )
             )
-        return self._audit(operation="rebuild", started=started)
+        report = self._audit(operation="rebuild", started=started)
+        if not report.succeeded or report.rebuild_required:
+            return self._poison_failed_rebuild(report)
+        return report
 
     def audit(self) -> RetrievalMaintenanceReport:
         """Cross-check canonical source identity and projection parity without mutation."""
@@ -203,6 +212,14 @@ class RetrievalMaintenanceService:
             with suppress(Exception):
                 self.index.close()
             return False
+
+    def _poison_failed_rebuild(
+        self,
+        report: RetrievalMaintenanceReport,
+    ) -> RetrievalMaintenanceReport:
+        with suppress(Exception):
+            self.index.mark_unavailable()
+        return report
 
     def _audit(
         self,

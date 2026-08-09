@@ -370,10 +370,7 @@ class CanonicalKnowledgeRepository:
                 manifest = self.load_manifest(source_id)
             except FileNotFoundError:
                 return False
-            if (
-                manifest.ingestion_status.value != "accepted"
-                or manifest.sha256 != prepared.manifest.sha256
-            ):
+            if manifest.ingestion_status.value != "accepted" or manifest != prepared.manifest:
                 return False
             self._invalidate_semantic_state(source_id, prepared.manifest.sha256)
             return True
@@ -480,9 +477,16 @@ class CanonicalKnowledgeRepository:
             try:
                 with self._source_transition_lock(source_id):
                     bundle, verification, quarantine = self._load_semantic_state(source_id)
+                    self._require_semantic_foundation_state(
+                        source_id,
+                        bundle=bundle,
+                        verification=verification,
+                        quarantine=quarantine,
+                    )
                 if bundle is None:
                     # A complete quarantine pair is canonical but deliberately not retrievable.
                     if verification is not None and quarantine is not None:
+                        self._require_current_retrieval_quarantine(quarantine)
                         continue
                     raise ValueError("semantic state does not contain a verified bundle")
                 self._require_current_retrieval_bundle(bundle)
@@ -613,7 +617,15 @@ class CanonicalKnowledgeRepository:
             self._recover_source(source_id)
             try:
                 bundle, verification, quarantine = self._load_semantic_state(source_id)
-            except ValueError:
+                foundation_manifest = self.load_manifest(source_id)
+                self._require_semantic_foundation_state(
+                    source_id,
+                    bundle=bundle,
+                    verification=verification,
+                    quarantine=quarantine,
+                    foundation=foundation_manifest,
+                )
+            except (FileNotFoundError, ValueError):
                 return None
             if verification is None:
                 return None
@@ -629,11 +641,13 @@ class CanonicalKnowledgeRepository:
             if manifest is None:
                 return None
             current = (
-                verification.source_id == source_id
+                foundation_manifest == prepared.manifest
+                and verification.source_id == source_id
                 and verification.source_sha256 == prepared.manifest.sha256
                 and manifest.foundation_schema_version == foundation.schema_version
                 and manifest.foundation_parser_id == foundation.parser_id
                 and manifest.foundation_parser_version == foundation.parser_version
+                and manifest.foundation_extraction == foundation
                 and (
                     bundle.schema_version == semantic_schema_version
                     if bundle is not None
@@ -1024,6 +1038,45 @@ class CanonicalKnowledgeRepository:
             )
         return bundle, verification, quarantine
 
+    def _require_semantic_foundation_state(
+        self,
+        source_id: str,
+        *,
+        bundle: SemanticKnowledgeBundle | None,
+        verification: SemanticVerificationRecord | None,
+        quarantine: SemanticQuarantineRecord | None,
+        foundation: DocumentManifest | None = None,
+    ) -> None:
+        """Bind every semantic disposition to its exact accepted foundation manifest."""
+        if bundle is None and verification is None and quarantine is None:
+            return
+        if foundation is None:
+            try:
+                foundation = self.load_manifest(source_id)
+            except FileNotFoundError as error:
+                raise ValueError("semantic state has no foundation manifest") from error
+        if foundation.ingestion_status.value != "accepted":
+            raise ValueError("semantic state foundation manifest is not accepted")
+        semantic_manifest = (
+            bundle.compilation_manifest
+            if bundle is not None
+            else quarantine.compilation_manifest
+            if quarantine is not None
+            else None
+        )
+        if semantic_manifest is None or verification is None:
+            raise ValueError("semantic state lacks foundation compilation attribution")
+        extraction = foundation.extraction
+        if (
+            verification.source_sha256 != foundation.sha256
+            or semantic_manifest.source_sha256 != foundation.sha256
+            or semantic_manifest.foundation_schema_version != extraction.schema_version
+            or semantic_manifest.foundation_parser_id != extraction.parser_id
+            or semantic_manifest.foundation_parser_version != extraction.parser_version
+            or semantic_manifest.foundation_extraction != extraction
+        ):
+            raise ValueError("semantic state does not match its current foundation manifest")
+
     def _semantic_inventory_entries(
         self,
     ) -> tuple[tuple[tuple[str, str, str, int], ...], tuple[str, ...]]:
@@ -1118,6 +1171,24 @@ class CanonicalKnowledgeRepository:
                     source_ids.add(source_id)
             finally:
                 os.close(directory_fd)
+        for source_id in sorted(source_ids):
+            try:
+                payload = self._read_optional_bytes("manifests", source_id)
+            except (OSError, ValueError) as exc:
+                raise SemanticBundleEnumerationError(
+                    source_id,
+                    "unsafe_foundation_record",
+                    "has an unsafe current foundation manifest",
+                ) from exc
+            if payload is not None:
+                entries.append(
+                    (
+                        "manifests",
+                        f"{source_id}.json",
+                        sha256(payload).hexdigest(),
+                        len(payload),
+                    )
+                )
         return tuple(sorted(entries)), tuple(sorted(source_ids))
 
     @staticmethod
@@ -1159,6 +1230,23 @@ class CanonicalKnowledgeRepository:
         ):
             raise SemanticBundleEnumerationError(
                 bundle.source_id,
+                "stale_semantic_record",
+                "is not current and must be semantically recompiled",
+            )
+
+    @staticmethod
+    def _require_current_retrieval_quarantine(quarantine: SemanticQuarantineRecord) -> None:
+        manifest = quarantine.compilation_manifest
+        if (
+            quarantine.semantic_schema_version != SEMANTIC_SCHEMA_VERSION
+            or manifest is None
+            or manifest.compiler_version != SEMANTIC_COMPILER_VERSION
+            or manifest.extractor_prompt_version != EXTRACTOR_PROMPT_VERSION
+            or manifest.critic_prompt_version != CRITIC_PROMPT_VERSION
+            or manifest.repair_prompt_version != REPAIR_PROMPT_VERSION
+        ):
+            raise SemanticBundleEnumerationError(
+                quarantine.source_id,
                 "stale_semantic_record",
                 "is not current and must be semantically recompiled",
             )

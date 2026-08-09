@@ -901,6 +901,9 @@ class _IndexDouble:
     def mark_unavailable(self) -> None:
         return None
 
+    def mark_rebuild_required(self) -> None:
+        return None
+
     def upsert_bundle(self, bundle: object) -> None:
         return None
 

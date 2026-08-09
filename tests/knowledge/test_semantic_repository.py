@@ -100,6 +100,7 @@ def _verified_result(
         foundation_schema_version=extraction.schema_version,
         foundation_parser_id=extraction.parser_id,
         foundation_parser_version=extraction.parser_version,
+        foundation_extraction=extraction,
         compiler_version=SEMANTIC_COMPILER_VERSION,
         extractor_prompt_version=EXTRACTOR_PROMPT_VERSION,
         critic_prompt_version=CRITIC_PROMPT_VERSION,
@@ -181,6 +182,57 @@ def test_verified_semantic_result_round_trips_with_deterministic_bytes(tmp_path:
     assert all(payload.endswith(b"\n") for payload in first)
     assert not (repository.root / "semantic_quarantine" / "semantic-source.json").exists()
     assert not list(repository.root.rglob("*.tmp"))
+
+
+def test_retrieval_snapshot_rejects_semantics_not_bound_to_current_foundation(
+    tmp_path: Path,
+) -> None:
+    """A semantic pair cannot remain retrievable after its accepted manifest changes."""
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    prepared = _prepared()
+    repository.write_manifest(prepared.manifest)
+    repository.write_semantic_result(_verified_result(prepared))
+    changed = prepared.manifest.model_copy(
+        update={
+            "extraction": prepared.manifest.extraction.model_copy(
+                update={"extractor_version": "changed-foundation"}
+            )
+        }
+    )
+    repository.write_manifest(changed)
+
+    with pytest.raises(Exception, match="foundation"):
+        repository.semantic_bundle_snapshot()
+    assert repository.load_current_semantic_result(prepared) is None
+
+
+def test_stale_failure_cannot_invalidate_newer_same_hash_foundation_semantics(
+    tmp_path: Path,
+) -> None:
+    """A delayed learning fallback must match the whole foundation, not only source bytes."""
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+    stale = _prepared()
+    current_manifest = stale.manifest.model_copy(
+        update={
+            "extraction": stale.manifest.extraction.model_copy(
+                update={"extractor_version": "new-foundation"}
+            )
+        }
+    )
+    current = PreparedSource(
+        manifest=current_manifest,
+        document=stale.document,
+        segments=stale.segments,
+    )
+    current_result = _verified_result(current)
+    repository.write_manifest(current.manifest)
+    repository.write_semantic_result(current_result)
+
+    with repository.semantic_compilation_guard(stale.manifest.source_id):
+        invalidated = repository.invalidate_failed_semantic_result(stale)
+
+    assert invalidated is False
+    assert repository.load_semantic_bundle(stale.manifest.source_id) == current_result.bundle
 
 
 def test_semantic_dispositions_replace_bundle_and_quarantine_exclusively(tmp_path: Path) -> None:
@@ -461,6 +513,7 @@ def test_current_semantic_result_is_one_linearizable_pair_across_instances(
     reader = CanonicalKnowledgeRepository(root)
     writer = CanonicalKnowledgeRepository(root)
     prepared = _prepared()
+    reader.write_manifest(prepared.manifest)
     original = _verified_result(
         prepared,
         extractor_model="extractor-original",
@@ -708,6 +761,7 @@ def test_semantic_result_currentness_covers_all_versions_and_optional_model_pin(
 ) -> None:
     repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
     prepared = _prepared()
+    repository.write_manifest(prepared.manifest)
     repository.write_semantic_result(_verified_result(prepared))
 
     assert repository.semantic_result_is_current(prepared)
