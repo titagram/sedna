@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 import sedna.plugin as plugin_module
+from sedna.knowledge.retrieval import KnowledgeGapCode
 from sedna.plugin import register
 from tests.knowledge.test_semantic_service import (
     RAW_FLAG,
@@ -473,3 +475,100 @@ def test_handlers_reject_non_json_values_and_scalar_type_coercion(tmp_path: Path
 
     assert non_json == {"ok": False, "error": "invalid_input"}
     assert wrong_scalar == {"ok": False, "error": "invalid_input"}
+
+
+LLM_GUIDE = Path(__file__).parents[1] / "docs" / "llm" / "sedna-knowledge-tools.md"
+README = Path(__file__).parents[1] / "README.md"
+_JSON_EXAMPLE = re.compile(r"```json\n(?P<payload>.*?)\n```", re.DOTALL)
+_KNOWLEDGE_TOOL_NAMES = {
+    "sedna_learn_local",
+    "sedna_retrieve_knowledge",
+    "sedna_get_knowledge_artifact",
+    "sedna_knowledge_maintenance",
+}
+_REQUIRED_GUIDE_SECTIONS = (
+    "## 1. When to call `sedna_learn_local`",
+    "## 2. Supplying authorization and current observations",
+    "## 3. Interpreting evidence lanes and applicability",
+    "## 4. Exact provenance with `sedna_get_knowledge_artifact`",
+    "## 5. Writing a strategic answer",
+    "## 6. Knowledge gaps and pre-backend stops",
+    "## 7. Idempotence, versions, audit, and rebuild",
+    "## 8. Safety and research boundaries",
+)
+
+
+def _guide_examples() -> tuple[dict[str, Any], ...]:
+    text = LLM_GUIDE.read_text(encoding="utf-8")
+    examples = tuple(json.loads(match.group("payload")) for match in _JSON_EXAMPLE.finditer(text))
+    assert examples
+    assert all(type(example) is dict for example in examples)
+    return examples
+
+
+def _nested_values(value: object, key: str) -> tuple[object, ...]:
+    if isinstance(value, dict):
+        direct = (value[key],) if key in value else ()
+        return direct + tuple(
+            item for child in value.values() for item in _nested_values(child, key)
+        )
+    if isinstance(value, list):
+        return tuple(item for child in value for item in _nested_values(child, key))
+    return ()
+
+
+def test_llm_guide_examples_name_only_registered_tools_and_closed_gap_codes(
+    tmp_path: Path,
+) -> None:
+    examples = _guide_examples()
+    tool_names = {value for example in examples for value in _nested_values(example, "tool")}
+    gap_codes = {value for example in examples for value in _nested_values(example, "code")}
+    context = _FakeContext(
+        llm=_ScriptedHost([]),
+        knowledge_root=tmp_path / "knowledge",
+    )
+    register(context)
+    registered_names = {tool["name"] for tool in context.tools}
+
+    assert tool_names == _KNOWLEDGE_TOOL_NAMES
+    assert tool_names <= registered_names
+    assert gap_codes == {code.value for code in KnowledgeGapCode}
+
+
+def test_llm_guide_examples_are_fictional_json_without_flags_or_secrets() -> None:
+    examples = _guide_examples()
+    rendered = json.dumps(examples, ensure_ascii=False, sort_keys=True)
+
+    assert "192.0.2." in rendered or "198.51.100." in rendered
+    assert re.search(r"(?i)(?:htb|flag)\s*\{", rendered) is None
+    assert (
+        re.search(
+            r"(?i)(?:password|api[_ -]?key|private[_ -]?key)\s*[:=]",
+            rendered,
+        )
+        is None
+    )
+    assert "provider-secret" not in rendered
+
+
+def test_llm_guide_is_granular_and_never_makes_case_studies_universal() -> None:
+    guide = LLM_GUIDE.read_text(encoding="utf-8")
+    lower = guide.casefold()
+
+    assert all(section in guide for section in _REQUIRED_GUIDE_SECTIONS)
+    assert "case studies are context-bound examples" in lower
+    assert "adapt" in lower
+    assert "follow case studies exactly" not in lower
+    assert "case studies override current evidence" not in lower
+    assert "tool-operation syntax belongs to hades" in lower
+
+
+def test_readme_describes_the_m4_local_learning_boundary() -> None:
+    readme = README.read_text(encoding="utf-8").casefold()
+
+    assert "local file or folder" in readme
+    assert "host llm" in readme
+    assert "classified and verified automatically" in readme
+    assert "idempotent" in readme
+    assert "direct remote fetching" in readme
+    assert "outside" in readme

@@ -54,11 +54,10 @@ retain exact segment provenance, applicability conditions, and graded epistemic
 metadata while keeping strategic intent separate from detailed Hades tool
 operation.
 
-M2 accepts a single `PreparedSource`; it does not traverse a folder, register a
-Hades tool, or expose a user-facing “learn folder” workflow. M3 adds the local
-retrieval layer described below, but not those Hades composition surfaces. PDF
-contents also remain quarantined until a deterministic PDF parser is added rather
-than being partially or silently extracted.
+M2's compiler still accepts one `PreparedSource` at a time. M4 composes that
+boundary into a user-facing local file-or-folder workflow through the same host
+LLM, as described below. PDF contents remain quarantined until a deterministic
+PDF parser is added rather than being partially or silently extracted.
 
 ## Local strategic retrieval (M3)
 
@@ -121,15 +120,47 @@ gain without dropping below the lexical precision baseline, introducing any hard
 incompatibility violation, or losing deterministic provenance before its operational
 cost is considered.
 
-M3 exposes Python retrieval and maintenance APIs only. It does **not** yet provide a
-Hades plugin tool, host-LLM orchestration, autonomous web learning, folder traversal,
-or a user-facing “learn this folder” command; those are later integration milestones.
+## Autonomous local learning and Hades tools (M4/M5)
+
+M4 exposes `sedna_learn_local` for one local file or folder. Documents are
+classified and verified automatically through the host LLM's structured facade;
+one malformed source does not stop the remaining folder. The workflow requires no
+human approval, reports every candidate disposition, persists only verified
+canonical semantics, and reconciles the disposable retrieval index after the run.
+
+Compilation is idempotent across the exact source, parser/extractor, schema,
+prompt, and compiler-version contract. An identical second learning run makes no
+host-model call for current sources and produces no duplicate canonical or indexed artifacts.
+A controlled version change reprocesses once and the next identical run is
+unchanged.
+
+The Hades plugin now registers four strategic-knowledge tools:
+
+- `sedna_learn_local` learns a supplied local source selection;
+- `sedna_retrieve_knowledge` validates authorization and target syntax, then
+  retrieves independent reference, case, negative-evidence, and guidance lanes;
+- `sedna_get_knowledge_artifact` loads exact canonical provenance for citation;
+- `sedna_knowledge_maintenance` audits or rebuilds the disposable SQLite
+  projection.
+
+Direct remote fetching remains outside Sedna's local learning tool. Hades may
+perform authorized technical research under its own policy, save the material
+locally with source metadata, and submit that file through the identical verified
+pipeline. Exact machine solutions and final-answer material remain out of scope.
+Operational tool syntax remains the responsibility of Hades `/learn` skills;
+Sedna provides strategy, technical references, applicability, and adaptable case
+experience.
+
+The executable M5 demo covers a source-backed hypothetical private-IP query,
+pre-backend invalid-IP rejection, a truthful Android/ADB knowledge gap, and exact
+artifact drill-down. The granular LLM-facing call and response contract is in the
+[Sedna knowledge tools guide](docs/llm/sedna-knowledge-tools.md).
 
 The approved architecture for semantic compilation and later retrieval is
 documented in the [semantic ingestion and retrieval design](docs/superpowers/specs/2026-08-07-sedna-semantic-ingestion-retrieval-design.md).
 It defines the host-LLM extractor and critic, applicability facets, automatic
-verification, canonical JSON/JSONL storage, SQLite FTS5 retrieval, the future
-document-learning skill, and the evaluation gate for any later vector database.
+verification, canonical JSON/JSONL storage, SQLite FTS5 retrieval, the implemented
+document-learning boundary, and the evaluation gate for any later vector database.
 
 `ingest_markdown` remains available temporarily for callers of the original
 SQLite-backed `KnowledgeChunk` workflow. It does not feed the strategic pipeline;
