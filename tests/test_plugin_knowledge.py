@@ -385,6 +385,40 @@ def test_learn_rejects_overlapping_knowledge_root_before_creating_runtime_state(
     assert host.calls == []
 
 
+def test_learn_blocks_knowledge_ancestor_symlink_swap_before_any_source_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "sources"
+    _write_case(source_root)
+    external_parent = tmp_path / "external"
+    external_parent.mkdir()
+    detached_parent = tmp_path / "external-detached"
+    knowledge_root = external_parent / "knowledge"
+    host = _ScriptedHost(_load_responses(SOURCE_CASES["reference"].fixture_name))
+    context = _FakeContext(llm=host, knowledge_root=knowledge_root)
+    register(context)
+    real_create = plugin_module.HadesKnowledgeRuntime.create
+
+    def swap_then_create(
+        host_llm: object,
+        requested_root: Path,
+        **kwargs: object,
+    ) -> object:
+        external_parent.rename(detached_parent)
+        external_parent.symlink_to(source_root, target_is_directory=True)
+        return real_create(host_llm, requested_root, **kwargs)
+
+    monkeypatch.setattr(plugin_module.HadesKnowledgeRuntime, "create", swap_then_create)
+
+    result = _call_tool(context, "sedna_learn_local", {"source_path": str(source_root)})
+
+    assert result == {"ok": False, "error": "knowledge_runtime_unavailable"}
+    assert not (source_root / "knowledge").exists()
+    assert not (source_root / "knowledge" / "indexes" / "retrieval.sqlite").exists()
+    assert host.calls == []
+
+
 def test_retrieve_unauthorized_scope_returns_existing_gap_without_runtime(tmp_path: Path) -> None:
     context = _FakeContext(llm=object())
     register(context)

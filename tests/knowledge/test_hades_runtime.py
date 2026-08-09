@@ -471,6 +471,77 @@ def test_runtime_binds_structured_host_callable_at_preflight(tmp_path: Path) -> 
         runtime.close()
 
 
+def test_guarded_runtime_retains_external_root_identity_through_repository_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replacing an opened root ancestor must not redirect repository/index writes to source."""
+    import sedna.knowledge.hades_runtime as runtime_module
+
+    source_root = _source_root(tmp_path)
+    external_parent = tmp_path / "external"
+    external_parent.mkdir()
+    detached_parent = tmp_path / "external-detached"
+    knowledge_root = external_parent / "knowledge"
+    swapped = False
+
+    class _SwappingRepository(CanonicalKnowledgeRepository):
+        def __init__(self, root: Path, *, root_fd: int | None = None) -> None:
+            nonlocal swapped
+            external_parent.rename(detached_parent)
+            external_parent.symlink_to(source_root, target_is_directory=True)
+            swapped = True
+            super().__init__(root, root_fd=root_fd)
+
+    monkeypatch.setattr(runtime_module, "CanonicalKnowledgeRepository", _SwappingRepository)
+
+    with pytest.raises(OSError):
+        HadesKnowledgeRuntime.create(
+            _ScriptedHost(_responses()),
+            knowledge_root,
+            external_source_path=source_root,
+        )
+
+    assert swapped
+    assert not (source_root / "knowledge").exists()
+    assert not (source_root / "knowledge" / "indexes" / "retrieval.sqlite").exists()
+
+
+def test_guarded_runtime_rejects_source_rename_before_creating_knowledge_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Moving the retained source into the external path must fail before mkdir."""
+    import sedna.knowledge.hades_runtime as runtime_module
+
+    source_root = _source_root(tmp_path)
+    external_parent = tmp_path / "external"
+    external_parent.mkdir()
+    detached_parent = tmp_path / "external-detached"
+    knowledge_root = external_parent / "knowledge"
+    real_open_root = runtime_module._open_or_create_directory
+    swapped = False
+
+    def move_source_then_open(path: Path, **kwargs: object) -> int:
+        nonlocal swapped
+        external_parent.rename(detached_parent)
+        source_root.rename(external_parent)
+        swapped = True
+        return real_open_root(path, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runtime_module, "_open_or_create_directory", move_source_then_open)
+
+    with pytest.raises((ValueError, RuntimeError)):
+        HadesKnowledgeRuntime.create(
+            _ScriptedHost(_responses()),
+            knowledge_root,
+            external_source_path=source_root,
+        )
+
+    assert swapped
+    assert not (external_parent / "knowledge").exists()
+
+
 class _TrackingRepository(CanonicalKnowledgeRepository):
     instances: list[_TrackingRepository] = []
 

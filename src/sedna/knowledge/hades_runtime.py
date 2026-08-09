@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import stat
 import threading
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,17 +37,43 @@ class HadesKnowledgeRuntime:
     _close_lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     @classmethod
-    def create(cls, host_llm: object, knowledge_root: Path) -> HadesKnowledgeRuntime:
+    def create(
+        cls,
+        host_llm: object,
+        knowledge_root: Path,
+        *,
+        external_source_path: Path | None = None,
+    ) -> HadesKnowledgeRuntime:
         """Create an owned local runtime using only the host structured-completion facade."""
         host = _require_structured_host(host_llm)
         repository: CanonicalKnowledgeRepository | None = None
         index: SQLiteRetrievalIndex | None = None
         index_parent_fd = -1
+        guarded_root_fd = -1
+        source_root_fd = -1
+        guarded_source_root: Path | None = None
         try:
-            repository = CanonicalKnowledgeRepository(Path(knowledge_root))
+            if external_source_path is None:
+                repository = CanonicalKnowledgeRepository(Path(knowledge_root))
+            else:
+                guarded_source_root, source_root_fd = _open_source_root_guard(external_source_path)
+                guarded_knowledge_root, guarded_root_fd = _open_external_knowledge_root(
+                    knowledge_root,
+                    guarded_source_root,
+                    source_root_fd,
+                )
+                repository = CanonicalKnowledgeRepository(
+                    guarded_knowledge_root,
+                    root_fd=guarded_root_fd,
+                )
+                os.close(guarded_root_fd)
+                guarded_root_fd = -1
+                _assert_guarded_roots(repository, guarded_source_root, source_root_fd)
             adapter = HadesLlmAdapter(host)
             compiler = SemanticCompiler(adapter, clock=lambda: datetime.now(UTC))
             semantic = SemanticIngestionService(repository, compiler)
+            if guarded_source_root is not None:
+                _assert_guarded_roots(repository, guarded_source_root, source_root_fd)
             index_parent_fd = repository.open_index_directory()
             index = SQLiteRetrievalIndex(
                 repository.root / "indexes" / "retrieval.sqlite",
@@ -54,6 +82,10 @@ class HadesKnowledgeRuntime:
             os.close(index_parent_fd)
             index_parent_fd = -1
             repository.assert_root_identity()
+            if guarded_source_root is not None:
+                _assert_guarded_roots(repository, guarded_source_root, source_root_fd)
+                os.close(source_root_fd)
+                source_root_fd = -1
             maintenance = RetrievalMaintenanceService(repository, index)
             learning = DocumentLearningService(
                 knowledge_root=repository.root,
@@ -71,6 +103,10 @@ class HadesKnowledgeRuntime:
         except BaseException:
             if index_parent_fd >= 0:
                 os.close(index_parent_fd)
+            if guarded_root_fd >= 0:
+                os.close(guarded_root_fd)
+            if source_root_fd >= 0:
+                os.close(source_root_fd)
             _close_owned(index, repository)
             raise
 
@@ -117,6 +153,125 @@ class _BoundStructuredHost:
 
     def complete_structured(self, **kwargs: object) -> object:
         return self._complete_structured(**kwargs)
+
+
+def _open_source_root_guard(source_path: Path) -> tuple[Path, int]:
+    requested = Path(source_path)
+    try:
+        requested_status = os.stat(requested, follow_symlinks=False)
+    except OSError as error:
+        raise ValueError("learning source path is unavailable") from error
+    if stat.S_ISDIR(requested_status.st_mode):
+        requested_root = requested
+    elif stat.S_ISREG(requested_status.st_mode):
+        requested_root = requested.parent
+    else:
+        raise ValueError("learning source path must be a regular file or directory")
+    resolved_root = requested_root.resolve(strict=True)
+    descriptor = os.open(resolved_root, _directory_open_flags())
+    try:
+        _assert_directory_identity(resolved_root, descriptor, "learning source root")
+        return resolved_root, descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_external_knowledge_root(
+    knowledge_root: Path,
+    source_root: Path,
+    source_root_fd: int,
+) -> tuple[Path, int]:
+    try:
+        resolved_root = Path(knowledge_root).resolve(strict=False)
+    except (OSError, ValueError) as error:
+        raise ValueError("knowledge root is unavailable") from error
+    _require_external_paths(source_root, resolved_root)
+    _assert_directory_identity(source_root, source_root_fd, "learning source root")
+    descriptor = _open_or_create_directory(
+        resolved_root,
+        forbidden_root_fd=source_root_fd,
+    )
+    try:
+        _assert_directory_identity(source_root, source_root_fd, "learning source root")
+        _require_external_paths(source_root, resolved_root)
+        return resolved_root, descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_or_create_directory(path: Path, *, forbidden_root_fd: int | None = None) -> int:
+    flags = _directory_open_flags()
+    descriptor = os.open(path.anchor, flags)
+    try:
+        _require_distinct_root_descriptor(descriptor, forbidden_root_fd)
+        for component in path.parts[1:]:
+            try:
+                child_fd = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                with suppress(FileExistsError):
+                    os.mkdir(component, mode=0o755, dir_fd=descriptor)
+                child_fd = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child_fd
+            _require_distinct_root_descriptor(descriptor, forbidden_root_fd)
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise ValueError("knowledge root is not a directory")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _require_distinct_root_descriptor(descriptor: int, forbidden_root_fd: int | None) -> None:
+    if forbidden_root_fd is None:
+        return
+    current = os.fstat(descriptor)
+    forbidden = os.fstat(forbidden_root_fd)
+    if (current.st_dev, current.st_ino) == (forbidden.st_dev, forbidden.st_ino):
+        raise ValueError("knowledge root must remain outside the learning source root")
+
+
+def _assert_guarded_roots(
+    repository: CanonicalKnowledgeRepository,
+    source_root: Path,
+    source_root_fd: int,
+) -> None:
+    _assert_directory_identity(source_root, source_root_fd, "learning source root")
+    repository.assert_root_identity()
+    _require_external_paths(source_root, repository.root)
+
+
+def _assert_directory_identity(path: Path, descriptor: int, label: str) -> None:
+    retained = os.fstat(descriptor)
+    try:
+        current = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise RuntimeError(f"{label} identity changed") from error
+    if (
+        not stat.S_ISDIR(retained.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or (
+            retained.st_dev,
+            retained.st_ino,
+        )
+        != (current.st_dev, current.st_ino)
+    ):
+        raise RuntimeError(f"{label} identity changed")
+
+
+def _require_external_paths(source_root: Path, knowledge_root: Path) -> None:
+    if (
+        source_root == knowledge_root
+        or knowledge_root.is_relative_to(source_root)
+        or source_root.is_relative_to(knowledge_root)
+    ):
+        raise ValueError("knowledge root must remain outside the learning source root")
+
+
+def _directory_open_flags() -> int:
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
 
 def _require_structured_host(host_llm: object) -> HostStructuredLlm:

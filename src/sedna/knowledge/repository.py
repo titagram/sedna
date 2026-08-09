@@ -190,6 +190,10 @@ class CanonicalKnowledgeRepository:
     renamed or replaced, so a returned path is a location hint rather than an identity
     handle in that exceptional case.
 
+    A supplied ``root_fd`` is duplicated rather than adopted; the caller retains ownership.
+    That guarded mode requires an existing nominal root with the same physical identity and
+    never creates path components before the match is established.
+
     Source transitions use POSIX ``flock`` locks opened relative to the retained
     root.  The locks are advisory, but every transition entry point participates;
     their open-file-description lifetime also releases locks after process death.
@@ -214,30 +218,33 @@ class CanonicalKnowledgeRepository:
         "semantic_quarantine",
     )
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, root_fd: int | None = None) -> None:
         self._descriptor_lock = threading.RLock()
         self._root_fd: int | None = None
         self._require_safe_primitives()
         requested_root = Path(root)
         if "\x00" in os.fspath(requested_root):
             raise ValueError("repository root must not contain NUL")
-        requested_root.mkdir(parents=True, exist_ok=True)
+        if root_fd is None:
+            requested_root.mkdir(parents=True, exist_ok=True)
         self.root = requested_root.resolve(strict=True)
         if not self.root.is_dir():
             raise ValueError(f"repository root is not a directory: {self.root}")
         expected = os.stat(self.root, follow_symlinks=False)
-        root_fd = os.open(self.root, self._directory_open_flags())
+        retained_root_fd = (
+            os.open(self.root, self._directory_open_flags()) if root_fd is None else os.dup(root_fd)
+        )
         try:
-            actual = os.fstat(root_fd)
+            actual = os.fstat(retained_root_fd)
             if not stat.S_ISDIR(actual.st_mode) or (actual.st_dev, actual.st_ino) != (
                 expected.st_dev,
                 expected.st_ino,
             ):
                 raise ValueError("repository root changed while it was being opened")
         except Exception:
-            os.close(root_fd)
+            os.close(retained_root_fd)
             raise
-        self._root_fd = root_fd
+        self._root_fd = retained_root_fd
         try:
             self._recover_pending_transactions()
         except BaseException:

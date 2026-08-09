@@ -402,7 +402,11 @@ def _runtime_for_context(
     if source_path is not None:
         _require_external_knowledge_root(source_path, knowledge_root)
     try:
-        return HadesKnowledgeRuntime.create(host, knowledge_root)
+        return HadesKnowledgeRuntime.create(
+            host,
+            knowledge_root,
+            external_source_path=source_path,
+        )
     except Exception as error:
         raise _ToolBoundaryError("knowledge_runtime_unavailable") from error
 
