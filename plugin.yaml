@@ -2,8 +2,12 @@ manifest_version: 1
 name: sedna
 version: "0.1.0"
 kind: standalone
-description: "Minimal HTB/CTF evidence store and safe Nmap wrappers."
+description: "HTB/CTF strategic knowledge learning, retrieval, and safe Nmap wrappers."
 author: Gabriele
 provides_tools:
   - sedna_nmap_tcp_discovery
   - sedna_nmap_service_scan
+  - sedna_learn_local
+  - sedna_retrieve_knowledge
+  - sedna_get_knowledge_artifact
+  - sedna_knowledge_maintenance
