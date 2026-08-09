@@ -81,6 +81,15 @@ class SemanticIngestionService:
                 if result.disposition == "quarantined":
                     result = self._with_quarantine_manifest(prepared, result)
                 self._repository.write_semantic_result(result)
+            elif result.disposition == "failed":
+                try:
+                    self._repository.invalidate_failed_semantic_result(prepared)
+                except Exception:
+                    return SemanticCompilationResult(
+                        disposition="failed",
+                        failure_code="internal_failure",
+                        failure_message=CANONICAL_COMPILATION_FAILURE_MESSAGES["internal_failure"],
+                    )
             return result
 
     def is_current(self, prepared: PreparedSource) -> bool:

@@ -214,7 +214,7 @@ class _MemoryConnection(sqlite3.Connection):
 class SQLiteRetrievalIndex:
     """A fixed-path retrieval index that never asks SQLite to open that path."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, parent_fd: int | None = None) -> None:
         self._mutex = threading.RLock()
         self._connection: _MemoryConnection | None = None
         self._parent_fd: int | None = None
@@ -225,7 +225,10 @@ class SQLiteRetrievalIndex:
         self.path, self._filename = self._prepare_target(path)
         self._lock_filename = f".{self._filename}.lock"
         try:
-            self._open_parent()
+            if parent_fd is None:
+                self._open_parent()
+            else:
+                self._open_parent_descriptor(parent_fd)
             self._open_lock()
             with self._file_lock(exclusive=True):
                 database_bytes, identity = self._read_database_bytes()
@@ -1074,6 +1077,21 @@ class SQLiteRetrievalIndex:
                     raise ValueError("database parent must contain only directories")
                 os.close(directory_fd)
                 directory_fd = child_fd
+            self._parent_fd = directory_fd
+            directory_fd = -1
+        finally:
+            if directory_fd >= 0:
+                os.close(directory_fd)
+
+    def _open_parent_descriptor(self, parent_fd: int) -> None:
+        """Retain a duplicate of an already-confined database parent descriptor."""
+        try:
+            directory_fd = os.dup(parent_fd)
+        except OSError as error:
+            raise ValueError("database parent descriptor is unavailable") from error
+        try:
+            if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
+                raise ValueError("database parent descriptor is not a directory")
             self._parent_fd = directory_fd
             directory_fd = -1
         finally:

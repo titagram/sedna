@@ -346,6 +346,69 @@ class CanonicalKnowledgeRepository:
                     )
                 raise
 
+    def invalidate_failed_semantic_result(self, prepared: PreparedSource) -> bool:
+        """Remove stale semantics after a failed compile for the current accepted source.
+
+        Callers must hold :meth:`semantic_compilation_guard` for ``prepared`` so a concurrent
+        compiler or foundation transition cannot invalidate a newer source state.
+        """
+        prepared = validate_prepared_source(prepared)
+        source_id = prepared.manifest.source_id
+        with (
+            self._semantic_inventory_lock(exclusive=True),
+            self._source_transition_lock(source_id),
+        ):
+            self._recover_source(source_id)
+            try:
+                manifest = self.load_manifest(source_id)
+            except FileNotFoundError:
+                return False
+            if (
+                manifest.ingestion_status.value != "accepted"
+                or manifest.sha256 != prepared.manifest.sha256
+            ):
+                return False
+            self._invalidate_semantic_state(source_id)
+            return True
+
+    def open_index_directory(self) -> int:
+        """Return a descriptor for the disposable index directory beneath this root."""
+        directory = "indexes"
+        with self._descriptor_lock:
+            root_fd = self._ensure_open()
+            with suppress(FileExistsError):
+                os.mkdir(directory, mode=0o755, dir_fd=root_fd)
+            try:
+                directory_fd = os.open(
+                    directory,
+                    self._directory_open_flags(),
+                    dir_fd=root_fd,
+                )
+            except OSError as error:
+                raise ValueError("repository index directory is unavailable") from error
+        try:
+            if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
+                raise ValueError("repository index target is not a directory")
+            return directory_fd
+        except Exception:
+            os.close(directory_fd)
+            raise
+
+    def assert_root_identity(self) -> None:
+        """Reject a replaced root pathname instead of mixing it with retained descriptors."""
+        with self._descriptor_lock:
+            root_fd = self._ensure_open()
+            retained = os.fstat(root_fd)
+            try:
+                current = os.stat(self.root, follow_symlinks=False)
+            except FileNotFoundError as error:
+                raise RuntimeError("repository root identity changed") from error
+        if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (
+            retained.st_dev,
+            retained.st_ino,
+        ):
+            raise RuntimeError("repository root identity changed")
+
     def load_semantic_bundle(self, source_id: str) -> SemanticKnowledgeBundle:
         """Load a strictly validated verified semantic bundle."""
         return self._load_semantic_component(source_id, "bundle")
@@ -1252,6 +1315,31 @@ class CanonicalKnowledgeRepository:
             except BaseException as exc:
                 errors.append(exc)
         return errors
+
+    def _invalidate_semantic_state(self, source_id: str) -> None:
+        snapshots = {
+            directory: self._read_optional_bytes(directory, source_id)
+            for directory in self._SEMANTIC_DIRECTORIES
+        }
+        self._write_semantic_transition_journal(source_id, snapshots)
+        try:
+            for directory in self._SEMANTIC_DIRECTORIES:
+                self._delete_record(directory, source_id)
+            self._fsync_directories(self._SEMANTIC_DIRECTORIES)
+            self._delete_semantic_transition_journal(source_id)
+        except BaseException as original_error:
+            rollback_errors = self._restore_semantic_snapshots(source_id, snapshots)
+            if not rollback_errors:
+                try:
+                    self._delete_semantic_transition_journal(source_id)
+                except BaseException as rollback_error:
+                    rollback_errors.append(rollback_error)
+            for rollback_error in rollback_errors:
+                original_error.add_note(
+                    "semantic invalidation rollback remains recoverable: "
+                    f"{type(rollback_error).__name__}: {rollback_error}"
+                )
+            raise
 
     def _fsync_directories(self, directories: Iterable[str]) -> None:
         for directory in directories:

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,6 +30,9 @@ class HadesKnowledgeRuntime:
     _repository: CanonicalKnowledgeRepository
     _index: SQLiteRetrievalIndex
     _closed: bool = field(default=False, init=False, repr=False)
+    _index_closed: bool = field(default=False, init=False, repr=False)
+    _repository_closed: bool = field(default=False, init=False, repr=False)
+    _close_lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     @classmethod
     def create(cls, host_llm: object, knowledge_root: Path) -> HadesKnowledgeRuntime:
@@ -34,12 +40,20 @@ class HadesKnowledgeRuntime:
         host = _require_structured_host(host_llm)
         repository: CanonicalKnowledgeRepository | None = None
         index: SQLiteRetrievalIndex | None = None
+        index_parent_fd = -1
         try:
             repository = CanonicalKnowledgeRepository(Path(knowledge_root))
             adapter = HadesLlmAdapter(host)
             compiler = SemanticCompiler(adapter, clock=lambda: datetime.now(UTC))
             semantic = SemanticIngestionService(repository, compiler)
-            index = SQLiteRetrievalIndex(repository.root / "indexes" / "retrieval.sqlite")
+            index_parent_fd = repository.open_index_directory()
+            index = SQLiteRetrievalIndex(
+                repository.root / "indexes" / "retrieval.sqlite",
+                parent_fd=index_parent_fd,
+            )
+            os.close(index_parent_fd)
+            index_parent_fd = -1
+            repository.assert_root_identity()
             maintenance = RetrievalMaintenanceService(repository, index)
             learning = DocumentLearningService(
                 knowledge_root=repository.root,
@@ -55,12 +69,15 @@ class HadesKnowledgeRuntime:
                 _index=index,
             )
         except BaseException:
+            if index_parent_fd >= 0:
+                os.close(index_parent_fd)
             _close_owned(index, repository)
             raise
 
     def __enter__(self) -> HadesKnowledgeRuntime:
-        if self._closed:
-            raise RuntimeError("knowledge runtime is closed")
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError("knowledge runtime is closed")
         return self
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
@@ -68,11 +85,38 @@ class HadesKnowledgeRuntime:
         self.close()
 
     def close(self) -> None:
-        """Close the disposable index and canonical repository exactly once."""
-        if self._closed:
-            return
-        self._closed = True
-        _close_owned(self._index, self._repository)
+        """Serialize close attempts and retry only resources whose prior close failed."""
+        with self._close_lock:
+            if self._closed:
+                return
+            failure: BaseException | None = None
+            if not self._index_closed:
+                try:
+                    self._index.close()
+                    self._index_closed = True
+                except BaseException as error:
+                    failure = error
+            if not self._repository_closed:
+                try:
+                    self._repository.close()
+                    self._repository_closed = True
+                except BaseException as error:
+                    if failure is None:
+                        failure = error
+            if self._index_closed and self._repository_closed:
+                self._closed = True
+            if failure is not None:
+                raise failure
+
+
+class _BoundStructuredHost:
+    """One immutable structured-completion callable captured during runtime preflight."""
+
+    def __init__(self, complete_structured: Callable[..., object]) -> None:
+        self._complete_structured = complete_structured
+
+    def complete_structured(self, **kwargs: object) -> object:
+        return self._complete_structured(**kwargs)
 
 
 def _require_structured_host(host_llm: object) -> HostStructuredLlm:
@@ -83,7 +127,7 @@ def _require_structured_host(host_llm: object) -> HostStructuredLlm:
         complete_structured = None
     if not callable(complete_structured):
         raise TypeError("host_llm must provide callable complete_structured")
-    return cast(HostStructuredLlm, host_llm)
+    return cast(HostStructuredLlm, _BoundStructuredHost(complete_structured))
 
 
 def _close_owned(
