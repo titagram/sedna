@@ -579,9 +579,75 @@ def test_current_quarantine_is_reused_without_host_calls(tmp_path: Path) -> None
         assert quarantined.disposition == "quarantined"
         assert quarantined.quarantine is not None
         assert quarantined.quarantine.compilation_manifest is not None
+        assert quarantined.quarantine.compilation_manifest.started_at == NOW
+        assert quarantined.quarantine.compilation_manifest.completed_at == NOW
         assert unchanged.disposition == "unchanged"
         assert unchanged.quarantine == quarantined.quarantine
         assert len(host.calls) == 4
+
+
+def test_tampered_quarantine_compilation_attribution_is_not_current(
+    tmp_path: Path,
+) -> None:
+    responses = _load_responses(SOURCE_CASES["repair"].fixture_name)
+    responses[-1] = copy.deepcopy(responses[1])
+    with _prepared_case(tmp_path, "repair") as (pipeline, prepared, _, _):
+        service, _ = _service(pipeline.repository, responses)
+        quarantined = service.compile_and_store(prepared)
+        assert quarantined.quarantine is not None
+        path = (
+            pipeline.repository.root / "semantic_quarantine" / f"{prepared.manifest.source_id}.json"
+        )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["compilation_manifest"]["critic_model_id"] = "tampered-model"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert service.is_current(prepared) is False
+
+
+def test_exclusion_waits_for_blocked_compile_then_invalidates_its_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _prepared_case(tmp_path, "reference") as (pipeline, prepared, source_path, _):
+        service, _ = _service(
+            pipeline.repository,
+            _load_responses(SOURCE_CASES["reference"].fixture_name),
+        )
+        entered = Event()
+        release = Event()
+        real_current = pipeline.repository.load_current_semantic_result
+
+        def block_after_current(*args: object, **kwargs: object) -> object:
+            result = real_current(*args, **kwargs)
+            entered.set()
+            assert release.wait(5)
+            return result
+
+        monkeypatch.setattr(
+            pipeline.repository,
+            "load_current_semantic_result",
+            block_after_current,
+        )
+        source_path.write_bytes(b"")
+        source_root = pipeline.source_root
+
+        def exclude_from_second_repository() -> object:
+            with IngestionPipeline(source_root, pipeline.repository.root) as competing:
+                candidate = discover_sources(source_root)[0]
+                return competing.prepare(candidate)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            compiling = executor.submit(service.compile_and_store, prepared)
+            assert entered.wait(5)
+            excluding = executor.submit(exclude_from_second_repository)
+            assert not excluding.done()
+            release.set()
+            assert compiling.result(timeout=5).disposition == "verified"
+            assert excluding.result(timeout=5) is None
+
+        with pytest.raises(FileNotFoundError):
+            pipeline.repository.load_semantic_bundle(prepared.manifest.source_id)
 
 
 def test_failed_result_remains_run_local_and_is_retried_by_another_instance(

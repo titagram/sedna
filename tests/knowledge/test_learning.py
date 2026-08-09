@@ -210,6 +210,46 @@ def test_foundation_terminal_transition_invalidates_old_verified_semantics(
     repository.close()
 
 
+def test_reopen_after_crash_between_semantic_and_foundation_journal_cleanup_is_safe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = SOURCE_CASES["reference"]
+    source_root = _source_root(tmp_path, {case.relative_path: case.markdown.encode("utf-8")})
+    knowledge_root = tmp_path / "knowledge"
+    repository = CanonicalKnowledgeRepository(knowledge_root)
+    semantic, _ = _semantic_service(repository, _load_responses(case.fixture_name))
+    service = DocumentLearningService(
+        knowledge_root=knowledge_root,
+        semantic_service=semantic,
+        maintenance=_Maintenance(),  # type: ignore[arg-type]
+    )
+    assert service.learn(source_root).verified_source_count == 1
+    source_path = source_root / case.relative_path
+    source_path.write_bytes(b"")
+
+    def crash_after_semantic_cleanup(_: str) -> None:
+        raise OSError("injected crash")
+
+    monkeypatch.setattr(
+        CanonicalKnowledgeRepository,
+        "_delete_transition_journal",
+        crash_after_semantic_cleanup,
+    )
+    failed = service.learn(source_root)
+    assert failed.failed_source_count == 1
+    monkeypatch.undo()
+    repository.close()
+
+    reopened = CanonicalKnowledgeRepository(knowledge_root)
+    source_id = discover_sources(source_root)[0].source_id
+    with pytest.raises(FileNotFoundError):
+        reopened.load_semantic_bundle(source_id)
+    manifest = reopened.load_manifest(source_id)
+    assert manifest.ingestion_status.value == "accepted"
+    reopened.close()
+
+
 def test_force_reprepare_refreshes_only_an_unchanged_accepted_source(tmp_path: Path) -> None:
     source_root = _source_root(
         tmp_path,
