@@ -250,6 +250,53 @@ def test_reopen_after_crash_between_semantic_and_foundation_journal_cleanup_is_s
     reopened.close()
 
 
+def test_partial_semantic_invalidation_rollback_retains_journal_and_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = SOURCE_CASES["reference"]
+    source_root = _source_root(tmp_path, {case.relative_path: case.markdown.encode("utf-8")})
+    knowledge_root = tmp_path / "knowledge"
+    repository = CanonicalKnowledgeRepository(knowledge_root)
+    semantic, _ = _semantic_service(repository, _load_responses(case.fixture_name))
+    service = DocumentLearningService(
+        knowledge_root=knowledge_root,
+        semantic_service=semantic,
+        maintenance=_Maintenance(),  # type: ignore[arg-type]
+    )
+    assert service.learn(source_root).verified_source_count == 1
+    source_path = source_root / case.relative_path
+    source_path.write_bytes(b"")
+    original_delete = CanonicalKnowledgeRepository._delete_record
+
+    def fail_after_bundle_delete(self: object, directory: str, source_id: str) -> bool:
+        if directory == "semantic_verification":
+            raise OSError("raw rollback payload")
+        return original_delete(self, directory, source_id)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(CanonicalKnowledgeRepository, "_delete_record", fail_after_bundle_delete)
+    monkeypatch.setattr(
+        CanonicalKnowledgeRepository,
+        "_restore_semantic_snapshots",
+        lambda *_: [OSError("raw restore payload")],
+    )
+    failed = service.learn(source_root)
+    source_id = discover_sources(source_root)[0].source_id
+    journal = knowledge_root / "transactions" / f"{source_id}.semantic-transaction.json"
+
+    assert failed.failed_source_count == 1
+    assert all("raw" not in message for item in failed.outcomes for message in item.messages)
+    assert journal.exists()
+    monkeypatch.undo()
+    repository.close()
+
+    reopened = CanonicalKnowledgeRepository(knowledge_root)
+    assert reopened.load_manifest(source_id).ingestion_status.value == "accepted"
+    assert reopened.load_semantic_bundle(source_id).source_id == source_id
+    assert not journal.exists()
+    reopened.close()
+
+
 def test_force_reprepare_refreshes_only_an_unchanged_accepted_source(tmp_path: Path) -> None:
     source_root = _source_root(
         tmp_path,
