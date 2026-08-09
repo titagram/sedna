@@ -247,6 +247,7 @@ class DocumentLearningService:
                     prepared = self._reprepare_if_semantic_stale(pipeline, candidate)
                     if prepared is not None:
                         semantic = self.semantic_service.compile_and_store(prepared)
+                        self._invalidate_failed_source_projection(candidate, semantic)
                         outcomes.append(_semantic_outcome(candidate, semantic))
                         return
                     if pipeline.last_outcome == "accepted":
@@ -260,6 +261,7 @@ class DocumentLearningService:
                 outcomes.append(_foundation_outcome(candidate, pipeline.last_outcome))
                 return
             semantic = self.semantic_service.compile_and_store(prepared)
+            self._invalidate_failed_source_projection(candidate, semantic)
             outcomes.append(_semantic_outcome(candidate, semantic))
         except Exception:
             outcomes.append(_failed_outcome(candidate, "source_processing_failed"))
@@ -295,6 +297,24 @@ class DocumentLearningService:
                     ),
                 ),
             )
+
+    def _invalidate_failed_source_projection(
+        self,
+        candidate: SourceCandidate,
+        semantic: object,
+    ) -> None:
+        """Remove a failed source from the live disposable projection before rebuilding."""
+        if getattr(semantic, "disposition", None) != "failed":
+            return
+        invalidate = getattr(self._maintenance, "invalidate_source_projection", None)
+        if not callable(invalidate):
+            return
+        try:
+            invalidate(candidate.source_id)
+        except Exception:
+            # A maintenance implementation outside this package may not fail closed itself.
+            # The semantic outcome remains safely failed and the normal rebuild is still attempted.
+            return
 
 
 def _resolve_learning_root(source_path: Path) -> tuple[Path, str | None]:

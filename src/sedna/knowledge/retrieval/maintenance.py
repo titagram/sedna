@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Literal
@@ -188,6 +189,19 @@ class RetrievalMaintenanceService:
     def audit(self) -> RetrievalMaintenanceReport:
         """Cross-check canonical source identity and projection parity without mutation."""
         return self._audit(operation="audit", started=time.perf_counter())
+
+    def invalidate_source_projection(self, source_id: str) -> bool:
+        """Delete and verify one stale projection, closing an unprovable index fail-closed."""
+        try:
+            self.index.delete_source(source_id)
+            snapshot = _strict_index_snapshot(self.index.snapshot_state())
+            if any(state.source_id == source_id for state in snapshot.source_states):
+                raise ValueError("source projection remained after invalidation")
+            return True
+        except Exception:
+            with suppress(Exception):
+                self.index.close()
+            return False
 
     def _audit(
         self,

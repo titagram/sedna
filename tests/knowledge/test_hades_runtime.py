@@ -217,6 +217,8 @@ def test_runtime_failed_relearn_rolls_forward_after_invalidation_journal_cleanup
         assert journal.exists()
         with pytest.raises(FileNotFoundError):
             runtime._repository.load_semantic_bundle(source_id)
+        assert runtime._index.snapshot_state().source_states == ()
+        assert runtime.retrieval.get_artifact(artifact_id) is None
     finally:
         runtime.close()
 
@@ -232,6 +234,38 @@ def test_runtime_failed_relearn_rolls_forward_after_invalidation_journal_cleanup
             recovered._repository.load_semantic_bundle(source_id)
     finally:
         recovered.close()
+
+
+def test_runtime_poisoned_index_cannot_serve_stale_artifact_after_projection_invalidation_fault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed source-projection deletion must make retrieval unavailable rather than stale."""
+    source_root = _source_root(tmp_path)
+    host = _ScriptedHost([*_responses(), OSError("changed-source transport failure")])
+    runtime = HadesKnowledgeRuntime.create(host, tmp_path / "knowledge")
+    try:
+        first = runtime.learning.learn(source_root)
+        source_id = first.outcomes[0].source_id
+        artifact_id = runtime._repository.load_semantic_bundle(source_id).references[0].artifact_id
+        source_path = source_root / SOURCE_CASES["reference"].relative_path
+        source_path.write_text(source_path.read_text(encoding="utf-8") + "\nChanged evidence.\n")
+
+        def fail_delete_source(_: str) -> None:
+            raise OSError("injected projection deletion failure")
+
+        monkeypatch.setattr(runtime._index, "delete_source", fail_delete_source)
+
+        failed = runtime.learning.learn(source_root)
+
+        assert failed.failed_source_count == 1
+        assert failed.index_report is not None and not failed.index_report.succeeded
+        with pytest.raises(RuntimeError, match="knowledge artifact lookup failed"):
+            runtime.retrieval.get_artifact(artifact_id)
+        with pytest.raises(RuntimeError, match="retrieval index is closed"):
+            runtime._index.snapshot_state()
+    finally:
+        runtime.close()
 
 
 def test_runtime_rebuilds_a_disposed_index_from_canonical_records(tmp_path: Path) -> None:
