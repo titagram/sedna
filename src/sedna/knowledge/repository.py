@@ -368,7 +368,7 @@ class CanonicalKnowledgeRepository:
                 or manifest.sha256 != prepared.manifest.sha256
             ):
                 return False
-            self._invalidate_semantic_state(source_id)
+            self._invalidate_semantic_state(source_id, prepared.manifest.sha256)
             return True
 
     def open_index_directory(self) -> int:
@@ -531,6 +531,8 @@ class CanonicalKnowledgeRepository:
                     source_id: str | None = None
                     if entry.name.endswith(".semantic-transaction.json"):
                         source_id = entry.name[: -len(".semantic-transaction.json")]
+                    elif entry.name.endswith(".semantic-invalidation.json"):
+                        source_id = entry.name[: -len(".semantic-invalidation.json")]
                     elif entry.name.endswith(".transaction.json"):
                         source_id = entry.name[: -len(".transaction.json")]
                     if source_id is not None:
@@ -1316,29 +1318,18 @@ class CanonicalKnowledgeRepository:
                 errors.append(exc)
         return errors
 
-    def _invalidate_semantic_state(self, source_id: str) -> None:
-        snapshots = {
-            directory: self._read_optional_bytes(directory, source_id)
-            for directory in self._SEMANTIC_DIRECTORIES
-        }
-        self._write_semantic_transition_journal(source_id, snapshots)
+    def _invalidate_semantic_state(self, source_id: str, source_sha256: str) -> None:
+        """Durably delete stale semantics with roll-forward-only crash recovery."""
+        self._write_semantic_invalidation_journal(source_id, source_sha256)
         try:
             for directory in self._SEMANTIC_DIRECTORIES:
                 self._delete_record(directory, source_id)
             self._fsync_directories(self._SEMANTIC_DIRECTORIES)
-            self._delete_semantic_transition_journal(source_id)
+            self._delete_semantic_invalidation_journal(source_id)
         except BaseException as original_error:
-            rollback_errors = self._restore_semantic_snapshots(source_id, snapshots)
-            if not rollback_errors:
-                try:
-                    self._delete_semantic_transition_journal(source_id)
-                except BaseException as rollback_error:
-                    rollback_errors.append(rollback_error)
-            for rollback_error in rollback_errors:
-                original_error.add_note(
-                    "semantic invalidation rollback remains recoverable: "
-                    f"{type(rollback_error).__name__}: {rollback_error}"
-                )
+            original_error.add_note(
+                "semantic invalidation remains pending and will roll forward on repository reopen"
+            )
             raise
 
     def _fsync_directories(self, directories: Iterable[str]) -> None:
@@ -1406,9 +1397,12 @@ class CanonicalKnowledgeRepository:
                 os.close(directory_fd)
             foundation_suffix = ".transaction.json"
             semantic_suffix = ".semantic-transaction.json"
+            invalidation_suffix = ".semantic-invalidation.json"
             source_ids: set[str] = set()
             for name in names:
-                if name.endswith(semantic_suffix):
+                if name.endswith(invalidation_suffix):
+                    source_ids.add(name[: -len(invalidation_suffix)])
+                elif name.endswith(semantic_suffix):
                     source_ids.add(name[: -len(semantic_suffix)])
                 elif name.endswith(foundation_suffix):
                     source_ids.add(name[: -len(foundation_suffix)])
@@ -1420,6 +1414,7 @@ class CanonicalKnowledgeRepository:
     def _recover_source(self, source_id: str) -> None:
         self._recover_foundation_source(source_id)
         self._recover_semantic_source(source_id)
+        self._recover_semantic_invalidation(source_id)
 
     def _recover_foundation_source(self, source_id: str) -> None:
         journal = self._read_transition_journal(source_id)
@@ -1445,6 +1440,16 @@ class CanonicalKnowledgeRepository:
                 error.add_note(f"{type(recovery_error).__name__}: {recovery_error}")
             raise error from errors[0]
         self._delete_semantic_transition_journal(source_id)
+
+    def _recover_semantic_invalidation(self, source_id: str) -> None:
+        source_sha256 = self._read_semantic_invalidation_journal(source_id)
+        if source_sha256 is None:
+            return
+        del source_sha256  # A hash mismatch still fails closed by deleting stale semantic state.
+        for directory in self._SEMANTIC_DIRECTORIES:
+            self._delete_record(directory, source_id)
+        self._fsync_directories(self._SEMANTIC_DIRECTORIES)
+        self._delete_semantic_invalidation_journal(source_id)
 
     def _write_transition_journal(
         self,
@@ -1653,6 +1658,105 @@ class CanonicalKnowledgeRepository:
             try:
                 os.unlink(
                     f"{source_id}.semantic-transaction.json",
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                return
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def _write_semantic_invalidation_journal(self, source_id: str, source_sha256: str) -> None:
+        _validate_stable_id(source_id)
+        if (
+            not isinstance(source_sha256, str)
+            or len(source_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in source_sha256)
+        ):
+            raise ValueError("semantic invalidation journal requires a SHA-256 source hash")
+        payload = (
+            json.dumps(
+                {
+                    "kind": "semantic_invalidation",
+                    "source_id": source_id,
+                    "source_sha256": source_sha256,
+                    "version": 1,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                indent=2,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("ascii")
+        directory_fd = self._open_child_directory("transactions", create=True)
+        try:
+            self._atomic_write_bytes(
+                directory_fd,
+                f"{source_id}.semantic-invalidation.json",
+                payload,
+            )
+        finally:
+            os.close(directory_fd)
+
+    def _read_semantic_invalidation_journal(self, source_id: str) -> str | None:
+        _validate_stable_id(source_id)
+        try:
+            directory_fd = self._open_child_directory("transactions", create=False)
+        except FileNotFoundError:
+            return None
+        filename = f"{source_id}.semantic-invalidation.json"
+        try:
+            try:
+                file_fd = os.open(filename, self._file_read_flags(), dir_fd=directory_fd)
+            except FileNotFoundError:
+                return None
+            try:
+                if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                    raise ValueError("semantic invalidation journal is not a regular file")
+                with os.fdopen(file_fd, mode="rb") as stream:
+                    file_fd = -1
+                    raw = stream.read()
+            finally:
+                if file_fd >= 0:
+                    os.close(file_fd)
+        finally:
+            os.close(directory_fd)
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or set(payload) != {
+                "kind",
+                "source_id",
+                "source_sha256",
+                "version",
+            }:
+                raise ValueError("unexpected semantic invalidation journal fields")
+            source_sha256 = payload["source_sha256"]
+            if (
+                payload["kind"] != "semantic_invalidation"
+                or payload["source_id"] != source_id
+                or type(payload["version"]) is not int
+                or payload["version"] != 1
+                or not isinstance(source_sha256, str)
+                or len(source_sha256) != 64
+                or any(character not in "0123456789abcdef" for character in source_sha256)
+            ):
+                raise ValueError("semantic invalidation journal identity or version mismatch")
+            return source_sha256
+        except (TypeError, UnicodeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid interrupted semantic invalidation journal for {source_id!r}"
+            ) from exc
+
+    def _delete_semantic_invalidation_journal(self, source_id: str) -> None:
+        try:
+            directory_fd = self._open_child_directory("transactions", create=False)
+        except FileNotFoundError:
+            return
+        try:
+            try:
+                os.unlink(
+                    f"{source_id}.semantic-invalidation.json",
                     dir_fd=directory_fd,
                 )
             except FileNotFoundError:

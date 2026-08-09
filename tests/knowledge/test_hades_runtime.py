@@ -173,6 +173,67 @@ def test_runtime_failed_relearn_removes_stale_canonical_and_indexed_knowledge(
         runtime.close()
 
 
+def test_runtime_failed_relearn_rolls_forward_after_invalidation_journal_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovering an interrupted invalidation must delete stale semantics, never restore them."""
+    knowledge_root = tmp_path / "knowledge"
+    source_root = _source_root(tmp_path)
+    host = _ScriptedHost([*_responses(), OSError("changed-source transport failure")])
+    runtime = HadesKnowledgeRuntime.create(host, knowledge_root)
+    try:
+        first = runtime.learning.learn(source_root)
+        source_id = first.outcomes[0].source_id
+        artifact_id = runtime._repository.load_semantic_bundle(source_id).references[0].artifact_id
+        source_path = source_root / SOURCE_CASES["reference"].relative_path
+        source_path.write_text(source_path.read_text(encoding="utf-8") + "\nChanged evidence.\n")
+        real_delete = getattr(
+            runtime._repository,
+            "_delete_semantic_invalidation_journal",
+            None,
+        )
+        calls = 0
+
+        def fail_once(failed_source_id: str) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("injected invalidation journal unlink failure")
+            assert real_delete is not None
+            real_delete(failed_source_id)
+
+        monkeypatch.setattr(
+            runtime._repository,
+            "_delete_semantic_invalidation_journal",
+            fail_once,
+            raising=False,
+        )
+
+        failed = runtime.learning.learn(source_root)
+        journal = knowledge_root / "transactions" / f"{source_id}.semantic-invalidation.json"
+
+        assert failed.failed_source_count == 1
+        assert journal.exists()
+        with pytest.raises(FileNotFoundError):
+            runtime._repository.load_semantic_bundle(source_id)
+    finally:
+        runtime.close()
+
+    recovered = HadesKnowledgeRuntime.create(_ScriptedHost([]), knowledge_root)
+    try:
+        report = recovered.maintenance.rebuild()
+
+        assert report.succeeded
+        assert report.indexed_source_count == 0
+        assert recovered.retrieval.get_artifact(artifact_id) is None
+        assert not journal.exists()
+        with pytest.raises(FileNotFoundError):
+            recovered._repository.load_semantic_bundle(source_id)
+    finally:
+        recovered.close()
+
+
 def test_runtime_rebuilds_a_disposed_index_from_canonical_records(tmp_path: Path) -> None:
     """Treating the index as canonical state would make recreation lose verified knowledge."""
     knowledge_root = tmp_path / "knowledge"

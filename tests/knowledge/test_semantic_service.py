@@ -685,6 +685,64 @@ def test_exclusion_waits_for_blocked_compile_then_invalidates_its_bundle(
             pipeline.repository.load_semantic_bundle(prepared.manifest.source_id)
 
 
+def test_failed_compile_serializes_before_a_competing_foundation_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed compiler must release its invalidation before a source transition can proceed."""
+    with _prepared_case(tmp_path, "reference") as (pipeline, prepared, source_path, _):
+        verified_service, _ = _service(
+            pipeline.repository,
+            _load_responses(SOURCE_CASES["reference"].fixture_name),
+        )
+        assert verified_service.compile_and_store(prepared).disposition == "verified"
+        source_path.write_text(source_path.read_text(encoding="utf-8") + "\nChanged evidence.\n")
+        source_root = pipeline.source_root
+        with IngestionPipeline(source_root, pipeline.repository.root) as refresher:
+            refreshed = refresher.prepare(discover_sources(source_root)[0])
+            assert refreshed is not None
+        failed_service, _ = _service(
+            pipeline.repository,
+            [RuntimeError("host transport failure")],
+        )
+        entered = Event()
+        release = Event()
+        real_current = pipeline.repository.load_current_semantic_result
+
+        def block_after_current(*args: object, **kwargs: object) -> object:
+            result = real_current(*args, **kwargs)
+            entered.set()
+            assert release.wait(5)
+            return result
+
+        monkeypatch.setattr(
+            pipeline.repository,
+            "load_current_semantic_result",
+            block_after_current,
+        )
+        source_path.write_bytes(b"")
+
+        def exclude_from_second_repository() -> object:
+            with IngestionPipeline(source_root, pipeline.repository.root) as competing:
+                return competing.prepare(discover_sources(source_root)[0])
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            compiling = executor.submit(failed_service.compile_and_store, refreshed)
+            assert entered.wait(5)
+            excluding = executor.submit(exclude_from_second_repository)
+            assert not excluding.done()
+            release.set()
+            assert compiling.result(timeout=5).disposition == "failed"
+            assert excluding.result(timeout=5) is None
+
+        assert (
+            pipeline.repository.load_manifest(prepared.manifest.source_id).ingestion_status.value
+            == "excluded"
+        )
+        with pytest.raises(FileNotFoundError):
+            pipeline.repository.load_semantic_bundle(prepared.manifest.source_id)
+
+
 def test_failed_result_remains_run_local_and_is_retried_by_another_instance(
     tmp_path: Path,
 ) -> None:
