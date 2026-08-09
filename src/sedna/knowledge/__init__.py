@@ -1,6 +1,7 @@
 """Local knowledge-base ingestion helpers."""
 
 from sedna.knowledge.ingest import ingest_markdown
+from sedna.knowledge.hades_runtime import HadesKnowledgeRuntime
 from sedna.knowledge.learning import (
     DocumentLearningService,
     LearningDisposition,
@@ -76,6 +77,7 @@ __all__ = [
     "EpistemicAssessment",
     "ExtractionMetadata",
     "Generalizability",
+    "HadesKnowledgeRuntime",
     "IngestionPipeline",
     "IngestionStatus",
     "KnowledgeCase",
