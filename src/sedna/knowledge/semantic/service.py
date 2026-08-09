@@ -64,5 +64,20 @@ class SemanticIngestionService:
                 self._repository.write_semantic_result(result)
             return result
 
+    def is_current(self, prepared: PreparedSource) -> bool:
+        """Check semantic currentness against this service's exact compiler contract."""
+        try:
+            prepared = validate_prepared_source(prepared)
+        except (TypeError, ValueError):
+            return False
+        return self._repository.semantic_result_is_current(
+            prepared,
+            semantic_schema_version=SEMANTIC_SCHEMA_VERSION,
+            extractor_prompt_version=EXTRACTOR_PROMPT_VERSION,
+            critic_prompt_version=CRITIC_PROMPT_VERSION,
+            repair_prompt_version=REPAIR_PROMPT_VERSION,
+            compiler_version=SEMANTIC_COMPILER_VERSION,
+        )
+
 
 __all__ = ["SemanticIngestionService"]

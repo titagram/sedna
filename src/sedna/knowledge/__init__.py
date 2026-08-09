@@ -1,6 +1,12 @@
 """Local knowledge-base ingestion helpers."""
 
 from sedna.knowledge.ingest import ingest_markdown
+from sedna.knowledge.learning import (
+    DocumentLearningService,
+    LearningDisposition,
+    LearningRunReport,
+    LearningSourceOutcome,
+)
 from sedna.knowledge.pipeline import CandidateIngestionError, IngestionPipeline
 from sedna.knowledge.retrieval import (
     KnowledgeRetrievalService,
@@ -66,6 +72,7 @@ __all__ = [
     "DecisionRule",
     "DocumentManifest",
     "DocumentType",
+    "DocumentLearningService",
     "EpistemicAssessment",
     "ExtractionMetadata",
     "Generalizability",
@@ -73,6 +80,9 @@ __all__ = [
     "IngestionStatus",
     "KnowledgeCase",
     "KnowledgeRole",
+    "LearningDisposition",
+    "LearningRunReport",
+    "LearningSourceOutcome",
     "KnowledgeRetrievalService",
     "RetrievalEvaluationReport",
     "RetrievalMaintenanceService",

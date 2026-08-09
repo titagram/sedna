@@ -133,25 +133,41 @@ class IngestionPipeline:
         if repository is not None:
             repository.close()
 
-    def prepare(self, candidate: SourceCandidate) -> PreparedSource | None:
-        """Prepare one current, confined inventory candidate or persist its disposition."""
+    def prepare(
+        self,
+        candidate: SourceCandidate,
+        *,
+        force_reprepare: bool = False,
+    ) -> PreparedSource | None:
+        """Prepare one current candidate, optionally refreshing an accepted unchanged source.
+
+        ``force_reprepare`` is deliberately narrow: it bypasses only the accepted
+        foundation's unchanged short-circuit.  It does not reprocess excluded or
+        foundation-quarantined sources and it never relaxes descriptor confinement.
+        """
         self._ensure_open()
         self.last_outcome = None
         try:
-            return self._prepare(candidate)
+            return self._prepare(candidate, force_reprepare=force_reprepare)
         except Exception:
             self.last_outcome = "failed"
             raise
 
-    def _prepare(self, candidate: SourceCandidate) -> PreparedSource | None:
+    def _prepare(
+        self,
+        candidate: SourceCandidate,
+        *,
+        force_reprepare: bool,
+    ) -> PreparedSource | None:
         source_bytes = self._verified_candidate_bytes(candidate)
         self._verify_current_asset_path_set(candidate)
         asset_refs = self._verified_asset_refs(candidate)
         existing = self._load_existing_manifest(candidate.source_id)
         if existing is not None and self._is_unchanged(existing, candidate, asset_refs):
             self._validate_incremental_state(existing)
-            self.last_outcome = "unchanged"
-            return None
+            if not force_reprepare or existing.ingestion_status is not IngestionStatus.ACCEPTED:
+                self.last_outcome = "unchanged"
+                return None
 
         if candidate.suffix.casefold() != ".md":
             classification = classify_document(candidate, None)
