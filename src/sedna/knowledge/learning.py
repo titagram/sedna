@@ -187,6 +187,8 @@ class DocumentLearningService:
                 source_path="<invalid-source-path>",
                 failure_codes=("invalid_source_path",),
             )
+        if len(report_path) > _MAX_SOURCE_PATH_LENGTH:
+            report_path = "<source-path-too-long>"
         try:
             root, only_relative_path = _resolve_learning_root(requested)
         except (OSError, ValueError):

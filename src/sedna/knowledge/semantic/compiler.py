@@ -113,6 +113,7 @@ class SemanticCompiler:
                     prepared,
                     final_critic,
                     repair_count=1,
+                    started_at=started_at,
                     calls=tuple(calls),
                 )
             return self._verified(
@@ -211,11 +212,13 @@ class SemanticCompiler:
         critic: StructuredResult[CriticVerdict],
         *,
         repair_count: int,
+        started_at: datetime,
         calls: tuple[SemanticCallMetadata, ...],
     ) -> SemanticCompilationResult:
-        del repair_count  # The audit schema records the adjudication, not a repair transcript.
         verdict = critic.parsed
         try:
+            extractor = calls[0]
+            completed_at = self._now()
             return SemanticCompilationResult(
                 disposition="quarantined",
                 verification=self._verification(prepared, critic, "quarantined"),
@@ -225,7 +228,25 @@ class SemanticCompiler:
                     reason_codes=tuple(finding.code for finding in verdict.findings),
                     messages=tuple(finding.message for finding in verdict.findings),
                     segment_indexes=self._finding_indexes(verdict.findings),
-                    recorded_at=self._now(),
+                    recorded_at=completed_at,
+                    semantic_schema_version=SEMANTIC_SCHEMA_VERSION,
+                    compilation_manifest=SemanticCompilationManifest(
+                        source_id=prepared.manifest.source_id,
+                        source_sha256=prepared.manifest.sha256,
+                        foundation_schema_version=prepared.manifest.extraction.schema_version,
+                        foundation_parser_id=prepared.manifest.extraction.parser_id,
+                        foundation_parser_version=prepared.manifest.extraction.parser_version,
+                        compiler_version=SEMANTIC_COMPILER_VERSION,
+                        extractor_prompt_version=EXTRACTOR_PROMPT_VERSION,
+                        critic_prompt_version=CRITIC_PROMPT_VERSION,
+                        repair_prompt_version=REPAIR_PROMPT_VERSION,
+                        extractor_model_id=extractor.model,
+                        critic_model_id=critic.model,
+                        disposition="quarantined",
+                        repair_count=repair_count,
+                        started_at=started_at,
+                        completed_at=completed_at,
+                    ),
                 ),
                 calls=calls,
             )

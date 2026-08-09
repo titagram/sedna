@@ -715,6 +715,7 @@ class CanonicalKnowledgeRepository:
         """Durably commit one source disposition or recover its previous bytes."""
         self.validate_source_state(manifest, quarantine)
         with (
+            self.semantic_compilation_guard(manifest.source_id),
             self._semantic_inventory_lock(exclusive=True),
             self._source_transition_lock(manifest.source_id),
         ):
@@ -779,9 +780,9 @@ class CanonicalKnowledgeRepository:
                         f"{type(rollback_error).__name__}: {rollback_error}"
                     )
                 raise
-            self._delete_transition_journal(manifest.source_id)
             if semantic_snapshots is not None:
                 self._delete_semantic_transition_journal(manifest.source_id)
+            self._delete_transition_journal(manifest.source_id)
 
     def load_manifest(self, source_id: str) -> DocumentManifest:
         """Load and validate one manifest, with path-specific errors."""
@@ -917,6 +918,17 @@ class CanonicalKnowledgeRepository:
                 raise ValueError(
                     f"invalid semantic state for source_id {source_id!r}: "
                     "quarantine and verification disposition mismatch"
+                )
+            manifest = quarantine.compilation_manifest
+            if manifest is not None and (
+                manifest.source_id != source_id
+                or manifest.source_sha256 != quarantine.source_sha256
+                or manifest.critic_model_id != verification.critic_call.model
+                or manifest.disposition != "quarantined"
+            ):
+                raise ValueError(
+                    f"invalid semantic state for source_id {source_id!r}: "
+                    "quarantine compilation identity mismatch"
                 )
         else:
             raise ValueError(

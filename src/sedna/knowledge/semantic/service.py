@@ -63,6 +63,23 @@ class SemanticIngestionService:
 
             result = self._compiler.compile(prepared)
             if result.disposition in {"verified", "quarantined"}:
+                try:
+                    manifest = self._repository.load_manifest(source_id)
+                except (FileNotFoundError, ValueError):
+                    return SemanticCompilationResult(
+                        disposition="failed",
+                        failure_code="internal_failure",
+                        failure_message=CANONICAL_COMPILATION_FAILURE_MESSAGES["internal_failure"],
+                    )
+                if (
+                    manifest.ingestion_status.value != "accepted"
+                    or manifest.sha256 != prepared.manifest.sha256
+                ):
+                    return SemanticCompilationResult(
+                        disposition="failed",
+                        failure_code="internal_failure",
+                        failure_message=CANONICAL_COMPILATION_FAILURE_MESSAGES["internal_failure"],
+                    )
                 if result.disposition == "quarantined":
                     result = self._with_quarantine_manifest(prepared, result)
                 self._repository.write_semantic_result(result)
@@ -90,6 +107,8 @@ class SemanticIngestionService:
     ) -> SemanticCompilationResult:
         quarantine = result.quarantine
         verification = result.verification
+        if quarantine is not None and quarantine.compilation_manifest is not None:
+            return result
         extractor = next(
             (call for call in result.calls if call.purpose == "sedna.semantic.extract"),
             None,
