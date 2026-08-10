@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import importlib
 import json
-from collections.abc import Callable
+import os
+import sys
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeVar
 
@@ -422,19 +425,56 @@ def _structured_host(ctx: Any) -> object:
     return _BoundStructuredHost(complete_structured)
 
 
+def _validated_root(value: object, *, error_code: ToolErrorCode) -> Path:
+    if type(value) is not str and not isinstance(value, Path):
+        raise _ToolBoundaryError(error_code)
+    rendered = str(value)
+    if not rendered or len(rendered) > _MAX_PATH_LENGTH or "\x00" in rendered:
+        raise _ToolBoundaryError(error_code)
+    return Path(rendered)
+
+
+def _platform_hades_home(
+    platform: str,
+    environment: Mapping[str, str],
+    user_home: Path,
+) -> Path:
+    if platform == "win32":
+        local = environment.get("LOCALAPPDATA")
+        return (Path(local) if local else user_home / "AppData" / "Local") / "hades"
+    return user_home / ".hades"
+
+
+def _default_knowledge_root() -> Path:
+    try:
+        module = importlib.import_module("hermes_constants")
+    except ModuleNotFoundError as error:
+        if error.name != "hermes_constants":
+            raise _ToolBoundaryError("knowledge_runtime_unavailable") from error
+        home: object = _platform_hades_home(sys.platform, os.environ, Path.home())
+    except ImportError as error:
+        raise _ToolBoundaryError("knowledge_runtime_unavailable") from error
+    else:
+        resolver = getattr(module, "get_hermes_home", None)
+        if not callable(resolver):
+            raise _ToolBoundaryError("knowledge_runtime_unavailable")
+        try:
+            home = resolver()
+        except Exception as error:
+            raise _ToolBoundaryError("knowledge_runtime_unavailable") from error
+    return _validated_root(home, error_code="knowledge_runtime_unavailable") / "knowledge" / "sedna"
+
+
 def _knowledge_root(ctx: Any, explicit: str | None) -> Path:
     if explicit is not None:
-        return Path(explicit)
+        return _validated_root(explicit, error_code="invalid_input")
     try:
         configured = ctx.sedna_knowledge_root
+    except AttributeError:
+        return _default_knowledge_root()
     except Exception as error:
-        raise _ToolBoundaryError("knowledge_root_required") from error
-    if type(configured) is not str and not isinstance(configured, Path):
-        raise _ToolBoundaryError("knowledge_root_required")
-    rendered = str(configured)
-    if not rendered or len(rendered) > _MAX_PATH_LENGTH:
-        raise _ToolBoundaryError("knowledge_root_required")
-    return Path(rendered)
+        raise _ToolBoundaryError("knowledge_runtime_unavailable") from error
+    return _validated_root(configured, error_code="invalid_input")
 
 
 def _require_external_knowledge_root(source_path: Path, knowledge_root: Path) -> None:
