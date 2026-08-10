@@ -54,7 +54,7 @@ from sedna.knowledge.semantic.prompts import (
 )
 
 SEMANTIC_SCHEMA_VERSION = "2.4.0"
-SEMANTIC_COMPILER_VERSION = "7"
+SEMANTIC_COMPILER_VERSION = "8"
 
 
 class SemanticCompiler:

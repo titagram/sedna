@@ -56,7 +56,7 @@ class HostStructuredLlm(Protocol):
         *,
         instructions: str,
         input: Sequence[Mapping[str, object]],
-        json_schema: Mapping[str, object],
+        json_schema: Mapping[str, object] | None,
         json_mode: bool = False,
         schema_name: str,
         system_prompt: str | None = None,
@@ -304,11 +304,22 @@ class HadesLlmAdapter:
             separators=(",", ":"),
             sort_keys=True,
         )
+        response_schema = json.dumps(
+            model_type.model_json_schema(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        schema_instructions = (
+            f"{instructions}\n\nReturn one JSON object matching this schema exactly:\n"
+            f"{response_schema}"
+        )
         try:
             host_result = self._host.complete_structured(
-                instructions=instructions,
+                instructions=schema_instructions,
                 input=[{"type": "text", "text": serialized_payload}],
-                json_schema=model_type.model_json_schema(),
+                json_schema=None,
+                json_mode=True,
                 schema_name=model_type.__name__,
                 temperature=0,
                 max_tokens=self._max_tokens,

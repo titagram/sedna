@@ -327,7 +327,11 @@ def test_source_authored_credential_examples_reach_recorded_extractor_unchanged(
     recorded = json.loads(call["input"][0]["text"])
     assert recorded["segments"][0]["text"] == payload.segments[0].text
     assert SOURCE_CREDENTIAL_EXAMPLES in recorded["segments"][0]["text"]
-    assert call["instructions"] == EXTRACTOR_PROMPT
+    assert call["instructions"].startswith(
+        f"{EXTRACTOR_PROMPT}\n\nReturn one JSON object matching this schema exactly:\n"
+    )
+    assert call["json_schema"] is None
+    assert call["json_mode"] is True
     assert "runtime-host-key-must-not-cross" not in call["input"][0]["text"]
 
 
@@ -643,19 +647,29 @@ def test_adapter_records_exact_host_contract_without_routing_overrides(
         "instructions",
         "input",
         "json_schema",
+        "json_mode",
         "schema_name",
         "temperature",
         "max_tokens",
         "timeout",
         "purpose",
     }
-    assert call["instructions"] == instructions
+    expected_schema = json.dumps(
+        model_type.model_json_schema(),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    assert call["instructions"] == (
+        f"{instructions}\n\nReturn one JSON object matching this schema exactly:\n{expected_schema}"
+    )
     assert call["purpose"] == purpose
     assert call["temperature"] == 0
     assert call["max_tokens"] == 4096
     assert call["timeout"] == 45.0
     assert call["schema_name"] == model_type.__name__
-    assert call["json_schema"] == model_type.model_json_schema()
+    assert call["json_schema"] is None
+    assert call["json_mode"] is True
     assert call["input"] == [
         {
             "type": "text",
