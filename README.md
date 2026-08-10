@@ -143,6 +143,13 @@ The Hades plugin now registers four strategic-knowledge tools:
 - `sedna_knowledge_maintenance` audits or rebuilds the disposable SQLite
   projection.
 
+The plugin is zero-configuration for canonical storage. Unless a call supplies
+`knowledge_root` or the host supplies `ctx.sedna_knowledge_root`, Sedna resolves
+`<active Hades home>/knowledge/sedna` on each operation. The active home honors Hades context,
+`HERMES_HOME`, `HADES_HOME`, and platform defaults, so installations and profiles remain
+isolated without hardcoded paths. Existing custom or pilot stores are not automatically migrated
+or merged.
+
 Direct remote fetching remains outside Sedna's local learning tool. Hades may
 perform authorized technical research under its own policy, save the material
 locally with source metadata, and submit that file through the identical verified

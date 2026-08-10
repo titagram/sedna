@@ -1,6 +1,6 @@
 # Sedna knowledge tools: operating contract for an LLM
 
-Contract version: `sedna-knowledge-tools-v1`
+Contract version: `sedna-knowledge-tools-v2`
 
 This guide is the operational contract for a Hades or Hermes LLM using Sedna's local strategic
 knowledge tools. Sedna stores source-backed strategy and technical knowledge. It does not teach
@@ -15,9 +15,13 @@ decision, not permission to act and not a replacement for target validation.
 
 Call `sedna_learn_local` when the user supplies exactly one existing regular, non-symlink local
 Markdown/PDF file or one local folder of candidate Markdown/PDF documents and asks Sedna to learn
-it. The configured knowledge root must be outside the selected source root. Prefer the context-owned
-`sedna_knowledge_root`; supply `knowledge_root` explicitly only when the host has deliberately
-selected a separate canonical location.
+it. The knowledge root must be outside the selected source root. `knowledge_root` is optional.
+Sedna selects the first available location in this order: the request's explicit `knowledge_root`,
+`ctx.sedna_knowledge_root`, then `<active Hades home>/knowledge/sedna`. Hades resolves its active
+home from its current context, `HERMES_HOME`, the compatibility `HADES_HOME`, and the platform
+default. Omit `knowledge_root` for normal zero-configuration use; provide it only for an
+intentional isolated or custom store. Existing custom and pilot stores remain explicit: this
+release does not automatically migrate or merge them.
 
 The tool inventories every candidate, classifies it deterministically, sends only a sanitized
 prepared representation through the host structured LLM, runs an isolated critic and bounded
@@ -37,8 +41,7 @@ Example local-folder request:
 {
   "tool": "sedna_learn_local",
   "arguments": {
-    "source_path": "/srv/lab-material/fictional-network-notes",
-    "knowledge_root": "/srv/sedna/knowledge"
+    "source_path": "/srv/lab-material/fictional-network-notes"
   }
 }
 ```

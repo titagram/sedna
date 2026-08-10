@@ -37,8 +37,8 @@ descriptor-bound `HadesKnowledgeRuntime`; do not create or cache storage during 
   and the existing handoff to `HadesKnowledgeRuntime`.
 - `tests/test_plugin_knowledge_root.py`: focused resolver and plugin lifecycle regressions for
   precedence, portability, profile isolation, side effects, and fail-closed behavior.
-- `tests/test_plugin_knowledge.py`: retains existing end-to-end knowledge-tool coverage and gains
-  the documentation contract assertion because it already owns the LLM guide/README checks.
+- `tests/test_plugin_knowledge.py`: retains existing end-to-end knowledge-tool and executable
+  JSON-example coverage.
 - `docs/llm/sedna-knowledge-tools.md`: tells the host LLM that the root is optional and explains
   override precedence without embedding a developer-machine path.
 - `README.md`: documents installation-time zero-configuration behavior and pilot/custom-root
@@ -417,49 +417,17 @@ Expected: the commit contains exactly the two listed files.
 ### Task 2: Document the zero-configuration contract and close the branch gate
 
 **Files:**
-- Modify: `tests/test_plugin_knowledge.py:480-end`
 - Modify: `docs/llm/sedna-knowledge-tools.md:1-45`
 - Modify: `README.md:125-165`
 
 **Interfaces:**
 - Consumes: the precedence and default path implemented in Task 1.
 - Produces: LLM-facing contract version `sedna-knowledge-tools-v2` and installation/user guidance
-  matching executable behavior.
+  matching executable behavior; human prose is reviewed rather than frozen by change-detector
+  assertions.
 - Preserves: every JSON example must name a registered tool and contain no flag or secret.
 
-- [ ] **Step 1: Add a failing documentation contract test**
-
-Append this test to `tests/test_plugin_knowledge.py`:
-
-```python
-def test_zero_config_docs_match_dynamic_root_contract() -> None:
-    guide = LLM_GUIDE.read_text(encoding="utf-8")
-    readme = README.read_text(encoding="utf-8")
-    combined = f"{guide}\n{readme}".casefold()
-
-    assert "contract version: `sedna-knowledge-tools-v2`" in guide.casefold()
-    assert "<active hades home>/knowledge/sedna" in combined
-    assert "knowledge_root" in combined and "optional" in combined
-    assert "ctx.sedna_knowledge_root" in combined
-    assert "hermes_home" in combined and "hades_home" in combined
-    assert "does not automatically migrate" in combined
-    assert "/users/gabriele" not in guide.casefold()
-    assert "/users/gabriele" not in readme.casefold()
-```
-
-- [ ] **Step 2: Run the documentation test and witness RED**
-
-Run:
-
-```bash
-PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
-  tests/test_plugin_knowledge.py::test_zero_config_docs_match_dynamic_root_contract
-```
-
-Expected: FAIL because the guide is still contract v1 and still tells callers that a configured
-root is required.
-
-- [ ] **Step 3: Update the LLM guide with exact precedence and a zero-config example**
+- [ ] **Step 1: Update the LLM guide with exact precedence and a zero-config example**
 
 In `docs/llm/sedna-knowledge-tools.md`:
 
@@ -480,7 +448,7 @@ for normal zero-configuration use; provide it only for an intentional isolated/c
 - state that custom/pilot roots remain explicit and that this release does not automatically
   migrate or merge them.
 
-- [ ] **Step 4: Update README installation behavior**
+- [ ] **Step 2: Update README installation behavior**
 
 Add a compact paragraph under `Autonomous local learning and Hades tools (M4/M5)`:
 
@@ -493,7 +461,7 @@ isolated without hardcoded paths. Existing custom or pilot stores are not automa
 or merged.
 ```
 
-- [ ] **Step 5: Run guide, plugin, and documentation tests**
+- [ ] **Step 3: Run guide, plugin, and documentation tests**
 
 Run:
 
@@ -503,9 +471,9 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
 ```
 
 Expected: all tests pass, including JSON-example parsing, registered tool names, closed gap codes,
-and the new zero-configuration assertions.
+and the zero-configuration runtime regressions from Task 1.
 
-- [ ] **Step 6: Run the complete regression gate**
+- [ ] **Step 4: Run the complete regression gate**
 
 Run:
 
@@ -522,17 +490,18 @@ Expected: the full pytest, Ruff, and diff checks pass. The final `rg` returns no
 test, README, LLM-guide, or plugin-manifest match; the intentionally historical path remains only
 in the approved design specification.
 
-- [ ] **Step 7: Commit documentation and its executable contract**
+- [ ] **Step 5: Commit documentation and its executable contract**
 
 ```bash
-git add README.md docs/llm/sedna-knowledge-tools.md tests/test_plugin_knowledge.py
+git add README.md docs/llm/sedna-knowledge-tools.md \
+  docs/superpowers/plans/2026-08-10-sedna-zero-config-knowledge-root.md
 git diff --cached --check
 git commit -m "docs(plugin): explain zero-config knowledge storage"
 ```
 
 Expected: the commit contains exactly the three listed files.
 
-- [ ] **Step 8: Verify final repository state**
+- [ ] **Step 6: Verify final repository state**
 
 Run:
 
