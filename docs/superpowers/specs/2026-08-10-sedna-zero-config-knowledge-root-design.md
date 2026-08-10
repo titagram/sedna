@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-10
 
-**Status:** Design approved; written specification pending final review
+**Status:** Approved for implementation
 
 **Scope:** Portable, profile-aware resolution of Sedna's canonical knowledge root when Sedna is
 used as a Hades plugin
