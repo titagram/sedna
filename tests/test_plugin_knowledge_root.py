@@ -159,6 +159,21 @@ def test_installed_but_failing_hades_resolver_never_falls_back(
     assert caught.value.code == "knowledge_runtime_unavailable"
 
 
+def test_hades_resolver_relative_home_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        plugin_module.importlib,
+        "import_module",
+        lambda _: SimpleNamespace(get_hermes_home=lambda: Path("relative-hades-home")),
+    )
+
+    with pytest.raises(plugin_module._ToolBoundaryError) as caught:
+        plugin_module._knowledge_root(_Context(), None)
+
+    assert caught.value.code == "knowledge_runtime_unavailable"
+
+
 @pytest.mark.parametrize("configured", ["", "bad\x00root", "x" * 4097, object()])
 def test_invalid_context_override_is_a_typed_input_error(configured: object) -> None:
     context = _Context()

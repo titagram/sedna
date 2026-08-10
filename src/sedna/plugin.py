@@ -462,7 +462,10 @@ def _default_knowledge_root() -> Path:
             home = resolver()
         except Exception as error:
             raise _ToolBoundaryError("knowledge_runtime_unavailable") from error
-    return _validated_root(home, error_code="knowledge_runtime_unavailable") / "knowledge" / "sedna"
+    home_path = _validated_root(home, error_code="knowledge_runtime_unavailable")
+    if not home_path.is_absolute():
+        raise _ToolBoundaryError("knowledge_runtime_unavailable")
+    return home_path / "knowledge" / "sedna"
 
 
 def _knowledge_root(ctx: Any, explicit: str | None) -> Path:
