@@ -12,7 +12,7 @@ from typing import Generic, Literal, Protocol, Self, TypeVar
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from sedna.knowledge.parsing import PreparedSource
-from sedna.knowledge.parsing.sanitize import sanitize_asset_target
+from sedna.knowledge.parsing.sanitize import sanitize_asset_target, sanitize_searchable_text
 from sedna.knowledge.schema import DocumentType, KnowledgeRole, SourceQuality
 from sedna.knowledge.schema.common import SearchableNonEmptyString, SearchableString
 from sedna.knowledge.semantic.drafts import CriticVerdict, SemanticDraftBundle
@@ -247,7 +247,7 @@ def build_safe_source_payload(prepared: PreparedSource) -> SafePreparedSourcePay
                 start_line=segment.start_line,
                 end_line=segment.end_line,
                 heading_path=tuple(segment.heading_path),
-                text=segment.text,
+                text=sanitize_searchable_text(segment.text, (segment.text,)),
                 assets=tuple(
                     SafeSegmentAsset(
                         asset_index=asset.asset_index,

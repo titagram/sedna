@@ -240,6 +240,26 @@ def test_safe_payload_rejects_final_flags_in_whitelisted_fields():
         SafeSourceSegment(index=0, start_line=1, end_line=1, text="HTB{segment_flag}")
 
 
+def test_safe_payload_redacts_contextual_hashes_instead_of_rejecting_prepared_source():
+    first_hash = "0123456789abcdef0123456789abcdef"
+    second_hash = "fedcba9876543210fedcba9876543210"
+    prepared = _prepared_from_markdown(
+        "# Hash catalogue\n\n"
+        f"The report says we got our root flag. Checksums: {first_hash} and {second_hash}.\n"
+    )
+    prepared_segment = next(segment for segment in prepared.segments if first_hash in segment.text)
+    prepared_index = prepared.segments.index(prepared_segment)
+
+    payload = build_safe_source_payload(prepared)
+    safe_segment = payload.segments[prepared_index]
+
+    assert first_hash in prepared_segment.text
+    assert second_hash in prepared_segment.text
+    assert first_hash not in safe_segment.text
+    assert second_hash not in safe_segment.text
+    assert safe_segment.text.count("<EXCLUDED_FLAG>") == 2
+
+
 def test_safe_payload_uses_only_the_foundation_sanitized_asset_locator():
     prepared = _prepared_source()
     credentialed_asset = prepared.document.assets[0].model_copy(
