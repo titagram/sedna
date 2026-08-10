@@ -173,8 +173,7 @@ def classify_document(candidate: SourceCandidate, text: str | None) -> Classific
     Reason codes intentionally expose the rule that won so a manifest or review
     report can explain every deterministic decision.
     """
-    relative_path = PurePosixPath(candidate.relative_path).as_posix()
-    normalized_path = relative_path.casefold()
+    normalized_path = _classification_path(candidate)
 
     if candidate.suffix.casefold() == ".pdf":
         return _classify_pdf(candidate)
@@ -604,6 +603,23 @@ def _walkthrough_quality(signals: _DocumentSignals) -> SourceQuality:
     if signals.word_count >= 200 and signals.code_block_count >= 1:
         return SourceQuality.COMPLETE
     return SourceQuality.PARTIAL
+
+
+def _classification_path(candidate: SourceCandidate) -> str:
+    """Retain corpus-family context when a nested file or folder is selected directly."""
+    relative_path = PurePosixPath(candidate.relative_path).as_posix().casefold()
+    physical_path = PurePosixPath(candidate.path).as_posix().casefold()
+    for marker in (
+        "write-ups/machines/",
+        "write-ups/challanges/",
+        "write-ups/challenges/",
+        "write-ups/academy/",
+        "01_information-gathering/",
+    ):
+        marker_offset = physical_path.find(marker)
+        if marker_offset >= 0:
+            return physical_path[marker_offset:]
+    return relative_path
 
 
 def _lesson_quality(signals: _DocumentSignals) -> SourceQuality:

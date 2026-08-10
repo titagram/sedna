@@ -81,6 +81,30 @@ def test_machine_walkthrough_uses_case_study_lane_and_github_profile() -> None:
     assert result.parser_profile == "github_walkthrough"
 
 
+@pytest.mark.parametrize("relative_path", ["walkthrough.md", "Lame/walkthrough.md"])
+def test_machine_context_survives_direct_file_or_machines_folder_selection(
+    tmp_path: Path,
+    relative_path: str,
+) -> None:
+    _, text = fixture_candidate("machine-walkthrough.md")
+    path = tmp_path / "raw_src" / "Write-ups" / "Machines" / relative_path
+    candidate = SourceCandidate(
+        source_id="source-selected-machine",
+        path=path,
+        relative_path=relative_path,
+        suffix=".md",
+        sha256="a" * 64,
+        size_bytes=len(text.encode()),
+        assets=(),
+    )
+
+    result = classify_document(candidate, text)
+
+    assert result.document_type == DocumentType.MACHINE_WALKTHROUGH
+    assert result.knowledge_role == KnowledgeRole.CASE_STUDY
+    assert result.ingestion_status == IngestionStatus.ACCEPTED
+
+
 def test_table_dominant_academy_source_is_a_cheatsheet(tmp_path: Path) -> None:
     path = tmp_path / "cheatsheet.md"
     text = """# SQL reference
