@@ -682,35 +682,25 @@ def _validate_envelope(
     payload_lane = getattr(payload, "lane", None)
     if payload_lane is not None and payload_lane != lane:
         raise ValueError("event lane must exactly match the payload lane")
-    if lane is not None and (actor == "system" or system_correlation is not None):
-        raise ValueError("host lane and system correlation are mutually exclusive")
-    if actor == "system" and system_correlation is None:
-        raise ValueError("system-owned events require typed system correlation")
-    if actor != "system" and system_correlation is not None:
-        raise ValueError("ordinary user or host events forbid system correlation")
-    if actor == "host_agent" and lane is None:
-        raise ValueError("host events require an exact execution lane")
-    if system_correlation is not None:
-        expected_source = _SYSTEM_SOURCE_BY_TYPE.get(event_type)
-        if event_type is EventType.CLOSURE_REQUESTED:
-            expected_source = (
-                "proof_settlement"
-                if isinstance(payload, ClosureRequestedPayload)
-                and payload.origin == "proof_settlement"
-                else None
-            )
-        if expected_source is None or system_correlation.source != expected_source:
-            raise ValueError("system correlation source does not match the event type")
+    expected_source = _SYSTEM_SOURCE_BY_TYPE.get(event_type)
     if (
         event_type is EventType.CLOSURE_REQUESTED
         and isinstance(payload, ClosureRequestedPayload)
         and payload.origin == "proof_settlement"
-        and (
-            system_correlation is None
-            or system_correlation.source != "proof_settlement"
-        )
     ):
-        raise ValueError("proof settlement requires proof_settlement system correlation")
+        expected_source = "proof_settlement"
+    if expected_source is not None:
+        if actor != "system" or lane is not None or system_correlation is None:
+            raise ValueError(
+                "system-owned event requires its typed system correlation without a lane"
+            )
+        if system_correlation.source != expected_source:
+            raise ValueError("system correlation source does not match the event type")
+        return
+    if actor == "system" or system_correlation is not None:
+        raise ValueError("ordinary user or host event cannot use system ownership")
+    if actor == "host_agent" and lane is None:
+        raise ValueError("host events require an exact execution lane")
 
 
 def _canonical_event_line_bytes(event: JournalEvent) -> bytes:

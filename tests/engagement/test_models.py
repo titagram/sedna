@@ -425,6 +425,41 @@ def test_system_lifecycle_requires_matching_system_correlation() -> None:
         )
 
 
+def test_non_system_actor_cannot_bypass_lifecycle_correlation() -> None:
+    payload = EngagementOpenedPayload(scope_references=())
+    with pytest.raises(ValidationError, match="system-owned"):
+        JournalEventDraft(actor="user", type=payload.kind, payload=payload)
+
+
+def test_non_system_actor_cannot_bypass_recovery_correlation() -> None:
+    payload = RecoveryWarningPayload(
+        reason_code="recovered_orphan_evidence",
+        evidence_id="evidence-sha256-" + "a" * 64,
+    )
+    with pytest.raises(ValidationError, match="system-owned"):
+        JournalEventDraft(actor="user", type=payload.kind, payload=payload)
+
+
+def test_system_actor_cannot_reclassify_ordinary_lane_event(lane) -> None:
+    payload = ToolCallStartedPayload(
+        call_id="call-1",
+        tool_name="terminal",
+        correlation=ToolCorrelation.uncertain("missing_stable_identity"),
+        safe_arguments={},
+    )
+    with pytest.raises(ValidationError):
+        JournalEventDraft(
+            actor="system",
+            lane=lane,
+            type=payload.kind,
+            payload=payload,
+            system_correlation=SystemCorrelation(
+                source="lifecycle",
+                operation_id=UUID("22222222-2222-4222-8222-222222222227"),
+            ),
+        )
+
+
 def test_proof_settlement_closure_requires_matching_system_correlation() -> None:
     payload = ClosureRequestedPayload(
         terminal_watermark=1,
