@@ -162,6 +162,9 @@ _BOUND_LANE_TYPES = frozenset(
         EventType.CONTROL_TOOL_INVOKED,
     }
 )
+_ATOMIC_RESTART_ERROR = (
+    "closure_cancelled must be immediately followed by tool_call_started"
+)
 
 
 def _canonical_event_hash(item: JournalEvent) -> str:
@@ -208,6 +211,7 @@ class _Accumulator:
     active_decisions: dict[str, ActiveDecision] = field(default_factory=dict)
     calls: dict[str, _CallState] = field(default_factory=dict)
     closure: ClosureBarrier | None = None
+    operational_restart_required: bool = False
     revision: JournalRevision = field(
         default_factory=lambda: JournalRevision(sequence=0, event_hash="0" * 64)
     )
@@ -235,6 +239,12 @@ class _Accumulator:
                 raise EngagementReplayError(
                     "closure cancellation must cite the current closure barrier"
                 )
+
+        if (
+            self.operational_restart_required
+            and item.type is not EventType.TOOL_CALL_STARTED
+        ):
+            raise EngagementReplayError(_ATOMIC_RESTART_ERROR)
 
         effect = EVENT_LIFECYCLE_EFFECTS[item.type]
         if effect not in STATUS_LIFECYCLE_MATRIX[self.status]:
@@ -367,6 +377,7 @@ class _Accumulator:
             lane=lane,
             started_sequence=item.sequence,
         )
+        self.operational_restart_required = False
 
     def _apply_tool_terminal(self, item: JournalEvent) -> None:
         payload = item.payload
@@ -419,6 +430,7 @@ class _Accumulator:
             )
         self.closure = None
         self.status = EngagementStatus.ACTIVE
+        self.operational_restart_required = True
 
     def _apply_reopened(self, item: JournalEvent) -> None:
         del item
@@ -430,6 +442,8 @@ class _Accumulator:
         self.status = EngagementStatus.ABANDONED
 
     def freeze(self) -> EngagementState:
+        if self.operational_restart_required:
+            raise EngagementReplayError(_ATOMIC_RESTART_ERROR)
         bindings = tuple(
             LaneBinding(lane=lane, engagement_id=self.manifest.engagement_id)
             for _, lane in sorted(self.bound_lanes.items())

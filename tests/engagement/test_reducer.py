@@ -470,6 +470,46 @@ def test_exact_barrier_cancellation_then_operational_start_is_atomic(manifest, l
     assert state.in_flight_call_ids == ("late-call",)
 
 
+def test_cancellation_must_be_immediately_followed_by_operational_start(
+    manifest, lane
+) -> None:
+    closing = chain(
+        manifest,
+        opened(manifest),
+        lane_bound(lane),
+        closure_requested(watermark=2, in_flight=()),
+    )
+    cancelled = event(manifest, closure_cancelled(closing[-1].event_id), closing)
+    intervening = event(manifest, user_note(), (*closing, cancelled))
+    started = event(
+        manifest,
+        tool_started(lane, call_id="late-call"),
+        (*closing, cancelled, intervening),
+    )
+
+    with pytest.raises(
+        EngagementReplayError,
+        match="immediately followed by tool_call_started",
+    ):
+        reduce_engagement(manifest, (*closing, cancelled, intervening, started))
+
+
+def test_cancellation_cannot_end_replay_without_operational_start(manifest, lane) -> None:
+    closing = chain(
+        manifest,
+        opened(manifest),
+        lane_bound(lane),
+        closure_requested(watermark=2, in_flight=()),
+    )
+    cancelled = event(manifest, closure_cancelled(closing[-1].event_id), closing)
+
+    with pytest.raises(
+        EngagementReplayError,
+        match="immediately followed by tool_call_started",
+    ):
+        reduce_engagement(manifest, (*closing, cancelled))
+
+
 def test_cancellation_requires_the_exact_current_barrier_identity(manifest, lane) -> None:
     closing = chain(
         manifest,
