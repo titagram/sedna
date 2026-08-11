@@ -8,8 +8,9 @@ import fcntl
 import json
 import os
 import stat
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -111,6 +112,18 @@ class _RecoverableTailError(Exception):
         self.recovery_lane = recovery_lane
 
 
+@dataclass(frozen=True)
+class _CreateRecovery:
+    engagement_id: UUID
+    manifest: EngagementManifest
+    manifest_bytes: bytes
+    events: tuple[JournalEvent, ...]
+    journal_bytes: bytes
+    head: JournalHead
+    head_bytes: bytes
+    projection_bytes: bytes
+
+
 def _require_posix_primitives() -> None:
     required = ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")
     if any(not hasattr(os, name) for name in required) or not hasattr(fcntl, "flock"):
@@ -165,6 +178,15 @@ def _validate_regular(fd: int, *, label: str, expected_mode: int | None = None) 
     if not stat.S_ISREG(result.st_mode):
         raise JournalUnavailableError(f"{label} must be a regular file")
     if expected_mode is not None and stat.S_IMODE(result.st_mode) != expected_mode:
+        raise JournalUnavailableError(f"{label} has an unsafe mode")
+    return result
+
+
+def _validate_directory(fd: int, *, label: str, expected_mode: int) -> os.stat_result:
+    result = os.fstat(fd)
+    if not stat.S_ISDIR(result.st_mode):
+        raise JournalUnavailableError(f"{label} must be a directory")
+    if stat.S_IMODE(result.st_mode) != expected_mode:
         raise JournalUnavailableError(f"{label} has an unsafe mode")
     return result
 
@@ -297,10 +319,11 @@ def _open_or_create_directory(parent_fd: int, name: str, mode: int) -> int:
         fd = os.open(name, _directory_flags(), dir_fd=parent_fd)
     except OSError as exc:
         raise JournalUnavailableError(f"unsafe directory: {name}") from exc
-    result = os.fstat(fd)
-    if not stat.S_ISDIR(result.st_mode):
+    try:
+        _validate_directory(fd, label=name, expected_mode=mode)
+    except Exception:
         os.close(fd)
-        raise JournalUnavailableError(f"unsafe directory: {name}")
+        raise
     return fd
 
 
@@ -310,7 +333,7 @@ def _open_regular(parent_fd: int, name: str, bound: int, label: str) -> int:
     except OSError as exc:
         raise JournalUnavailableError(f"unable to open {label}") from exc
     try:
-        result = _validate_regular(fd, label=label)
+        result = _validate_regular(fd, label=label, expected_mode=0o600)
         if result.st_size > bound:
             raise JournalUnavailableError(f"{label} exceeds its byte bound")
         return fd
@@ -337,10 +360,54 @@ def _read_bounded(parent_fd: int, name: str, bound: int, label: str) -> bytes:
         os.close(fd)
 
 
+def _scan_directory_bounded(parent_fd: int, bound: int, label: str) -> list[str]:
+    entries: list[str] = []
+    with os.scandir(parent_fd) as iterator:
+        for entry in iterator:
+            if len(entries) >= bound:
+                raise JournalUnavailableError(f"{label} entry bound exceeded")
+            entries.append(entry.name)
+    return entries
+
+
+def _iter_journal_lines(data: bytes) -> Iterator[bytes]:
+    start = 0
+    count = 0
+    while start < len(data):
+        end = data.find(b"\n", start)
+        if end < 0:
+            end = len(data)
+            next_start = len(data)
+        else:
+            next_start = end + 1
+        line = data[start:end]
+        count += 1
+        if count > MAX_JOURNAL_EVENTS:
+            raise ValueError("journal event count exceeds its bound")
+        if len(line) > MAX_JOURNAL_EVENT_BYTES:
+            raise ValueError("journal event exceeds its byte bound")
+        yield line
+        start = next_start
+
+
 def _atomic_write(parent_fd: int, name: str, data: bytes) -> None:
+    try:
+        existing_fd = os.open(name, _read_flags(), dir_fd=parent_fd)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise JournalUnavailableError(f"unsafe atomic target: {name}") from exc
+    else:
+        try:
+            _validate_regular(
+                existing_fd, label=name, expected_mode=0o600
+            )
+        finally:
+            os.close(existing_fd)
     temporary = f".{name}.tmp-{uuid4()}"
     fd = os.open(temporary, _create_flags(), 0o600, dir_fd=parent_fd)
     try:
+        os.fchmod(fd, 0o600)
         _write_all(fd, data)
         os.fsync(fd)
     finally:
@@ -371,8 +438,7 @@ def _locked_file(parent_fd: int, name: str):
     if fd is None:
         raise JournalUnavailableError(f"unable to open lock {name}")
     try:
-        _validate_regular(fd, label=name)
-        os.fchmod(fd, 0o600)
+        _validate_regular(fd, label=name, expected_mode=0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
@@ -401,6 +467,9 @@ class EngagementJournalRepository:
         self._closed = False
         self._root_fd = self._open_absolute_root(raw)
         try:
+            _validate_directory(
+                self._root_fd, label="knowledge root", expected_mode=0o700
+            )
             pathname = os.stat(raw, follow_symlinks=False)
             retained = os.fstat(self._root_fd)
             if not stat.S_ISDIR(pathname.st_mode) or (
@@ -411,8 +480,34 @@ class EngagementJournalRepository:
             self._engagements_fd = _open_or_create_directory(
                 self._root_fd, "engagements", 0o700
             )
-            self._bounded_engagement_entries()
+            entries = self._bounded_engagement_entries()
+            if (
+                ".registry.lock" not in entries
+                and len(entries) >= MAX_ENGAGEMENT_DIRECTORY_ENTRIES
+            ):
+                raise JournalUnavailableError(
+                    "engagement directory entry bound exceeded"
+                )
+            with _locked_file(self._engagements_fd, ".registry.lock"):
+                entries = self._bounded_engagement_entries()
+                self._recover_pending_creates(entries)
+                entries = self._bounded_engagement_entries()
+                for name in entries:
+                    entry_stat = os.stat(
+                        name,
+                        dir_fd=self._engagements_fd,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        _is_uuid_name(name)
+                        and stat.S_ISDIR(entry_stat.st_mode)
+                        and stat.S_IMODE(entry_stat.st_mode) == 0o700
+                    ):
+                        self._recover_published_create_intent(UUID(name))
+                self._bounded_engagement_entries()
         except Exception:
+            with suppress(AttributeError):
+                os.close(self._engagements_fd)
             os.close(self._root_fd)
             raise
 
@@ -426,8 +521,12 @@ class EngagementJournalRepository:
                 try:
                     next_fd = os.open(component, _directory_flags(), dir_fd=current)
                 except FileNotFoundError:
-                    os.mkdir(component, 0o700, dir_fd=current)
-                    os.fsync(current)
+                    try:
+                        os.mkdir(component, 0o700, dir_fd=current)
+                    except FileExistsError:
+                        pass
+                    else:
+                        os.fsync(current)
                     next_fd = os.open(component, _directory_flags(), dir_fd=current)
                 os.close(current)
                 current = next_fd
@@ -458,10 +557,248 @@ class EngagementJournalRepository:
         del point
 
     def _bounded_engagement_entries(self) -> list[str]:
-        entries = os.listdir(self._engagements_fd)
-        if len(entries) > MAX_ENGAGEMENT_DIRECTORY_ENTRIES:
-            raise JournalUnavailableError("engagement directory entry bound exceeded")
-        return entries
+        return _scan_directory_bounded(
+            self._engagements_fd,
+            MAX_ENGAGEMENT_DIRECTORY_ENTRIES,
+            "engagement directory",
+        )
+
+    def _recover_pending_creates(self, entries: Sequence[str]) -> None:
+        pending: list[tuple[str, UUID]] = []
+        published = {name for name in entries if _is_uuid_name(name)}
+        for name in entries:
+            engagement_id = _pending_create_id(name)
+            if engagement_id is not None:
+                pending.append((name, engagement_id))
+        prospective = len(published) + sum(
+            str(engagement_id) not in published for _, engagement_id in pending
+        )
+        if prospective > MAX_ENGAGEMENTS:
+            raise JournalUnavailableError("engagement count exceeds its bound")
+        for name, engagement_id in pending:
+            self._recover_pending_create(name, engagement_id)
+
+    def _decode_create_intent(
+        self, raw: bytes, expected_engagement_id: UUID
+    ) -> _CreateRecovery:
+        try:
+            value = json.loads(raw)
+            if _canonical_json(value) != raw:
+                raise ValueError("intent is not canonical")
+            if set(value) != {
+                "engagement_id",
+                "manifest",
+                "journal",
+                "head",
+                "manifest_sha256",
+                "journal_sha256",
+                "head_sha256",
+            }:
+                raise ValueError("intent fields differ")
+            manifest_bytes = base64.b64decode(value["manifest"], validate=True)
+            journal_bytes = base64.b64decode(value["journal"], validate=True)
+            head_bytes = base64.b64decode(value["head"], validate=True)
+            if (
+                value["engagement_id"] != str(expected_engagement_id)
+                or sha256(manifest_bytes).hexdigest() != value["manifest_sha256"]
+                or sha256(journal_bytes).hexdigest() != value["journal_sha256"]
+                or sha256(head_bytes).hexdigest() != value["head_sha256"]
+            ):
+                raise ValueError("intent digest mismatch")
+            if len(manifest_bytes) > MAX_MANIFEST_BYTES:
+                raise ValueError("manifest exceeds limits")
+            manifest = EngagementManifest.model_validate_json(manifest_bytes)
+            if manifest_bytes != _model_bytes(manifest):
+                raise ValueError("manifest is not canonical")
+            if not journal_bytes.endswith(b"\n"):
+                raise ValueError("initial journal is incomplete")
+            raw_lines = tuple(_iter_journal_lines(journal_bytes))
+            events = tuple(JournalEvent.model_validate_json(line) for line in raw_lines)
+            if journal_bytes != b"".join(_event_line(item) + b"\n" for item in events):
+                raise ValueError("initial journal is not canonical")
+            if (
+                len(events) != 2
+                or events[0].type != "engagement_opened"
+                or events[1].type != "lane_bound"
+                or not isinstance(events[1].payload, LaneBoundPayload)
+                or events[1].lane != events[1].payload.lane
+            ):
+                raise ValueError("initial event pair is invalid")
+            self._validate_journal_limits(events, journal_bytes)
+            head = JournalHead.model_validate_json(head_bytes)
+            if (
+                manifest.engagement_id != expected_engagement_id
+                or head.engagement_id != expected_engagement_id
+                or head_bytes != _model_bytes(head)
+                or head != _head(expected_engagement_id, events, journal_bytes)
+            ):
+                raise ValueError("create identity or head mismatch")
+            state = reduce_engagement(manifest, events)
+            projection = self._projection_bytes(head.revision, state)
+        except Exception as exc:
+            raise JournalUnavailableError(
+                "conflicting pending create transaction"
+            ) from exc
+        return _CreateRecovery(
+            engagement_id=expected_engagement_id,
+            manifest=manifest,
+            manifest_bytes=manifest_bytes,
+            events=events,
+            journal_bytes=journal_bytes,
+            head=head,
+            head_bytes=head_bytes,
+            projection_bytes=projection,
+        )
+
+    @staticmethod
+    def _verify_create_files(
+        directory_fd: int, recovery: _CreateRecovery, *, allow_missing: bool
+    ) -> tuple[str, ...]:
+        missing: list[str] = []
+        for name, expected in (
+            ("engagement.json", recovery.manifest_bytes),
+            ("events.jsonl", recovery.journal_bytes),
+            ("journal-head.json", recovery.head_bytes),
+        ):
+            try:
+                actual = _read_bounded(
+                    directory_fd,
+                    name,
+                    max(len(expected), 1),
+                    f"staged {name}",
+                )
+            except JournalUnavailableError as exc:
+                if allow_missing and _missing_file(exc):
+                    missing.append(name)
+                    continue
+                raise JournalUnavailableError(
+                    "conflicting pending create transaction"
+                ) from exc
+            if actual != expected:
+                raise JournalUnavailableError(
+                    "conflicting pending create transaction"
+                )
+        return tuple(missing)
+
+    def _finalize_published_create(
+        self, engagement_fd: int, recovery: _CreateRecovery
+    ) -> None:
+        self._verify_create_files(engagement_fd, recovery, allow_missing=False)
+        _atomic_write(
+            engagement_fd, "engagement-state.json", recovery.projection_bytes
+        )
+        with suppress(FileNotFoundError):
+            os.unlink(".create-intent.json", dir_fd=engagement_fd)
+        os.fsync(engagement_fd)
+
+    def _recover_pending_create(self, name: str, engagement_id: UUID) -> None:
+        try:
+            pending_fd = os.open(name, _directory_flags(), dir_fd=self._engagements_fd)
+        except OSError as exc:
+            raise JournalUnavailableError("unsafe pending create directory") from exc
+        try:
+            _validate_directory(
+                pending_fd, label="pending create directory", expected_mode=0o700
+            )
+            entries = _scan_directory_bounded(
+                pending_fd, 8, "pending create directory"
+            )
+            if not entries:
+                os.close(pending_fd)
+                pending_fd = -1
+                os.rmdir(name, dir_fd=self._engagements_fd)
+                os.fsync(self._engagements_fd)
+                return
+            allowed = {
+                ".create-intent.json",
+                "engagement.json",
+                "events.jsonl",
+                "journal-head.json",
+            }
+            if any(entry not in allowed for entry in entries):
+                raise JournalUnavailableError(
+                    "conflicting pending create transaction"
+                )
+            raw = _read_bounded(
+                pending_fd,
+                ".create-intent.json",
+                MAX_CREATE_INTENT_BYTES,
+                "create intent",
+            )
+            recovery = self._decode_create_intent(raw, engagement_id)
+            missing = self._verify_create_files(
+                pending_fd, recovery, allow_missing=True
+            )
+            self._assert_lane_available(
+                recovery.events[1].lane, exclude=engagement_id
+            )
+            expected_by_name = {
+                "engagement.json": recovery.manifest_bytes,
+                "events.jsonl": recovery.journal_bytes,
+                "journal-head.json": recovery.head_bytes,
+            }
+            for missing_name in missing:
+                _atomic_write(pending_fd, missing_name, expected_by_name[missing_name])
+            os.fsync(pending_fd)
+            try:
+                published_fd = self._engagement_fd(engagement_id)
+            except JournalUnavailableError as exc:
+                if not _missing_file(exc):
+                    raise
+                os.close(pending_fd)
+                pending_fd = -1
+                os.rename(
+                    name,
+                    str(engagement_id),
+                    src_dir_fd=self._engagements_fd,
+                    dst_dir_fd=self._engagements_fd,
+                )
+                os.fsync(self._engagements_fd)
+                published_fd = self._engagement_fd(engagement_id)
+            else:
+                self._verify_create_files(
+                    published_fd, recovery, allow_missing=False
+                )
+                for entry in _scan_directory_bounded(
+                    pending_fd, 8, "pending create directory"
+                ):
+                    os.unlink(entry, dir_fd=pending_fd)
+                os.close(pending_fd)
+                pending_fd = -1
+                os.rmdir(name, dir_fd=self._engagements_fd)
+                os.fsync(self._engagements_fd)
+            try:
+                self._finalize_published_create(published_fd, recovery)
+            finally:
+                os.close(published_fd)
+        except JournalUnavailableError:
+            raise
+        except Exception as exc:
+            raise JournalUnavailableError(
+                "conflicting pending create transaction"
+            ) from exc
+        finally:
+            if pending_fd >= 0:
+                os.close(pending_fd)
+
+    def _recover_published_create_intent(self, engagement_id: UUID) -> None:
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            try:
+                raw = _read_bounded(
+                    engagement_fd,
+                    ".create-intent.json",
+                    MAX_CREATE_INTENT_BYTES,
+                    "create intent",
+                )
+            except JournalUnavailableError as exc:
+                if _missing_file(exc):
+                    return
+                raise
+            recovery = self._decode_create_intent(raw, engagement_id)
+            self._finalize_published_create(engagement_fd, recovery)
+        finally:
+            os.close(engagement_fd)
 
     def _engagement_fd(self, engagement_id: UUID) -> int:
         self._require_open()
@@ -473,9 +810,13 @@ class EngagementJournalRepository:
             if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
                 raise ValueError("unsafe engagement directory") from exc
             raise JournalUnavailableError("engagement does not exist") from exc
-        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+        try:
+            _validate_directory(
+                fd, label="engagement directory", expected_mode=0o700
+            )
+        except Exception:
             os.close(fd)
-            raise ValueError("unsafe engagement directory")
+            raise
         return fd
 
     def create(
@@ -543,10 +884,26 @@ class EngagementJournalRepository:
                     pending_name, _directory_flags(), dir_fd=self._engagements_fd
                 )
                 try:
-                    entries = os.listdir(pending_fd)
-                    if len(entries) > 8:
+                    _validate_directory(
+                        pending_fd,
+                        label="pending create directory",
+                        expected_mode=0o700,
+                    )
+                    entries = _scan_directory_bounded(
+                        pending_fd, 8, "pending create directory"
+                    )
+                    if any(
+                        entry
+                        not in {
+                            ".create-intent.json",
+                            "engagement.json",
+                            "events.jsonl",
+                            "journal-head.json",
+                        }
+                        for entry in entries
+                    ):
                         raise JournalUnavailableError(
-                            "pending create directory entry bound exceeded"
+                            "conflicting pending create transaction"
                         )
                     try:
                         existing_intent = _read_bounded(
@@ -566,6 +923,11 @@ class EngagementJournalRepository:
                                 pending_name,
                                 _directory_flags(),
                                 dir_fd=self._engagements_fd,
+                            )
+                            _validate_directory(
+                                pending_fd,
+                                label="pending create directory",
+                                expected_mode=0o700,
                             )
                             existing_intent = None
                         else:
@@ -599,7 +961,7 @@ class EngagementJournalRepository:
                             )
                             stored_events = tuple(
                                 JournalEvent.model_validate_json(line)
-                                for line in stored_journal_bytes.splitlines()
+                                for line in _iter_journal_lines(stored_journal_bytes)
                             )
                             stored_head = JournalHead.model_validate_json(stored_head_bytes)
                             if (
@@ -674,6 +1036,11 @@ class EngagementJournalRepository:
             self._fault("create_after_directory")
             pending_fd = os.open(pending_name, _directory_flags(), dir_fd=self._engagements_fd)
             try:
+                _validate_directory(
+                    pending_fd,
+                    label="pending create directory",
+                    expected_mode=0o700,
+                )
                 _atomic_write(pending_fd, ".create-intent.json", intent)
                 self._fault("create_after_intent")
                 _atomic_write(pending_fd, "engagement.json", manifest_bytes)
@@ -747,6 +1114,7 @@ class EngagementJournalRepository:
                 )
                 prior = self._resolve_existing_batch(existing, validated)
                 if prior is not None:
+                    self._validate_journal_limits(existing, journal_bytes)
                     state = reduce_engagement(manifest, existing)
                     expected_projection = self._projection_bytes(
                         current_head.revision, state
@@ -758,7 +1126,9 @@ class EngagementJournalRepository:
                             MAX_DERIVED_PROJECTION_BYTES,
                             "engagement state projection",
                         )
-                    except JournalUnavailableError:
+                    except JournalUnavailableError as exc:
+                        if not _missing_file(exc):
+                            raise
                         actual_projection = b""
                     if actual_projection != expected_projection:
                         _atomic_write(
@@ -821,7 +1191,9 @@ class EngagementJournalRepository:
             dir_fd=engagement_fd,
         )
         try:
-            result = _validate_regular(journal_fd, label="events.jsonl")
+            result = _validate_regular(
+                journal_fd, label="events.jsonl", expected_mode=0o600
+            )
             if result.st_size != base_head.journal_bytes:
                 raise JournalUnavailableError("journal_corrupt: append base size changed")
             for line in lines:
@@ -874,7 +1246,9 @@ class EngagementJournalRepository:
                         MAX_DERIVED_PROJECTION_BYTES,
                         "engagement state projection",
                     )
-                except JournalUnavailableError:
+                except JournalUnavailableError as exc:
+                    if not _missing_file(exc):
+                        raise
                     actual = b""
                 if actual != expected:
                     _atomic_write(engagement_fd, "engagement-state.json", expected)
@@ -927,8 +1301,10 @@ class EngagementJournalRepository:
                     MAX_DERIVED_PROJECTION_BYTES,
                     "projection",
                 )
-            except JournalUnavailableError:
-                return None
+            except JournalUnavailableError as exc:
+                if _missing_file(exc):
+                    return None
+                raise
             value = json.loads(data)
             if not isinstance(value, dict) or value.get("owner") != owner:
                 raise ProjectionOwnershipError("stored projection owner does not match")
@@ -1072,9 +1448,9 @@ class EngagementJournalRepository:
             raise ValueError("journal event count exceeds its bound")
         if len(data) > MAX_JOURNAL_BYTES:
             raise ValueError("journal bytes exceed their bound")
-        for line in data.splitlines():
-            if len(line) > MAX_JOURNAL_EVENT_BYTES:
-                raise ValueError("journal event exceeds its byte bound")
+        parsed_count = sum(1 for _ in _iter_journal_lines(data))
+        if parsed_count != len(events):
+            raise ValueError("journal event count does not match its lines")
 
     @staticmethod
     def _projection_bytes(revision: JournalRevision, state: BaseModel) -> bytes:
@@ -1133,10 +1509,8 @@ class EngagementJournalRepository:
             or sha256(prefix).hexdigest() != head.journal_sha256
         ):
             raise JournalUnavailableError("journal_corrupt: journal disagrees with head")
+        lines = tuple(_iter_journal_lines(prefix))
         try:
-            lines = prefix.splitlines()
-            if len(lines) > MAX_JOURNAL_EVENTS:
-                raise ValueError("too many journal events")
             events = tuple(JournalEvent.model_validate_json(line) for line in lines)
             state = reduce_engagement(manifest, events)
         except Exception as exc:
@@ -1349,7 +1723,11 @@ class EngagementJournalRepository:
                         dir_fd=engagement_fd,
                     )
                     try:
-                        _validate_regular(journal_fd, label="events.jsonl")
+                        _validate_regular(
+                            journal_fd,
+                            label="events.jsonl",
+                            expected_mode=0o600,
+                        )
                         os.ftruncate(journal_fd, base_head.journal_bytes)
                         os.fsync(journal_fd)
                     finally:
@@ -1404,7 +1782,10 @@ class EngagementJournalRepository:
                 engagement_fd, "engagement.json", MAX_MANIFEST_BYTES, "engagement manifest"
             )
         )
-        events = tuple(JournalEvent.model_validate_json(line) for line in prefix.splitlines())
+        events = tuple(
+            JournalEvent.model_validate_json(line)
+            for line in _iter_journal_lines(prefix)
+        )
         reduce_engagement(manifest, events)
         if head != _head(engagement_id, events, prefix):
             raise JournalUnavailableError("journal_corrupt: tail recovery head mismatch")
@@ -1416,6 +1797,16 @@ def _is_uuid_name(value: str) -> bool:
         return str(UUID(value)) == value
     except ValueError:
         return False
+
+
+def _pending_create_id(value: str) -> UUID | None:
+    prefix = ".pending-create-"
+    if not value.startswith(prefix):
+        return None
+    identifier = value[len(prefix) :]
+    if not _is_uuid_name(identifier):
+        return None
+    return UUID(identifier)
 
 
 def _missing_file(exc: JournalUnavailableError) -> bool:

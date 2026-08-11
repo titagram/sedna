@@ -4,13 +4,19 @@ import json
 import os
 import stat
 from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
 from pathlib import Path
 from uuid import UUID
 
 import pytest
 
 import sedna.engagement.repository as repository_module
-from sedna.engagement import JournalRevision
+from sedna.engagement import (
+    EngagementAbandonedPayload,
+    JournalEventDraft,
+    JournalRevision,
+    SystemCorrelation,
+)
 from sedna.engagement.reducer import EngagementReplayError
 from sedna.engagement.repository import (
     EngagementJournalRepository,
@@ -25,6 +31,33 @@ def _repository(root: Path, fixed_clock, fixed_uuid_factory):
         root,
         clock=fixed_clock,
         uuid_factory=fixed_uuid_factory,
+    )
+
+
+def _engagement_path(root: Path, engagement_id: UUID) -> Path:
+    return root / "engagements" / str(engagement_id)
+
+
+def _forbid_repository_writes(monkeypatch):
+    calls: list[str] = []
+
+    def forbidden(_parent_fd: int, name: str, _data: bytes) -> None:
+        calls.append(name)
+        raise AssertionError(f"unexpected repository write: {name}")
+
+    monkeypatch.setattr(repository_module, "_atomic_write", forbidden)
+    return calls
+
+
+def _second_manifest_and_lane(manifest, new_lane):
+    return (
+        manifest.model_copy(
+            update={
+                "engagement_id": UUID("22222222-2222-4222-8222-222222222222"),
+                "display_name": "HTB-Orion-2",
+            }
+        ),
+        new_lane(session_id="session-pegasus", task_id="task-second"),
     )
 
 
@@ -262,6 +295,8 @@ def test_symlinked_engagement_directory_cannot_escape(tmp_path, manifest) -> Non
     outside.mkdir()
     engagements = root / "engagements"
     engagements.mkdir(parents=True)
+    root.chmod(0o700)
+    engagements.chmod(0o700)
     (engagements / str(manifest.engagement_id)).symlink_to(outside, target_is_directory=True)
 
     with EngagementJournalRepository(root) as repository, pytest.raises(ValueError):
@@ -470,3 +505,744 @@ def test_head_contains_exact_authoritative_journal_measurements(
     assert head["revision"] == snapshot.revision.model_dump(mode="json")
     assert head["event_count"] == 2
     assert head["journal_bytes"] == len(journal)
+
+
+def test_manifest_exact_byte_limit_is_accepted_and_one_over_is_prewrite(
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    manifest_size = len(repository_module._model_bytes(manifest))
+    monkeypatch.setattr(repository_module, "MAX_MANIFEST_BYTES", manifest_size)
+    with _repository(tmp_path / "exact", fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+
+    repository = _repository(tmp_path / "over", fixed_clock, fixed_uuid_factory)
+    calls = _forbid_repository_writes(monkeypatch)
+    monkeypatch.setattr(repository_module, "MAX_MANIFEST_BYTES", manifest_size - 1)
+    with pytest.raises(ValueError, match="manifest exceeds"):
+        repository.create(manifest, initial_drafts(manifest, lane))
+    repository.close()
+    assert calls == []
+
+
+def test_materialized_event_exact_byte_limit_is_rechecked_on_idempotent_replay(
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    user_note_draft,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    draft = user_note_draft("event-boundary").model_copy(
+        update={
+            "event_id": UUID("33333333-3333-4333-8333-333333333333"),
+            "idempotency_key": "event-boundary",
+        }
+    )
+    repository = _repository(tmp_path / "knowledge", fixed_clock, fixed_uuid_factory)
+    repository.create(manifest, initial_drafts(manifest, lane))
+    existing = repository.load_events(manifest.engagement_id)
+    event = repository._materialize(manifest.engagement_id, existing, (draft,))[0]
+    event_size = max(
+        len(repository_module._event_line(item)) for item in (*existing, event)
+    )
+    monkeypatch.setattr(repository_module, "MAX_JOURNAL_EVENT_BYTES", event_size)
+    repository.append_batch(manifest.engagement_id, (draft,))
+
+    calls = _forbid_repository_writes(monkeypatch)
+    monkeypatch.setattr(repository_module, "MAX_JOURNAL_EVENT_BYTES", event_size - 1)
+    with pytest.raises(ValueError, match="journal event exceeds"):
+        repository.append_batch(manifest.engagement_id, (draft,))
+    repository.close()
+    assert calls == []
+
+
+def test_batch_exact_count_limit_is_accepted_and_one_over_is_prewrite(
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    user_note_draft,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    repository = _repository(tmp_path / "knowledge", fixed_clock, fixed_uuid_factory)
+    repository.create(manifest, initial_drafts(manifest, lane))
+    monkeypatch.setattr(repository_module, "MAX_JOURNAL_BATCH_EVENTS", 2)
+    repository.append_batch(
+        manifest.engagement_id,
+        (user_note_draft("exact-1"), user_note_draft("exact-2")),
+    )
+
+    calls = _forbid_repository_writes(monkeypatch)
+    with pytest.raises(ValueError, match="journal batch exceeds"):
+        repository.append_batch(
+            manifest.engagement_id,
+            (
+                user_note_draft("over-1"),
+                user_note_draft("over-2"),
+                user_note_draft("over-3"),
+            ),
+        )
+    repository.close()
+    assert calls == []
+
+
+def test_prospective_event_count_exact_limit_is_accepted_and_one_over_is_prewrite(
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    user_note_draft,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    repository = _repository(tmp_path / "knowledge", fixed_clock, fixed_uuid_factory)
+    repository.create(manifest, initial_drafts(manifest, lane))
+    monkeypatch.setattr(repository_module, "MAX_JOURNAL_EVENTS", 3)
+    repository.append_batch(manifest.engagement_id, (user_note_draft("exact"),))
+
+    calls = _forbid_repository_writes(monkeypatch)
+    with pytest.raises(ValueError, match="event count exceeds"):
+        repository.append_batch(manifest.engagement_id, (user_note_draft("over"),))
+    repository.close()
+    assert calls == []
+
+
+def test_prospective_journal_bytes_include_newlines_at_exact_boundary(
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    user_note_draft,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    draft = user_note_draft("journal-byte-boundary").model_copy(
+        update={"event_id": UUID("44444444-4444-4444-8444-444444444444")}
+    )
+    exact_root = tmp_path / "exact"
+    with _repository(exact_root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+        existing_size = len(
+            (_engagement_path(exact_root, manifest.engagement_id) / "events.jsonl").read_bytes()
+        )
+        event = repository._materialize(
+            manifest.engagement_id, repository.load_events(manifest.engagement_id), (draft,)
+        )[0]
+        prospective_size = existing_size + len(repository_module._event_line(event)) + 1
+        monkeypatch.setattr(repository_module, "MAX_JOURNAL_BYTES", prospective_size)
+        repository.append_batch(manifest.engagement_id, (draft,))
+
+    over_root = tmp_path / "over"
+    repository = _repository(over_root, fixed_clock, fixed_uuid_factory)
+    repository.create(manifest, initial_drafts(manifest, lane))
+    calls = _forbid_repository_writes(monkeypatch)
+    monkeypatch.setattr(repository_module, "MAX_JOURNAL_BYTES", prospective_size - 1)
+    with pytest.raises(ValueError, match="journal bytes exceed"):
+        repository.append_batch(manifest.engagement_id, (draft,))
+    repository.close()
+    assert calls == []
+
+
+def test_prospective_projection_exact_byte_limit_is_accepted_and_one_over_is_prewrite(
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    user_note_draft,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    draft = user_note_draft("projection-boundary").model_copy(
+        update={"event_id": UUID("55555555-5555-4555-8555-555555555555")}
+    )
+    exact_root = tmp_path / "exact"
+    with _repository(exact_root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+        repository.append_batch(manifest.engagement_id, (draft,))
+    projection_size = len(
+        (
+            _engagement_path(exact_root, manifest.engagement_id)
+            / "engagement-state.json"
+        ).read_bytes()
+    )
+
+    accepted_root = tmp_path / "accepted"
+    with _repository(accepted_root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+        monkeypatch.setattr(
+            repository_module, "MAX_DERIVED_PROJECTION_BYTES", projection_size
+        )
+        repository.append_batch(manifest.engagement_id, (draft,))
+
+    over_root = tmp_path / "over"
+    repository = _repository(over_root, fixed_clock, fixed_uuid_factory)
+    repository.create(manifest, initial_drafts(manifest, lane))
+    calls = _forbid_repository_writes(monkeypatch)
+    monkeypatch.setattr(
+        repository_module, "MAX_DERIVED_PROJECTION_BYTES", projection_size - 1
+    )
+    with pytest.raises(ValueError, match="projection exceeds"):
+        repository.append_batch(manifest.engagement_id, (draft,))
+    repository.close()
+    assert calls == []
+
+
+def test_published_engagement_exact_count_is_accepted_and_one_over_is_prewrite(
+    tmp_path,
+    manifest,
+    lane,
+    new_lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    second_manifest, second_lane = _second_manifest_and_lane(manifest, new_lane)
+    repository = _repository(tmp_path / "knowledge", fixed_clock, fixed_uuid_factory)
+    monkeypatch.setattr(repository_module, "MAX_ENGAGEMENTS", 1)
+    repository.create(manifest, initial_drafts(manifest, lane))
+
+    calls = _forbid_repository_writes(monkeypatch)
+    with pytest.raises(ValueError, match="engagement count exceeds"):
+        repository.create(
+            second_manifest, initial_drafts(second_manifest, second_lane)
+        )
+    repository.close()
+    assert calls == []
+
+
+def test_mixed_engagement_directory_exact_count_is_accepted_and_one_over_rejected(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "knowledge"
+    engagements = root / "engagements"
+    engagements.mkdir(parents=True, mode=0o700)
+    root.chmod(0o700)
+    (engagements / ".registry.lock").write_bytes(b"")
+    (engagements / ".registry.lock").chmod(0o600)
+    (engagements / "invalid-entry").write_bytes(b"")
+    monkeypatch.setattr(repository_module, "MAX_ENGAGEMENT_DIRECTORY_ENTRIES", 2)
+    EngagementJournalRepository(root).close()
+
+    (engagements / "another-invalid-entry").write_bytes(b"")
+    before = sorted(item.name for item in engagements.iterdir())
+    with pytest.raises(JournalUnavailableError, match="directory entry bound"):
+        EngagementJournalRepository(root)
+    assert sorted(item.name for item in engagements.iterdir()) == before
+
+
+def test_constructor_recovers_exact_pending_create_before_reads(
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "knowledge"
+    repository = _repository(root, fixed_clock, fixed_uuid_factory)
+
+    def fail_after_head(point: str) -> None:
+        if point == "create_after_head":
+            raise OSError("injected create crash")
+
+    monkeypatch.setattr(repository, "_fault", fail_after_head)
+    with pytest.raises(OSError, match="injected"):
+        repository.create(manifest, initial_drafts(manifest, lane))
+    repository.close()
+
+    with EngagementJournalRepository(root) as recovered:
+        events = recovered.load_events(manifest.engagement_id)
+
+    assert [event.sequence for event in events] == [1, 2]
+    assert not (
+        root / "engagements" / f".pending-create-{manifest.engagement_id}"
+    ).exists()
+
+
+def test_constructor_removes_empty_preintent_directory_and_fsyncs_parent(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "knowledge"
+    engagements = root / "engagements"
+    engagements.mkdir(parents=True, mode=0o700)
+    root.chmod(0o700)
+    pending = engagements / ".pending-create-11111111-1111-4111-8111-111111111111"
+    pending.mkdir(mode=0o700)
+    fsynced: list[int] = []
+    real_fsync = repository_module.os.fsync
+
+    def spy_fsync(fd: int) -> None:
+        fsynced.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(repository_module.os, "fsync", spy_fsync)
+    with EngagementJournalRepository(root):
+        pass
+
+    assert not pending.exists()
+    assert fsynced
+
+
+def test_constructor_fails_closed_on_unknown_or_mismatched_pending_create(
+    tmp_path,
+) -> None:
+    root = tmp_path / "knowledge"
+    engagements = root / "engagements"
+    engagements.mkdir(parents=True, mode=0o700)
+    root.chmod(0o700)
+    pending = engagements / ".pending-create-11111111-1111-4111-8111-111111111111"
+    pending.mkdir(mode=0o700)
+    (pending / "unknown-user-bytes").write_bytes(b"do-not-publish")
+
+    with pytest.raises(JournalUnavailableError, match="pending create"):
+        EngagementJournalRepository(root)
+    assert pending.is_dir()
+    assert not (engagements / "11111111-1111-4111-8111-111111111111").exists()
+
+
+def test_constructor_rejects_conflicting_published_uuid_and_pending_intent(
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+) -> None:
+    root = tmp_path / "knowledge"
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+    pending = root / "engagements" / f".pending-create-{manifest.engagement_id}"
+    pending.mkdir(mode=0o700)
+    (pending / ".create-intent.json").write_bytes(b"{}")
+    (pending / ".create-intent.json").chmod(0o600)
+
+    with pytest.raises(JournalUnavailableError, match="pending create"):
+        EngagementJournalRepository(root)
+    assert pending.is_dir()
+
+
+def test_engagement_inventory_uses_incremental_scan_not_listdir(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "knowledge"
+    engagements = root / "engagements"
+    engagements.mkdir(parents=True, mode=0o700)
+    root.chmod(0o700)
+    (engagements / ".registry.lock").write_bytes(b"")
+    (engagements / ".registry.lock").chmod(0o600)
+
+    def forbid_listdir(*_args, **_kwargs):
+        raise AssertionError("unbounded listdir used")
+
+    monkeypatch.setattr(repository_module.os, "listdir", forbid_listdir)
+    EngagementJournalRepository(root).close()
+
+
+def test_directory_cap_is_checked_before_empty_pending_recovery(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "knowledge"
+    engagements = root / "engagements"
+    engagements.mkdir(parents=True, mode=0o700)
+    root.chmod(0o700)
+    pending = engagements / ".pending-create-11111111-1111-4111-8111-111111111111"
+    pending.mkdir(mode=0o700)
+    (engagements / "invalid-1").write_bytes(b"")
+    (engagements / "invalid-2").write_bytes(b"")
+    monkeypatch.setattr(repository_module, "MAX_ENGAGEMENT_DIRECTORY_ENTRIES", 2)
+
+    with pytest.raises(JournalUnavailableError, match="directory entry bound"):
+        EngagementJournalRepository(root)
+    assert pending.is_dir()
+
+
+def test_pending_create_recovery_rejects_a_lane_reserved_by_published_history(
+    tmp_path,
+    manifest,
+    lane,
+    new_lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "knowledge"
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+
+    second_manifest, _ = _second_manifest_and_lane(manifest, new_lane)
+    staging_root = tmp_path / "staging"
+    staging = _repository(staging_root, fixed_clock, fixed_uuid_factory)
+
+    def fail_after_head(point: str) -> None:
+        if point == "create_after_head":
+            raise OSError("injected create crash")
+
+    monkeypatch.setattr(staging, "_fault", fail_after_head)
+    with pytest.raises(OSError, match="injected"):
+        staging.create(second_manifest, initial_drafts(second_manifest, lane))
+    staging.close()
+    pending_name = f".pending-create-{second_manifest.engagement_id}"
+    (staging_root / "engagements" / pending_name).rename(
+        root / "engagements" / pending_name
+    )
+
+    with pytest.raises(
+        (ValueError, JournalUnavailableError), match="lane is already bound|pending create"
+    ):
+        EngagementJournalRepository(root)
+    assert not _engagement_path(root, second_manifest.engagement_id).exists()
+
+
+def test_abandoned_history_retains_lane_until_exact_unbind_then_releases_it(
+    tmp_path,
+    manifest,
+    lane,
+    new_lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+) -> None:
+    root = tmp_path / "knowledge"
+    second_manifest, second_lane = _second_manifest_and_lane(manifest, new_lane)
+    abandoned = JournalEventDraft(
+        actor="system",
+        type="engagement_abandoned",
+        payload=EngagementAbandonedPayload(reason="host stopped"),
+        system_correlation=SystemCorrelation(
+            source="lifecycle",
+            operation_id=UUID("66666666-6666-4666-8666-666666666666"),
+        ),
+    )
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+        repository.append_batch(manifest.engagement_id, (abandoned,))
+        with pytest.raises(ValueError, match="lane is already bound"):
+            repository.create(second_manifest, initial_drafts(second_manifest, lane))
+        repository.unbind_lane(
+            manifest.engagement_id, lane, reason="handoff after abandonment"
+        )
+        created = repository.create(
+            second_manifest, initial_drafts(second_manifest, lane)
+        )
+
+    assert created.engagement_id == second_manifest.engagement_id
+    assert second_lane != lane
+
+
+def test_bind_conflict_is_rejected_before_target_lifecycle_mutation(
+    tmp_path,
+    manifest,
+    lane,
+    new_lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+) -> None:
+    root = tmp_path / "knowledge"
+    second_manifest, second_lane = _second_manifest_and_lane(manifest, new_lane)
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+        second = repository.create(
+            second_manifest, initial_drafts(second_manifest, second_lane)
+        )
+        with pytest.raises(ValueError, match="lane is already bound"):
+            repository.bind_lane(
+                second_manifest.engagement_id,
+                lane,
+                reason="conflicting bind",
+                expected_revision=second.revision,
+            )
+        assert repository.load_snapshot(second_manifest.engagement_id) == second
+
+    with EngagementJournalRepository(root) as reopened:
+        with pytest.raises(ValueError, match="lane is already bound"):
+            reopened.bind_lane(
+                second_manifest.engagement_id,
+                lane,
+                reason="still conflicting after reopen",
+            )
+        assert len(reopened.load_events(second_manifest.engagement_id)) == 2
+
+
+@pytest.mark.parametrize(
+    "relative_name",
+    [
+        "engagement.json",
+        "events.jsonl",
+        "journal-head.json",
+        "engagement-state.json",
+        ".journal.lock",
+    ],
+)
+def test_existing_authoritative_control_and_projection_mode_drift_is_rejected(
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+    relative_name,
+) -> None:
+    root = tmp_path / "knowledge"
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+        repository.load_events(manifest.engagement_id)
+    target = _engagement_path(root, manifest.engagement_id) / relative_name
+    target.chmod(0o644)
+
+    with (
+        EngagementJournalRepository(root) as repository,
+        pytest.raises(JournalUnavailableError, match="unsafe mode"),
+    ):
+        repository.load_snapshot(manifest.engagement_id)
+
+
+@pytest.mark.parametrize("directory", ["root", "engagements", "engagement"])
+def test_existing_repository_directory_mode_drift_is_rejected(
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+    directory,
+) -> None:
+    root = tmp_path / "knowledge"
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+    target = {
+        "root": root,
+        "engagements": root / "engagements",
+        "engagement": _engagement_path(root, manifest.engagement_id),
+    }[directory]
+    target.chmod(0o755)
+
+    if directory in {"root", "engagements"}:
+        with pytest.raises(JournalUnavailableError, match="unsafe mode"):
+            EngagementJournalRepository(root)
+    else:
+        with (
+            EngagementJournalRepository(root) as repository,
+            pytest.raises(JournalUnavailableError, match="unsafe mode"),
+        ):
+            repository.load_events(manifest.engagement_id)
+
+
+def test_registry_lock_mode_drift_is_rejected_not_repaired(tmp_path) -> None:
+    root = tmp_path / "knowledge"
+    repository = EngagementJournalRepository(root)
+    repository.close()
+    lock = root / "engagements" / ".registry.lock"
+    lock.chmod(0o644)
+
+    with pytest.raises(JournalUnavailableError, match="unsafe mode"):
+        EngagementJournalRepository(root)
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o644
+
+
+def test_projection_symlink_is_rejected_instead_of_treated_as_missing(
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+) -> None:
+    root = tmp_path / "knowledge"
+    outside = tmp_path / "outside.json"
+    outside.write_text("untouched", encoding="utf-8")
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+    projection = _engagement_path(root, manifest.engagement_id) / "engagement-state.json"
+    projection.unlink()
+    projection.symlink_to(outside)
+
+    with (
+        EngagementJournalRepository(root) as repository,
+        pytest.raises(JournalUnavailableError),
+    ):
+        repository.load_snapshot(manifest.engagement_id)
+    assert outside.read_text(encoding="utf-8") == "untouched"
+
+
+def test_pending_create_intent_mode_drift_fails_before_recovery(
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "knowledge"
+    repository = _repository(root, fixed_clock, fixed_uuid_factory)
+
+    def fail_after_intent(point: str) -> None:
+        if point == "create_after_intent":
+            raise OSError("injected create crash")
+
+    monkeypatch.setattr(repository, "_fault", fail_after_intent)
+    with pytest.raises(OSError, match="injected"):
+        repository.create(manifest, initial_drafts(manifest, lane))
+    repository.close()
+    intent = (
+        root
+        / "engagements"
+        / f".pending-create-{manifest.engagement_id}"
+        / ".create-intent.json"
+    )
+    intent.chmod(0o644)
+
+    with pytest.raises(JournalUnavailableError, match="unsafe mode"):
+        EngagementJournalRepository(root)
+    assert not _engagement_path(root, manifest.engagement_id).exists()
+
+
+@pytest.mark.parametrize("intent_name", [".pending-append.json", ".tail-recovery.json"])
+def test_pending_and_tail_intent_mode_drift_is_rejected_before_parsing(
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+    intent_name,
+) -> None:
+    root = tmp_path / "knowledge"
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+    intent = _engagement_path(root, manifest.engagement_id) / intent_name
+    intent.write_bytes(b"{}")
+    intent.chmod(0o644)
+
+    with (
+        EngagementJournalRepository(root) as repository,
+        pytest.raises(JournalUnavailableError, match="unsafe mode"),
+    ):
+        repository.load_events(manifest.engagement_id)
+
+
+@pytest.mark.parametrize("drift", ["directory", "object"])
+def test_evidence_directory_and_object_mode_drift_is_rejected_before_capture(
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+    drift,
+) -> None:
+    root = tmp_path / "knowledge"
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+    engagement = _engagement_path(root, manifest.engagement_id)
+    tail = b'{"interrupted":true'
+    with (engagement / "events.jsonl").open("ab") as stream:
+        stream.write(tail)
+        stream.flush()
+        os.fsync(stream.fileno())
+    evidence = engagement / "evidence"
+    evidence.mkdir(mode=0o700)
+    if drift == "directory":
+        evidence.chmod(0o755)
+    else:
+        blob = evidence / f"blob-{sha256(tail).hexdigest()}.bin"
+        blob.write_bytes(tail)
+        blob.chmod(0o644)
+
+    with (
+        EngagementJournalRepository(root) as repository,
+        pytest.raises(JournalUnavailableError, match="unsafe mode"),
+    ):
+        repository.load_events(manifest.engagement_id)
+
+
+def test_absolute_root_with_parent_traversal_component_is_rejected(tmp_path) -> None:
+    unsafe = f"{tmp_path}/knowledge/../escaped"
+    with pytest.raises(ValueError, match="unsafe component"):
+        EngagementJournalRepository(unsafe)
+    assert not (tmp_path / "escaped").exists()
+
+
+def test_competing_creates_for_one_lane_publish_exactly_one_engagement(
+    tmp_path,
+    manifest,
+    lane,
+    new_lane,
+    initial_drafts,
+    fixed_clock,
+) -> None:
+    root = tmp_path / "knowledge"
+    second_manifest, _ = _second_manifest_and_lane(manifest, new_lane)
+
+    def create(candidate) -> tuple[UUID, bool]:
+        try:
+            with EngagementJournalRepository(root, clock=fixed_clock) as repository:
+                repository.create(candidate, initial_drafts(candidate, lane))
+        except ValueError:
+            return candidate.engagement_id, False
+        return candidate.engagement_id, True
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = tuple(pool.map(create, (manifest, second_manifest)))
+
+    assert sum(created for _, created in outcomes) == 1
+    winner = next(identifier for identifier, created in outcomes if created)
+    loser = next(identifier for identifier, created in outcomes if not created)
+    with EngagementJournalRepository(root) as repository:
+        assert len(repository.load_events(winner)) == 2
+        with pytest.raises(JournalUnavailableError, match="does not exist"):
+            repository.load_events(loser)
+
+
+def test_competing_binds_for_one_lane_append_to_exactly_one_target(
+    tmp_path,
+    manifest,
+    lane,
+    new_lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+) -> None:
+    root = tmp_path / "knowledge"
+    second_manifest, second_lane = _second_manifest_and_lane(manifest, new_lane)
+    reserved = new_lane(session_id="session-shared", task_id="task-shared")
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+        repository.create(
+            second_manifest, initial_drafts(second_manifest, second_lane)
+        )
+
+    def bind(identifier: UUID) -> tuple[UUID, bool]:
+        try:
+            with EngagementJournalRepository(root, clock=fixed_clock) as repository:
+                repository.bind_lane(identifier, reserved, reason="concurrent reservation")
+        except ValueError:
+            return identifier, False
+        return identifier, True
+
+    identifiers = (manifest.engagement_id, second_manifest.engagement_id)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = tuple(pool.map(bind, identifiers))
+
+    assert sum(created for _, created in outcomes) == 1
+    with EngagementJournalRepository(root) as repository:
+        lengths = {
+            identifier: len(repository.load_events(identifier))
+            for identifier in identifiers
+        }
+    assert sorted(lengths.values()) == [2, 3]
