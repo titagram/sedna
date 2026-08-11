@@ -296,11 +296,18 @@ class _EvidenceObjectStore:
                 )
                 objects: list[tuple[str, int, tuple[int, int]]] = []
                 for entry in entries:
-                    if not (
-                        (entry.startswith("blob-") or entry.startswith(".pending-blob-"))
-                        and entry.endswith(".bin")
-                    ):
+                    if entry.startswith("blob-") and entry.endswith(".bin"):
+                        expected_digest = entry[len("blob-") : -len(".bin")]
+                    elif entry.startswith(".pending-blob-") and entry.endswith(".bin"):
+                        expected_digest = entry[
+                            len(".pending-blob-") : -len(".bin")
+                        ]
+                    else:
                         raise JournalUnavailableError("invalid evidence directory entry")
+                    if len(expected_digest) != 64 or any(
+                        char not in "0123456789abcdef" for char in expected_digest
+                    ):
+                        raise JournalUnavailableError("invalid evidence object digest name")
                     fd = _open_regular(
                         evidence_fd,
                         entry,
@@ -309,6 +316,19 @@ class _EvidenceObjectStore:
                     )
                     try:
                         object_stat = os.fstat(fd)
+                        content_digest = sha256()
+                        while True:
+                            chunk = os.read(fd, 65_536)
+                            if not chunk:
+                                break
+                            content_digest.update(chunk)
+                        if (
+                            content_digest.hexdigest() != expected_digest
+                            and entry != pending_name
+                        ):
+                            raise JournalUnavailableError(
+                                "evidence object filename digest mismatch"
+                            )
                         objects.append(
                             (
                                 entry,
@@ -318,12 +338,9 @@ class _EvidenceObjectStore:
                         )
                     finally:
                         os.close(fd)
-                canonical_identities = {
-                    identity
-                    for item, _, identity in objects
-                    if item.startswith("blob-")
-                }
-                canonical_count = len(canonical_identities)
+                canonical_count = sum(
+                    item.startswith("blob-") for item, _, _ in objects
+                )
                 payload_by_identity = {
                     identity: size for _, size, identity in objects
                 }

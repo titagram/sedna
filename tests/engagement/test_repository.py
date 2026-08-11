@@ -2131,6 +2131,35 @@ def test_evidence_publication_retry_counts_hard_links_once_at_exact_byte_quota(
     assert not list(evidence.glob(".pending-blob-*.bin"))
 
 
+def test_distinct_canonical_evidence_names_sharing_inode_fail_closed(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "knowledge"
+    data = b"canonical-evidence"
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+        engagement_fd = repository._engagement_fd(manifest.engagement_id)
+        try:
+            repository_module._EvidenceObjectStore(engagement_fd).capture(data)
+        finally:
+            os.close(engagement_fd)
+    evidence = _engagement_path(root, manifest.engagement_id) / "evidence"
+    canonical = next(evidence.glob("blob-*.bin"))
+    alias = evidence / f"blob-{sha256(b'different-name').hexdigest()}.bin"
+    os.link(canonical, alias)
+    monkeypatch.setattr(repository_module, "MAX_EVIDENCE_OBJECTS", 1)
+    with EngagementJournalRepository(root) as repository:
+        engagement_fd = repository._engagement_fd(manifest.engagement_id)
+        try:
+            with pytest.raises(
+                (ValueError, JournalUnavailableError), match="quota|digest"
+            ):
+                repository_module._EvidenceObjectStore(engagement_fd).capture(data)
+        finally:
+            os.close(engagement_fd)
+
+
 @pytest.mark.parametrize("head_bytes", [None, b"not-json"])
 def test_exact_pending_append_recovers_missing_or_malformed_head(
     tmp_path, manifest, lane, initial_drafts, user_note_draft, fixed_clock,
