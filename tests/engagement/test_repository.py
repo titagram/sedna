@@ -4,6 +4,7 @@ import json
 import os
 import stat
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
 from threading import Barrier, Event
@@ -1701,6 +1702,248 @@ def test_oversized_engagement_projection_is_rebuilt_from_authoritative_journal(
         snapshot = recovered.load_snapshot(manifest.engagement_id)
     assert snapshot == expected
     assert projection.read_bytes() == canonical
+
+
+def test_create_preflights_pending_directory_against_total_entry_cap(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    accepted_root = tmp_path / "accepted"
+    monkeypatch.setattr(repository_module, "MAX_ENGAGEMENT_DIRECTORY_ENTRIES", 2)
+    with _repository(accepted_root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+
+    rejected_root = tmp_path / "rejected"
+    monkeypatch.setattr(repository_module, "MAX_ENGAGEMENT_DIRECTORY_ENTRIES", 10)
+    repository = _repository(rejected_root, fixed_clock, fixed_uuid_factory)
+    real_mkdir = repository_module.os.mkdir
+    mutations: list[str] = []
+
+    def spy_mkdir(path, *args, **kwargs):
+        mutations.append(os.fspath(path))
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(repository_module.os, "mkdir", spy_mkdir)
+    monkeypatch.setattr(repository_module, "MAX_ENGAGEMENT_DIRECTORY_ENTRIES", 1)
+    with pytest.raises(ValueError, match="directory entry bound"):
+        repository.create(manifest, initial_drafts(manifest, lane))
+    repository.close()
+    assert mutations == []
+    assert sorted(item.name for item in (rejected_root / "engagements").iterdir()) == [
+        ".registry.lock"
+    ]
+
+
+def test_concurrent_tail_helpers_accept_exact_pair_when_intent_already_cleared(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+) -> None:
+    root = tmp_path / "knowledge"
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+    engagement = _engagement_path(root, manifest.engagement_id)
+    journal = engagement / "events.jsonl"
+    tail = b'{"two-helpers"'
+    with journal.open("ab") as stream:
+        stream.write(tail)
+        stream.flush()
+        os.fsync(stream.fileno())
+    rendezvous = Barrier(2)
+
+    def help_recovery():
+        with EngagementJournalRepository(root, clock=fixed_clock) as repository:
+            def pause(point: str) -> None:
+                if point == "tail_before_second_lock":
+                    rendezvous.wait(timeout=3)
+
+            repository._fault = pause
+            return repository.load_events(manifest.engagement_id)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = tuple(pool.map(lambda _index: help_recovery(), range(2)))
+    assert results[0] == results[1]
+    assert [event.type.value for event in results[0][-2:]] == [
+        "evidence_attached", "recovery_warning"
+    ]
+    assert len([event for event in results[0] if event.type.value == "evidence_attached"]) == 1
+    assert not (engagement / ".tail-recovery.json").exists()
+    assert [item.read_bytes() for item in (engagement / "evidence").glob("blob-*.bin")] == [tail]
+
+
+@pytest.mark.parametrize("failure", ["write", "fsync"])
+def test_atomic_create_intent_failure_cleans_temp_and_reopen_can_retry(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    monkeypatch, failure,
+) -> None:
+    root = tmp_path / failure
+    repository = _repository(root, fixed_clock, fixed_uuid_factory)
+    fired = False
+    real_write_all = repository_module._write_all
+    real_fsync = repository_module.os.fsync
+
+    def failing_write(fd: int, data: bytes) -> None:
+        nonlocal fired
+        if not fired:
+            fired = True
+            raise OSError("injected atomic write failure")
+        real_write_all(fd, data)
+
+    def failing_fsync(fd: int) -> None:
+        nonlocal fired
+        descriptor = os.fstat(fd)
+        if not fired and stat.S_ISREG(descriptor.st_mode) and descriptor.st_size:
+            fired = True
+            raise OSError("injected atomic fsync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(
+        repository_module,
+        "_write_all",
+        failing_write if failure == "write" else real_write_all,
+    )
+    if failure == "fsync":
+        monkeypatch.setattr(repository_module.os, "fsync", failing_fsync)
+    with pytest.raises(OSError, match="injected atomic"):
+        repository.create(manifest, initial_drafts(manifest, lane))
+    repository.close()
+    pending = root / "engagements" / f".pending-create-{manifest.engagement_id}"
+    assert fired
+    assert not list(pending.glob("..create-intent.json.tmp-*"))
+    monkeypatch.setattr(repository_module, "_write_all", real_write_all)
+    monkeypatch.setattr(repository_module.os, "fsync", real_fsync)
+    with _repository(root, fixed_clock, fixed_uuid_factory) as recovered:
+        snapshot = recovered.create(manifest, initial_drafts(manifest, lane))
+    assert snapshot.revision.sequence == 2
+
+
+def test_constructor_promotes_exact_crash_left_create_intent_temp(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "knowledge"
+    repository = _repository(root, fixed_clock, fixed_uuid_factory)
+    real_atomic_write = repository_module._atomic_write
+    temp_name = "..create-intent.json.tmp-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+    def crash_with_complete_temp(parent_fd: int, name: str, data: bytes) -> None:
+        if name != ".create-intent.json":
+            return real_atomic_write(parent_fd, name, data)
+        fd = os.open(
+            temp_name,
+            repository_module._create_flags(),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            repository_module._write_all(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        raise OSError("simulated process crash after temp fsync")
+
+    monkeypatch.setattr(repository_module, "_atomic_write", crash_with_complete_temp)
+    with pytest.raises(OSError, match="simulated process crash"):
+        repository.create(manifest, initial_drafts(manifest, lane))
+    repository.close()
+    monkeypatch.setattr(repository_module, "_atomic_write", real_atomic_write)
+    with EngagementJournalRepository(root) as recovered:
+        events = recovered.load_events(manifest.engagement_id)
+    assert [event.sequence for event in events] == [1, 2]
+    engagement = _engagement_path(root, manifest.engagement_id)
+    assert not (engagement / temp_name).exists()
+    assert not (engagement / ".create-intent.json").exists()
+
+
+@pytest.mark.parametrize("operation", ["create", "bind", "unbind"])
+def test_registry_lane_operations_release_before_tail_evidence_lock(
+    tmp_path, manifest, lane, new_lane, initial_drafts, fixed_clock,
+    fixed_uuid_factory, monkeypatch, operation,
+) -> None:
+    root = tmp_path / operation
+    second_manifest, second_lane = _second_manifest_and_lane(manifest, new_lane)
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+        if operation == "bind":
+            repository.create(
+                second_manifest, initial_drafts(second_manifest, second_lane)
+            )
+    first = _engagement_path(root, manifest.engagement_id)
+    with (first / "events.jsonl").open("ab") as stream:
+        stream.write(b'{"registry-tail"')
+        stream.flush()
+        os.fsync(stream.fileno())
+
+    real_locked_file = repository_module._locked_file
+    held: list[str] = []
+
+    @contextmanager
+    def instrumented_lock(parent_fd: int, name: str):
+        if name == ".evidence.lock" and ".registry.lock" in held:
+            raise AssertionError("evidence lock acquired under registry lock")
+        with real_locked_file(parent_fd, name):
+            held.append(name)
+            try:
+                yield
+            finally:
+                assert held.pop() == name
+
+    monkeypatch.setattr(repository_module, "_locked_file", instrumented_lock)
+    with EngagementJournalRepository(root, clock=fixed_clock) as repository:
+        if operation == "create":
+            repository.create(
+                second_manifest, initial_drafts(second_manifest, second_lane)
+            )
+        elif operation == "bind":
+            repository.bind_lane(
+                second_manifest.engagement_id,
+                new_lane(session_id="registry-bind", task_id="registry-bind"),
+                reason="post-tail bind",
+            )
+        else:
+            repository.unbind_lane(
+                manifest.engagement_id,
+                lane,
+                reason="post-tail unbind",
+            )
+        recovered = repository.load_events(manifest.engagement_id)
+    assert [event.type.value for event in recovered[2:4]] == [
+        "evidence_attached", "recovery_warning"
+    ]
+
+
+@pytest.mark.parametrize("quota", ["objects", "bytes"])
+def test_existing_evidence_capture_still_validates_full_inventory_quotas(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    monkeypatch, quota,
+) -> None:
+    root = tmp_path / quota
+    existing = b"existing-evidence"
+    migrated = b"migrated-evidence"
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+        engagement_fd = repository._engagement_fd(manifest.engagement_id)
+        try:
+            repository_module._EvidenceObjectStore(engagement_fd).capture(existing)
+        finally:
+            os.close(engagement_fd)
+    evidence = _engagement_path(root, manifest.engagement_id) / "evidence"
+    migrated_path = evidence / f"blob-{sha256(migrated).hexdigest()}.bin"
+    migrated_path.write_bytes(migrated)
+    migrated_path.chmod(0o600)
+    if quota == "objects":
+        monkeypatch.setattr(repository_module, "MAX_EVIDENCE_OBJECTS", 1)
+    else:
+        monkeypatch.setattr(
+            repository_module,
+            "MAX_EVIDENCE_ENGAGEMENT_BYTES",
+            len(existing) + len(migrated) - 1,
+        )
+    with EngagementJournalRepository(root) as repository:
+        engagement_fd = repository._engagement_fd(manifest.engagement_id)
+        try:
+            with pytest.raises(ValueError, match="quota"):
+                repository_module._EvidenceObjectStore(engagement_fd).capture(existing)
+        finally:
+            os.close(engagement_fd)
 
 
 @pytest.mark.parametrize("head_bytes", [None, b"not-json"])

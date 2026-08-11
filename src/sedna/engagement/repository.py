@@ -112,6 +112,11 @@ class _RecoverableTailError(Exception):
         self.recovery_lane = recovery_lane
 
 
+class _RegistryTailRecoveryRequiredError(Exception):
+    def __init__(self, engagement_id: UUID) -> None:
+        self.engagement_id = engagement_id
+
+
 @dataclass(frozen=True)
 class _CreateRecovery:
     engagement_id: UUID
@@ -280,6 +285,14 @@ class _EvidenceObjectStore:
                         objects.append((entry, os.fstat(fd).st_size))
                     finally:
                         os.close(fd)
+                canonical_count = sum(
+                    item.startswith("blob-") for item, _ in objects
+                )
+                payload_bytes = sum(size for _, size in objects)
+                if canonical_count > MAX_EVIDENCE_OBJECTS:
+                    raise ValueError("evidence object quota exceeded")
+                if payload_bytes > MAX_EVIDENCE_ENGAGEMENT_BYTES:
+                    raise ValueError("evidence engagement quota exceeded")
                 existing = next((size for item, size in objects if item == name), None)
                 if existing is not None:
                     found = _read_bounded(
@@ -304,9 +317,6 @@ class _EvidenceObjectStore:
                         os.unlink(pending_name, dir_fd=evidence_fd)
                         os.fsync(evidence_fd)
                 else:
-                    canonical_count = sum(
-                        item.startswith("blob-") for item, _ in objects
-                    )
                     if canonical_count + 1 > MAX_EVIDENCE_OBJECTS:
                         raise ValueError("evidence object quota exceeded")
                     pending = next(
@@ -326,7 +336,7 @@ class _EvidenceObjectStore:
                                 item for item in objects if item[0] != pending_name
                             ]
                             pending = None
-                    payload_bytes = sum(size for _, size in objects)
+                            payload_bytes = sum(size for _, size in objects)
                     additional = 0 if pending is not None else len(data)
                     if payload_bytes + additional > MAX_EVIDENCE_ENGAGEMENT_BYTES:
                         raise ValueError("evidence engagement quota exceeded")
@@ -549,13 +559,20 @@ def _atomic_write(parent_fd: int, name: str, data: bytes) -> None:
         finally:
             os.close(existing_fd)
     temporary = f".{name}.tmp-{uuid4()}"
-    fd = os.open(temporary, _create_flags(), 0o600, dir_fd=parent_fd)
     try:
-        os.fchmod(fd, 0o600)
-        _write_all(fd, data)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+        fd = os.open(temporary, _create_flags(), 0o600, dir_fd=parent_fd)
+        try:
+            os.fchmod(fd, 0o600)
+            _write_all(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except Exception:
+        with suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=parent_fd)
+        with suppress(OSError):
+            os.fsync(parent_fd)
+        raise
     try:
         os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         os.fsync(parent_fd)
@@ -632,23 +649,7 @@ class EngagementJournalRepository:
                 raise JournalUnavailableError(
                     "engagement directory entry bound exceeded"
                 )
-            with _locked_file(self._engagements_fd, ".registry.lock"):
-                entries = self._bounded_engagement_entries()
-                self._recover_pending_creates(entries)
-                entries = self._bounded_engagement_entries()
-                for name in entries:
-                    entry_stat = os.stat(
-                        name,
-                        dir_fd=self._engagements_fd,
-                        follow_symlinks=False,
-                    )
-                    if (
-                        _is_uuid_name(name)
-                        and stat.S_ISDIR(entry_stat.st_mode)
-                        and stat.S_IMODE(entry_stat.st_mode) == 0o700
-                    ):
-                        self._recover_published_create_intent(UUID(name))
-                self._bounded_engagement_entries()
+            self._retry_registry_tail_recovery(self._recover_registry_once)
         except Exception:
             with suppress(AttributeError):
                 os.close(self._engagements_fd)
@@ -696,6 +697,33 @@ class EngagementJournalRepository:
     def _require_open(self) -> None:
         if self._closed:
             raise JournalUnavailableError("repository is closed")
+
+    def _retry_registry_tail_recovery(self, operation: Callable[[], Any]) -> Any:
+        for _ in range(MAX_ENGAGEMENTS + 1):
+            try:
+                return operation()
+            except _RegistryTailRecoveryRequiredError as recovery:
+                self._complete_tail_recovery(recovery.engagement_id)
+        raise JournalUnavailableError("registry tail-recovery retry bound exceeded")
+
+    def _recover_registry_once(self) -> None:
+        with _locked_file(self._engagements_fd, ".registry.lock"):
+            entries = self._bounded_engagement_entries()
+            self._recover_pending_creates(entries)
+            entries = self._bounded_engagement_entries()
+            for name in entries:
+                entry_stat = os.stat(
+                    name,
+                    dir_fd=self._engagements_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    _is_uuid_name(name)
+                    and stat.S_ISDIR(entry_stat.st_mode)
+                    and stat.S_IMODE(entry_stat.st_mode) == 0o700
+                ):
+                    self._recover_published_create_intent(UUID(name))
+            self._bounded_engagement_entries()
 
     def _fault(self, point: str) -> None:
         del point
@@ -847,6 +875,58 @@ class EngagementJournalRepository:
             entries = _scan_directory_bounded(
                 pending_fd, 8, "pending create directory"
             )
+            intent_temp_prefix = "..create-intent.json.tmp-"
+            intent_temps = [
+                entry for entry in entries if entry.startswith(intent_temp_prefix)
+            ]
+            if any(
+                not _is_uuid_name(entry[len(intent_temp_prefix) :])
+                for entry in intent_temps
+            ) or len(intent_temps) > 1:
+                raise JournalUnavailableError(
+                    "conflicting pending create transaction"
+                )
+            if intent_temps:
+                temp_name = intent_temps[0]
+                try:
+                    temp_bytes = _read_bounded(
+                        pending_fd,
+                        temp_name,
+                        MAX_CREATE_INTENT_BYTES,
+                        "create intent temporary",
+                    )
+                    self._decode_create_intent(temp_bytes, engagement_id)
+                except Exception:
+                    os.unlink(temp_name, dir_fd=pending_fd)
+                    os.fsync(pending_fd)
+                else:
+                    try:
+                        canonical_intent = _read_bounded(
+                            pending_fd,
+                            ".create-intent.json",
+                            MAX_CREATE_INTENT_BYTES,
+                            "create intent",
+                        )
+                    except JournalUnavailableError as exc:
+                        if not _missing_file(exc):
+                            raise
+                        os.replace(
+                            temp_name,
+                            ".create-intent.json",
+                            src_dir_fd=pending_fd,
+                            dst_dir_fd=pending_fd,
+                        )
+                        os.fsync(pending_fd)
+                    else:
+                        if canonical_intent != temp_bytes:
+                            raise JournalUnavailableError(
+                                "conflicting pending create transaction"
+                            )
+                        os.unlink(temp_name, dir_fd=pending_fd)
+                        os.fsync(pending_fd)
+                entries = _scan_directory_bounded(
+                    pending_fd, 8, "pending create directory"
+                )
             if not entries:
                 os.close(pending_fd)
                 pending_fd = -1
@@ -968,6 +1048,15 @@ class EngagementJournalRepository:
         manifest: EngagementManifest,
         initial_drafts: Sequence[JournalEventDraft],
     ):
+        return self._retry_registry_tail_recovery(
+            lambda: self._create_once(manifest, initial_drafts)
+        )
+
+    def _create_once(
+        self,
+        manifest: EngagementManifest,
+        initial_drafts: Sequence[JournalEventDraft],
+    ):
         self._require_open()
         manifest = EngagementManifest.model_validate(manifest.model_dump(mode="python"))
         if not isinstance(initial_drafts, tuple) or len(initial_drafts) != 2:
@@ -991,12 +1080,14 @@ class EngagementJournalRepository:
             entries = self._bounded_engagement_entries()
             published = [name for name in entries if _is_uuid_name(name)]
             if str(manifest.engagement_id) in published:
-                snapshot = self.load_snapshot(manifest.engagement_id)
+                snapshot = self._load_snapshot_registry_locked(manifest.engagement_id)
                 if snapshot.manifest == manifest and self._drafts_match(
                     snapshot.events[:2], drafts
                 ):
                     return snapshot
                 raise ValueError("engagement UUID already exists with different content")
+            if len(entries) + 1 > MAX_ENGAGEMENT_DIRECTORY_ENTRIES:
+                raise ValueError("engagement directory entry bound exceeded")
             if len(published) + 1 > MAX_ENGAGEMENTS:
                 raise ValueError("engagement count exceeds its bound")
             self._assert_lane_available(drafts[1].lane, exclude=None)
@@ -1244,6 +1335,21 @@ class EngagementJournalRepository:
         *,
         expected_revision: JournalRevision | None = None,
     ) -> BatchAppendResult:
+        return self._append_batch(
+            engagement_id,
+            drafts,
+            expected_revision=expected_revision,
+            defer_tail_recovery=False,
+        )
+
+    def _append_batch(
+        self,
+        engagement_id: UUID,
+        drafts: Sequence[JournalEventDraft],
+        *,
+        expected_revision: JournalRevision | None,
+        defer_tail_recovery: bool,
+    ) -> BatchAppendResult:
         self._require_open()
         if not isinstance(drafts, Sequence) or isinstance(drafts, (str, bytes)):
             raise TypeError("drafts must be a sequence")
@@ -1252,14 +1358,30 @@ class EngagementJournalRepository:
         validated = tuple(
             JournalEventDraft.model_validate(item.model_dump(mode="python")) for item in drafts
         )
-        self._complete_tail_recovery(engagement_id)
+        if not defer_tail_recovery:
+            self._complete_tail_recovery(engagement_id)
         engagement_fd = self._engagement_fd(engagement_id)
         try:
             with _locked_file(engagement_fd, ".journal.lock"):
                 self._recover_pending_append(engagement_fd, engagement_id)
-                manifest, existing, current_head, journal_bytes = self._load_authoritative_locked(
-                    engagement_fd, engagement_id, allow_tail=False
-                )
+                if defer_tail_recovery:
+                    (
+                        manifest,
+                        existing,
+                        current_head,
+                        journal_bytes,
+                    ) = self._load_authoritative_registry_locked(
+                        engagement_fd, engagement_id
+                    )
+                else:
+                    (
+                        manifest,
+                        existing,
+                        current_head,
+                        journal_bytes,
+                    ) = self._load_authoritative_locked(
+                        engagement_fd, engagement_id, allow_tail=False
+                    )
                 prior = self._resolve_existing_batch(existing, validated)
                 if prior is not None:
                     self._validate_journal_limits(existing, journal_bytes)
@@ -1532,11 +1654,17 @@ class EngagementJournalRepository:
             payload=LaneBoundPayload(lane=lane, binding_reason=reason),
             idempotency_key=f"lane-bind:{lane.stable_key}:{engagement_id}",
         )
-        with _locked_file(self._engagements_fd, ".registry.lock"):
-            self._assert_lane_available(lane, exclude=engagement_id)
-            return self.append_batch(
-                engagement_id, (draft,), expected_revision=expected_revision
-            )
+        def attempt() -> BatchAppendResult:
+            with _locked_file(self._engagements_fd, ".registry.lock"):
+                self._assert_lane_available(lane, exclude=engagement_id)
+                return self._append_batch(
+                    engagement_id,
+                    (draft,),
+                    expected_revision=expected_revision,
+                    defer_tail_recovery=True,
+                )
+
+        return self._retry_registry_tail_recovery(attempt)
 
     def unbind_lane(
         self,
@@ -1553,10 +1681,16 @@ class EngagementJournalRepository:
             payload=LaneUnboundPayload(lane=lane, reason=reason),
             idempotency_key=f"lane-unbind:{lane.stable_key}:{engagement_id}",
         )
-        with _locked_file(self._engagements_fd, ".registry.lock"):
-            return self.append_batch(
-                engagement_id, (draft,), expected_revision=expected_revision
-            )
+        def attempt() -> BatchAppendResult:
+            with _locked_file(self._engagements_fd, ".registry.lock"):
+                return self._append_batch(
+                    engagement_id,
+                    (draft,),
+                    expected_revision=expected_revision,
+                    defer_tail_recovery=True,
+                )
+
+        return self._retry_registry_tail_recovery(attempt)
 
     def _assert_lane_available(
         self, lane: ExecutionLaneKey | None, *, exclude: UUID | None
@@ -1571,9 +1705,60 @@ class EngagementJournalRepository:
             engagement_id = UUID(name)
             if engagement_id == exclude:
                 continue
-            snapshot = self.load_snapshot(engagement_id)
+            snapshot = self._load_snapshot_registry_locked(engagement_id)
             if any(binding.lane == lane for binding in snapshot.state.bound_lanes):
                 raise ValueError("execution lane is already bound to another engagement")
+
+    def _load_authoritative_registry_locked(
+        self,
+        engagement_fd: int,
+        engagement_id: UUID,
+    ) -> tuple[EngagementManifest, tuple[JournalEvent, ...], JournalHead, bytes]:
+        try:
+            _read_bounded(
+                engagement_fd,
+                ".tail-recovery.json",
+                MAX_TAIL_RECOVERY_INTENT_BYTES,
+                "tail recovery intent",
+            )
+        except JournalUnavailableError as exc:
+            if not _missing_file(exc):
+                raise
+        else:
+            raise _RegistryTailRecoveryRequiredError(engagement_id)
+        try:
+            return self._load_authoritative_locked(
+                engagement_fd, engagement_id, allow_tail=True
+            )
+        except _RecoverableTailError as recovery:
+            raise _RegistryTailRecoveryRequiredError(engagement_id) from recovery
+
+    def _load_snapshot_registry_locked(self, engagement_id: UUID):
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            with _locked_file(engagement_fd, ".journal.lock"):
+                self._recover_pending_append(engagement_fd, engagement_id)
+                manifest, events, head, _ = self._load_authoritative_registry_locked(
+                    engagement_fd, engagement_id
+                )
+                state = reduce_engagement(manifest, events)
+                expected = self._projection_bytes(head.revision, state)
+                try:
+                    actual = _read_bounded(
+                        engagement_fd,
+                        "engagement-state.json",
+                        MAX_DERIVED_PROJECTION_BYTES,
+                        "engagement state projection",
+                    )
+                except JournalUnavailableError as exc:
+                    if not _recoverable_projection_read(exc):
+                        raise
+                    actual = b""
+                if actual != expected:
+                    _atomic_write(engagement_fd, "engagement-state.json", expected)
+                return self._snapshot(manifest, events, state)
+        finally:
+            os.close(engagement_fd)
 
     @staticmethod
     def _drafts_match(
@@ -1963,6 +2148,7 @@ class EngagementJournalRepository:
                             ) from recovery
                         self._fault("tail_before_intent")
                         _atomic_write(engagement_fd, ".tail-recovery.json", intent)
+                        raw_intent = intent
                         self._fault("tail_after_intent")
                     elif (
                         recorded_head != head
@@ -2007,6 +2193,29 @@ class EngagementJournalRepository:
                 )
             self._fault("tail_before_second_lock")
             with _locked_file(engagement_fd, ".journal.lock"):
+                try:
+                    current_intent = _read_bounded(
+                        engagement_fd,
+                        ".tail-recovery.json",
+                        MAX_TAIL_RECOVERY_INTENT_BYTES,
+                        "tail recovery intent",
+                    )
+                except JournalUnavailableError as exc:
+                    if not _missing_file(exc):
+                        raise
+                    manifest, events, _, _ = self._load_authoritative_locked(
+                        engagement_fd, engagement_id, allow_tail=False
+                    )
+                    reduce_engagement(manifest, events)
+                    if self._resolve_existing_batch(events, drafts) is None:
+                        raise JournalUnavailableError(
+                            "journal_corrupt: cleared tail intent lacks committed pair"
+                        ) from exc
+                    return
+                if raw_intent is None or current_intent != raw_intent:
+                    raise JournalUnavailableError(
+                        "journal_corrupt: tail recovery intent changed"
+                    )
                 journal_fd = _open_regular(
                     engagement_fd,
                     "events.jsonl",
