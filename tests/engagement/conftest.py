@@ -21,6 +21,7 @@ from sedna.engagement import (
     JournalEventDraft,
     LaneBoundPayload,
     ProofRequirement,
+    SystemCorrelation,
     ToolCallCompletedPayload,
     ToolCallStartedPayload,
     ToolCallTerminatedPayload,
@@ -114,6 +115,10 @@ def opened_draft() -> Callable[..., JournalEventDraft]:
             actor="system",
             type="engagement_opened",
             payload=EngagementOpenedPayload(scope_references=scope_references),
+            system_correlation=SystemCorrelation(
+                source="lifecycle",
+                operation_id=UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            ),
         )
 
     return factory
@@ -259,8 +264,16 @@ def closure_requested():
         in_flight: Iterable[str],
         origin: str = "manual",
     ):
+        system_correlation = None
+        actor = "user"
+        if origin == "proof_settlement":
+            actor = "system"
+            system_correlation = SystemCorrelation(
+                source="proof_settlement",
+                operation_id=UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            )
         return JournalEventDraft(
-            actor="system",
+            actor=actor,
             type="closure_requested",
             payload=ClosureRequestedPayload(
                 terminal_watermark=watermark,
@@ -268,6 +281,7 @@ def closure_requested():
                 reason="requested by operator",
                 origin=origin,
             ),
+            system_correlation=system_correlation,
         )
 
     return factory

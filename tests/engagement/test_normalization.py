@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from sedna.engagement import (
     MAX_HOST_VALUE_DEPTH,
     MAX_HOST_VALUE_NODES,
+    CorrelationKind,
     NormalizationFailure,
     SanitizedHostValue,
+    ToolCorrelation,
     normalize_host_payload,
     sanitize_host_arguments,
 )
@@ -58,7 +61,7 @@ def test_mapping_order_is_deterministic() -> None:
 
 
 def test_sanitized_host_values_cannot_be_forged_by_callers() -> None:
-    with pytest.raises(TypeError):
+    with pytest.raises((TypeError, ValidationError)):
         SanitizedHostValue(
             value={"provider_token": "not-sanitized"},
             canonical_bytes=b"{}",
@@ -66,6 +69,61 @@ def test_sanitized_host_values_cannot_be_forged_by_callers() -> None:
             byte_length=2,
             representation="sanitized_host_json",
         )
+
+
+def test_legitimate_sanitized_value_revalidates_but_forged_copy_does_not() -> None:
+    sanitized = sanitize_host_arguments({"command": "id"})
+    assert SanitizedHostValue.model_validate(sanitized) == sanitized
+    forged = sanitized.model_copy(update={"canonical_digest": "b" * 64})
+    with pytest.raises(ValidationError):
+        SanitizedHostValue.model_validate(forged)
+
+
+def test_model_copy_forgery_is_rejected_at_correlation_boundary(lane) -> None:
+    sanitized = sanitize_host_arguments({"command": "id"})
+    forged = sanitized.model_copy(
+        update={
+            "value": {"provider_token": "forged-secret"},
+            "canonical_bytes": b'{"command":"id"}',
+            "canonical_digest": "b" * 64,
+        }
+    )
+    correlation = ToolCorrelation.from_hook(
+        lane=lane,
+        tool_name="terminal",
+        sanitized_arguments=forged,
+        tool_call_id="",
+        turn_id="turn",
+        api_request_id="request",
+        api_call_count=1,
+        tool_call_ordinal=0,
+    )
+    assert correlation.kind is CorrelationKind.UNCERTAIN
+    assert correlation.reason == "normalization_failed"
+    assert "forged-secret" not in correlation.model_dump_json()
+
+
+def test_casefold_colliding_keys_fail_deterministically_without_secret_leakage() -> None:
+    secret_a = "first-provider-secret"
+    secret_b = "second-provider-secret"
+    first = sanitize_host_arguments(
+        {"Provider": {"token": secret_a}, "provider": {"token": secret_b}}
+    )
+    second = sanitize_host_arguments(
+        {"provider": {"token": secret_b}, "Provider": {"token": secret_a}}
+    )
+    assert isinstance(first, NormalizationFailure)
+    assert first == second
+    rendered = first.model_dump_json()
+    assert secret_a not in rendered
+    assert secret_b not in rendered
+
+
+def test_invalid_unicode_mapping_key_returns_closed_typed_failure() -> None:
+    result = sanitize_host_arguments({"\ud800": "provider-secret"})
+    assert isinstance(result, NormalizationFailure)
+    assert result.reason_code == "unsupported_value"
+    assert "provider-secret" not in result.model_dump_json()
 
 
 def test_cycles_are_typed_failures_without_raw_or_digest_material() -> None:

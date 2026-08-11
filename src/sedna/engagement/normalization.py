@@ -5,10 +5,14 @@ from __future__ import annotations
 import json
 import math
 import unicodedata
+from base64 import b64encode
 from hashlib import sha256
+from hmac import compare_digest
+from hmac import new as new_hmac
+from secrets import token_bytes
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 MAX_HOST_VALUE_DEPTH = 32
 MAX_HOST_VALUE_NODES = 100_000
@@ -46,13 +50,13 @@ SOURCE_SECRET_KEYS = frozenset(
         "secret_access_key",
     }
 )
-_SANITIZED_CONSTRUCTION_TOKEN = object()
+_SANITIZED_INTEGRITY_KEY = token_bytes(32)
 
 
 class NormalizationFailure(BaseModel):
     """A closed failure that never retains an unsafe value or partial digest."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
     reason_code: Literal[
         "normalization_limit_exceeded", "unsupported_value", "serialization_failed"
@@ -65,6 +69,7 @@ class SanitizedHostValue(BaseModel):
     model_config = ConfigDict(
         frozen=True,
         extra="forbid",
+        revalidate_instances="always",
         ser_json_bytes="base64",
         val_json_bytes="base64",
     )
@@ -81,11 +86,88 @@ class SanitizedHostValue(BaseModel):
         "host_returned_no_result",
     ]
     provider_or_host_secret_redacted: bool = False
+    integrity_tag: str = Field(pattern=r"^[0-9a-f]{64}$", exclude=True, repr=False)
 
-    def __init__(self, **data: Any) -> None:
-        if data.pop("_construction_token", None) is not _SANITIZED_CONSTRUCTION_TOKEN:
-            raise TypeError("SanitizedHostValue instances are created by normalization helpers")
-        super().__init__(**data)
+    @classmethod
+    def _create(cls, **data: Any) -> SanitizedHostValue:
+        data.setdefault("provider_or_host_secret_redacted", False)
+        return cls(integrity_tag=_sanitized_integrity_tag(**data), **data)
+
+    def _calculate_integrity_tag(self) -> str:
+        return _sanitized_integrity_tag(
+            value=self.value,
+            canonical_bytes=self.canonical_bytes,
+            canonical_digest=self.canonical_digest,
+            byte_length=self.byte_length,
+            representation=self.representation,
+            provider_or_host_secret_redacted=self.provider_or_host_secret_redacted,
+        )
+
+    @model_validator(mode="after")
+    def validate_integrity(self) -> SanitizedHostValue:
+        if not self.has_valid_integrity():
+            raise ValueError("sanitized host value integrity check failed")
+        return self
+
+    def has_valid_integrity(self) -> bool:
+        """Return whether module construction metadata still matches every public field."""
+
+        try:
+            if not compare_digest(self.integrity_tag, self._calculate_integrity_tag()):
+                return False
+            if self.canonical_bytes is None:
+                return (
+                    self.representation == "host_returned_no_result"
+                    and self.value is None
+                    and self.canonical_digest is None
+                    and self.byte_length == 0
+                )
+            if self.byte_length != len(self.canonical_bytes):
+                return False
+            if self.canonical_digest != sha256(self.canonical_bytes).hexdigest():
+                return False
+            if self.representation in {"sanitized_host_json", "canonical_host_json"}:
+                return self.canonical_bytes == _canonical_json(self.value)
+            if self.representation == "host_text":
+                return isinstance(self.value, str) and self.canonical_bytes == self.value.encode()
+            return self.representation == "host_bytes" and self.value is None
+        except (AttributeError, TypeError, UnicodeError, _NormalizationError):
+            return False
+
+
+def _sanitized_integrity_tag(
+    *,
+    value: Any,
+    canonical_bytes: bytes | None,
+    canonical_digest: str | None,
+    byte_length: int,
+    representation: str,
+    provider_or_host_secret_redacted: bool,
+) -> str:
+    payload = {
+        "value": value,
+        "canonical_bytes": (
+            b64encode(canonical_bytes).decode("ascii")
+            if canonical_bytes is not None
+            else None
+        ),
+        "canonical_digest": canonical_digest,
+        "byte_length": byte_length,
+        "representation": representation,
+        "provider_or_host_secret_redacted": provider_or_host_secret_redacted,
+    }
+    encoded = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return new_hmac(
+        _SANITIZED_INTEGRITY_KEY,
+        b"sanitized-host-value\0" + encoded,
+        sha256,
+    ).hexdigest()
 
 
 class _NormalizationError(ValueError):
@@ -160,13 +242,22 @@ def _sanitize_structure(value: Any) -> tuple[Any, bool]:
             if not all(isinstance(item_key, str) for item_key in item):
                 raise _NormalizationError("unsupported_value")
             normalized_to_original: dict[str, str] = {}
+            casefolded_keys: set[str] = set()
             for original_key in item:
                 normalized_key = unicodedata.normalize("NFC", original_key)
                 if normalized_key in normalized_to_original:
                     raise _NormalizationError("unsupported_value")
-                if len(normalized_key.encode("utf-8")) > MAX_HOST_SCALAR_BYTES:
+                folded_key = normalized_key.casefold()
+                if folded_key in casefolded_keys:
+                    raise _NormalizationError("unsupported_value")
+                try:
+                    key_size = len(normalized_key.encode("utf-8"))
+                except UnicodeError as exc:
+                    raise _NormalizationError("unsupported_value") from exc
+                if key_size > MAX_HOST_SCALAR_BYTES:
                     raise _NormalizationError("normalization_limit_exceeded")
                 normalized_to_original[normalized_key] = original_key
+                casefolded_keys.add(folded_key)
 
             casefolded = {
                 normalized_key.casefold(): original_key
@@ -239,8 +330,7 @@ def sanitize_host_arguments(value: Any) -> SanitizedHostValue | NormalizationFai
         encoded = _canonical_json(sanitized)
     except _NormalizationError as exc:
         return NormalizationFailure(reason_code=exc.reason_code)
-    return SanitizedHostValue(
-        _construction_token=_SANITIZED_CONSTRUCTION_TOKEN,
+    return SanitizedHostValue._create(
         value=sanitized,
         canonical_bytes=encoded,
         canonical_digest=sha256(encoded).hexdigest(),
@@ -254,8 +344,7 @@ def normalize_host_payload(value: Any) -> SanitizedHostValue | NormalizationFail
     """Normalize one host-delivered result while preserving its delivered representation."""
 
     if value is None:
-        return SanitizedHostValue(
-            _construction_token=_SANITIZED_CONSTRUCTION_TOKEN,
+        return SanitizedHostValue._create(
             value=None,
             canonical_bytes=None,
             canonical_digest=None,
@@ -265,8 +354,7 @@ def normalize_host_payload(value: Any) -> SanitizedHostValue | NormalizationFail
     if isinstance(value, bytes):
         if len(value) > MAX_HOST_NORMALIZED_BYTES:
             return NormalizationFailure(reason_code="normalization_limit_exceeded")
-        return SanitizedHostValue(
-            _construction_token=_SANITIZED_CONSTRUCTION_TOKEN,
+        return SanitizedHostValue._create(
             value=None,
             canonical_bytes=value,
             canonical_digest=sha256(value).hexdigest(),
@@ -280,8 +368,7 @@ def normalize_host_payload(value: Any) -> SanitizedHostValue | NormalizationFail
             return NormalizationFailure(reason_code="unsupported_value")
         if len(encoded) > MAX_HOST_NORMALIZED_BYTES:
             return NormalizationFailure(reason_code="normalization_limit_exceeded")
-        return SanitizedHostValue(
-            _construction_token=_SANITIZED_CONSTRUCTION_TOKEN,
+        return SanitizedHostValue._create(
             value=value,
             canonical_bytes=encoded,
             canonical_digest=sha256(encoded).hexdigest(),
@@ -292,7 +379,14 @@ def normalize_host_payload(value: Any) -> SanitizedHostValue | NormalizationFail
     sanitized = sanitize_host_arguments(value)
     if isinstance(sanitized, NormalizationFailure):
         return sanitized
-    return sanitized.model_copy(update={"representation": "canonical_host_json"})
+    return SanitizedHostValue._create(
+        value=sanitized.value,
+        canonical_bytes=sanitized.canonical_bytes,
+        canonical_digest=sanitized.canonical_digest,
+        byte_length=sanitized.byte_length,
+        representation="canonical_host_json",
+        provider_or_host_secret_redacted=sanitized.provider_or_host_secret_redacted,
+    )
 
 
 __all__ = [

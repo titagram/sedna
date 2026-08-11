@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
@@ -25,6 +26,7 @@ from sedna.engagement.models import (
     MAX_EVIDENCE_ITEM_BYTES,
     MAX_HOST_CORRELATION_ID_CHARS,
     MAX_IN_FLIGHT_CALLS,
+    MAX_JOURNAL_EVENT_BYTES,
     MAX_JOURNAL_EVENTS,
     MAX_SETTLEMENT_PENDING_RANGES,
     MAX_TOOL_CALL_ORDINAL,
@@ -75,11 +77,13 @@ class CorrelationKind(StrEnum):
 def _bounded_identity(value: str | None, field_name: str) -> str | None:
     if value is None:
         return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    if len(value) > MAX_HOST_CORRELATION_ID_CHARS:
+        raise ValueError(f"{field_name} exceeds its bound")
     normalized = value.strip()
     if not normalized:
         return None
-    if len(normalized) > MAX_HOST_CORRELATION_ID_CHARS:
-        raise ValueError(f"{field_name} exceeds its bound")
     return normalized
 
 
@@ -154,8 +158,10 @@ class ToolCorrelation(BaseModel):
     ) -> ToolCorrelation:
         if not isinstance(tool_name, str):
             raise ValueError("tool_name is required")
+        if len(tool_name) > MAX_TOOL_NAME_CHARS:
+            raise ValueError("tool_name is required and bounded")
         normalized_tool_name = tool_name.strip()
-        if not normalized_tool_name or len(normalized_tool_name) > MAX_TOOL_NAME_CHARS:
+        if not normalized_tool_name:
             raise ValueError("tool_name is required and bounded")
         host_tool_call_id = _bounded_identity(tool_call_id, "tool_call_id")
         normalized_turn = _bounded_identity(turn_id, "turn_id")
@@ -172,6 +178,11 @@ class ToolCorrelation(BaseModel):
         )
         if not isinstance(sanitized_arguments, (SanitizedHostValue, NormalizationFailure)):
             raise TypeError("sanitized_arguments must be a bounded normalized host value")
+        if (
+            isinstance(sanitized_arguments, SanitizedHostValue)
+            and not sanitized_arguments.has_valid_integrity()
+        ):
+            sanitized_arguments = NormalizationFailure(reason_code="serialization_failed")
 
         tool_digest = sha256(normalized_tool_name.encode()).hexdigest()
         argument_digest = (
@@ -404,6 +415,18 @@ class ToolCallStartedPayload(_Payload):
     def validate_argument_pair(self) -> ToolCallStartedPayload:
         if (self.argument_evidence_id is None) != (self.argument_attachment_event_id is None):
             raise ValueError("argument evidence and attachment event IDs must be supplied together")
+        try:
+            encoded = json.dumps(
+                self.safe_arguments,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise ValueError("safe_arguments must be canonical JSON") from exc
+        if len(encoded) > MAX_JOURNAL_EVENT_BYTES:
+            raise ValueError("safe_arguments exceed the journal event byte bound")
         return self
 
 
@@ -622,6 +645,7 @@ _LANE_REQUIRED_TYPES = frozenset(
         EventType.TOOL_CALL_STARTED,
         EventType.TOOL_CALL_COMPLETED,
         EventType.TOOL_CALL_TERMINATED,
+        EventType.UNMATCHED_TOOL_COMPLETION,
         EventType.EVIDENCE_ATTACHED,
         EventType.EVIDENCE_CAPTURE_FAILED,
         EventType.UNPLANNED_ACTION,
@@ -629,6 +653,18 @@ _LANE_REQUIRED_TYPES = frozenset(
         EventType.UNCERTAIN_CORRELATION,
     }
 )
+
+_SYSTEM_SOURCE_BY_TYPE: dict[EventType, str] = {
+    EventType.ENGAGEMENT_OPENED: "lifecycle",
+    EventType.ENGAGEMENT_RESUMED: "lifecycle",
+    EventType.OBJECTIVE_CHANGED: "lifecycle",
+    EventType.SCOPE_CHANGED: "lifecycle",
+    EventType.CLOSURE_CANCELLED: "lifecycle",
+    EventType.ENGAGEMENT_REOPENED: "lifecycle",
+    EventType.ENGAGEMENT_ABANDONED: "lifecycle",
+    EventType.SOURCE_SUGGESTED: "planning",
+    EventType.RECOVERY_WARNING: "recovery",
+}
 
 
 def _validate_envelope(
@@ -646,15 +682,48 @@ def _validate_envelope(
     payload_lane = getattr(payload, "lane", None)
     if payload_lane is not None and payload_lane != lane:
         raise ValueError("event lane must exactly match the payload lane")
-    if event_type is EventType.RECOVERY_WARNING:
-        if (
+    if lane is not None and (actor == "system" or system_correlation is not None):
+        raise ValueError("host lane and system correlation are mutually exclusive")
+    if actor == "system" and system_correlation is None:
+        raise ValueError("system-owned events require typed system correlation")
+    if actor != "system" and system_correlation is not None:
+        raise ValueError("ordinary user or host events forbid system correlation")
+    if actor == "host_agent" and lane is None:
+        raise ValueError("host events require an exact execution lane")
+    if system_correlation is not None:
+        expected_source = _SYSTEM_SOURCE_BY_TYPE.get(event_type)
+        if event_type is EventType.CLOSURE_REQUESTED:
+            expected_source = (
+                "proof_settlement"
+                if isinstance(payload, ClosureRequestedPayload)
+                and payload.origin == "proof_settlement"
+                else None
+            )
+        if expected_source is None or system_correlation.source != expected_source:
+            raise ValueError("system correlation source does not match the event type")
+    if (
+        event_type is EventType.CLOSURE_REQUESTED
+        and isinstance(payload, ClosureRequestedPayload)
+        and payload.origin == "proof_settlement"
+        and (
             system_correlation is None
-            or system_correlation.source != "recovery"
-            or lane is not None
-        ):
-            raise ValueError("recovery events require recovery system correlation without a lane")
-    elif system_correlation is not None and (actor != "system" or lane is not None):
-        raise ValueError("system correlation requires a system actor without a host lane")
+            or system_correlation.source != "proof_settlement"
+        )
+    ):
+        raise ValueError("proof settlement requires proof_settlement system correlation")
+
+
+def _canonical_event_line_bytes(event: JournalEvent) -> bytes:
+    try:
+        return json.dumps(
+            event.model_dump(mode="json", warnings="error"),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ValueError("event cannot be canonically serialized") from exc
 
 
 class JournalEventDraft(BaseModel):
@@ -721,6 +790,8 @@ class JournalEvent(BaseModel):
             raise ValueError("the first event cannot have a previous hash")
         if self.sequence > 1 and self.previous_hash is None:
             raise ValueError("later events require a previous hash")
+        if len(_canonical_event_line_bytes(self)) > MAX_JOURNAL_EVENT_BYTES:
+            raise ValueError("canonical event line exceeds the journal event byte bound")
         return self
 
 
@@ -730,7 +801,7 @@ class EngagementSnapshot(BaseModel):
     engagement_id: UUID
     revision: JournalRevision
     manifest: EngagementManifest
-    events: tuple[JournalEvent, ...]
+    events: tuple[JournalEvent, ...] = Field(max_length=MAX_JOURNAL_EVENTS)
     state: EngagementState
 
     @model_validator(mode="after")
@@ -742,6 +813,17 @@ class EngagementSnapshot(BaseModel):
         if any(event.engagement_id != self.engagement_id for event in self.events):
             raise ValueError("event identity does not match snapshot")
         if self.events:
+            seen_event_ids: set[UUID] = set()
+            previous: JournalEvent | None = None
+            for expected_sequence, event in enumerate(self.events, start=1):
+                if event.sequence != expected_sequence:
+                    raise ValueError("event sequence must start at one and be contiguous")
+                if event.event_id in seen_event_ids:
+                    raise ValueError("event_id values must be unique")
+                seen_event_ids.add(event.event_id)
+                if previous is not None and event.previous_hash != previous.event_hash:
+                    raise ValueError("event previous hash does not match the prior event")
+                previous = event
             last = self.events[-1]
             if (last.sequence, last.event_hash) != (
                 self.revision.sequence,
@@ -755,7 +837,9 @@ class EngagementSnapshot(BaseModel):
         return self
 
 
-__all__ = [name for name in globals() if name.endswith("Payload")]
+__all__ = [
+    name for name in globals() if name.endswith("Payload") and not name.startswith("_")
+]
 __all__ += [
     "CONTROL_TOOL_NAMES",
     "CONTROL_TOOL_POLICY_VERSION",
