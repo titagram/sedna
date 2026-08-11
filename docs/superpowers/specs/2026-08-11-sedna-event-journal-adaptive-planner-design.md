@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-11
 
-**Status:** Conversational design approved; written specification pending final review
+**Status:** Approved for implementation planning
 
 **Scope:** Persistent security engagements, append-only execution evidence, LLM-managed
 strategic frontiers, Hades/Hermes plugin orchestration, operational reports, and verified case
@@ -200,10 +200,12 @@ M6 adds project-scoped shared sources and engagements without moving existing ca
     └── <engagement-uuid>/
         ├── engagement.json
         ├── events.jsonl
+        ├── journal-head.json
         ├── evidence/
         │   ├── 20260811-143022-htb-orion.md
         │   ├── nmap-event-0021.txt
         │   └── response-event-0037.json
+        ├── engagement-state.json
         ├── state.json
         ├── strategy-ledger.json
         ├── strategy-archive.jsonl
@@ -212,7 +214,7 @@ M6 adds project-scoped shared sources and engagements without moving existing ca
         │   ├── report-v1.md
         │   └── report-v1.json
         └── promotion/
-            ├── candidate-case.json
+            ├── candidate-case-vN.json
             └── sources/
                 ├── promotion-v1.md
                 └── promotion-v1.provenance.json
@@ -297,6 +299,8 @@ progress but does not close the engagement.
 
 - `engagement.json`: immutable identity header, initial objective and scope, and version metadata;
 - `events.jsonl`: append-only chronological event stream;
+- `journal-head.json`: crash-safe commit anchor binding the exact journal revision, event count,
+  byte length, and complete-file digest;
 - original evidence payloads stored inline in typed events or in referenced `evidence/` sidecars,
   including outputs, attachments, flags, and runtime secrets.
 - committed promotion source revisions and their provenance maps after a
@@ -307,7 +311,8 @@ silent rewrites of the identity header.
 
 ### Rebuildable projections
 
-- `state.json`: compact current situation;
+- `engagement-state.json`: replayed M6A lifecycle/lane/closure state;
+- `state.json`: compact M6B current situation;
 - `strategy-ledger.json`: bounded hot strategy families, variants, attempts, and reassessments;
 - `strategy-archive.jsonl`: paginated compact projections of the remaining archived strategies;
 - `frontier.json`: most recent validated strategic frontier;
@@ -344,8 +349,12 @@ Every event has a closed, versioned envelope containing at least:
 }
 ```
 
-The hash chain detects accidental truncation, rewriting, and incoherent replay. It is not a claim
-of external notarization.
+The hash chain plus `journal-head.json` detects accidental truncation (including removal of a clean
+newline-terminated suffix), rewriting, and incoherent replay. The head advances only through the
+same pending append transaction as the journal: a crash-proven valid journal extension may roll
+the head forward, while a journal behind/divergent from its head fails closed. This is not a claim
+of external notarization or protection against an attacker able to rewrite every authoritative
+file consistently.
 
 Initial event families include:
 
@@ -383,6 +392,13 @@ exists, the action is unplanned or unbound; it is never attached to another conc
 decision. The engagement journal still provides one monotonic global event sequence across all
 of its lanes.
 
+The host adapter uses a stable host tool-call identifier when one is available. Otherwise it may
+derive the call key only from documented correlation fields that distinguish calls within a turn,
+such as session, task, turn, API request, and API-call ordinal. If the host supplies neither form,
+Sedna records a typed uncertain-correlation gap and does not silently deduplicate identical calls.
+Child-lane inheritance is likewise applied only when the host supplies an exact parent identity or
+there is exactly one unambiguous parent lane.
+
 ## Evidence and Session Logbooks
 
 Every host session linked to an engagement creates one human-readable logbook such as:
@@ -419,6 +435,10 @@ be mistaken for proof that its content was interpreted.
 
 Flags and runtime credentials are intentionally retained at this private execution layer so task
 success can be verified. They are excluded at later retrieval and promotion boundaries.
+Known structured provider credentials and unrelated host secrets are different: the adapter
+redacts them before argument normalization, correlation, events, sidecars, hashes, logbooks, or
+errors, and records only a typed capture limitation. Opaque tool-result bytes remain best-effort
+private evidence because this boundary cannot safely infer every secret format.
 
 ## Current Situation Projection
 
@@ -544,6 +564,11 @@ confirms all objective proofs, without requiring a separate user close command. 
 that the persistence hook performs an inline LLM call. Settlement first enters `closing` when
 other lane calls are in flight and emits the final report only after their terminal events are
 accounted for.
+
+Objective proofs are an explicit, small list in the engagement manifest, not an inference from
+free-form objective prose. A normal HTB engagement may declare separate `user-flag` and
+`root-flag` requirements; one of two does not close. An empty requirement list disables
+proof-driven automatic closure while preserving explicit manual close.
 
 ### Observation extractor
 
@@ -892,7 +917,8 @@ or mismatched assets make the canonical bundle non-current and non-retrievable. 
 repository versions must make `journal-promotion` identity distinct from external document
 collections and prevent source-ID collisions.
 
-`promotion/candidate-case.json` remains a disposable derived preview. Canonical provenance never
+`promotion/candidate-case-vN.json` remains an immutable, attempt/revision-bound disposable derived
+preview whose internally derived N equals the promotion revision. Canonical provenance never
 points to that preview.
 
 The case compiler derives:
@@ -1009,6 +1035,7 @@ Version independently:
 
 - engagement manifest schema;
 - event envelope and event payload schemas;
+- authoritative journal-head schema and append-recovery protocol;
 - observation extractor prompt and schema;
 - situation reducer schema;
 - strategy-ledger reducer, hot/archive schemas, retry-predicate matcher, and context limits;
@@ -1036,10 +1063,14 @@ Deliver:
 - shared `sources.md` management;
 - explicit host/session/task execution-lane binding;
 - Hades hook capture;
-- engagement management and decision recording tools.
+- engagement management and decision recording tools;
+- closure requests, the exact in-flight-call barrier, cancellation, and the finalization seam used
+  by M6C.
 
-Success means an engagement can be named, stopped, resumed, closed, reopened, and replayed across
-host sessions while retaining real commands, outputs, flags, and credentials privately.
+Success means an engagement can be named, stopped, resumed, moved safely into or out of `closing`,
+and replayed across host sessions while retaining real commands, outputs, flags, and credentials
+privately. M6C completes the atomic report-plus-`closed_unverified` transition because every final
+closure is required to reference a report revision.
 
 ### M6B — Adaptive LLM Planner
 
@@ -1109,6 +1140,8 @@ Given FTP, SSH, and HTTP observations:
 - Duplicate hooks produce one logical action.
 - Concurrent session/task lanes cannot steal one another's engagement or active decision.
 - A crash after evidence persistence and before projection update replays cleanly.
+- A crash between journal fsync, head publication, and transaction cleanup reaches one exact
+  committed head; clean suffix truncation fails closed even when the remaining hash chain parses.
 - A concurrent event prevents committing a frontier based on an obsolete state.
 - A closure request waits for every in-flight call captured by its terminal watermark.
 - A corrupted projection is rebuilt without changing the journal.
