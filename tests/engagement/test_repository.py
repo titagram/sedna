@@ -1946,6 +1946,191 @@ def test_existing_evidence_capture_still_validates_full_inventory_quotas(
             os.close(engagement_fd)
 
 
+def test_exact_directory_cap_retry_resumes_existing_pending_create(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "knowledge"
+    monkeypatch.setattr(repository_module, "MAX_ENGAGEMENT_DIRECTORY_ENTRIES", 2)
+    repository = _repository(root, fixed_clock, fixed_uuid_factory)
+    fired = False
+
+    def crash_once(point: str) -> None:
+        nonlocal fired
+        if point == "create_after_directory" and not fired:
+            fired = True
+            raise OSError("pending directory durable")
+
+    monkeypatch.setattr(repository, "_fault", crash_once)
+    with pytest.raises(OSError, match="pending directory durable"):
+        repository.create(manifest, initial_drafts(manifest, lane))
+    pending = root / "engagements" / f".pending-create-{manifest.engagement_id}"
+    assert pending.is_dir()
+    snapshot = repository.create(manifest, initial_drafts(manifest, lane))
+    repository.close()
+    assert snapshot.revision.sequence == 2
+    assert not pending.exists()
+    assert sorted(item.name for item in (root / "engagements").iterdir()) == [
+        ".registry.lock", str(manifest.engagement_id)
+    ]
+
+
+@pytest.mark.parametrize(
+    "staged_name", ["engagement.json", "events.jsonl", "journal-head.json"]
+)
+def test_constructor_promotes_exact_crash_left_authoritative_stage_temp(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    monkeypatch, staged_name,
+) -> None:
+    root = tmp_path / staged_name
+    repository = _repository(root, fixed_clock, fixed_uuid_factory)
+    real_atomic_write = repository_module._atomic_write
+    temp_name = f".{staged_name}.tmp-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+    def crash_with_complete_temp(parent_fd: int, name: str, data: bytes) -> None:
+        if name != staged_name:
+            return real_atomic_write(parent_fd, name, data)
+        fd = os.open(
+            temp_name,
+            repository_module._create_flags(),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            repository_module._write_all(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        raise OSError(f"crash after {staged_name} temp fsync")
+
+    monkeypatch.setattr(repository_module, "_atomic_write", crash_with_complete_temp)
+    with pytest.raises(OSError, match="temp fsync"):
+        repository.create(manifest, initial_drafts(manifest, lane))
+    repository.close()
+    monkeypatch.setattr(repository_module, "_atomic_write", real_atomic_write)
+    with EngagementJournalRepository(root) as recovered:
+        events = recovered.load_events(manifest.engagement_id)
+    engagement = _engagement_path(root, manifest.engagement_id)
+    assert [event.sequence for event in events] == [1, 2]
+    assert not (engagement / temp_name).exists()
+    assert (engagement / staged_name).is_file()
+
+
+@pytest.mark.parametrize("case", ["unknown", "multiple", "conflicting"])
+def test_constructor_rejects_untrusted_authoritative_stage_temps(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    monkeypatch, case,
+) -> None:
+    root = tmp_path / case
+    repository = _repository(root, fixed_clock, fixed_uuid_factory)
+
+    def crash(point: str) -> None:
+        if point == "create_after_intent":
+            raise OSError("intent published")
+
+    monkeypatch.setattr(repository, "_fault", crash)
+    with pytest.raises(OSError, match="intent published"):
+        repository.create(manifest, initial_drafts(manifest, lane))
+    repository.close()
+    pending = root / "engagements" / f".pending-create-{manifest.engagement_id}"
+    if case == "unknown":
+        temps = [(".engagement.json.tmp-not-a-uuid", b"{}")]
+    elif case == "multiple":
+        temps = [
+            (".events.jsonl.tmp-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", b""),
+            (".events.jsonl.tmp-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", b""),
+        ]
+    else:
+        conflicting = manifest.model_copy(update={"display_name": "conflict"})
+        temps = [
+            (
+                ".engagement.json.tmp-cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                repository_module._model_bytes(conflicting),
+            )
+        ]
+    for name, data in temps:
+        target = pending / name
+        target.write_bytes(data)
+        target.chmod(0o600)
+    with pytest.raises(JournalUnavailableError, match="conflicting pending create"):
+        EngagementJournalRepository(root)
+    assert pending.is_dir()
+    assert not _engagement_path(root, manifest.engagement_id).exists()
+
+
+@pytest.mark.parametrize(
+    "staged_name", ["engagement.json", "events.jsonl", "journal-head.json"]
+)
+def test_constructor_discards_incomplete_stage_temp_then_fills_from_intent(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    monkeypatch, staged_name,
+) -> None:
+    root = tmp_path / f"incomplete-{staged_name}"
+    repository = _repository(root, fixed_clock, fixed_uuid_factory)
+
+    def crash(point: str) -> None:
+        if point == "create_after_intent":
+            raise OSError("intent published")
+
+    monkeypatch.setattr(repository, "_fault", crash)
+    with pytest.raises(OSError, match="intent published"):
+        repository.create(manifest, initial_drafts(manifest, lane))
+    repository.close()
+    pending = root / "engagements" / f".pending-create-{manifest.engagement_id}"
+    temp = pending / (
+        f".{staged_name}.tmp-dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    )
+    temp.write_bytes(b'{"incomplete"')
+    temp.chmod(0o600)
+    with EngagementJournalRepository(root) as recovered:
+        events = recovered.load_events(manifest.engagement_id)
+    engagement = _engagement_path(root, manifest.engagement_id)
+    assert [event.sequence for event in events] == [1, 2]
+    assert not (engagement / temp.name).exists()
+    assert (engagement / staged_name).is_file()
+
+
+def test_evidence_publication_retry_counts_hard_links_once_at_exact_byte_quota(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "knowledge"
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+    engagement = _engagement_path(root, manifest.engagement_id)
+    journal = engagement / "events.jsonl"
+    tail = b'{"hard-link-boundary"'
+    with journal.open("ab") as stream:
+        stream.write(tail)
+        stream.flush()
+        os.fsync(stream.fileno())
+    monkeypatch.setattr(
+        repository_module, "MAX_EVIDENCE_ENGAGEMENT_BYTES", len(tail)
+    )
+    fired = False
+    with EngagementJournalRepository(root, clock=fixed_clock) as repository:
+        def crash_once(point: str) -> None:
+            nonlocal fired
+            if point == "evidence_after_publication" and not fired:
+                fired = True
+                raise OSError("canonical link published")
+
+        monkeypatch.setattr(repository, "_fault", crash_once)
+        with pytest.raises(OSError, match="canonical link published"):
+            repository.load_events(manifest.engagement_id)
+    evidence = engagement / "evidence"
+    canonical = next(evidence.glob("blob-*.bin"))
+    pending = next(evidence.glob(".pending-blob-*.bin"))
+    assert canonical.stat().st_ino == pending.stat().st_ino
+    with EngagementJournalRepository(root, clock=fixed_clock) as recovered:
+        events = recovered.load_events(manifest.engagement_id)
+    assert [event.type.value for event in events[-2:]] == [
+        "evidence_attached", "recovery_warning"
+    ]
+    assert canonical.read_bytes() == tail
+    assert not list(evidence.glob(".pending-blob-*.bin"))
+
+
 @pytest.mark.parametrize("head_bytes", [None, b"not-json"])
 def test_exact_pending_append_recovers_missing_or_malformed_head(
     tmp_path, manifest, lane, initial_drafts, user_note_draft, fixed_clock,

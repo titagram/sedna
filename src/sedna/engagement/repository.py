@@ -240,6 +240,32 @@ def _draft_material(event: JournalEvent) -> dict[str, Any]:
     )
 
 
+def _complete_staged_create_value(
+    name: str, data: bytes, engagement_id: UUID
+) -> bool:
+    try:
+        if name == "engagement.json":
+            return (
+                EngagementManifest.model_validate_json(data).engagement_id
+                == engagement_id
+            )
+        if name == "journal-head.json":
+            return JournalHead.model_validate_json(data).engagement_id == engagement_id
+        if name == "events.jsonl":
+            if not data or not data.endswith(b"\n"):
+                return False
+            events = tuple(
+                JournalEvent.model_validate_json(line)
+                for line in _iter_journal_lines(data)
+            )
+            return bool(events) and all(
+                event.engagement_id == engagement_id for event in events
+            )
+    except Exception:
+        return False
+    return False
+
+
 class _EvidenceObjectStore:
     """Private normalized-byte object primitive shared with the future public store."""
 
@@ -268,7 +294,7 @@ class _EvidenceObjectStore:
                     MAX_EVIDENCE_DIRECTORY_ENTRIES,
                     "evidence directory",
                 )
-                objects: list[tuple[str, int]] = []
+                objects: list[tuple[str, int, tuple[int, int]]] = []
                 for entry in entries:
                     if not (
                         (entry.startswith("blob-") or entry.startswith(".pending-blob-"))
@@ -282,18 +308,33 @@ class _EvidenceObjectStore:
                         "evidence object",
                     )
                     try:
-                        objects.append((entry, os.fstat(fd).st_size))
+                        object_stat = os.fstat(fd)
+                        objects.append(
+                            (
+                                entry,
+                                object_stat.st_size,
+                                (object_stat.st_dev, object_stat.st_ino),
+                            )
+                        )
                     finally:
                         os.close(fd)
-                canonical_count = sum(
-                    item.startswith("blob-") for item, _ in objects
+                canonical_identities = {
+                    identity
+                    for item, _, identity in objects
+                    if item.startswith("blob-")
+                }
+                canonical_count = len(canonical_identities)
+                payload_by_identity = {
+                    identity: size for _, size, identity in objects
+                }
+                payload_bytes = sum(payload_by_identity.values())
+                existing = next(
+                    (size for item, size, _ in objects if item == name), None
                 )
-                payload_bytes = sum(size for _, size in objects)
                 if canonical_count > MAX_EVIDENCE_OBJECTS:
                     raise ValueError("evidence object quota exceeded")
                 if payload_bytes > MAX_EVIDENCE_ENGAGEMENT_BYTES:
                     raise ValueError("evidence engagement quota exceeded")
-                existing = next((size for item, size in objects if item == name), None)
                 if existing is not None:
                     found = _read_bounded(
                         evidence_fd,
@@ -320,7 +361,12 @@ class _EvidenceObjectStore:
                     if canonical_count + 1 > MAX_EVIDENCE_OBJECTS:
                         raise ValueError("evidence object quota exceeded")
                     pending = next(
-                        (size for item, size in objects if item == pending_name), None
+                        (
+                            size
+                            for item, size, _ in objects
+                            if item == pending_name
+                        ),
+                        None,
                     )
                     if pending is not None:
                         pending_data = _read_bounded(
@@ -336,7 +382,12 @@ class _EvidenceObjectStore:
                                 item for item in objects if item[0] != pending_name
                             ]
                             pending = None
-                            payload_bytes = sum(size for _, size in objects)
+                            payload_bytes = sum(
+                                {
+                                    identity: size
+                                    for _, size, identity in objects
+                                }.values()
+                            )
                     additional = 0 if pending is not None else len(data)
                     if payload_bytes + additional > MAX_EVIDENCE_ENGAGEMENT_BYTES:
                         raise ValueError("evidence engagement quota exceeded")
@@ -933,11 +984,36 @@ class EngagementJournalRepository:
                 os.rmdir(name, dir_fd=self._engagements_fd)
                 os.fsync(self._engagements_fd)
                 return
+            staged_temp_prefixes = {
+                staged_name: f".{staged_name}.tmp-"
+                for staged_name in (
+                    "engagement.json",
+                    "events.jsonl",
+                    "journal-head.json",
+                )
+            }
+            staged_temps: dict[str, list[str]] = {
+                staged_name: [] for staged_name in staged_temp_prefixes
+            }
+            for entry in entries:
+                for staged_name, prefix in staged_temp_prefixes.items():
+                    if entry.startswith(prefix):
+                        if not _is_uuid_name(entry[len(prefix) :]):
+                            raise JournalUnavailableError(
+                                "conflicting pending create transaction"
+                            )
+                        staged_temps[staged_name].append(entry)
+                        break
+            if sum(len(temps) for temps in staged_temps.values()) > 1:
+                raise JournalUnavailableError(
+                    "conflicting pending create transaction"
+                )
             allowed = {
                 ".create-intent.json",
                 "engagement.json",
                 "events.jsonl",
                 "journal-head.json",
+                *(temp for temps in staged_temps.values() for temp in temps),
             }
             if any(entry not in allowed for entry in entries):
                 raise JournalUnavailableError(
@@ -950,17 +1026,72 @@ class EngagementJournalRepository:
                 "create intent",
             )
             recovery = self._decode_create_intent(raw, engagement_id)
+            expected_by_name = {
+                "engagement.json": recovery.manifest_bytes,
+                "events.jsonl": recovery.journal_bytes,
+                "journal-head.json": recovery.head_bytes,
+            }
+            staged_bounds = {
+                "engagement.json": MAX_MANIFEST_BYTES,
+                "events.jsonl": MAX_JOURNAL_BYTES,
+                "journal-head.json": MAX_JOURNAL_HEAD_BYTES,
+            }
+            for staged_name, temps in staged_temps.items():
+                if not temps:
+                    continue
+                temp_name = temps[0]
+                expected = expected_by_name[staged_name]
+                try:
+                    temp_bytes = _read_bounded(
+                        pending_fd,
+                        temp_name,
+                        staged_bounds[staged_name],
+                        f"staged {staged_name} temporary",
+                    )
+                except JournalUnavailableError as exc:
+                    if "exceeds its byte bound" not in str(exc):
+                        raise
+                    temp_bytes = b""
+                if temp_bytes != expected:
+                    if _complete_staged_create_value(
+                        staged_name, temp_bytes, engagement_id
+                    ):
+                        raise JournalUnavailableError(
+                            "conflicting pending create transaction"
+                        )
+                    os.unlink(temp_name, dir_fd=pending_fd)
+                    os.fsync(pending_fd)
+                    continue
+                try:
+                    canonical = _read_bounded(
+                        pending_fd,
+                        staged_name,
+                        max(len(expected), 1),
+                        f"staged {staged_name}",
+                    )
+                except JournalUnavailableError as exc:
+                    if not _missing_file(exc):
+                        raise
+                    os.replace(
+                        temp_name,
+                        staged_name,
+                        src_dir_fd=pending_fd,
+                        dst_dir_fd=pending_fd,
+                    )
+                    os.fsync(pending_fd)
+                else:
+                    if canonical != expected:
+                        raise JournalUnavailableError(
+                            "conflicting pending create transaction"
+                        )
+                    os.unlink(temp_name, dir_fd=pending_fd)
+                    os.fsync(pending_fd)
             missing = self._verify_create_files(
                 pending_fd, recovery, allow_missing=True
             )
             self._assert_lane_available(
                 recovery.events[1].lane, exclude=engagement_id
             )
-            expected_by_name = {
-                "engagement.json": recovery.manifest_bytes,
-                "events.jsonl": recovery.journal_bytes,
-                "journal-head.json": recovery.head_bytes,
-            }
             for missing_name in missing:
                 _atomic_write(pending_fd, missing_name, expected_by_name[missing_name])
             os.fsync(pending_fd)
@@ -1079,6 +1210,7 @@ class EngagementJournalRepository:
         with _locked_file(self._engagements_fd, ".registry.lock"):
             entries = self._bounded_engagement_entries()
             published = [name for name in entries if _is_uuid_name(name)]
+            pending_name = f".pending-create-{manifest.engagement_id}"
             if str(manifest.engagement_id) in published:
                 snapshot = self._load_snapshot_registry_locked(manifest.engagement_id)
                 if snapshot.manifest == manifest and self._drafts_match(
@@ -1086,7 +1218,11 @@ class EngagementJournalRepository:
                 ):
                     return snapshot
                 raise ValueError("engagement UUID already exists with different content")
-            if len(entries) + 1 > MAX_ENGAGEMENT_DIRECTORY_ENTRIES:
+            pending_reservation = 0 if pending_name in entries else 1
+            if (
+                len(entries) + pending_reservation
+                > MAX_ENGAGEMENT_DIRECTORY_ENTRIES
+            ):
                 raise ValueError("engagement directory entry bound exceeded")
             if len(published) + 1 > MAX_ENGAGEMENTS:
                 raise ValueError("engagement count exceeds its bound")
@@ -1111,7 +1247,6 @@ class EngagementJournalRepository:
             )
             if len(intent) > MAX_CREATE_INTENT_BYTES:
                 raise ValueError("create intent exceeds its byte bound")
-            pending_name = f".pending-create-{manifest.engagement_id}"
             try:
                 os.mkdir(pending_name, 0o700, dir_fd=self._engagements_fd)
             except FileExistsError:
