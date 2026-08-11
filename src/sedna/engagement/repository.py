@@ -1,0 +1,1434 @@
+"""Descriptor-confined durable storage for append-only engagement journals."""
+
+from __future__ import annotations
+
+import base64
+import errno
+import fcntl
+import json
+import os
+import stat
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager, suppress
+from datetime import UTC, datetime
+from hashlib import sha256
+from pathlib import Path
+from typing import Any, Literal
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
+
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
+
+from sedna.engagement.events import (
+    EvidenceAttachedPayload,
+    JournalEvent,
+    JournalEventDraft,
+    LaneBoundPayload,
+    LaneUnboundPayload,
+    RecoveryWarningPayload,
+    SystemCorrelation,
+)
+from sedna.engagement.models import (
+    MAX_CREATE_INTENT_BYTES,
+    MAX_DERIVED_PROJECTION_BYTES,
+    MAX_ENGAGEMENT_DIRECTORY_ENTRIES,
+    MAX_ENGAGEMENTS,
+    MAX_EVIDENCE_DIRECTORY_ENTRIES,
+    MAX_EVIDENCE_ENGAGEMENT_BYTES,
+    MAX_EVIDENCE_ITEM_BYTES,
+    MAX_EVIDENCE_OBJECTS,
+    MAX_JOURNAL_BATCH_EVENTS,
+    MAX_JOURNAL_BYTES,
+    MAX_JOURNAL_EVENT_BYTES,
+    MAX_JOURNAL_EVENTS,
+    MAX_JOURNAL_HEAD_BYTES,
+    MAX_MANIFEST_BYTES,
+    MAX_PENDING_APPEND_BYTES,
+    MAX_RECOVERABLE_TAIL_BYTES,
+    MAX_TAIL_RECOVERY_INTENT_BYTES,
+    EngagementManifest,
+    EvidenceReference,
+    ExecutionLaneKey,
+    JournalRevision,
+)
+from sedna.engagement.reducer import reduce_engagement
+
+JOURNAL_HEAD_SCHEMA_VERSION = "sedna.journal-head.v1"
+
+PROJECTION_OWNERS = {
+    "engagement-state": "engagement",
+    "state": "planning",
+    "frontier": "planning",
+    "strategy-ledger": "planning",
+}
+
+
+class RevisionConflictError(ValueError):
+    """A compare-and-swap revision did not match the authoritative journal head."""
+
+
+class ProjectionOwnershipError(ValueError):
+    """A projection writer attempted to cross a sealed ownership boundary."""
+
+
+class JournalUnavailableError(ValueError):
+    """The journal cannot be served without weakening its durability contract."""
+
+
+class JournalHead(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    schema_version: Literal[JOURNAL_HEAD_SCHEMA_VERSION] = JOURNAL_HEAD_SCHEMA_VERSION
+    engagement_id: UUID
+    revision: JournalRevision
+    event_count: StrictInt = Field(ge=0, le=MAX_JOURNAL_EVENTS)
+    journal_bytes: StrictInt = Field(ge=0, le=MAX_JOURNAL_BYTES)
+    journal_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class AppendResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    event: JournalEvent
+    revision: JournalRevision
+    created: bool
+
+
+class BatchAppendResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    events: tuple[JournalEvent, ...]
+    revision: JournalRevision
+    created_event_ids: tuple[UUID, ...] = ()
+    existing_event_ids: tuple[UUID, ...] = ()
+
+
+class _RecoverableTailError(Exception):
+    def __init__(
+        self, tail: bytes, head: JournalHead, recovery_lane: ExecutionLaneKey
+    ) -> None:
+        self.tail = tail
+        self.head = head
+        self.recovery_lane = recovery_lane
+
+
+def _require_posix_primitives() -> None:
+    required = ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")
+    if any(not hasattr(os, name) for name in required) or not hasattr(fcntl, "flock"):
+        raise JournalUnavailableError("required POSIX descriptor primitives are unavailable")
+    if os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd:
+        raise JournalUnavailableError("required POSIX descriptor primitives are unavailable")
+
+
+def _directory_flags() -> int:
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _read_flags() -> int:
+    return os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _create_flags(*, append: bool = False) -> int:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    if append:
+        flags |= os.O_APPEND
+    return flags | getattr(os, "O_CLOEXEC", 0)
+
+
+def _canonical_json(value: Any) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ValueError("value cannot be canonically serialized") from exc
+
+
+def _model_bytes(model: BaseModel) -> bytes:
+    return _canonical_json(model.model_dump(mode="json", warnings="error"))
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short descriptor write")
+        view = view[written:]
+
+
+def _validate_regular(fd: int, *, label: str, expected_mode: int | None = None) -> os.stat_result:
+    result = os.fstat(fd)
+    if not stat.S_ISREG(result.st_mode):
+        raise JournalUnavailableError(f"{label} must be a regular file")
+    if expected_mode is not None and stat.S_IMODE(result.st_mode) != expected_mode:
+        raise JournalUnavailableError(f"{label} has an unsafe mode")
+    return result
+
+
+def _revision(events: Sequence[JournalEvent]) -> JournalRevision:
+    if not events:
+        return JournalRevision(sequence=0, event_hash="0" * 64)
+    event = events[-1]
+    return JournalRevision(sequence=event.sequence, event_hash=event.event_hash)
+
+
+def _head(engagement_id: UUID, events: Sequence[JournalEvent], data: bytes) -> JournalHead:
+    return JournalHead(
+        engagement_id=engagement_id,
+        revision=_revision(events),
+        event_count=len(events),
+        journal_bytes=len(data),
+        journal_sha256=sha256(data).hexdigest(),
+    )
+
+
+def _event_line(event: JournalEvent) -> bytes:
+    return _model_bytes(event)
+
+
+def _draft_material(event: JournalEvent) -> dict[str, Any]:
+    return event.model_dump(
+        mode="json",
+        exclude={
+            "schema_version",
+            "event_id",
+            "sequence",
+            "occurred_at",
+            "engagement_id",
+            "previous_hash",
+            "event_hash",
+        },
+    )
+
+
+class _EvidenceObjectStore:
+    """Private normalized-byte object primitive shared with the future public store."""
+
+    def __init__(self, engagement_fd: int) -> None:
+        self._engagement_fd = engagement_fd
+
+    def capture(self, data: bytes) -> EvidenceReference:
+        if not isinstance(data, bytes):
+            raise TypeError("evidence object store accepts normalized bytes only")
+        if len(data) > MAX_EVIDENCE_ITEM_BYTES:
+            raise ValueError("evidence item quota exceeded")
+        digest = sha256(data).hexdigest()
+        name = f"blob-{digest}.bin"
+        with _locked_file(self._engagement_fd, ".evidence.lock"):
+            evidence_fd = _open_or_create_directory(self._engagement_fd, "evidence", 0o700)
+            try:
+                entries = os.listdir(evidence_fd)
+                if len(entries) > MAX_EVIDENCE_DIRECTORY_ENTRIES:
+                    raise JournalUnavailableError("evidence directory entry bound exceeded")
+                objects: list[tuple[str, int]] = []
+                for entry in entries:
+                    if not entry.startswith("blob-") or not entry.endswith(".bin"):
+                        raise JournalUnavailableError("invalid evidence directory entry")
+                    fd = _open_regular(
+                        evidence_fd,
+                        entry,
+                        MAX_EVIDENCE_ITEM_BYTES,
+                        "evidence object",
+                    )
+                    try:
+                        objects.append((entry, os.fstat(fd).st_size))
+                    finally:
+                        os.close(fd)
+                existing = next((size for item, size in objects if item == name), None)
+                if existing is not None:
+                    found = _read_bounded(
+                        evidence_fd,
+                        name,
+                        MAX_EVIDENCE_ITEM_BYTES,
+                        "evidence object",
+                    )
+                    if found != data:
+                        raise JournalUnavailableError("evidence digest collision")
+                else:
+                    if len(objects) + 1 > MAX_EVIDENCE_OBJECTS:
+                        raise ValueError("evidence object quota exceeded")
+                    if sum(size for _, size in objects) + len(data) > MAX_EVIDENCE_ENGAGEMENT_BYTES:
+                        raise ValueError("evidence engagement quota exceeded")
+                    _atomic_write(evidence_fd, name, data)
+                    os.fsync(evidence_fd)
+            finally:
+                os.close(evidence_fd)
+        return EvidenceReference(
+            evidence_id=f"evidence-sha256-{digest}",
+            sha256=digest,
+            size=len(data),
+            media_type="application/octet-stream",
+            representation="recovery_tail",
+            relative_path=f"evidence/{name}",
+        )
+
+    def load(self, digest: str, size: int) -> bytes:
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise JournalUnavailableError("tail recovery evidence digest is invalid")
+        if not 0 <= size <= MAX_EVIDENCE_ITEM_BYTES:
+            raise JournalUnavailableError("tail recovery evidence size is invalid")
+        with _locked_file(self._engagement_fd, ".evidence.lock"):
+            evidence_fd = _open_or_create_directory(self._engagement_fd, "evidence", 0o700)
+            try:
+                data = _read_bounded(
+                    evidence_fd,
+                    f"blob-{digest}.bin",
+                    MAX_EVIDENCE_ITEM_BYTES,
+                    "tail recovery evidence",
+                )
+            finally:
+                os.close(evidence_fd)
+        if len(data) != size or sha256(data).hexdigest() != digest:
+            raise JournalUnavailableError("tail recovery evidence does not match its intent")
+        return data
+
+
+def _open_or_create_directory(parent_fd: int, name: str, mode: int) -> int:
+    try:
+        os.mkdir(name, mode, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except FileExistsError:
+        pass
+    try:
+        fd = os.open(name, _directory_flags(), dir_fd=parent_fd)
+    except OSError as exc:
+        raise JournalUnavailableError(f"unsafe directory: {name}") from exc
+    result = os.fstat(fd)
+    if not stat.S_ISDIR(result.st_mode):
+        os.close(fd)
+        raise JournalUnavailableError(f"unsafe directory: {name}")
+    return fd
+
+
+def _open_regular(parent_fd: int, name: str, bound: int, label: str) -> int:
+    try:
+        fd = os.open(name, _read_flags(), dir_fd=parent_fd)
+    except OSError as exc:
+        raise JournalUnavailableError(f"unable to open {label}") from exc
+    try:
+        result = _validate_regular(fd, label=label)
+        if result.st_size > bound:
+            raise JournalUnavailableError(f"{label} exceeds its byte bound")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _read_bounded(parent_fd: int, name: str, bound: int, label: str) -> bytes:
+    fd = _open_regular(parent_fd, name, bound, label)
+    try:
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(65_536, bound + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > bound:
+                raise JournalUnavailableError(f"{label} exceeds its byte bound")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _atomic_write(parent_fd: int, name: str, data: bytes) -> None:
+    temporary = f".{name}.tmp-{uuid4()}"
+    fd = os.open(temporary, _create_flags(), 0o600, dir_fd=parent_fd)
+    try:
+        _write_all(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except Exception:
+        with suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=parent_fd)
+        raise
+
+
+@contextmanager
+def _locked_file(parent_fd: int, name: str):
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    fd: int | None = None
+    for _ in range(3):
+        try:
+            fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
+            break
+        except FileNotFoundError:
+            # A concurrently created descriptor-relative lock can transiently race
+            # with another opener on Darwin. The retained parent remains authoritative.
+            continue
+        except OSError as exc:
+            raise JournalUnavailableError(f"unable to open lock {name}") from exc
+    if fd is None:
+        raise JournalUnavailableError(f"unable to open lock {name}")
+    try:
+        _validate_regular(fd, label=name)
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+class EngagementJournalRepository:
+    """Append-only engagement repository rooted in retained POSIX descriptors."""
+
+    def __init__(
+        self,
+        knowledge_root: str | Path,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        uuid_factory: Callable[[], UUID] | None = None,
+    ) -> None:
+        _require_posix_primitives()
+        raw = os.fspath(knowledge_root)
+        if not isinstance(raw, str) or "\0" in raw or not os.path.isabs(raw):
+            raise ValueError("knowledge root must be an absolute NUL-free path")
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._uuid_factory = uuid_factory or uuid4
+        self._closed = False
+        self._root_fd = self._open_absolute_root(raw)
+        try:
+            pathname = os.stat(raw, follow_symlinks=False)
+            retained = os.fstat(self._root_fd)
+            if not stat.S_ISDIR(pathname.st_mode) or (
+                pathname.st_dev,
+                pathname.st_ino,
+            ) != (retained.st_dev, retained.st_ino):
+                raise JournalUnavailableError("knowledge root descriptor identity mismatch")
+            self._engagements_fd = _open_or_create_directory(
+                self._root_fd, "engagements", 0o700
+            )
+            self._bounded_engagement_entries()
+        except Exception:
+            os.close(self._root_fd)
+            raise
+
+    @staticmethod
+    def _open_absolute_root(path: str) -> int:
+        current = os.open("/", _directory_flags())
+        try:
+            for component in Path(path).parts[1:]:
+                if component in {"", ".", ".."}:
+                    raise ValueError("knowledge root contains an unsafe component")
+                try:
+                    next_fd = os.open(component, _directory_flags(), dir_fd=current)
+                except FileNotFoundError:
+                    os.mkdir(component, 0o700, dir_fd=current)
+                    os.fsync(current)
+                    next_fd = os.open(component, _directory_flags(), dir_fd=current)
+                os.close(current)
+                current = next_fd
+            return current
+        except Exception:
+            os.close(current)
+            raise
+
+    def __enter__(self) -> EngagementJournalRepository:
+        self._require_open()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        os.close(self._engagements_fd)
+        os.close(self._root_fd)
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise JournalUnavailableError("repository is closed")
+
+    def _fault(self, point: str) -> None:
+        del point
+
+    def _bounded_engagement_entries(self) -> list[str]:
+        entries = os.listdir(self._engagements_fd)
+        if len(entries) > MAX_ENGAGEMENT_DIRECTORY_ENTRIES:
+            raise JournalUnavailableError("engagement directory entry bound exceeded")
+        return entries
+
+    def _engagement_fd(self, engagement_id: UUID) -> int:
+        self._require_open()
+        if type(engagement_id) is not UUID:
+            raise ValueError("engagement_id must be a UUID")
+        try:
+            fd = os.open(str(engagement_id), _directory_flags(), dir_fd=self._engagements_fd)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ValueError("unsafe engagement directory") from exc
+            raise JournalUnavailableError("engagement does not exist") from exc
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise ValueError("unsafe engagement directory")
+        return fd
+
+    def create(
+        self,
+        manifest: EngagementManifest,
+        initial_drafts: Sequence[JournalEventDraft],
+    ):
+        self._require_open()
+        manifest = EngagementManifest.model_validate(manifest.model_dump(mode="python"))
+        if not isinstance(initial_drafts, tuple) or len(initial_drafts) != 2:
+            raise ValueError("initial journal requires an immutable pair of drafts")
+        drafts = tuple(
+            JournalEventDraft.model_validate(item.model_dump(mode="python"))
+            for item in initial_drafts
+        )
+        if drafts[0].type != "engagement_opened" or drafts[1].type != "lane_bound":
+            raise ValueError("initial journal must be engagement_opened then lane_bound")
+        if (
+            not isinstance(drafts[1].payload, LaneBoundPayload)
+            or drafts[1].lane != drafts[1].payload.lane
+        ):
+            raise ValueError("initial lane binding must be exact")
+        manifest_bytes = _model_bytes(manifest)
+        if len(manifest_bytes) > MAX_MANIFEST_BYTES:
+            raise ValueError("manifest exceeds its byte bound")
+
+        with _locked_file(self._engagements_fd, ".registry.lock"):
+            entries = self._bounded_engagement_entries()
+            published = [name for name in entries if _is_uuid_name(name)]
+            if str(manifest.engagement_id) in published:
+                snapshot = self.load_snapshot(manifest.engagement_id)
+                if snapshot.manifest == manifest and self._drafts_match(
+                    snapshot.events[:2], drafts
+                ):
+                    return snapshot
+                raise ValueError("engagement UUID already exists with different content")
+            if len(published) + 1 > MAX_ENGAGEMENTS:
+                raise ValueError("engagement count exceeds its bound")
+            self._assert_lane_available(drafts[1].lane, exclude=None)
+            events = self._materialize(manifest.engagement_id, (), drafts)
+            state = reduce_engagement(manifest, events)
+            journal_bytes = b"".join(_event_line(item) + b"\n" for item in events)
+            self._validate_journal_limits(events, journal_bytes)
+            head = _head(manifest.engagement_id, events, journal_bytes)
+            head_bytes = _model_bytes(head)
+            projection = self._projection_bytes(head.revision, state)
+            intent = _canonical_json(
+                {
+                    "engagement_id": str(manifest.engagement_id),
+                    "manifest": base64.b64encode(manifest_bytes).decode(),
+                    "journal": base64.b64encode(journal_bytes).decode(),
+                    "head": base64.b64encode(head_bytes).decode(),
+                    "manifest_sha256": sha256(manifest_bytes).hexdigest(),
+                    "journal_sha256": sha256(journal_bytes).hexdigest(),
+                    "head_sha256": sha256(head_bytes).hexdigest(),
+                }
+            )
+            if len(intent) > MAX_CREATE_INTENT_BYTES:
+                raise ValueError("create intent exceeds its byte bound")
+            pending_name = f".pending-create-{manifest.engagement_id}"
+            try:
+                os.mkdir(pending_name, 0o700, dir_fd=self._engagements_fd)
+            except FileExistsError:
+                pending_fd = os.open(
+                    pending_name, _directory_flags(), dir_fd=self._engagements_fd
+                )
+                try:
+                    entries = os.listdir(pending_fd)
+                    if len(entries) > 8:
+                        raise JournalUnavailableError(
+                            "pending create directory entry bound exceeded"
+                        )
+                    try:
+                        existing_intent = _read_bounded(
+                            pending_fd,
+                            ".create-intent.json",
+                            MAX_CREATE_INTENT_BYTES,
+                            "create intent",
+                        )
+                    except JournalUnavailableError as exc:
+                        if _missing_file(exc) and not entries:
+                            os.close(pending_fd)
+                            pending_fd = -1
+                            os.rmdir(pending_name, dir_fd=self._engagements_fd)
+                            os.fsync(self._engagements_fd)
+                            os.mkdir(pending_name, 0o700, dir_fd=self._engagements_fd)
+                            pending_fd = os.open(
+                                pending_name,
+                                _directory_flags(),
+                                dir_fd=self._engagements_fd,
+                            )
+                            existing_intent = None
+                        else:
+                            raise JournalUnavailableError(
+                                "conflicting pending create transaction"
+                            ) from exc
+                    if existing_intent is not None:
+                        try:
+                            stored = json.loads(existing_intent)
+                            stored_manifest_bytes = base64.b64decode(
+                                stored["manifest"], validate=True
+                            )
+                            stored_journal_bytes = base64.b64decode(
+                                stored["journal"], validate=True
+                            )
+                            stored_head_bytes = base64.b64decode(
+                                stored["head"], validate=True
+                            )
+                            if (
+                                stored["engagement_id"] != str(manifest.engagement_id)
+                                or sha256(stored_manifest_bytes).hexdigest()
+                                != stored["manifest_sha256"]
+                                or sha256(stored_journal_bytes).hexdigest()
+                                != stored["journal_sha256"]
+                                or sha256(stored_head_bytes).hexdigest()
+                                != stored["head_sha256"]
+                            ):
+                                raise ValueError("intent digest mismatch")
+                            stored_manifest = EngagementManifest.model_validate_json(
+                                stored_manifest_bytes
+                            )
+                            stored_events = tuple(
+                                JournalEvent.model_validate_json(line)
+                                for line in stored_journal_bytes.splitlines()
+                            )
+                            stored_head = JournalHead.model_validate_json(stored_head_bytes)
+                            if (
+                                stored_manifest != manifest
+                                or not self._drafts_match(stored_events, drafts)
+                                or stored_head
+                                != _head(
+                                    manifest.engagement_id,
+                                    stored_events,
+                                    stored_journal_bytes,
+                                )
+                            ):
+                                raise ValueError("intent content mismatch")
+                            stored_state = reduce_engagement(
+                                stored_manifest, stored_events
+                            )
+                        except Exception as exc:
+                            raise JournalUnavailableError(
+                                "conflicting pending create transaction"
+                            ) from exc
+                        manifest_bytes = stored_manifest_bytes
+                        journal_bytes = stored_journal_bytes
+                        head_bytes = stored_head_bytes
+                        events = stored_events
+                        head = stored_head
+                        state = stored_state
+                        projection = self._projection_bytes(head.revision, state)
+                        for name, expected in (
+                            ("engagement.json", manifest_bytes),
+                            ("events.jsonl", journal_bytes),
+                            ("journal-head.json", head_bytes),
+                        ):
+                            try:
+                                actual = _read_bounded(
+                                    pending_fd,
+                                    name,
+                                    max(len(expected), 1),
+                                    f"staged {name}",
+                                )
+                            except JournalUnavailableError as exc:
+                                if not _missing_file(exc):
+                                    raise
+                                _atomic_write(pending_fd, name, expected)
+                            else:
+                                if actual != expected:
+                                    raise JournalUnavailableError(
+                                        "conflicting pending create transaction"
+                                    )
+                        os.fsync(pending_fd)
+                        os.close(pending_fd)
+                        pending_fd = -1
+                        os.rename(
+                            pending_name,
+                            str(manifest.engagement_id),
+                            src_dir_fd=self._engagements_fd,
+                            dst_dir_fd=self._engagements_fd,
+                        )
+                        os.fsync(self._engagements_fd)
+                        engagement_fd = self._engagement_fd(manifest.engagement_id)
+                        try:
+                            _atomic_write(
+                                engagement_fd, "engagement-state.json", projection
+                            )
+                            os.unlink(".create-intent.json", dir_fd=engagement_fd)
+                            os.fsync(engagement_fd)
+                        finally:
+                            os.close(engagement_fd)
+                        return self._snapshot(manifest, events, state)
+                finally:
+                    if pending_fd >= 0:
+                        os.close(pending_fd)
+            self._fault("create_after_directory")
+            pending_fd = os.open(pending_name, _directory_flags(), dir_fd=self._engagements_fd)
+            try:
+                _atomic_write(pending_fd, ".create-intent.json", intent)
+                self._fault("create_after_intent")
+                _atomic_write(pending_fd, "engagement.json", manifest_bytes)
+                self._fault("create_after_manifest")
+                _atomic_write(pending_fd, "events.jsonl", journal_bytes)
+                self._fault("create_after_journal")
+                _atomic_write(pending_fd, "journal-head.json", head_bytes)
+                self._fault("create_after_head")
+                os.fsync(pending_fd)
+                self._fault("create_after_directory_fsync")
+            finally:
+                os.close(pending_fd)
+            os.rename(
+                pending_name,
+                str(manifest.engagement_id),
+                src_dir_fd=self._engagements_fd,
+                dst_dir_fd=self._engagements_fd,
+            )
+            os.fsync(self._engagements_fd)
+            self._fault("create_after_rename")
+            engagement_fd = self._engagement_fd(manifest.engagement_id)
+            try:
+                _atomic_write(engagement_fd, "engagement-state.json", projection)
+                with suppress(FileNotFoundError):
+                    os.unlink(".create-intent.json", dir_fd=engagement_fd)
+                os.fsync(engagement_fd)
+            finally:
+                os.close(engagement_fd)
+            return self._snapshot(manifest, events, state)
+
+    def append(
+        self,
+        engagement_id: UUID,
+        draft: JournalEventDraft,
+        *,
+        expected_revision: JournalRevision | None = None,
+    ) -> AppendResult:
+        result = self.append_batch(
+            engagement_id,
+            (draft,),
+            expected_revision=expected_revision,
+        )
+        return AppendResult(
+            event=result.events[0],
+            revision=result.revision,
+            created=bool(result.created_event_ids),
+        )
+
+    def append_batch(
+        self,
+        engagement_id: UUID,
+        drafts: Sequence[JournalEventDraft],
+        *,
+        expected_revision: JournalRevision | None = None,
+    ) -> BatchAppendResult:
+        self._require_open()
+        if not isinstance(drafts, Sequence) or isinstance(drafts, (str, bytes)):
+            raise TypeError("drafts must be a sequence")
+        if not 1 <= len(drafts) <= MAX_JOURNAL_BATCH_EVENTS:
+            raise ValueError("journal batch exceeds its event bound")
+        validated = tuple(
+            JournalEventDraft.model_validate(item.model_dump(mode="python")) for item in drafts
+        )
+        self._complete_tail_recovery(engagement_id)
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            with _locked_file(engagement_fd, ".journal.lock"):
+                self._recover_pending_append(engagement_fd, engagement_id)
+                manifest, existing, current_head, journal_bytes = self._load_authoritative_locked(
+                    engagement_fd, engagement_id, allow_tail=False
+                )
+                prior = self._resolve_existing_batch(existing, validated)
+                if prior is not None:
+                    state = reduce_engagement(manifest, existing)
+                    expected_projection = self._projection_bytes(
+                        current_head.revision, state
+                    )
+                    try:
+                        actual_projection = _read_bounded(
+                            engagement_fd,
+                            "engagement-state.json",
+                            MAX_DERIVED_PROJECTION_BYTES,
+                            "engagement state projection",
+                        )
+                    except JournalUnavailableError:
+                        actual_projection = b""
+                    if actual_projection != expected_projection:
+                        _atomic_write(
+                            engagement_fd,
+                            "engagement-state.json",
+                            expected_projection,
+                        )
+                    return BatchAppendResult(
+                        events=prior,
+                        revision=current_head.revision,
+                        existing_event_ids=tuple(item.event_id for item in prior),
+                    )
+                if expected_revision is not None and expected_revision != current_head.revision:
+                    raise RevisionConflictError("expected revision is stale")
+                return self._append_locked(
+                    engagement_fd,
+                    manifest,
+                    existing,
+                    current_head,
+                    journal_bytes,
+                    validated,
+                )
+        finally:
+            os.close(engagement_fd)
+
+    def _append_locked(
+        self,
+        engagement_fd: int,
+        manifest: EngagementManifest,
+        existing: tuple[JournalEvent, ...],
+        base_head: JournalHead,
+        journal_bytes: bytes,
+        drafts: tuple[JournalEventDraft, ...],
+    ) -> BatchAppendResult:
+        new_events = self._materialize(manifest.engagement_id, existing, drafts)
+        lines = tuple(_event_line(item) + b"\n" for item in new_events)
+        for line in lines:
+            if len(line) - 1 > MAX_JOURNAL_EVENT_BYTES:
+                raise ValueError("journal event exceeds its byte bound")
+        target_bytes = journal_bytes + b"".join(lines)
+        all_events = (*existing, *new_events)
+        self._validate_journal_limits(all_events, target_bytes)
+        state = reduce_engagement(manifest, all_events)
+        projection_bytes = self._projection_bytes(_revision(all_events), state)
+        target_head = _head(manifest.engagement_id, all_events, target_bytes)
+        intent = _canonical_json(
+            {
+                "base_head": base_head.model_dump(mode="json"),
+                "target_head": target_head.model_dump(mode="json"),
+                "lines": [base64.b64encode(line).decode() for line in lines],
+            }
+        )
+        if len(intent) > MAX_PENDING_APPEND_BYTES:
+            raise ValueError("pending append exceeds its byte bound")
+        _atomic_write(engagement_fd, ".pending-append.json", intent)
+        self._fault("append_after_intent")
+        journal_fd = os.open(
+            "events.jsonl",
+            os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=engagement_fd,
+        )
+        try:
+            result = _validate_regular(journal_fd, label="events.jsonl")
+            if result.st_size != base_head.journal_bytes:
+                raise JournalUnavailableError("journal_corrupt: append base size changed")
+            for line in lines:
+                _write_all(journal_fd, line)
+            os.fsync(journal_fd)
+        finally:
+            os.close(journal_fd)
+        self._fault("append_after_journal_fsync")
+        _atomic_write(engagement_fd, "journal-head.json", _model_bytes(target_head))
+        self._fault("append_after_head_replace")
+        os.unlink(".pending-append.json", dir_fd=engagement_fd)
+        os.fsync(engagement_fd)
+        self._fault("append_after_intent_clear")
+        _atomic_write(engagement_fd, "engagement-state.json", projection_bytes)
+        self._fault("append_before_response")
+        return BatchAppendResult(
+            events=new_events,
+            revision=target_head.revision,
+            created_event_ids=tuple(item.event_id for item in new_events),
+        )
+
+    def load_events(self, engagement_id: UUID) -> tuple[JournalEvent, ...]:
+        self._complete_tail_recovery(engagement_id)
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            with _locked_file(engagement_fd, ".journal.lock"):
+                self._recover_pending_append(engagement_fd, engagement_id)
+                _, events, _, _ = self._load_authoritative_locked(
+                    engagement_fd, engagement_id, allow_tail=False
+                )
+                return events
+        finally:
+            os.close(engagement_fd)
+
+    def load_snapshot(self, engagement_id: UUID):
+        self._complete_tail_recovery(engagement_id)
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            with _locked_file(engagement_fd, ".journal.lock"):
+                self._recover_pending_append(engagement_fd, engagement_id)
+                manifest, events, head, _ = self._load_authoritative_locked(
+                    engagement_fd, engagement_id, allow_tail=False
+                )
+                state = reduce_engagement(manifest, events)
+                expected = self._projection_bytes(head.revision, state)
+                try:
+                    actual = _read_bounded(
+                        engagement_fd,
+                        "engagement-state.json",
+                        MAX_DERIVED_PROJECTION_BYTES,
+                        "engagement state projection",
+                    )
+                except JournalUnavailableError:
+                    actual = b""
+                if actual != expected:
+                    _atomic_write(engagement_fd, "engagement-state.json", expected)
+                return self._snapshot(manifest, events, state)
+        finally:
+            os.close(engagement_fd)
+
+    def write_projection(
+        self,
+        engagement_id: UUID,
+        *,
+        name: str,
+        owner: str,
+        envelope: Mapping[str, Any],
+        expected_revision: JournalRevision | None = None,
+    ) -> None:
+        expected_owner = PROJECTION_OWNERS.get(name)
+        if expected_owner is None or expected_owner != owner or name == "engagement-state":
+            raise ProjectionOwnershipError("projection name is not owned by this writer")
+        snapshot = self.load_snapshot(engagement_id)
+        if expected_revision is not None and snapshot.revision != expected_revision:
+            raise RevisionConflictError("projection revision is stale")
+        supplied = envelope.get("authoritative_revision")
+        if supplied is not None and JournalRevision.model_validate(supplied) != snapshot.revision:
+            raise RevisionConflictError("projection envelope revision is stale")
+        value = dict(envelope)
+        value["owner"] = owner
+        value["authoritative_revision"] = snapshot.revision.model_dump(mode="json")
+        data = _canonical_json(value)
+        if len(data) > MAX_DERIVED_PROJECTION_BYTES:
+            raise ValueError("projection exceeds its byte bound")
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            _atomic_write(engagement_fd, f"{name}.json", data)
+        finally:
+            os.close(engagement_fd)
+
+    def load_projection(
+        self, engagement_id: UUID, *, name: str, owner: str
+    ) -> dict[str, Any] | None:
+        expected_owner = PROJECTION_OWNERS.get(name)
+        if expected_owner is None or expected_owner != owner:
+            raise ProjectionOwnershipError("projection name is not owned by this reader")
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            try:
+                data = _read_bounded(
+                    engagement_fd,
+                    f"{name}.json",
+                    MAX_DERIVED_PROJECTION_BYTES,
+                    "projection",
+                )
+            except JournalUnavailableError:
+                return None
+            value = json.loads(data)
+            if not isinstance(value, dict) or value.get("owner") != owner:
+                raise ProjectionOwnershipError("stored projection owner does not match")
+            return value
+        finally:
+            os.close(engagement_fd)
+
+    def bind_lane(
+        self,
+        engagement_id: UUID,
+        lane: ExecutionLaneKey,
+        *,
+        reason: str,
+        expected_revision: JournalRevision | None = None,
+    ) -> BatchAppendResult:
+        draft = JournalEventDraft(
+            lane=lane,
+            actor="host_agent",
+            type="lane_bound",
+            payload=LaneBoundPayload(lane=lane, binding_reason=reason),
+            idempotency_key=f"lane-bind:{lane.stable_key}:{engagement_id}",
+        )
+        with _locked_file(self._engagements_fd, ".registry.lock"):
+            self._assert_lane_available(lane, exclude=engagement_id)
+            return self.append_batch(
+                engagement_id, (draft,), expected_revision=expected_revision
+            )
+
+    def unbind_lane(
+        self,
+        engagement_id: UUID,
+        lane: ExecutionLaneKey,
+        *,
+        reason: str,
+        expected_revision: JournalRevision | None = None,
+    ) -> BatchAppendResult:
+        draft = JournalEventDraft(
+            lane=lane,
+            actor="host_agent",
+            type="lane_unbound",
+            payload=LaneUnboundPayload(lane=lane, reason=reason),
+            idempotency_key=f"lane-unbind:{lane.stable_key}:{engagement_id}",
+        )
+        with _locked_file(self._engagements_fd, ".registry.lock"):
+            return self.append_batch(
+                engagement_id, (draft,), expected_revision=expected_revision
+            )
+
+    def _assert_lane_available(
+        self, lane: ExecutionLaneKey | None, *, exclude: UUID | None
+    ) -> None:
+        if lane is None:
+            raise ValueError("lane binding requires a lane")
+        entries = self._bounded_engagement_entries()
+        published = [name for name in entries if _is_uuid_name(name)]
+        if len(published) > MAX_ENGAGEMENTS:
+            raise JournalUnavailableError("engagement count exceeds its bound")
+        for name in published:
+            engagement_id = UUID(name)
+            if engagement_id == exclude:
+                continue
+            snapshot = self.load_snapshot(engagement_id)
+            if any(binding.lane == lane for binding in snapshot.state.bound_lanes):
+                raise ValueError("execution lane is already bound to another engagement")
+
+    @staticmethod
+    def _drafts_match(
+        events: Sequence[JournalEvent], drafts: Sequence[JournalEventDraft]
+    ) -> bool:
+        if len(events) != len(drafts):
+            return False
+        for event, draft in zip(events, drafts, strict=True):
+            if _draft_material(event) != draft.model_dump(mode="json", exclude={"event_id"}):
+                return False
+            if draft.event_id is not None and draft.event_id != event.event_id:
+                return False
+        return True
+
+    def _resolve_existing_batch(
+        self,
+        events: tuple[JournalEvent, ...],
+        drafts: tuple[JournalEventDraft, ...],
+    ) -> tuple[JournalEvent, ...] | None:
+        starts: set[int] = set()
+        for draft in drafts:
+            identifier = draft.idempotency_key
+            matches = [
+                index
+                for index, event in enumerate(events)
+                if (identifier is not None and event.idempotency_key == identifier)
+                or (draft.event_id is not None and event.event_id == draft.event_id)
+            ]
+            for index in matches:
+                event = events[index]
+                expected = draft.model_dump(mode="json", exclude={"event_id"})
+                if _draft_material(event) != expected or (
+                    draft.event_id is not None and event.event_id != draft.event_id
+                ):
+                    if identifier is not None:
+                        raise ValueError("idempotency key collision")
+                    raise ValueError("event ID collision")
+                starts.add(index)
+        if not starts:
+            return None
+        for start in sorted(starts):
+            candidate = events[start : start + len(drafts)]
+            if len(candidate) == len(drafts) and self._drafts_match(candidate, drafts):
+                return candidate
+        raise ValueError("idempotent batch is not a consecutive exact match")
+
+    def _materialize(
+        self,
+        engagement_id: UUID,
+        existing: Sequence[JournalEvent],
+        drafts: Sequence[JournalEventDraft],
+    ) -> tuple[JournalEvent, ...]:
+        created: list[JournalEvent] = []
+        previous_hash = existing[-1].event_hash if existing else None
+        for offset, draft in enumerate(drafts, start=1):
+            event = JournalEvent(
+                **draft.model_dump(exclude={"event_id"}),
+                event_id=draft.event_id or self._uuid_factory(),
+                sequence=len(existing) + offset,
+                occurred_at=self._clock(),
+                engagement_id=engagement_id,
+                previous_hash=previous_hash,
+                event_hash="0" * 64,
+            )
+            digest = sha256(
+                _canonical_json(event.model_dump(mode="json", exclude={"event_hash"}))
+            ).hexdigest()
+            event = event.model_copy(update={"event_hash": digest})
+            event = JournalEvent.model_validate(event.model_dump(mode="python"))
+            created.append(event)
+            previous_hash = digest
+        return tuple(created)
+
+    @staticmethod
+    def _validate_journal_limits(events: Sequence[JournalEvent], data: bytes) -> None:
+        if len(events) > MAX_JOURNAL_EVENTS:
+            raise ValueError("journal event count exceeds its bound")
+        if len(data) > MAX_JOURNAL_BYTES:
+            raise ValueError("journal bytes exceed their bound")
+        for line in data.splitlines():
+            if len(line) > MAX_JOURNAL_EVENT_BYTES:
+                raise ValueError("journal event exceeds its byte bound")
+
+    @staticmethod
+    def _projection_bytes(revision: JournalRevision, state: BaseModel) -> bytes:
+        data = _canonical_json(
+            {
+                "authoritative_revision": revision.model_dump(mode="json"),
+                "owner": "engagement",
+                "state": state.model_dump(mode="json"),
+            }
+        )
+        if len(data) > MAX_DERIVED_PROJECTION_BYTES:
+            raise ValueError("engagement state projection exceeds its byte bound")
+        return data
+
+    @staticmethod
+    def _snapshot(manifest, events, state):
+        from sedna.engagement.events import EngagementSnapshot
+
+        return EngagementSnapshot(
+            engagement_id=manifest.engagement_id,
+            revision=_revision(events),
+            manifest=manifest,
+            events=events,
+            state=state,
+        )
+
+    def _load_authoritative_locked(
+        self,
+        engagement_fd: int,
+        engagement_id: UUID,
+        *,
+        allow_tail: bool,
+    ) -> tuple[EngagementManifest, tuple[JournalEvent, ...], JournalHead, bytes]:
+        manifest_bytes = _read_bounded(
+            engagement_fd, "engagement.json", MAX_MANIFEST_BYTES, "engagement manifest"
+        )
+        head_bytes = _read_bounded(
+            engagement_fd, "journal-head.json", MAX_JOURNAL_HEAD_BYTES, "journal head"
+        )
+        journal_bytes = _read_bounded(
+            engagement_fd,
+            "events.jsonl",
+            MAX_JOURNAL_BYTES + MAX_RECOVERABLE_TAIL_BYTES,
+            "events.jsonl",
+        )
+        try:
+            manifest = EngagementManifest.model_validate_json(manifest_bytes)
+            head = JournalHead.model_validate_json(head_bytes)
+        except Exception as exc:
+            raise JournalUnavailableError("journal_corrupt: invalid manifest or head") from exc
+        if head.engagement_id != engagement_id or manifest.engagement_id != engagement_id:
+            raise JournalUnavailableError("journal_corrupt: engagement identity mismatch")
+        prefix = journal_bytes[: head.journal_bytes]
+        if (
+            len(prefix) != head.journal_bytes
+            or sha256(prefix).hexdigest() != head.journal_sha256
+        ):
+            raise JournalUnavailableError("journal_corrupt: journal disagrees with head")
+        try:
+            lines = prefix.splitlines()
+            if len(lines) > MAX_JOURNAL_EVENTS:
+                raise ValueError("too many journal events")
+            events = tuple(JournalEvent.model_validate_json(line) for line in lines)
+            state = reduce_engagement(manifest, events)
+        except Exception as exc:
+            raise JournalUnavailableError("journal_corrupt: invalid event chain") from exc
+        if len(events) != head.event_count or _revision(events) != head.revision:
+            raise JournalUnavailableError("journal_corrupt: head revision mismatch")
+        tail = journal_bytes[head.journal_bytes :]
+        if tail:
+            if (
+                allow_tail
+                and len(tail) <= MAX_RECOVERABLE_TAIL_BYTES
+                and not tail.endswith(b"\n")
+                and b"\n" not in tail
+            ):
+                if not state.bound_lanes:
+                    raise JournalUnavailableError(
+                        "journal_corrupt: recovery evidence requires a retained lane"
+                    )
+                raise _RecoverableTailError(tail, head, state.bound_lanes[0].lane)
+            raise JournalUnavailableError("journal_corrupt: journal is ahead of head")
+        return manifest, events, head, prefix
+
+    def _recover_pending_append(self, engagement_fd: int, engagement_id: UUID) -> None:
+        try:
+            raw = _read_bounded(
+                engagement_fd,
+                ".pending-append.json",
+                MAX_PENDING_APPEND_BYTES,
+                "pending append",
+            )
+        except JournalUnavailableError as exc:
+            if _missing_file(exc):
+                return
+            raise
+        try:
+            value = json.loads(raw)
+            base = JournalHead.model_validate(value["base_head"])
+            target = JournalHead.model_validate(value["target_head"])
+            lines = tuple(base64.b64decode(item, validate=True) for item in value["lines"])
+        except Exception as exc:
+            raise JournalUnavailableError("journal_corrupt: invalid pending append") from exc
+        if base.engagement_id != engagement_id or target.engagement_id != engagement_id:
+            raise JournalUnavailableError("journal_corrupt: pending append identity mismatch")
+        journal = _read_bounded(
+            engagement_fd, "events.jsonl", MAX_JOURNAL_BYTES, "events.jsonl"
+        )
+        suffix = b"".join(lines)
+        if len(journal) < base.journal_bytes or journal[: base.journal_bytes] == b"":
+            raise JournalUnavailableError("journal_corrupt: pending append base missing")
+        if sha256(journal[: base.journal_bytes]).hexdigest() != base.journal_sha256:
+            raise JournalUnavailableError("journal_corrupt: pending append base mismatch")
+        present = journal[base.journal_bytes :]
+        if not suffix.startswith(present):
+            raise JournalUnavailableError("journal_corrupt: pending append diverged")
+        if len(journal) + len(suffix) - len(present) > MAX_JOURNAL_BYTES:
+            raise JournalUnavailableError("journal_corrupt: pending append exceeds limits")
+        current_head = JournalHead.model_validate_json(
+            _read_bounded(
+                engagement_fd, "journal-head.json", MAX_JOURNAL_HEAD_BYTES, "journal head"
+            )
+        )
+        if current_head not in {base, target}:
+            raise JournalUnavailableError("journal_corrupt: pending append head mismatch")
+        if present != suffix:
+            fd = os.open(
+                "events.jsonl",
+                os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=engagement_fd,
+            )
+            try:
+                _write_all(fd, suffix[len(present) :])
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        completed = journal[: base.journal_bytes] + suffix
+        if (
+            len(completed) != target.journal_bytes
+            or sha256(completed).hexdigest() != target.journal_sha256
+        ):
+            raise JournalUnavailableError("journal_corrupt: pending target mismatch")
+        _atomic_write(engagement_fd, "journal-head.json", _model_bytes(target))
+        os.unlink(".pending-append.json", dir_fd=engagement_fd)
+        os.fsync(engagement_fd)
+
+    def _complete_tail_recovery(self, engagement_id: UUID) -> None:
+        engagement_fd = self._engagement_fd(engagement_id)
+        tail: bytes | None = None
+        recorded_head: JournalHead | None = None
+        recovery_lane: ExecutionLaneKey | None = None
+        tail_digest: str | None = None
+        tail_size: int | None = None
+        try:
+            with _locked_file(engagement_fd, ".journal.lock"):
+                self._recover_pending_append(engagement_fd, engagement_id)
+                try:
+                    raw_intent = _read_bounded(
+                        engagement_fd,
+                        ".tail-recovery.json",
+                        MAX_TAIL_RECOVERY_INTENT_BYTES,
+                        "tail recovery intent",
+                    )
+                except JournalUnavailableError as exc:
+                    if not _missing_file(exc):
+                        raise
+                    raw_intent = None
+                if raw_intent is not None:
+                    try:
+                        stored = json.loads(raw_intent)
+                        if stored["engagement_id"] != str(engagement_id):
+                            raise ValueError("identity mismatch")
+                        recorded_head = JournalHead.model_validate(stored["head"])
+                        tail_digest = str(stored["tail_sha256"])
+                        tail_size = int(stored["tail_size"])
+                    except Exception as exc:
+                        raise JournalUnavailableError(
+                            "journal_corrupt: invalid tail recovery intent"
+                        ) from exc
+                try:
+                    manifest, events, head, _ = self._load_authoritative_locked(
+                        engagement_fd, engagement_id, allow_tail=True
+                    )
+                    state = reduce_engagement(manifest, events)
+                    if raw_intent is None:
+                        return
+                    if not state.bound_lanes:
+                        raise JournalUnavailableError(
+                            "journal_corrupt: recovery evidence requires a retained lane"
+                        )
+                    recovery_lane = state.bound_lanes[0].lane
+                except _RecoverableTailError as recovery:
+                    tail = recovery.tail
+                    head = recovery.head
+                    recovery_lane = recovery.recovery_lane
+                    digest = sha256(tail).hexdigest()
+                    if raw_intent is None:
+                        recorded_head = head
+                        tail_digest = digest
+                        tail_size = len(tail)
+                        intent = _canonical_json(
+                            {
+                                "engagement_id": str(engagement_id),
+                                "head": head.model_dump(mode="json"),
+                                "tail_sha256": digest,
+                                "tail_size": len(tail),
+                            }
+                        )
+                        if len(intent) > MAX_TAIL_RECOVERY_INTENT_BYTES:
+                            raise JournalUnavailableError(
+                                "tail recovery intent exceeds its bound"
+                            ) from recovery
+                        _atomic_write(engagement_fd, ".tail-recovery.json", intent)
+                        self._fault("tail_after_intent")
+                    elif (
+                        recorded_head != head
+                        or tail_digest != digest
+                        or tail_size != len(tail)
+                    ):
+                        raise JournalUnavailableError(
+                            "journal_corrupt: tail recovery intent mismatch"
+                        ) from recovery
+            if recorded_head is None or tail_digest is None or tail_size is None:
+                raise JournalUnavailableError("journal_corrupt: incomplete tail recovery state")
+            evidence_store = _EvidenceObjectStore(engagement_fd)
+            if tail is None:
+                tail = evidence_store.load(tail_digest, tail_size)
+            reference = evidence_store.capture(tail)
+            self._fault("tail_after_evidence")
+            digest = reference.sha256
+            evidence_event_id = uuid5(
+                NAMESPACE_URL, f"sedna-tail-evidence:{engagement_id}:{digest}"
+            )
+            warning_event_id = uuid5(NAMESPACE_URL, f"sedna-tail-warning:{engagement_id}:{digest}")
+            correlation_id = uuid5(NAMESPACE_URL, f"sedna-tail-operation:{engagement_id}:{digest}")
+            correlation = SystemCorrelation(source="recovery", operation_id=correlation_id)
+            drafts = (
+                JournalEventDraft(
+                    event_id=evidence_event_id,
+                    lane=recovery_lane,
+                    actor="host_agent",
+                    type="evidence_attached",
+                    payload=EvidenceAttachedPayload(evidence=reference),
+                    idempotency_key=f"tail-evidence:{digest}",
+                ),
+                JournalEventDraft(
+                    event_id=warning_event_id,
+                    actor="system",
+                    type="recovery_warning",
+                    payload=RecoveryWarningPayload(
+                        reason_code="partial_final_jsonl_record",
+                        evidence_id=reference.evidence_id,
+                    ),
+                    system_correlation=correlation,
+                    idempotency_key=f"tail-warning:{digest}",
+                ),
+            )
+            with _locked_file(engagement_fd, ".journal.lock"):
+                journal = _read_bounded(
+                    engagement_fd,
+                    "events.jsonl",
+                    MAX_JOURNAL_BYTES + MAX_RECOVERABLE_TAIL_BYTES,
+                    "events.jsonl",
+                )
+                if journal[recorded_head.journal_bytes :] == tail:
+                    manifest, events, base_head, prefix = self._load_prefix_with_tail(
+                        engagement_fd, engagement_id, tail
+                    )
+                    journal_fd = os.open(
+                        "events.jsonl",
+                        os.O_WRONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                        dir_fd=engagement_fd,
+                    )
+                    try:
+                        _validate_regular(journal_fd, label="events.jsonl")
+                        os.ftruncate(journal_fd, base_head.journal_bytes)
+                        os.fsync(journal_fd)
+                    finally:
+                        os.close(journal_fd)
+                    self._fault("tail_after_truncate")
+                else:
+                    manifest, events, base_head, prefix = self._load_authoritative_locked(
+                        engagement_fd, engagement_id, allow_tail=False
+                    )
+                    committed = self._resolve_existing_batch(events, drafts)
+                    if committed is not None:
+                        os.unlink(".tail-recovery.json", dir_fd=engagement_fd)
+                        os.fsync(engagement_fd)
+                        return
+                    if base_head != recorded_head:
+                        raise JournalUnavailableError(
+                            "journal_corrupt: tail recovery revision changed"
+                        )
+                self._append_locked(
+                    engagement_fd,
+                    manifest,
+                    events,
+                    base_head,
+                    prefix,
+                    drafts,
+                )
+                os.unlink(".tail-recovery.json", dir_fd=engagement_fd)
+                os.fsync(engagement_fd)
+                self._fault("tail_after_intent_clear")
+        finally:
+            os.close(engagement_fd)
+
+    def _load_prefix_with_tail(
+        self, engagement_fd: int, engagement_id: UUID, expected_tail: bytes
+    ) -> tuple[EngagementManifest, tuple[JournalEvent, ...], JournalHead, bytes]:
+        journal = _read_bounded(
+            engagement_fd,
+            "events.jsonl",
+            MAX_JOURNAL_BYTES + MAX_RECOVERABLE_TAIL_BYTES,
+            "events.jsonl",
+        )
+        head = JournalHead.model_validate_json(
+            _read_bounded(
+                engagement_fd, "journal-head.json", MAX_JOURNAL_HEAD_BYTES, "journal head"
+            )
+        )
+        if journal[head.journal_bytes :] != expected_tail:
+            raise JournalUnavailableError("journal_corrupt: tail changed during recovery")
+        prefix = journal[: head.journal_bytes]
+        manifest = EngagementManifest.model_validate_json(
+            _read_bounded(
+                engagement_fd, "engagement.json", MAX_MANIFEST_BYTES, "engagement manifest"
+            )
+        )
+        events = tuple(JournalEvent.model_validate_json(line) for line in prefix.splitlines())
+        reduce_engagement(manifest, events)
+        if head != _head(engagement_id, events, prefix):
+            raise JournalUnavailableError("journal_corrupt: tail recovery head mismatch")
+        return manifest, events, head, prefix
+
+
+def _is_uuid_name(value: str) -> bool:
+    try:
+        return str(UUID(value)) == value
+    except ValueError:
+        return False
+
+
+def _missing_file(exc: JournalUnavailableError) -> bool:
+    cause = exc.__cause__
+    return isinstance(cause, OSError) and cause.errno == errno.ENOENT
+
+
+__all__ = [
+    "AppendResult",
+    "BatchAppendResult",
+    "EngagementJournalRepository",
+    "JournalHead",
+    "JournalUnavailableError",
+    "ProjectionOwnershipError",
+    "RevisionConflictError",
+]
