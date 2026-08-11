@@ -164,6 +164,14 @@ def _model_bytes(model: BaseModel) -> bytes:
     return _canonical_json(model.model_dump(mode="json", warnings="error"))
 
 
+def _canonical_projection_envelope(value: Mapping[str, Any]) -> bytes:
+    material = dict(value)
+    material.pop("projection_digest", None)
+    digest = sha256(_canonical_json(material)).hexdigest()
+    material["projection_digest"] = digest
+    return _canonical_json(material)
+
+
 def _write_all(fd: int, data: bytes) -> None:
     view = memoryview(data)
     while view:
@@ -230,8 +238,14 @@ def _draft_material(event: JournalEvent) -> dict[str, Any]:
 class _EvidenceObjectStore:
     """Private normalized-byte object primitive shared with the future public store."""
 
-    def __init__(self, engagement_fd: int) -> None:
+    def __init__(
+        self,
+        engagement_fd: int,
+        *,
+        fault: Callable[[str], None] | None = None,
+    ) -> None:
         self._engagement_fd = engagement_fd
+        self._fault = fault or (lambda _point: None)
 
     def capture(self, data: bytes) -> EvidenceReference:
         if not isinstance(data, bytes):
@@ -240,15 +254,21 @@ class _EvidenceObjectStore:
             raise ValueError("evidence item quota exceeded")
         digest = sha256(data).hexdigest()
         name = f"blob-{digest}.bin"
+        pending_name = f".pending-blob-{digest}.bin"
         with _locked_file(self._engagement_fd, ".evidence.lock"):
             evidence_fd = _open_or_create_directory(self._engagement_fd, "evidence", 0o700)
             try:
-                entries = os.listdir(evidence_fd)
-                if len(entries) > MAX_EVIDENCE_DIRECTORY_ENTRIES:
-                    raise JournalUnavailableError("evidence directory entry bound exceeded")
+                entries = _scan_directory_bounded(
+                    evidence_fd,
+                    MAX_EVIDENCE_DIRECTORY_ENTRIES,
+                    "evidence directory",
+                )
                 objects: list[tuple[str, int]] = []
                 for entry in entries:
-                    if not entry.startswith("blob-") or not entry.endswith(".bin"):
+                    if not (
+                        (entry.startswith("blob-") or entry.startswith(".pending-blob-"))
+                        and entry.endswith(".bin")
+                    ):
                         raise JournalUnavailableError("invalid evidence directory entry")
                     fd = _open_regular(
                         evidence_fd,
@@ -270,12 +290,89 @@ class _EvidenceObjectStore:
                     )
                     if found != data:
                         raise JournalUnavailableError("evidence digest collision")
+                    if pending_name in entries:
+                        pending = _read_bounded(
+                            evidence_fd,
+                            pending_name,
+                            MAX_EVIDENCE_ITEM_BYTES,
+                            "pending evidence object",
+                        )
+                        if pending != data:
+                            raise JournalUnavailableError(
+                                "pending evidence object does not match canonical object"
+                            )
+                        os.unlink(pending_name, dir_fd=evidence_fd)
+                        os.fsync(evidence_fd)
                 else:
-                    if len(objects) + 1 > MAX_EVIDENCE_OBJECTS:
+                    canonical_count = sum(
+                        item.startswith("blob-") for item, _ in objects
+                    )
+                    if canonical_count + 1 > MAX_EVIDENCE_OBJECTS:
                         raise ValueError("evidence object quota exceeded")
-                    if sum(size for _, size in objects) + len(data) > MAX_EVIDENCE_ENGAGEMENT_BYTES:
+                    pending = next(
+                        (size for item, size in objects if item == pending_name), None
+                    )
+                    if pending is not None:
+                        pending_data = _read_bounded(
+                            evidence_fd,
+                            pending_name,
+                            MAX_EVIDENCE_ITEM_BYTES,
+                            "pending evidence object",
+                        )
+                        if pending_data != data:
+                            os.unlink(pending_name, dir_fd=evidence_fd)
+                            os.fsync(evidence_fd)
+                            objects = [
+                                item for item in objects if item[0] != pending_name
+                            ]
+                            pending = None
+                    payload_bytes = sum(size for _, size in objects)
+                    additional = 0 if pending is not None else len(data)
+                    if payload_bytes + additional > MAX_EVIDENCE_ENGAGEMENT_BYTES:
                         raise ValueError("evidence engagement quota exceeded")
-                    _atomic_write(evidence_fd, name, data)
+                    if pending is None:
+                        self._fault("evidence_before_temp_write")
+                        fd = os.open(
+                            pending_name,
+                            _create_flags(),
+                            0o600,
+                            dir_fd=evidence_fd,
+                        )
+                        try:
+                            os.fchmod(fd, 0o600)
+                            split = max(1, len(data) // 2) if data else 0
+                            _write_all(fd, data[:split])
+                            self._fault("evidence_after_partial_temp_write")
+                            _write_all(fd, data[split:])
+                            self._fault("evidence_after_complete_temp_write")
+                            os.fsync(fd)
+                            self._fault("evidence_after_file_fsync")
+                        finally:
+                            os.close(fd)
+                    try:
+                        os.link(
+                            pending_name,
+                            name,
+                            src_dir_fd=evidence_fd,
+                            dst_dir_fd=evidence_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileExistsError:
+                        found = _read_bounded(
+                            evidence_fd,
+                            name,
+                            MAX_EVIDENCE_ITEM_BYTES,
+                            "evidence object",
+                        )
+                        if found != data:
+                            raise JournalUnavailableError(
+                                "evidence digest collision"
+                            ) from None
+                    self._fault("evidence_after_publication")
+                    os.fsync(evidence_fd)
+                    self._fault("evidence_after_directory_fsync")
+                    with suppress(FileNotFoundError):
+                        os.unlink(pending_name, dir_fd=evidence_fd)
                     os.fsync(evidence_fd)
             finally:
                 os.close(evidence_fd)
@@ -307,6 +404,53 @@ class _EvidenceObjectStore:
         if len(data) != size or sha256(data).hexdigest() != digest:
             raise JournalUnavailableError("tail recovery evidence does not match its intent")
         return data
+
+
+def _tail_recovery_drafts(
+    engagement_id: UUID,
+    lane: ExecutionLaneKey,
+    digest: str,
+    size: int,
+) -> tuple[JournalEventDraft, JournalEventDraft]:
+    reference = EvidenceReference(
+        evidence_id=f"evidence-sha256-{digest}",
+        sha256=digest,
+        size=size,
+        media_type="application/octet-stream",
+        representation="recovery_tail",
+        relative_path=f"evidence/blob-{digest}.bin",
+    )
+    correlation = SystemCorrelation(
+        source="recovery",
+        operation_id=uuid5(
+            NAMESPACE_URL, f"sedna-tail-operation:{engagement_id}:{digest}"
+        ),
+    )
+    return (
+        JournalEventDraft(
+            event_id=uuid5(
+                NAMESPACE_URL, f"sedna-tail-evidence:{engagement_id}:{digest}"
+            ),
+            lane=lane,
+            actor="host_agent",
+            type="evidence_attached",
+            payload=EvidenceAttachedPayload(evidence=reference),
+            idempotency_key=f"tail-evidence:{digest}",
+        ),
+        JournalEventDraft(
+            event_id=uuid5(
+                NAMESPACE_URL, f"sedna-tail-warning:{engagement_id}:{digest}"
+            ),
+            actor="system",
+            type="recovery_warning",
+            payload=RecoveryWarningPayload(
+                reason_code="partial_final_jsonl_record",
+                evidence_id=reference.evidence_id,
+            ),
+            system_correlation=correlation,
+            idempotency_key=f"tail-warning:{digest}",
+        ),
+    )
 
 
 def _open_or_create_directory(parent_fd: int, name: str, mode: int) -> int:
@@ -1059,16 +1203,20 @@ class EngagementJournalRepository:
                 src_dir_fd=self._engagements_fd,
                 dst_dir_fd=self._engagements_fd,
             )
+            self._fault("create_after_rename_before_parent_fsync")
             os.fsync(self._engagements_fd)
+            self._fault("create_after_parent_fsync")
             self._fault("create_after_rename")
             engagement_fd = self._engagement_fd(manifest.engagement_id)
             try:
                 _atomic_write(engagement_fd, "engagement-state.json", projection)
+                self._fault("create_after_projection")
                 with suppress(FileNotFoundError):
                     os.unlink(".create-intent.json", dir_fd=engagement_fd)
                 os.fsync(engagement_fd)
             finally:
                 os.close(engagement_fd)
+            self._fault("create_before_response")
             return self._snapshot(manifest, events, state)
 
     def append(
@@ -1127,7 +1275,7 @@ class EngagementJournalRepository:
                             "engagement state projection",
                         )
                     except JournalUnavailableError as exc:
-                        if not _missing_file(exc):
+                        if not _recoverable_projection_read(exc):
                             raise
                         actual_projection = b""
                     if actual_projection != expected_projection:
@@ -1183,8 +1331,10 @@ class EngagementJournalRepository:
         )
         if len(intent) > MAX_PENDING_APPEND_BYTES:
             raise ValueError("pending append exceeds its byte bound")
+        self._fault("append_before_intent")
         _atomic_write(engagement_fd, ".pending-append.json", intent)
         self._fault("append_after_intent")
+        self._fault("append_before_journal_write")
         journal_fd = os.open(
             "events.jsonl",
             os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
@@ -1196,8 +1346,13 @@ class EngagementJournalRepository:
             )
             if result.st_size != base_head.journal_bytes:
                 raise JournalUnavailableError("journal_corrupt: append base size changed")
-            for line in lines:
-                _write_all(journal_fd, line)
+            for index, line in enumerate(lines):
+                split = max(1, len(line) // 2)
+                _write_all(journal_fd, line[:split])
+                if index == 0:
+                    self._fault("append_after_partial_journal_write")
+                _write_all(journal_fd, line[split:])
+            self._fault("append_after_complete_journal_write")
             os.fsync(journal_fd)
         finally:
             os.close(journal_fd)
@@ -1208,6 +1363,7 @@ class EngagementJournalRepository:
         os.fsync(engagement_fd)
         self._fault("append_after_intent_clear")
         _atomic_write(engagement_fd, "engagement-state.json", projection_bytes)
+        self._fault("append_after_projection")
         self._fault("append_before_response")
         return BatchAppendResult(
             events=new_events,
@@ -1247,7 +1403,7 @@ class EngagementJournalRepository:
                         "engagement state projection",
                     )
                 except JournalUnavailableError as exc:
-                    if not _missing_file(exc):
+                    if not _recoverable_projection_read(exc):
                         raise
                     actual = b""
                 if actual != expected:
@@ -1268,21 +1424,49 @@ class EngagementJournalRepository:
         expected_owner = PROJECTION_OWNERS.get(name)
         if expected_owner is None or expected_owner != owner or name == "engagement-state":
             raise ProjectionOwnershipError("projection name is not owned by this writer")
-        snapshot = self.load_snapshot(engagement_id)
-        if expected_revision is not None and snapshot.revision != expected_revision:
-            raise RevisionConflictError("projection revision is stale")
-        supplied = envelope.get("authoritative_revision")
-        if supplied is not None and JournalRevision.model_validate(supplied) != snapshot.revision:
-            raise RevisionConflictError("projection envelope revision is stale")
-        value = dict(envelope)
-        value["owner"] = owner
-        value["authoritative_revision"] = snapshot.revision.model_dump(mode="json")
-        data = _canonical_json(value)
-        if len(data) > MAX_DERIVED_PROJECTION_BYTES:
-            raise ValueError("projection exceeds its byte bound")
+        self._complete_tail_recovery(engagement_id)
         engagement_fd = self._engagement_fd(engagement_id)
         try:
-            _atomic_write(engagement_fd, f"{name}.json", data)
+            with _locked_file(engagement_fd, ".journal.lock"):
+                self._recover_pending_append(engagement_fd, engagement_id)
+                manifest, events, head, _ = self._load_authoritative_locked(
+                    engagement_fd, engagement_id, allow_tail=False
+                )
+                state = reduce_engagement(manifest, events)
+                engagement_projection = self._projection_bytes(head.revision, state)
+                try:
+                    current_projection = _read_bounded(
+                        engagement_fd,
+                        "engagement-state.json",
+                        MAX_DERIVED_PROJECTION_BYTES,
+                        "engagement state projection",
+                    )
+                except JournalUnavailableError as exc:
+                    if not _recoverable_projection_read(exc):
+                        raise
+                    current_projection = b""
+                if current_projection != engagement_projection:
+                    _atomic_write(
+                        engagement_fd,
+                        "engagement-state.json",
+                        engagement_projection,
+                    )
+                if expected_revision is not None and head.revision != expected_revision:
+                    raise RevisionConflictError("projection revision is stale")
+                supplied = envelope.get("authoritative_revision")
+                if (
+                    supplied is not None
+                    and JournalRevision.model_validate(supplied) != head.revision
+                ):
+                    raise RevisionConflictError("projection envelope revision is stale")
+                value = dict(envelope)
+                value["name"] = name
+                value["owner"] = owner
+                value["authoritative_revision"] = head.revision.model_dump(mode="json")
+                data = _canonical_projection_envelope(value)
+                if len(data) > MAX_DERIVED_PROJECTION_BYTES:
+                    raise ValueError("projection exceeds its byte bound")
+                _atomic_write(engagement_fd, f"{name}.json", data)
         finally:
             os.close(engagement_fd)
 
@@ -1292,6 +1476,7 @@ class EngagementJournalRepository:
         expected_owner = PROJECTION_OWNERS.get(name)
         if expected_owner is None or expected_owner != owner:
             raise ProjectionOwnershipError("projection name is not owned by this reader")
+        snapshot = self.load_snapshot(engagement_id)
         engagement_fd = self._engagement_fd(engagement_id)
         try:
             try:
@@ -1306,8 +1491,28 @@ class EngagementJournalRepository:
                     return None
                 raise
             value = json.loads(data)
-            if not isinstance(value, dict) or value.get("owner") != owner:
+            if (
+                not isinstance(value, dict)
+                or value.get("owner") != owner
+                or value.get("name") != name
+            ):
                 raise ProjectionOwnershipError("stored projection owner does not match")
+            supplied_digest = value.get("projection_digest")
+            material = dict(value)
+            material.pop("projection_digest", None)
+            if (
+                not isinstance(supplied_digest, str)
+                or supplied_digest != sha256(_canonical_json(material)).hexdigest()
+            ):
+                raise JournalUnavailableError("projection digest is invalid")
+            try:
+                revision = JournalRevision.model_validate(
+                    value["authoritative_revision"]
+                )
+            except Exception as exc:
+                raise JournalUnavailableError("projection revision is invalid") from exc
+            if revision != snapshot.revision:
+                raise RevisionConflictError("projection revision is stale")
             return value
         finally:
             os.close(engagement_fd)
@@ -1454,9 +1659,10 @@ class EngagementJournalRepository:
 
     @staticmethod
     def _projection_bytes(revision: JournalRevision, state: BaseModel) -> bytes:
-        data = _canonical_json(
+        data = _canonical_projection_envelope(
             {
                 "authoritative_revision": revision.model_dump(mode="json"),
+                "name": "engagement-state",
                 "owner": "engagement",
                 "state": state.model_dump(mode="json"),
             }
@@ -1558,22 +1764,69 @@ class EngagementJournalRepository:
             engagement_fd, "events.jsonl", MAX_JOURNAL_BYTES, "events.jsonl"
         )
         suffix = b"".join(lines)
-        if len(journal) < base.journal_bytes or journal[: base.journal_bytes] == b"":
+        prefix = journal[: base.journal_bytes]
+        if len(prefix) != base.journal_bytes or not prefix:
             raise JournalUnavailableError("journal_corrupt: pending append base missing")
-        if sha256(journal[: base.journal_bytes]).hexdigest() != base.journal_sha256:
+        if sha256(prefix).hexdigest() != base.journal_sha256:
             raise JournalUnavailableError("journal_corrupt: pending append base mismatch")
         present = journal[base.journal_bytes :]
         if not suffix.startswith(present):
             raise JournalUnavailableError("journal_corrupt: pending append diverged")
-        if len(journal) + len(suffix) - len(present) > MAX_JOURNAL_BYTES:
-            raise JournalUnavailableError("journal_corrupt: pending append exceeds limits")
-        current_head = JournalHead.model_validate_json(
-            _read_bounded(
-                engagement_fd, "journal-head.json", MAX_JOURNAL_HEAD_BYTES, "journal head"
+        completed = prefix + suffix
+        try:
+            if any(not line.endswith(b"\n") for line in lines):
+                raise ValueError("pending line is not complete")
+            manifest = EngagementManifest.model_validate_json(
+                _read_bounded(
+                    engagement_fd,
+                    "engagement.json",
+                    MAX_MANIFEST_BYTES,
+                    "engagement manifest",
+                )
             )
-        )
+            base_events = tuple(
+                JournalEvent.model_validate_json(line)
+                for line in _iter_journal_lines(prefix)
+            )
+            target_events = tuple(
+                JournalEvent.model_validate_json(line)
+                for line in _iter_journal_lines(completed)
+            )
+            if base != _head(engagement_id, base_events, prefix):
+                raise ValueError("pending base head mismatch")
+            if target != _head(engagement_id, target_events, completed):
+                raise ValueError("pending target head mismatch")
+            self._validate_journal_limits(target_events, completed)
+            state = reduce_engagement(manifest, target_events)
+            self._projection_bytes(target.revision, state)
+        except Exception as exc:
+            raise JournalUnavailableError(
+                "journal_corrupt: pending append exceeds limits or is invalid"
+            ) from exc
+        try:
+            current_head_bytes = _read_bounded(
+                engagement_fd,
+                "journal-head.json",
+                MAX_JOURNAL_HEAD_BYTES,
+                "journal head",
+            )
+        except JournalUnavailableError as exc:
+            if not _missing_file(exc):
+                raise
+            # The exact sealed transaction is the sole authority for restoring a
+            # missing/malformed commit anchor; no transaction means fail closed.
+            current_head = target if present == suffix else base
+        else:
+            try:
+                current_head = JournalHead.model_validate_json(current_head_bytes)
+            except Exception:
+                current_head = target if present == suffix else base
         if current_head not in {base, target}:
             raise JournalUnavailableError("journal_corrupt: pending append head mismatch")
+        if current_head == target and present != suffix:
+            raise JournalUnavailableError(
+                "journal_corrupt: committed head is ahead of pending journal"
+            )
         if present != suffix:
             fd = os.open(
                 "events.jsonl",
@@ -1585,7 +1838,6 @@ class EngagementJournalRepository:
                 os.fsync(fd)
             finally:
                 os.close(fd)
-        completed = journal[: base.journal_bytes] + suffix
         if (
             len(completed) != target.journal_bytes
             or sha256(completed).hexdigest() != target.journal_sha256
@@ -1602,6 +1854,9 @@ class EngagementJournalRepository:
         recovery_lane: ExecutionLaneKey | None = None
         tail_digest: str | None = None
         tail_size: int | None = None
+        journal_identity: tuple[int, int] | None = None
+        full_file_size: int | None = None
+        sealed_drafts: tuple[JournalEventDraft, JournalEventDraft] | None = None
         try:
             with _locked_file(engagement_fd, ".journal.lock"):
                 self._recover_pending_append(engagement_fd, engagement_id)
@@ -1624,6 +1879,25 @@ class EngagementJournalRepository:
                         recorded_head = JournalHead.model_validate(stored["head"])
                         tail_digest = str(stored["tail_sha256"])
                         tail_size = int(stored["tail_size"])
+                        identity = stored["journal_identity"]
+                        journal_identity = (int(identity[0]), int(identity[1]))
+                        full_file_size = int(stored["full_file_size"])
+                        if int(stored["last_valid_offset"]) != recorded_head.journal_bytes:
+                            raise ValueError("valid offset mismatch")
+                        if (
+                            JournalRevision.model_validate(stored["valid_prefix_revision"])
+                            != recorded_head.revision
+                            or stored["valid_prefix_hash"]
+                            != recorded_head.revision.event_hash
+                        ):
+                            raise ValueError("valid prefix mismatch")
+                        parsed_drafts = tuple(
+                            JournalEventDraft.model_validate(item)
+                            for item in stored["drafts"]
+                        )
+                        if len(parsed_drafts) != 2:
+                            raise ValueError("recovery pair mismatch")
+                        sealed_drafts = (parsed_drafts[0], parsed_drafts[1])
                     except Exception as exc:
                         raise JournalUnavailableError(
                             "journal_corrupt: invalid tail recovery intent"
@@ -1649,64 +1923,104 @@ class EngagementJournalRepository:
                         recorded_head = head
                         tail_digest = digest
                         tail_size = len(tail)
+                        journal_fd = _open_regular(
+                            engagement_fd,
+                            "events.jsonl",
+                            MAX_JOURNAL_BYTES + MAX_RECOVERABLE_TAIL_BYTES,
+                            "events.jsonl",
+                        )
+                        try:
+                            journal_stat = os.fstat(journal_fd)
+                        finally:
+                            os.close(journal_fd)
+                        journal_identity = (journal_stat.st_dev, journal_stat.st_ino)
+                        full_file_size = journal_stat.st_size
+                        sealed_drafts = _tail_recovery_drafts(
+                            engagement_id, recovery_lane, digest, len(tail)
+                        )
                         intent = _canonical_json(
                             {
                                 "engagement_id": str(engagement_id),
                                 "head": head.model_dump(mode="json"),
+                                "journal_identity": list(journal_identity),
+                                "full_file_size": full_file_size,
+                                "last_valid_offset": head.journal_bytes,
+                                "valid_prefix_revision": head.revision.model_dump(
+                                    mode="json"
+                                ),
+                                "valid_prefix_hash": head.revision.event_hash,
                                 "tail_sha256": digest,
                                 "tail_size": len(tail),
+                                "drafts": [
+                                    draft.model_dump(mode="json")
+                                    for draft in sealed_drafts
+                                ],
                             }
                         )
                         if len(intent) > MAX_TAIL_RECOVERY_INTENT_BYTES:
                             raise JournalUnavailableError(
                                 "tail recovery intent exceeds its bound"
                             ) from recovery
+                        self._fault("tail_before_intent")
                         _atomic_write(engagement_fd, ".tail-recovery.json", intent)
                         self._fault("tail_after_intent")
                     elif (
                         recorded_head != head
                         or tail_digest != digest
                         or tail_size != len(tail)
+                        or full_file_size != head.journal_bytes + len(tail)
                     ):
                         raise JournalUnavailableError(
                             "journal_corrupt: tail recovery intent mismatch"
                         ) from recovery
-            if recorded_head is None or tail_digest is None or tail_size is None:
+                if (
+                    recovery_lane is not None
+                    and tail_digest is not None
+                    and tail_size is not None
+                    and sealed_drafts
+                    != _tail_recovery_drafts(
+                        engagement_id, recovery_lane, tail_digest, tail_size
+                    )
+                ):
+                    raise JournalUnavailableError(
+                        "journal_corrupt: tail recovery drafts are not deterministic"
+                    )
+            if (
+                recorded_head is None
+                or tail_digest is None
+                or tail_size is None
+                or journal_identity is None
+                or full_file_size is None
+                or sealed_drafts is None
+            ):
                 raise JournalUnavailableError("journal_corrupt: incomplete tail recovery state")
-            evidence_store = _EvidenceObjectStore(engagement_fd)
+            evidence_store = _EvidenceObjectStore(engagement_fd, fault=self._fault)
             if tail is None:
                 tail = evidence_store.load(tail_digest, tail_size)
             reference = evidence_store.capture(tail)
             self._fault("tail_after_evidence")
-            digest = reference.sha256
-            evidence_event_id = uuid5(
-                NAMESPACE_URL, f"sedna-tail-evidence:{engagement_id}:{digest}"
-            )
-            warning_event_id = uuid5(NAMESPACE_URL, f"sedna-tail-warning:{engagement_id}:{digest}")
-            correlation_id = uuid5(NAMESPACE_URL, f"sedna-tail-operation:{engagement_id}:{digest}")
-            correlation = SystemCorrelation(source="recovery", operation_id=correlation_id)
-            drafts = (
-                JournalEventDraft(
-                    event_id=evidence_event_id,
-                    lane=recovery_lane,
-                    actor="host_agent",
-                    type="evidence_attached",
-                    payload=EvidenceAttachedPayload(evidence=reference),
-                    idempotency_key=f"tail-evidence:{digest}",
-                ),
-                JournalEventDraft(
-                    event_id=warning_event_id,
-                    actor="system",
-                    type="recovery_warning",
-                    payload=RecoveryWarningPayload(
-                        reason_code="partial_final_jsonl_record",
-                        evidence_id=reference.evidence_id,
-                    ),
-                    system_correlation=correlation,
-                    idempotency_key=f"tail-warning:{digest}",
-                ),
-            )
+            drafts = sealed_drafts
+            expected_reference = drafts[0].payload.evidence
+            if reference != expected_reference:
+                raise JournalUnavailableError(
+                    "journal_corrupt: tail evidence disagrees with sealed draft"
+                )
+            self._fault("tail_before_second_lock")
             with _locked_file(engagement_fd, ".journal.lock"):
+                journal_fd = _open_regular(
+                    engagement_fd,
+                    "events.jsonl",
+                    MAX_JOURNAL_BYTES + MAX_RECOVERABLE_TAIL_BYTES,
+                    "events.jsonl",
+                )
+                try:
+                    journal_stat = os.fstat(journal_fd)
+                finally:
+                    os.close(journal_fd)
+                if (journal_stat.st_dev, journal_stat.st_ino) != journal_identity:
+                    raise JournalUnavailableError(
+                        "journal_corrupt: tail recovery descriptor identity changed"
+                    )
                 journal = _read_bounded(
                     engagement_fd,
                     "events.jsonl",
@@ -1714,6 +2028,10 @@ class EngagementJournalRepository:
                     "events.jsonl",
                 )
                 if journal[recorded_head.journal_bytes :] == tail:
+                    if len(journal) != full_file_size:
+                        raise JournalUnavailableError(
+                            "journal_corrupt: tail recovery file size changed"
+                        )
                     manifest, events, base_head, prefix = self._load_prefix_with_tail(
                         engagement_fd, engagement_id, tail
                     )
@@ -1812,6 +2130,10 @@ def _pending_create_id(value: str) -> UUID | None:
 def _missing_file(exc: JournalUnavailableError) -> bool:
     cause = exc.__cause__
     return isinstance(cause, OSError) and cause.errno == errno.ENOENT
+
+
+def _recoverable_projection_read(exc: JournalUnavailableError) -> bool:
+    return _missing_file(exc) or "exceeds its byte bound" in str(exc)
 
 
 __all__ = [

@@ -6,6 +6,7 @@ import stat
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
+from threading import Barrier, Event
 from uuid import UUID
 
 import pytest
@@ -498,6 +499,7 @@ def test_head_contains_exact_authoritative_journal_measurements(
     root = tmp_path / "knowledge"
     with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
         snapshot = repository.create(manifest, initial_drafts(manifest, lane))
+        engagement = _engagement_path(root, manifest.engagement_id)
     engagement = root / "engagements" / str(manifest.engagement_id)
     journal = (engagement / "events.jsonl").read_bytes()
     head = json.loads((engagement / "journal-head.json").read_bytes())
@@ -1246,3 +1248,484 @@ def test_competing_binds_for_one_lane_append_to_exactly_one_target(
             for identifier in identifiers
         }
     assert sorted(lengths.values()) == [2, 3]
+
+
+@pytest.mark.parametrize(
+    "fault_point",
+    [
+        "create_after_directory",
+        "create_after_intent",
+        "create_after_manifest",
+        "create_after_journal",
+        "create_after_head",
+        "create_after_directory_fsync",
+        "create_after_rename_before_parent_fsync",
+        "create_after_parent_fsync",
+        "create_after_projection",
+        "create_before_response",
+    ],
+)
+def test_every_create_crash_window_converges_to_identical_publication(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    monkeypatch, fault_point,
+) -> None:
+    names = ("engagement.json", "events.jsonl", "journal-head.json", "engagement-state.json")
+    root = tmp_path / fault_point
+    repository = _repository(root, fixed_clock, fixed_uuid_factory)
+    fired = False
+
+    def crash_once(point: str) -> None:
+        nonlocal fired
+        if point == fault_point and not fired:
+            fired = True
+            raise OSError(f"crash at {fault_point}")
+
+    monkeypatch.setattr(repository, "_fault", crash_once)
+    with pytest.raises(OSError, match="crash at"):
+        repository.create(manifest, initial_drafts(manifest, lane))
+    repository.close()
+    with _repository(root, fixed_clock, fixed_uuid_factory) as recovered:
+        snapshot = recovered.create(manifest, initial_drafts(manifest, lane))
+    engagement = _engagement_path(root, manifest.engagement_id)
+    journal = (engagement / "events.jsonl").read_bytes()
+    head = json.loads((engagement / "journal-head.json").read_bytes())
+    projection = json.loads((engagement / "engagement-state.json").read_bytes())
+    assert fired and snapshot.revision.sequence == 2
+    assert all((engagement / name).is_file() for name in names)
+    assert head["journal_sha256"] == sha256(journal).hexdigest()
+    assert projection["authoritative_revision"] == head["revision"]
+    assert not (root / "engagements" / f".pending-create-{manifest.engagement_id}").exists()
+    assert not (engagement / ".create-intent.json").exists()
+
+
+@pytest.mark.parametrize(
+    "fault_point",
+    [
+        "append_before_intent",
+        "append_after_intent",
+        "append_before_journal_write",
+        "append_after_partial_journal_write",
+        "append_after_complete_journal_write",
+        "append_after_journal_fsync",
+        "append_after_head_replace",
+        "append_after_intent_clear",
+        "append_after_projection",
+        "append_before_response",
+    ],
+)
+def test_every_append_crash_window_converges_to_exact_batch_and_projection(
+    tmp_path, manifest, lane, initial_drafts, user_note_draft, fixed_clock,
+    fixed_uuid_factory, monkeypatch, fault_point,
+) -> None:
+    root = tmp_path / fault_point
+    draft = user_note_draft(fault_point).model_copy(
+        update={
+            "event_id": UUID("77777777-7777-4777-8777-777777777777"),
+            "idempotency_key": f"append-window:{fault_point}",
+        }
+    )
+    repository = _repository(root, fixed_clock, fixed_uuid_factory)
+    opening = repository.create(manifest, initial_drafts(manifest, lane))
+    fired = False
+
+    def crash_once(point: str) -> None:
+        nonlocal fired
+        if point == fault_point and not fired:
+            fired = True
+            raise OSError(f"crash at {fault_point}")
+
+    monkeypatch.setattr(repository, "_fault", crash_once)
+    with pytest.raises(OSError, match="crash at"):
+        repository.append_batch(
+            manifest.engagement_id, (draft,), expected_revision=opening.revision
+        )
+    repository.close()
+    with EngagementJournalRepository(root, clock=fixed_clock) as recovered:
+        result = recovered.append_batch(
+            manifest.engagement_id, (draft,), expected_revision=opening.revision
+        )
+        snapshot = recovered.load_snapshot(manifest.engagement_id)
+    engagement = _engagement_path(root, manifest.engagement_id)
+    projection = json.loads((engagement / "engagement-state.json").read_bytes())
+    assert fired
+    if fault_point == "append_before_intent":
+        assert result.created_event_ids == (draft.event_id,)
+    else:
+        assert result.existing_event_ids == (draft.event_id,)
+    assert [event.event_id for event in snapshot.events].count(draft.event_id) == 1
+    assert projection["authoritative_revision"] == result.revision.model_dump(mode="json")
+    assert not (engagement / ".pending-append.json").exists()
+
+
+@pytest.mark.parametrize("projection_state", ["present", "missing", "stale"])
+def test_hash_valid_journal_behind_head_is_corrupt_regardless_of_projection(
+    tmp_path, manifest, lane, initial_drafts, user_note_draft, fixed_clock,
+    fixed_uuid_factory, projection_state,
+) -> None:
+    root = tmp_path / projection_state
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+        engagement = _engagement_path(root, manifest.engagement_id)
+        prefix = (engagement / "events.jsonl").read_bytes()
+        repository.append_batch(manifest.engagement_id, (user_note_draft("later"),))
+    projection = engagement / "engagement-state.json"
+    if projection_state == "missing":
+        projection.unlink()
+    elif projection_state == "stale":
+        projection.write_bytes(b'{"owner":"engagement"}')
+    (engagement / "events.jsonl").write_bytes(prefix)
+    with EngagementJournalRepository(root) as repository, pytest.raises(
+        JournalUnavailableError, match="journal_corrupt"
+    ):
+        repository.load_snapshot(manifest.engagement_id)
+
+
+@pytest.mark.parametrize("head_bytes", [None, b"{}"])
+def test_missing_or_malformed_published_head_fails_closed(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory, head_bytes,
+) -> None:
+    root = tmp_path / "knowledge"
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+    head = _engagement_path(root, manifest.engagement_id) / "journal-head.json"
+    head.unlink() if head_bytes is None else head.write_bytes(head_bytes)
+    with EngagementJournalRepository(root) as repository, pytest.raises(
+        JournalUnavailableError, match="journal_corrupt|journal head"
+    ):
+        repository.load_events(manifest.engagement_id)
+
+
+def test_valid_newline_extension_without_matching_intent_is_corrupt(
+    tmp_path, manifest, lane, initial_drafts, user_note_draft, fixed_clock,
+    fixed_uuid_factory,
+) -> None:
+    root = tmp_path / "knowledge"
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+        engagement = _engagement_path(root, manifest.engagement_id)
+        base = (engagement / "events.jsonl").read_bytes()
+        base_events = repository.load_events(manifest.engagement_id)
+        repository.append_batch(manifest.engagement_id, (user_note_draft("valid"),))
+    opening_head = repository_module._head(manifest.engagement_id, base_events, base)
+    (engagement / "journal-head.json").write_bytes(repository_module._model_bytes(opening_head))
+    with EngagementJournalRepository(root) as repository, pytest.raises(
+        JournalUnavailableError, match="journal_corrupt"
+    ):
+        repository.load_events(manifest.engagement_id)
+
+
+def test_tail_intent_seals_descriptor_prefix_tail_and_exact_recovery_drafts(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "knowledge"
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+    engagement = _engagement_path(root, manifest.engagement_id)
+    journal = engagement / "events.jsonl"
+    tail = b'{"partial":"tail"'
+    with journal.open("ab") as stream:
+        stream.write(tail)
+        stream.flush()
+        os.fsync(stream.fileno())
+    with EngagementJournalRepository(root, clock=fixed_clock) as repository:
+        def crash(point: str) -> None:
+            if point == "tail_after_intent":
+                raise OSError("sealed")
+
+        monkeypatch.setattr(repository, "_fault", crash)
+        with pytest.raises(OSError, match="sealed"):
+            repository.load_events(manifest.engagement_id)
+    intent = json.loads((engagement / ".tail-recovery.json").read_bytes())
+    journal_stat = journal.stat()
+    assert intent["engagement_id"] == str(manifest.engagement_id)
+    assert intent["journal_identity"] == [journal_stat.st_dev, journal_stat.st_ino]
+    assert intent["full_file_size"] == journal_stat.st_size
+    assert intent["last_valid_offset"] == journal_stat.st_size - len(tail)
+    assert intent["valid_prefix_revision"]["sequence"] == 2
+    assert intent["tail_sha256"] == sha256(tail).hexdigest()
+    assert [draft["type"] for draft in intent["drafts"]] == [
+        "evidence_attached", "recovery_warning"
+    ]
+
+
+def test_tail_second_lock_rejects_byte_identical_journal_descriptor_replacement(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "knowledge"
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+    engagement = _engagement_path(root, manifest.engagement_id)
+    journal = engagement / "events.jsonl"
+    with journal.open("ab") as stream:
+        stream.write(b'{"partial"')
+        stream.flush()
+        os.fsync(stream.fileno())
+    original = journal.read_bytes()
+    replaced = False
+    with EngagementJournalRepository(root, clock=fixed_clock) as repository:
+        def replace(point: str) -> None:
+            nonlocal replaced
+            if point == "tail_before_second_lock" and not replaced:
+                replaced = True
+                journal.rename(engagement / "old-events.jsonl")
+                journal.write_bytes(original)
+                journal.chmod(0o600)
+
+        monkeypatch.setattr(repository, "_fault", replace)
+        with pytest.raises(JournalUnavailableError, match="journal_corrupt"):
+            repository.load_events(manifest.engagement_id)
+    assert replaced and journal.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "fault_point",
+    [
+        "tail_before_intent",
+        "tail_after_intent",
+        "evidence_before_temp_write",
+        "evidence_after_partial_temp_write",
+        "evidence_after_complete_temp_write",
+        "evidence_after_file_fsync",
+        "evidence_after_publication",
+        "evidence_after_directory_fsync",
+        "tail_before_second_lock",
+        "tail_after_truncate",
+        "append_after_head_replace",
+        "append_after_projection",
+        "tail_after_intent_clear",
+    ],
+)
+def test_every_tail_evidence_crash_window_recovers_one_exact_pair(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    monkeypatch, fault_point,
+) -> None:
+    root = tmp_path / fault_point
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+    engagement = _engagement_path(root, manifest.engagement_id)
+    journal = engagement / "events.jsonl"
+    tail = f'{{"partial":"{fault_point}"'.encode()
+    with journal.open("ab") as stream:
+        stream.write(tail)
+        stream.flush()
+        os.fsync(stream.fileno())
+    fired = False
+    with EngagementJournalRepository(root, clock=fixed_clock) as repository:
+        def crash_once(point: str) -> None:
+            nonlocal fired
+            if point == fault_point and not fired:
+                fired = True
+                raise OSError(f"crash at {fault_point}")
+
+        monkeypatch.setattr(repository, "_fault", crash_once)
+        with pytest.raises(OSError, match="crash at"):
+            repository.load_events(manifest.engagement_id)
+    with EngagementJournalRepository(root, clock=fixed_clock) as recovered:
+        events = recovered.load_events(manifest.engagement_id)
+        snapshot = recovered.load_snapshot(manifest.engagement_id)
+    assert fired
+    assert [event.type.value for event in events[-2:]] == [
+        "evidence_attached", "recovery_warning"
+    ]
+    assert len([event for event in events if event.type.value == "evidence_attached"]) == 1
+    blobs = list((engagement / "evidence").glob("blob-*.bin"))
+    assert [blob.read_bytes() for blob in blobs] == [tail]
+    assert not list((engagement / "evidence").glob(".pending-blob-*.bin"))
+    projection = json.loads((engagement / "engagement-state.json").read_bytes())
+    assert projection["authoritative_revision"] == snapshot.revision.model_dump(mode="json")
+
+
+def test_tail_recovery_wins_deterministic_private_capture_quota_race(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "knowledge"
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+    engagement = _engagement_path(root, manifest.engagement_id)
+    journal = engagement / "events.jsonl"
+    tail = b'{"quota-race"'
+    with journal.open("ab") as stream:
+        stream.write(tail)
+        stream.flush()
+        os.fsync(stream.fileno())
+    monkeypatch.setattr(repository_module, "MAX_EVIDENCE_OBJECTS", 1)
+    monkeypatch.setattr(repository_module, "MAX_EVIDENCE_ENGAGEMENT_BYTES", len(tail))
+    rendezvous = Barrier(2)
+    tail_done = Event()
+    real_capture = repository_module._EvidenceObjectStore.capture
+
+    def ordered_capture(store, data):
+        rendezvous.wait(timeout=2)
+        if data != tail:
+            assert tail_done.wait(timeout=2)
+            return real_capture(store, data)
+        try:
+            return real_capture(store, data)
+        finally:
+            tail_done.set()
+
+    monkeypatch.setattr(repository_module._EvidenceObjectStore, "capture", ordered_capture)
+
+    def recover_tail():
+        with EngagementJournalRepository(root, clock=fixed_clock) as repository:
+            return repository.load_events(manifest.engagement_id)
+
+    def capture_ordinary():
+        with EngagementJournalRepository(root) as repository:
+            engagement_fd = repository._engagement_fd(manifest.engagement_id)
+            try:
+                return repository_module._EvidenceObjectStore(engagement_fd).capture(
+                    b"ordinary-private"
+                )
+            finally:
+                os.close(engagement_fd)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        tail_future = pool.submit(recover_tail)
+        ordinary_future = pool.submit(capture_ordinary)
+        events = tail_future.result(timeout=5)
+        with pytest.raises(ValueError, match="quota"):
+            ordinary_future.result(timeout=5)
+    assert [event.type.value for event in events[-2:]] == [
+        "evidence_attached", "recovery_warning"
+    ]
+    assert [item.read_bytes() for item in (engagement / "evidence").glob("blob-*.bin")] == [tail]
+    assert not list((engagement / "evidence").glob(".pending-blob-*.bin"))
+
+
+def test_projection_envelopes_have_digest_cas_and_exact_bounds_for_sealed_names(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "knowledge"
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        snapshot = repository.create(manifest, initial_drafts(manifest, lane))
+        engagement = _engagement_path(root, manifest.engagement_id)
+        engagement_projection = repository.load_projection(
+            manifest.engagement_id, name="engagement-state", owner="engagement"
+        )
+        assert engagement_projection is not None
+        for name in ("state", "frontier", "strategy-ledger"):
+            repository.write_projection(
+                manifest.engagement_id,
+                name=name,
+                owner="planning",
+                envelope={"payload": {"name": name}},
+                expected_revision=snapshot.revision,
+            )
+            loaded = repository.load_projection(
+                manifest.engagement_id, name=name, owner="planning"
+            )
+            assert loaded is not None
+            digest = loaded.pop("projection_digest")
+            assert digest == sha256(repository_module._canonical_json(loaded)).hexdigest()
+        with pytest.raises(RevisionConflictError):
+            repository.write_projection(
+                manifest.engagement_id,
+                name="state",
+                owner="planning",
+                envelope={"payload": {}},
+                expected_revision=JournalRevision(sequence=0, event_hash="0" * 64),
+            )
+        value = {
+            "payload": {"large": "x" * 2_000},
+            "owner": "planning",
+            "authoritative_revision": snapshot.revision.model_dump(mode="json"),
+            "name": "state",
+        }
+        exact = repository_module._canonical_projection_envelope(value)
+        monkeypatch.setattr(repository_module, "MAX_DERIVED_PROJECTION_BYTES", len(exact))
+        repository.write_projection(
+            manifest.engagement_id,
+            name="state",
+            owner="planning",
+            envelope={"payload": {"large": "x" * 2_000}},
+        )
+        target = engagement / "state.json"
+        before = target.read_bytes()
+        monkeypatch.setattr(repository_module, "MAX_DERIVED_PROJECTION_BYTES", len(exact) - 1)
+        with pytest.raises(ValueError, match="projection exceeds"):
+            repository.write_projection(
+                manifest.engagement_id,
+                name="state",
+                owner="planning",
+                envelope={"payload": {"large": "x" * 2_000}},
+            )
+        assert target.read_bytes() == before
+
+
+def test_pending_append_revalidates_recovered_totals_before_any_mutation(
+    tmp_path, manifest, lane, initial_drafts, user_note_draft, fixed_clock,
+    fixed_uuid_factory, monkeypatch,
+) -> None:
+    root = tmp_path / "knowledge"
+    repository = _repository(root, fixed_clock, fixed_uuid_factory)
+    repository.create(manifest, initial_drafts(manifest, lane))
+    engagement = _engagement_path(root, manifest.engagement_id)
+    before = (engagement / "events.jsonl").read_bytes()
+
+    def crash(point: str) -> None:
+        if point == "append_after_intent":
+            raise OSError("intent durable")
+
+    monkeypatch.setattr(repository, "_fault", crash)
+    with pytest.raises(OSError, match="intent durable"):
+        repository.append_batch(manifest.engagement_id, (user_note_draft("over-cap"),))
+    repository.close()
+    monkeypatch.setattr(repository_module, "MAX_JOURNAL_EVENTS", 2)
+    with EngagementJournalRepository(root) as recovered, pytest.raises(
+        JournalUnavailableError, match="exceeds limits"
+    ):
+        recovered.load_events(manifest.engagement_id)
+    assert (engagement / "events.jsonl").read_bytes() == before
+    assert (engagement / ".pending-append.json").is_file()
+
+
+def test_oversized_engagement_projection_is_rebuilt_from_authoritative_journal(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "knowledge"
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        expected = repository.create(manifest, initial_drafts(manifest, lane))
+    projection = _engagement_path(root, manifest.engagement_id) / "engagement-state.json"
+    canonical = projection.read_bytes()
+    projection.write_bytes(canonical + b"x")
+    monkeypatch.setattr(
+        repository_module, "MAX_DERIVED_PROJECTION_BYTES", len(canonical)
+    )
+    with EngagementJournalRepository(root) as recovered:
+        snapshot = recovered.load_snapshot(manifest.engagement_id)
+    assert snapshot == expected
+    assert projection.read_bytes() == canonical
+
+
+@pytest.mark.parametrize("head_bytes", [None, b"not-json"])
+def test_exact_pending_append_recovers_missing_or_malformed_head(
+    tmp_path, manifest, lane, initial_drafts, user_note_draft, fixed_clock,
+    fixed_uuid_factory, monkeypatch, head_bytes,
+) -> None:
+    root = tmp_path / "knowledge"
+    repository = _repository(root, fixed_clock, fixed_uuid_factory)
+    repository.create(manifest, initial_drafts(manifest, lane))
+
+    def crash(point: str) -> None:
+        if point == "append_after_complete_journal_write":
+            raise OSError("journal complete")
+
+    monkeypatch.setattr(repository, "_fault", crash)
+    with pytest.raises(OSError, match="journal complete"):
+        repository.append_batch(manifest.engagement_id, (user_note_draft("recover-head"),))
+    repository.close()
+    head = _engagement_path(root, manifest.engagement_id) / "journal-head.json"
+    if head_bytes is None:
+        head.unlink()
+    else:
+        head.write_bytes(head_bytes)
+    with EngagementJournalRepository(root) as recovered:
+        events = recovered.load_events(manifest.engagement_id)
+    assert len(events) == 3
+    assert events[-1].payload.note == "recover-head"
