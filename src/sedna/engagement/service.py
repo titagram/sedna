@@ -1,0 +1,1096 @@
+"""Stable engagement journal service facade with sealed lifecycle ownership."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager, contextmanager
+from datetime import UTC, datetime
+from hashlib import sha256
+from pathlib import Path
+from typing import Annotated, Any, Literal, Protocol, TypeVar
+from uuid import UUID, uuid4
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from sedna.engagement.events import (
+    ChildLaneLinkedPayload,
+    ClosureRequestedPayload,
+    DecisionRecordedPayload,
+    EngagementAbandonedPayload,
+    EngagementOpenedPayload,
+    EngagementReopenedPayload,
+    EngagementResumedPayload,
+    EngagementSnapshot,
+    JournalEvent,
+    JournalEventDraft,
+    LaneBoundPayload,
+    ObjectiveChangedPayload,
+    ScopeChangedPayload,
+    ToolCallStartedPayload,
+    ToolCallTerminatedPayload,
+    ToolCorrelation,
+)
+from sedna.engagement.models import (
+    MAX_EVIDENCE_ITEM_BYTES,
+    MAX_JOURNAL_EVENTS,
+    MAX_PUBLIC_INVENTORY_ITEMS,
+    MAX_SETTLEMENT_PENDING_RANGES,
+    ActiveDecision,
+    AuthorizationScope,
+    EngagementManifest,
+    EvidenceId,
+    EvidenceReference,
+    EvidenceSlice,
+    ExecutionLaneKey,
+    HostAdaptedCommandRecord,
+    HostIdentity,
+    HostKind,
+    JournalRevision,
+    PendingSubjectCursor,
+    ProofRequirement,
+    SettlementSafeCode,
+    Sha256Hex,
+    scope_references,
+)
+from sedna.engagement.normalization import (
+    bounded_safe_argument_summary,
+    sanitize_host_arguments,
+)
+from sedna.engagement.repository import (
+    EngagementJournalRepository,
+    ProjectionOwnershipError,
+)
+
+ProjectionT = TypeVar("ProjectionT", bound=BaseModel)
+
+PLANNING_PROJECTION_NAMES = frozenset({"state", "frontier", "strategy-ledger"})
+LOADABLE_PROJECTION_NAMES = PLANNING_PROJECTION_NAMES | {"engagement-state"}
+EVENT_APPEND_OWNER_BY_TYPE: dict[str, str] = {
+    "engagement_opened": "repository_create",
+    "engagement_resumed": "lifecycle_service",
+    "lane_bound": "lifecycle_service",
+    "lane_unbound": "lifecycle_service",
+    "child_lane_linked": "lifecycle_service",
+    "objective_changed": "lifecycle_service",
+    "scope_changed": "lifecycle_service",
+    "decision_recorded": "lifecycle_service",
+    "agent_deviation_recorded": "lifecycle_service",
+    "engagement_reopened": "lifecycle_service",
+    "engagement_abandoned": "lifecycle_service",
+    "session_started": "hook_adapter",
+    "session_checkpointed": "hook_adapter",
+    "session_finalized": "hook_adapter",
+    "tool_call_started": "hook_adapter",
+    "tool_call_completed": "hook_adapter",
+    "evidence_attached": "hook_adapter",
+    "evidence_capture_failed": "hook_adapter",
+    "unmatched_tool_completion": "hook_adapter",
+    "unplanned_action": "hook_adapter",
+    "control_tool_invoked": "hook_adapter",
+    "uncertain_correlation": "hook_adapter",
+    "tool_call_terminated": "tool_resolution_service",
+    "closure_requested": "closure_service",
+    "closure_cancelled": "closure_service",
+    "source_suggested": "source_registry",
+    "recovery_warning": "recovery_repository",
+    "user_note": "caller_facade",
+}
+
+SettlementReason = Literal[
+    "plan",
+    "close",
+    "verify",
+    "reject",
+    "reopen",
+    "report",
+    "resume",
+    "session_finalize",
+]
+
+
+class EngagementAmbiguousError(ValueError):
+    """A resume or lane resolution matched more than one engagement."""
+
+    def __init__(
+        self,
+        candidates: tuple[EngagementListItem, ...] | list[EngagementListItem],
+    ) -> None:
+        self.candidates = tuple(candidates)
+        super().__init__("engagement selection is ambiguous")
+
+
+class EngagementNotFoundError(ValueError):
+    """A resume or lane resolution selector matched no engagement."""
+
+    def __init__(self) -> None:
+        super().__init__("no matching engagement exists")
+
+
+class EngagementMutationResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    snapshot: EngagementSnapshot
+    created_event_ids: tuple[UUID, ...] = ()
+    existing_event_ids: tuple[UUID, ...] = ()
+
+    @property
+    def engagement_id(self) -> UUID:
+        return self.snapshot.engagement_id
+
+
+class JournalEventPage(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    engagement_id: UUID
+    authoritative_revision: JournalRevision
+    through_revision: JournalRevision | None = None
+    events: tuple[JournalEvent, ...] = Field(max_length=256)
+    next_after_sequence: int = Field(ge=0, le=MAX_JOURNAL_EVENTS)
+    complete: bool
+
+
+class EvidenceDescriptor(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    attachment_event_id: UUID
+    event_sequence: int = Field(ge=0, le=MAX_JOURNAL_EVENTS)
+    reference: EvidenceReference
+
+
+class EvidenceDescriptorPage(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    engagement_id: UUID
+    authoritative_revision: JournalRevision
+    through_revision: JournalRevision | None = None
+    items: tuple[EvidenceDescriptor, ...] = Field(max_length=256)
+    next_after_sequence: int = Field(ge=0, le=MAX_JOURNAL_EVENTS)
+    complete: bool
+
+
+class EngagementListItem(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    engagement_id: UUID
+    display_name: str
+    status: str
+    created_at: datetime
+    revision: JournalRevision
+
+
+class EngagementListPage(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    items: tuple[EngagementListItem, ...] = Field(max_length=MAX_PUBLIC_INVENTORY_ITEMS)
+    total_count: int = Field(ge=0)
+    next_after_engagement_id: UUID | None = None
+    omitted_items_sha256: Sha256Hex | None = None
+
+
+class LaneBindingResolution(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    mode: Literal[
+        "exact", "session_unique", "linked_child_unique", "ambiguous", "unbound"
+    ]
+    engagement_id: UUID | None = None
+    lane: ExecutionLaneKey | None = None
+    candidates: tuple[EngagementListItem, ...] = ()
+    total_count: int = Field(ge=0)
+    omitted_items_sha256: Sha256Hex | None = None
+
+    @model_validator(mode="after")
+    def validate_resolution(self) -> LaneBindingResolution:
+        unique = {"exact", "session_unique", "linked_child_unique"}
+        if self.mode in unique and self.engagement_id is None:
+            raise ValueError("unique lane resolution requires an engagement id")
+        if self.mode == "ambiguous" and not self.candidates:
+            raise ValueError("ambiguous lane resolution requires candidates")
+        if self.mode not in unique and self.engagement_id is not None:
+            raise ValueError("identity is allowed only for unique resolutions")
+        return self
+
+
+class EngagementSettlementOutcome(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    status: Literal["complete", "incomplete", "failed", "unavailable"]
+    pending_range_count: int = Field(ge=0, le=MAX_SETTLEMENT_PENDING_RANGES)
+    next_pending_offset: int | None = Field(
+        default=None, ge=0, le=MAX_EVIDENCE_ITEM_BYTES
+    )
+    next_pending_subject: PendingSubjectCursor | None = None
+    pending_inventory_sha256: Sha256Hex | None = None
+    safe_code: SettlementSafeCode | None = None
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> EngagementSettlementOutcome:
+        has_pending = self.pending_range_count > 0 or (
+            self.next_pending_offset is not None
+            or self.next_pending_subject is not None
+            or self.pending_inventory_sha256 is not None
+        )
+        if self.status == "complete" and (
+            has_pending or self.safe_code is not None
+        ):
+            raise ValueError("complete settlement carries no pending metadata")
+        if self.status == "unavailable" and (
+            has_pending
+            or self.safe_code
+            not in {
+                "journal_unavailable",
+                "journal_corrupt",
+                "settlement_unavailable",
+            }
+        ):
+            raise ValueError("unavailable settlement requires a safe code")
+        return self
+
+
+class EngagementSettlementPort(Protocol):
+    def settle(
+        self,
+        engagement_id: UUID,
+        *,
+        reason: SettlementReason,
+    ) -> EngagementSettlementOutcome: ...
+
+
+class EngagementSettlementPortFactory(Protocol):
+    def open(self, resolved_root: Path) -> AbstractContextManager[EngagementSettlementPort]: ...
+
+
+class ClosureFinalizer(Protocol):
+    def finalize(self, *, snapshot: EngagementSnapshot) -> EngagementSnapshot: ...
+
+
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def create_operational_start_draft(
+    lane: ExecutionLaneKey, *, call_id: str
+) -> JournalEventDraft:
+    sanitized = sanitize_host_arguments({"call_id": call_id})
+    value = sanitized.value if isinstance(sanitized, BaseModel) else {}
+    summary, _ = bounded_safe_argument_summary(value)
+    return JournalEventDraft(
+        lane=lane,
+        actor="host_agent",
+        type="tool_call_started",
+        payload=ToolCallStartedPayload(
+            call_id=call_id,
+            tool_name="terminal",
+            correlation=ToolCorrelation.uncertain("missing_stable_identity"),
+            safe_arguments=summary or {},
+        ),
+    )
+
+
+class EngagementJournalService:
+    """Context-managed facade over the engagement journal repository."""
+
+    def __init__(
+        self,
+        repository: EngagementJournalRepository,
+        *,
+        clock: Callable[[], datetime],
+        uuid_factory: Callable[[], UUID],
+    ) -> None:
+        self._repository = repository
+        self._clock = clock
+        self._uuid_factory = uuid_factory
+
+    @classmethod
+    @contextmanager
+    def open(
+        cls,
+        knowledge_root: Path,
+        *,
+        clock: Callable[[], datetime] = utc_now,
+        uuid_factory: Callable[[], UUID] = uuid4,
+        evidence_quota: Any | None = None,
+    ) -> Any:
+        with EngagementJournalRepository(
+            knowledge_root,
+            clock=clock,
+            uuid_factory=uuid_factory,
+            evidence_quota=evidence_quota,
+        ) as repository:
+            yield cls(repository, clock=clock, uuid_factory=uuid_factory)
+
+    def _manifest(
+        self,
+        *,
+        display_name: str,
+        objective: str,
+        scope: AuthorizationScope,
+        required_proofs: Sequence[ProofRequirement],
+    ) -> EngagementManifest:
+        return EngagementManifest(
+            engagement_id=self._uuid_factory(),
+            display_name=display_name,
+            initial_objective=objective,
+            initial_scope=scope,
+            required_proofs=tuple(required_proofs),
+            created_at=self._clock(),
+            created_by_host=HostIdentity(kind=HostKind.HADES, adapter_version="1"),
+        )
+
+    def create_engagement(
+        self,
+        *,
+        display_name: str,
+        objective: str,
+        scope: AuthorizationScope,
+        lane: ExecutionLaneKey,
+        required_proofs: Sequence[ProofRequirement] = (),
+    ) -> EngagementMutationResult:
+        manifest = self._manifest(
+            display_name=display_name,
+            objective=objective,
+            scope=scope,
+            required_proofs=required_proofs,
+        )
+        return self.create_from_manifest(manifest, lane=lane)
+
+    def create_from_manifest(
+        self,
+        manifest: EngagementManifest,
+        *,
+        lane: ExecutionLaneKey,
+    ) -> EngagementMutationResult:
+        from sedna.engagement.events import SystemCorrelation
+
+        opening = JournalEventDraft(
+            lane=None,
+            actor="system",
+            type="engagement_opened",
+            payload=EngagementOpenedPayload(
+                scope_references=scope_references(manifest.initial_scope)
+            ),
+            system_correlation=SystemCorrelation(
+                source="lifecycle",
+                operation_id=self._uuid_factory(),
+            ),
+        )
+        binding = JournalEventDraft(
+            lane=lane,
+            actor="host_agent",
+            type="lane_bound",
+            payload=LaneBoundPayload(lane=lane, binding_reason="initial binding"),
+        )
+        snapshot = self._repository.create(manifest, (opening, binding))
+        return EngagementMutationResult(
+            snapshot=snapshot,
+            created_event_ids=tuple(event.event_id for event in snapshot.events),
+        )
+
+    def _list_snapshots(self) -> tuple[EngagementSnapshot, ...]:
+        identifiers = self._repository.list_snapshot_ids()
+        return tuple(
+            self._repository.load_snapshot(identifier) for identifier in identifiers
+        )
+
+    def resume_engagement(
+        self,
+        *,
+        lane: ExecutionLaneKey,
+        engagement_id: UUID | None = None,
+        display_name: str | None = None,
+        scope: AuthorizationScope | None = None,
+        expected_revision: JournalRevision | None = None,
+    ) -> EngagementMutationResult:
+        if engagement_id is not None:
+            snapshot = self._repository.load_snapshot(engagement_id)
+        else:
+            snapshots = self._list_snapshots()
+            resumable = [
+                item
+                for item in snapshots
+                if item.state.status in {"active", "closing"}
+            ]
+            candidates: list[EngagementSnapshot] = []
+            if display_name is not None:
+                candidates = [
+                    item
+                    for item in resumable
+                    if item.manifest.display_name == display_name
+                ]
+            elif scope is not None:
+                supplied = scope_references(scope)
+                supplied_ids = {ref.reference_id for ref in supplied}
+                candidates = [
+                    item
+                    for item in resumable
+                    if any(
+                        ref.reference_id in supplied_ids
+                        for ref in item.state.scope_references
+                    )
+                ]
+            if len(candidates) > 1:
+                raise EngagementAmbiguousError(
+                    _engagement_list_items(candidates)
+                )
+            if not candidates:
+                raise EngagementNotFoundError()
+            snapshot = candidates[0]
+        resolved = self._repository.load_snapshot(snapshot.engagement_id)
+        from sedna.engagement.events import SystemCorrelation
+
+        resumed_draft = JournalEventDraft(
+            lane=None,
+            actor="system",
+            type="engagement_resumed",
+            payload=EngagementResumedPayload(reason="resumed from another session"),
+            system_correlation=SystemCorrelation(
+                source="lifecycle", operation_id=self._uuid_factory()
+            ),
+        )
+        if lane.stable_key not in {
+            binding.lane.stable_key for binding in resolved.state.bound_lanes
+        }:
+            resumed = self._repository.append_batch(
+                resolved.engagement_id,
+                (
+                    resumed_draft,
+                    JournalEventDraft(
+                        lane=lane,
+                        actor="host_agent",
+                        type="lane_bound",
+                        payload=LaneBoundPayload(
+                            lane=lane, binding_reason="resume binding"
+                        ),
+                    ),
+                ),
+                expected_revision=expected_revision,
+            )
+        else:
+            resumed = self._repository.append_batch(
+                resolved.engagement_id,
+                (resumed_draft,),
+                expected_revision=expected_revision,
+            )
+        return _mutation_result(self._repository, resolved.engagement_id, resumed)
+
+    def inspect_engagement(self, engagement_id: UUID) -> EngagementSnapshot:
+        return self._repository.load_snapshot(engagement_id)
+
+    def list_engagements(
+        self,
+        *,
+        after_engagement_id: UUID | None = None,
+        limit: int = MAX_PUBLIC_INVENTORY_ITEMS,
+    ) -> EngagementListPage:
+        if not 1 <= limit <= MAX_PUBLIC_INVENTORY_ITEMS:
+            raise ValueError("engagement list limit is out of bounds")
+        snapshots = self._list_snapshots()
+        items = _engagement_list_items(snapshots)
+        if after_engagement_id is not None:
+            items = tuple(
+                item
+                for item in items
+                if item.engagement_id > after_engagement_id
+            )
+        page = items[:limit]
+        omitted = items[limit:]
+        digest = (
+            sha256(
+                ",".join(str(item.engagement_id) for item in omitted).encode("utf-8")
+            ).hexdigest()
+            if omitted
+            else None
+        )
+        return EngagementListPage(
+            items=page,
+            total_count=len(items),
+            next_after_engagement_id=page[-1].engagement_id if len(items) > limit else None,
+            omitted_items_sha256=digest,
+        )
+
+    def resolve_lane_binding(self, lane: ExecutionLaneKey) -> LaneBindingResolution:
+        snapshots = self._list_snapshots()
+        exact = [
+            item
+            for item in snapshots
+            if any(binding.lane == lane for binding in item.state.bound_lanes)
+        ]
+        if len(exact) == 1:
+            return LaneBindingResolution(
+                mode="exact",
+                engagement_id=exact[0].engagement_id,
+                lane=lane,
+                total_count=1,
+            )
+        session_unique = [
+            item
+            for item in snapshots
+            if any(
+                binding.lane.session_id == lane.session_id
+                and binding.lane.host_kind == lane.host_kind
+                for binding in item.state.bound_lanes
+            )
+        ]
+        if len(session_unique) == 1:
+            return LaneBindingResolution(
+                mode="session_unique",
+                engagement_id=session_unique[0].engagement_id,
+                lane=lane,
+                total_count=1,
+            )
+        if len(session_unique) > 1:
+            return LaneBindingResolution(
+                mode="ambiguous",
+                candidates=_engagement_list_items(session_unique),
+                total_count=len(session_unique),
+            )
+        return LaneBindingResolution(mode="unbound", total_count=0)
+
+    def bind_lane(
+        self,
+        engagement_id: UUID,
+        lane: ExecutionLaneKey,
+        *,
+        reason: str,
+        expected_revision: JournalRevision | None = None,
+    ) -> EngagementMutationResult:
+        result = self._repository.bind_lane(
+            engagement_id, lane, reason=reason, expected_revision=expected_revision
+        )
+        return _mutation_result(self._repository, engagement_id, result)
+
+    def unbind_lane(
+        self,
+        engagement_id: UUID,
+        lane: ExecutionLaneKey,
+        *,
+        reason: str,
+        expected_revision: JournalRevision | None = None,
+    ) -> EngagementMutationResult:
+        result = self._repository.unbind_lane(
+            engagement_id, lane, reason=reason, expected_revision=expected_revision
+        )
+        return _mutation_result(self._repository, engagement_id, result)
+
+    def link_child_session(
+        self,
+        *,
+        parent_session_id: str,
+        parent_task_id: str | None,
+        child_session_id: str,
+        child_subagent_id: str | None,
+    ) -> LaneBindingResolution:
+        snapshots = self._list_snapshots()
+        parents = [
+            item
+            for item in snapshots
+            if any(
+                binding.lane.session_id == parent_session_id
+                and (
+                    parent_task_id is None
+                    or binding.lane.task_id == parent_task_id
+                )
+                for binding in item.state.bound_lanes
+            )
+        ]
+        if len(parents) == 1:
+            parent = parents[0]
+            self._repository.append_batch(
+                parent.engagement_id,
+                (
+                    JournalEventDraft(
+                        lane=parent.state.bound_lanes[0].lane,
+                        actor="host_agent",
+                        type="child_lane_linked",
+                        payload=ChildLaneLinkedPayload(
+                            parent_session_id=parent_session_id,
+                            child_session_id=child_session_id,
+                            child_subagent_id=child_subagent_id or "subagent",
+                        ),
+                    ),
+                ),
+            )
+            return LaneBindingResolution(
+                mode="linked_child_unique",
+                engagement_id=parent.engagement_id,
+                total_count=1,
+            )
+        if len(parents) > 1:
+            return LaneBindingResolution(
+                mode="ambiguous",
+                candidates=_engagement_list_items(parents),
+                total_count=len(parents),
+            )
+        return LaneBindingResolution(mode="unbound", total_count=0)
+
+    def change_objective(
+        self,
+        engagement_id: UUID,
+        *,
+        lane: ExecutionLaneKey,
+        objective: str,
+        authorization_basis: str,
+        expected_revision: JournalRevision | None = None,
+    ) -> EngagementMutationResult:
+        from sedna.engagement.events import SystemCorrelation
+
+        result = self._repository.append_batch(
+            engagement_id,
+            (
+                JournalEventDraft(
+                    lane=None,
+                    actor="system",
+                    type="objective_changed",
+                    payload=ObjectiveChangedPayload(
+                        objective=objective,
+                        authorization_basis=authorization_basis,
+                    ),
+                    system_correlation=SystemCorrelation(
+                        source="lifecycle", operation_id=self._uuid_factory()
+                    ),
+                ),
+            ),
+            expected_revision=expected_revision,
+        )
+        return _mutation_result(self._repository, engagement_id, result)
+
+    def change_scope(
+        self,
+        engagement_id: UUID,
+        *,
+        lane: ExecutionLaneKey,
+        scope: AuthorizationScope,
+        authorization_basis: str,
+        expected_revision: JournalRevision | None = None,
+    ) -> EngagementMutationResult:
+        from sedna.engagement.events import SystemCorrelation
+
+        result = self._repository.append_batch(
+            engagement_id,
+            (
+                JournalEventDraft(
+                    lane=None,
+                    actor="system",
+                    type="scope_changed",
+                    payload=ScopeChangedPayload(
+                        scope=scope,
+                        scope_references=scope_references(scope),
+                        authorization_basis=authorization_basis,
+                    ),
+                    system_correlation=SystemCorrelation(
+                        source="lifecycle", operation_id=self._uuid_factory()
+                    ),
+                ),
+            ),
+            expected_revision=expected_revision,
+        )
+        return _mutation_result(self._repository, engagement_id, result)
+
+    def reopen_engagement(
+        self,
+        engagement_id: UUID,
+        *,
+        lane: ExecutionLaneKey,
+        reason: str,
+        expected_revision: JournalRevision | None = None,
+    ) -> EngagementMutationResult:
+        from sedna.engagement.events import SystemCorrelation
+
+        drafts: list[JournalEventDraft] = []
+        snapshot = self._repository.load_snapshot(engagement_id)
+        if lane.stable_key not in {
+            binding.lane.stable_key for binding in snapshot.state.bound_lanes
+        }:
+            drafts.append(
+                JournalEventDraft(
+                    lane=lane,
+                    actor="host_agent",
+                    type="lane_bound",
+                    payload=LaneBoundPayload(lane=lane, binding_reason="reopen binding"),
+                )
+            )
+        drafts.append(
+            JournalEventDraft(
+                lane=None,
+                actor="system",
+                type="engagement_reopened",
+                payload=EngagementReopenedPayload(reason=reason),
+                system_correlation=SystemCorrelation(
+                    source="lifecycle", operation_id=self._uuid_factory()
+                ),
+            )
+        )
+        result = self._repository.append_batch(
+            engagement_id, tuple(drafts), expected_revision=expected_revision
+        )
+        return _mutation_result(self._repository, engagement_id, result)
+
+    def abandon_engagement(
+        self,
+        engagement_id: UUID,
+        *,
+        lane: ExecutionLaneKey,
+        reason: str,
+        expected_revision: JournalRevision | None = None,
+    ) -> EngagementMutationResult:
+        from sedna.engagement.events import SystemCorrelation
+
+        result = self._repository.append_batch(
+            engagement_id,
+            (
+                JournalEventDraft(
+                    lane=None,
+                    actor="system",
+                    type="engagement_abandoned",
+                    payload=EngagementAbandonedPayload(reason=reason),
+                    system_correlation=SystemCorrelation(
+                        source="lifecycle", operation_id=self._uuid_factory()
+                    ),
+                ),
+            ),
+            expected_revision=expected_revision,
+        )
+        return _mutation_result(self._repository, engagement_id, result)
+
+    def load_snapshot(self, engagement_id: UUID) -> EngagementSnapshot:
+        return self._repository.load_snapshot(engagement_id)
+
+    def load_events(
+        self,
+        engagement_id: UUID,
+        *,
+        after_sequence: int = 0,
+        through_revision: JournalRevision | None = None,
+        limit: int = 256,
+    ) -> JournalEventPage:
+        if not 1 <= limit <= 256:
+            raise ValueError("event page limit must be within 1..256")
+        snapshot = self._repository.load_snapshot(engagement_id)
+        selected = [
+            event
+            for event in snapshot.events
+            if event.sequence > after_sequence
+            and (
+                through_revision is None
+                or event.sequence <= through_revision.sequence
+            )
+        ]
+        page = tuple(selected[:limit])
+        complete = len(selected) <= limit
+        return JournalEventPage(
+            engagement_id=engagement_id,
+            authoritative_revision=snapshot.revision,
+            through_revision=through_revision,
+            events=page,
+            next_after_sequence=page[-1].sequence + 1 if page else after_sequence,
+            complete=complete,
+        )
+
+    def list_evidence_descriptors(
+        self,
+        engagement_id: UUID,
+        *,
+        after_sequence: int = 0,
+        through_revision: JournalRevision | None = None,
+        limit: int = 256,
+    ) -> EvidenceDescriptorPage:
+        if not 1 <= limit <= 256:
+            raise ValueError("evidence page limit must be within 1..256")
+        snapshot = self._repository.load_snapshot(engagement_id)
+        selected: list[EvidenceDescriptor] = []
+        for event in snapshot.events:
+            if event.sequence <= after_sequence:
+                continue
+            if through_revision is not None and event.sequence > through_revision.sequence:
+                continue
+            if event.type.value != "evidence_attached":
+                continue
+            selected.append(
+                EvidenceDescriptor(
+                    attachment_event_id=event.event_id,
+                    event_sequence=event.sequence,
+                    reference=event.payload.evidence,
+                )
+            )
+        page = tuple(selected[:limit])
+        complete = len(selected) <= limit
+        return EvidenceDescriptorPage(
+            engagement_id=engagement_id,
+            authoritative_revision=snapshot.revision,
+            through_revision=through_revision,
+            items=page,
+            next_after_sequence=page[-1].event_sequence + 1 if page else after_sequence,
+            complete=complete,
+        )
+
+    def append_events(
+        self,
+        engagement_id: UUID,
+        drafts: Sequence[JournalEventDraft],
+        *,
+        expected_revision: JournalRevision | None = None,
+    ) -> EngagementMutationResult:
+        validated = tuple(
+            JournalEventDraft.model_validate(item.model_dump(mode="python"))
+            for item in drafts
+        )
+        for draft in validated:
+            owner = EVENT_APPEND_OWNER_BY_TYPE.get(draft.type)
+            if owner != "caller_facade":
+                raise ValueError(
+                    f"generic facade cannot append {draft.type}; owner is {owner}"
+                )
+        result = self._repository.append_batch(
+            engagement_id, validated, expected_revision=expected_revision
+        )
+        return _mutation_result(self._repository, engagement_id, result)
+
+    def append_operational_start(
+        self,
+        engagement_id: UUID,
+        draft: JournalEventDraft,
+        *,
+        expected_revision: JournalRevision | None = None,
+    ) -> EngagementMutationResult:
+        validated = JournalEventDraft.model_validate(draft.model_dump(mode="python"))
+        owner = EVENT_APPEND_OWNER_BY_TYPE.get(validated.type)
+        if owner not in {"hook_adapter", "tool_resolution_service"}:
+            raise ValueError(
+                f"operational start cannot append {validated.type}; owner is {owner}"
+            )
+        result = self._repository.append_batch(
+            engagement_id, (validated,), expected_revision=expected_revision
+        )
+        return _mutation_result(self._repository, engagement_id, result)
+
+    def request_close(
+        self,
+        engagement_id: UUID,
+        *,
+        lane: ExecutionLaneKey,
+        reason: str,
+        expected_revision: JournalRevision | None = None,
+    ) -> EngagementMutationResult:
+        snapshot = self._repository.load_snapshot(engagement_id)
+        terminal_watermark = snapshot.revision.sequence
+        in_flight = snapshot.state.in_flight_call_ids
+        result = self._repository.append_batch(
+            engagement_id,
+            (
+                JournalEventDraft(
+                    lane=lane,
+                    actor="host_agent",
+                    type="closure_requested",
+                    payload=ClosureRequestedPayload(
+                        terminal_watermark=terminal_watermark,
+                        in_flight_call_ids=in_flight,
+                        reason=reason,
+                        origin="manual",
+                    ),
+                ),
+            ),
+            expected_revision=expected_revision,
+        )
+        return _mutation_result(self._repository, engagement_id, result)
+
+    def read_evidence_slice(
+        self,
+        engagement_id: UUID,
+        evidence_id: EvidenceId,
+        *,
+        offset: int,
+        limit: int,
+    ) -> EvidenceSlice:
+        return self._repository.read_evidence_slice(
+            engagement_id, evidence_id, offset=offset, limit=limit
+        )
+
+    def load_projection(
+        self,
+        engagement_id: UUID,
+        name: str,
+        model_type: type[ProjectionT],
+    ) -> ProjectionT | None:
+        if name not in LOADABLE_PROJECTION_NAMES:
+            raise ProjectionOwnershipError("projection name is not owned by this reader")
+        if name == "engagement-state":
+            value = self._repository.load_projection(
+                engagement_id, name=name, owner="engagement"
+            )
+            if value is None:
+                return None
+            return model_type.model_validate(value["state"])
+        value = self._repository.load_projection(
+            engagement_id, name=name, owner="planning"
+        )
+        if value is None:
+            return None
+        return model_type.model_validate(value["payload"])
+
+    def commit_projection(
+        self,
+        engagement_id: UUID,
+        name: str,
+        projection: BaseModel,
+        *,
+        expected_revision: JournalRevision,
+    ) -> Path:
+        if name not in PLANNING_PROJECTION_NAMES:
+            raise ProjectionOwnershipError(
+                "projection name is not owned by this writer"
+            )
+        self._repository.write_projection(
+            engagement_id,
+            name=name,
+            owner="planning",
+            envelope={
+                "payload": projection.model_dump(mode="json"),
+                "schema": "sedna.planning.v1",
+            },
+            expected_revision=expected_revision,
+        )
+        return (
+            self._repository._knowledge_root
+            / "engagements"
+            / str(engagement_id)
+            / f"{name}.json"
+        )
+
+    def resolve_lane_binding_method(self, lane: ExecutionLaneKey) -> LaneBindingResolution:
+        return self.resolve_lane_binding(lane)
+
+    def load_active_decision(
+        self,
+        engagement_id: UUID,
+        lane: ExecutionLaneKey,
+    ) -> ActiveDecision | None:
+        snapshot = self._repository.load_snapshot(engagement_id)
+        for decision in snapshot.state.active_decisions:
+            if decision.lane == lane:
+                return decision
+        return None
+
+    def terminate_tool_call(
+        self,
+        engagement_id: UUID,
+        call_id: str,
+        *,
+        resolution: Literal["timed_out", "abandoned"],
+        reason: str,
+        lane: ExecutionLaneKey,
+        expected_revision: JournalRevision | None = None,
+    ) -> EngagementMutationResult:
+        snapshot = self._repository.load_snapshot(engagement_id)
+        if call_id not in snapshot.state.in_flight_call_ids:
+            raise ValueError("call_id is not an in-flight tool call")
+        result = self._repository.append_batch(
+            engagement_id,
+            (
+                JournalEventDraft(
+                    lane=lane,
+                    actor="host_agent",
+                    type="tool_call_terminated",
+                    payload=ToolCallTerminatedPayload(
+                        call_id=call_id,
+                        resolution=resolution,
+                        reason=reason,
+                    ),
+                ),
+            ),
+            expected_revision=expected_revision,
+        )
+        return _mutation_result(self._repository, engagement_id, result)
+
+    def record_decision(
+        self,
+        engagement_id: UUID,
+        *,
+        lane: ExecutionLaneKey,
+        proposal_id: UUID | None = None,
+        strategy: Annotated[str | None, Field(min_length=1, max_length=8192)] = None,
+        rationale: Annotated[str | None, Field(min_length=1, max_length=8192)] = None,
+        host_adapted_command: HostAdaptedCommandRecord | None = None,
+        expected_revision: JournalRevision | None = None,
+    ) -> EngagementMutationResult:
+        if (proposal_id is None) == (strategy is None):
+            raise ValueError("proposal_id and strategy are mutually exclusive")
+        if strategy is not None and rationale is None:
+            raise ValueError("custom decisions require a rationale")
+        resolved_strategy = strategy or "planner proposal"
+        resolved_rationale = rationale or ""
+        result = self._repository.append_batch(
+            engagement_id,
+            (
+                JournalEventDraft(
+                    lane=lane,
+                    actor="host_agent",
+                    type="decision_recorded",
+                    payload=DecisionRecordedPayload(
+                        decision_id=f"decision-{self._uuid_factory()}",
+                        proposal_id=proposal_id,
+                        strategy=resolved_strategy,
+                        rationale=resolved_rationale,
+                        host_adapted_command=host_adapted_command,
+                    ),
+                ),
+            ),
+            expected_revision=expected_revision,
+        )
+        return _mutation_result(self._repository, engagement_id, result)
+
+    def __enter__(self) -> EngagementJournalService:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self._repository.close()
+
+
+def _mutation_result(
+    repository: EngagementJournalRepository,
+    engagement_id: UUID,
+    result: Any,
+) -> EngagementMutationResult:
+    snapshot = repository.load_snapshot(engagement_id)
+    return EngagementMutationResult(
+        snapshot=snapshot,
+        created_event_ids=tuple(result.created_event_ids),
+        existing_event_ids=tuple(result.existing_event_ids),
+    )
+
+
+def _engagement_list_items(
+    snapshots: Sequence[EngagementSnapshot],
+) -> tuple[EngagementListItem, ...]:
+    items = [
+        EngagementListItem(
+            engagement_id=snapshot.engagement_id,
+            display_name=snapshot.manifest.display_name,
+            status=snapshot.state.status.value,
+            created_at=snapshot.manifest.created_at,
+            revision=snapshot.revision,
+        )
+        for snapshot in snapshots
+    ]
+    return tuple(
+        sorted(items, key=lambda item: (item.display_name, item.created_at))
+    )
+
+
+__all__ = [
+    "ClosureFinalizer",
+    "EngagementAmbiguousError",
+    "EngagementJournalService",
+    "EngagementListItem",
+    "EngagementListPage",
+    "EngagementMutationResult",
+    "EngagementNotFoundError",
+    "EngagementSettlementOutcome",
+    "EngagementSettlementPort",
+    "EngagementSettlementPortFactory",
+    "EvidenceDescriptor",
+    "EvidenceDescriptorPage",
+    "JournalEventPage",
+    "LaneBindingResolution",
+    "SettlementReason",
+    "create_operational_start_draft",
+]

@@ -866,6 +866,15 @@ class EngagementJournalRepository:
             "engagement directory",
         )
 
+    def list_snapshot_ids(self) -> tuple[UUID, ...]:
+        """Return published engagement UUIDs under the registry lock (bounded)."""
+        self._require_open()
+        with _locked_file(self._engagements_fd, ".registry.lock"):
+            entries = self._bounded_engagement_entries()
+            return tuple(
+                UUID(name) for name in entries if _is_uuid_name(name)
+            )
+
     def _recover_pending_creates(self, entries: Sequence[str]) -> None:
         pending: list[tuple[str, UUID]] = []
         published = {name for name in entries if _is_uuid_name(name)}
