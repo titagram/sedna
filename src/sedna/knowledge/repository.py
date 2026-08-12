@@ -35,7 +35,9 @@ from sedna.knowledge.schema import (
     SemanticVerificationRecord,
     foundation_manifest_digest,
 )
+from sedna.knowledge.schema.execution import ExecutionExample
 from sedna.knowledge.semantic.compiler import (
+    EXECUTION_EXAMPLE_SCHEMA_VERSION,
     SEMANTIC_COMPILER_VERSION,
     SEMANTIC_SCHEMA_VERSION,
 )
@@ -45,6 +47,10 @@ from sedna.knowledge.semantic.prompts import (
     EXTRACTOR_PROMPT_VERSION,
     REPAIR_PROMPT_VERSION,
 )
+
+_LEGACY_RETRIEVAL_SCHEMA_VERSION = "2.4.0"
+_LEGACY_RETRIEVAL_COMPILER_VERSION = "8"
+_LEGACY_RETRIEVAL_PROMPT_VERSION = "1"
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 _MAX_SEMANTIC_INVENTORY_FILES = 100_000
@@ -427,6 +433,36 @@ class CanonicalKnowledgeRepository:
         """Load a strictly validated verified semantic bundle."""
         return self._load_semantic_component(source_id, "bundle")
 
+    def load_execution_examples(
+        self,
+        source_id: str,
+        *,
+        parent_artifact_id: str,
+        example_ids: tuple[str, ...] | None = None,
+    ) -> tuple[ExecutionExample, ...]:
+        """Load bundle-owned examples for one exact parent, sorted by example ID.
+
+        Uses the descriptor-relative bundle loader only; it never searches command
+        text and never falls back to filesystem paths.
+        """
+        _validate_stable_id(source_id)
+        for identifier in (parent_artifact_id,) + tuple(example_ids or ()):
+            _validate_stable_id(identifier)
+        bundle = self.load_semantic_bundle(source_id)
+        selected = tuple(
+            example
+            for example in bundle.execution_examples
+            if example.parent_artifact_id == parent_artifact_id
+        )
+        ordered = tuple(sorted(selected, key=lambda example: example.example_id))
+        if example_ids is not None and set(example_ids) != {
+            example.example_id for example in ordered
+        }:
+            raise ValueError(
+                "example_ids must exactly match the parent's execution examples"
+            )
+        return ordered
+
     def load_semantic_verification(self, source_id: str) -> SemanticVerificationRecord:
         """Load a strictly validated semantic verification record."""
         return self._load_semantic_component(source_id, "verification")
@@ -625,6 +661,7 @@ class CanonicalKnowledgeRepository:
         critic_prompt_version: str = CRITIC_PROMPT_VERSION,
         repair_prompt_version: str = REPAIR_PROMPT_VERSION,
         compiler_version: str = SEMANTIC_COMPILER_VERSION,
+        execution_example_schema_version: str = EXECUTION_EXAMPLE_SCHEMA_VERSION,
         pin_models: bool = False,
         extractor_model_id: str | None = None,
         critic_model_id: str | None = None,
@@ -683,6 +720,11 @@ class CanonicalKnowledgeRepository:
                 and manifest.critic_prompt_version == critic_prompt_version
                 and manifest.repair_prompt_version == repair_prompt_version
                 and manifest.compiler_version == compiler_version
+                and (
+                    not manifest.emitted_execution_example_ids
+                    or manifest.execution_example_schema_version
+                    == execution_example_schema_version
+                )
             )
             if pin_models:
                 current = current and (
@@ -745,6 +787,7 @@ class CanonicalKnowledgeRepository:
         critic_prompt_version: str = CRITIC_PROMPT_VERSION,
         repair_prompt_version: str = REPAIR_PROMPT_VERSION,
         compiler_version: str = SEMANTIC_COMPILER_VERSION,
+        execution_example_schema_version: str = EXECUTION_EXAMPLE_SCHEMA_VERSION,
         pin_models: bool = False,
         extractor_model_id: str | None = None,
         critic_model_id: str | None = None,
@@ -758,6 +801,7 @@ class CanonicalKnowledgeRepository:
                 critic_prompt_version=critic_prompt_version,
                 repair_prompt_version=repair_prompt_version,
                 compiler_version=compiler_version,
+                execution_example_schema_version=execution_example_schema_version,
                 pin_models=pin_models,
                 extractor_model_id=extractor_model_id,
                 critic_model_id=critic_model_id,
@@ -1413,36 +1457,65 @@ class CanonicalKnowledgeRepository:
 
     @staticmethod
     def _require_current_retrieval_bundle(bundle: SemanticKnowledgeBundle) -> None:
+        if CanonicalKnowledgeRepository._is_current_or_legacy_bundle(bundle):
+            return
+        raise SemanticBundleEnumerationError(
+            bundle.source_id,
+            "stale_semantic_record",
+            "is not current and must be semantically recompiled",
+        )
+
+    @staticmethod
+    def _is_current_or_legacy_bundle(bundle: SemanticKnowledgeBundle) -> bool:
+        """Retrieval accepts the current contract or exactly the legacy strategic contract."""
         manifest = bundle.compilation_manifest
         if (
-            bundle.schema_version != SEMANTIC_SCHEMA_VERSION
-            or manifest.compiler_version != SEMANTIC_COMPILER_VERSION
-            or manifest.extractor_prompt_version != EXTRACTOR_PROMPT_VERSION
-            or manifest.critic_prompt_version != CRITIC_PROMPT_VERSION
-            or manifest.repair_prompt_version != REPAIR_PROMPT_VERSION
+            bundle.schema_version == SEMANTIC_SCHEMA_VERSION
+            and manifest.compiler_version == SEMANTIC_COMPILER_VERSION
+            and manifest.extractor_prompt_version == EXTRACTOR_PROMPT_VERSION
+            and manifest.critic_prompt_version == CRITIC_PROMPT_VERSION
+            and manifest.repair_prompt_version == REPAIR_PROMPT_VERSION
         ):
-            raise SemanticBundleEnumerationError(
-                bundle.source_id,
-                "stale_semantic_record",
-                "is not current and must be semantically recompiled",
-            )
+            return True
+        return (
+            bundle.schema_version == _LEGACY_RETRIEVAL_SCHEMA_VERSION
+            and manifest.compiler_version == _LEGACY_RETRIEVAL_COMPILER_VERSION
+            and manifest.extractor_prompt_version == _LEGACY_RETRIEVAL_PROMPT_VERSION
+            and manifest.critic_prompt_version == _LEGACY_RETRIEVAL_PROMPT_VERSION
+            and manifest.repair_prompt_version == _LEGACY_RETRIEVAL_PROMPT_VERSION
+            and manifest.execution_example_schema_version is None
+            and not manifest.emitted_execution_example_ids
+            and not bundle.execution_examples
+        )
 
     @staticmethod
     def _require_current_retrieval_quarantine(quarantine: SemanticQuarantineRecord) -> None:
         manifest = quarantine.compilation_manifest
-        if (
-            quarantine.semantic_schema_version != SEMANTIC_SCHEMA_VERSION
-            or manifest is None
-            or manifest.compiler_version != SEMANTIC_COMPILER_VERSION
-            or manifest.extractor_prompt_version != EXTRACTOR_PROMPT_VERSION
-            or manifest.critic_prompt_version != CRITIC_PROMPT_VERSION
-            or manifest.repair_prompt_version != REPAIR_PROMPT_VERSION
-        ):
-            raise SemanticBundleEnumerationError(
-                quarantine.source_id,
-                "stale_semantic_record",
-                "is not current and must be semantically recompiled",
-            )
+        current = (
+            quarantine.semantic_schema_version == SEMANTIC_SCHEMA_VERSION
+            and manifest is not None
+            and manifest.compiler_version == SEMANTIC_COMPILER_VERSION
+            and manifest.extractor_prompt_version == EXTRACTOR_PROMPT_VERSION
+            and manifest.critic_prompt_version == CRITIC_PROMPT_VERSION
+            and manifest.repair_prompt_version == REPAIR_PROMPT_VERSION
+        )
+        legacy = (
+            quarantine.semantic_schema_version == _LEGACY_RETRIEVAL_SCHEMA_VERSION
+            and manifest is not None
+            and manifest.compiler_version == _LEGACY_RETRIEVAL_COMPILER_VERSION
+            and manifest.extractor_prompt_version == _LEGACY_RETRIEVAL_PROMPT_VERSION
+            and manifest.critic_prompt_version == _LEGACY_RETRIEVAL_PROMPT_VERSION
+            and manifest.repair_prompt_version == _LEGACY_RETRIEVAL_PROMPT_VERSION
+            and manifest.execution_example_schema_version is None
+            and not manifest.emitted_execution_example_ids
+        )
+        if current or legacy:
+            return
+        raise SemanticBundleEnumerationError(
+            quarantine.source_id,
+            "stale_semantic_record",
+            "is not current and must be semantically recompiled",
+        )
 
     def _read_optional_model(
         self,

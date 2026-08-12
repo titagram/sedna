@@ -428,6 +428,7 @@ class SemanticCompiler:
             references=references,
             cases=cases,
             guidance=guidance,
+            execution_examples=execution_examples,
         )
 
     @staticmethod

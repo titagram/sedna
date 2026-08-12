@@ -239,12 +239,14 @@ class SemanticKnowledgeBundle(BaseModel):
             + tuple(knowledge_case.case_id for knowledge_case in self.cases)
             + tuple(step.step_id for knowledge_case in self.cases for step in knowledge_case.steps)
             + tuple(rule.rule_id for rule in self.guidance)
-            + tuple(example.example_id for example in self.execution_examples)
         )
         if len(set(nested_ids)) != len(nested_ids):
             raise ValueError("artifact IDs must be unique across the semantic bundle")
         if set(self.compilation_manifest.emitted_artifact_ids) != set(nested_ids):
             raise ValueError("compilation manifest IDs must exactly match bundle artifact IDs")
+        example_ids = tuple(example.example_id for example in self.execution_examples)
+        if len(set(example_ids)) != len(example_ids):
+            raise ValueError("execution example IDs must be unique across the semantic bundle")
         parent_ids = {
             reference.artifact_id for reference in self.references
         } | {
