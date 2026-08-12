@@ -863,6 +863,35 @@ class EngagementJournalService:
         )
         return _mutation_result(self._repository, engagement_id, result)
 
+    def append_hook_events(
+        self,
+        engagement_id: UUID,
+        drafts: Sequence[JournalEventDraft],
+        *,
+        expected_revision: JournalRevision | None = None,
+    ) -> EngagementMutationResult:
+        """Append one sealed hook-adapter batch (hook, closure, resolution owners)."""
+        validated = tuple(
+            JournalEventDraft.model_validate(item.model_dump(mode="python"))
+            for item in drafts
+        )
+        allowed_owners = {
+            "hook_adapter",
+            "closure_service",
+            "tool_resolution_service",
+            "recovery_repository",
+        }
+        for draft in validated:
+            owner = EVENT_APPEND_OWNER_BY_TYPE.get(draft.type)
+            if owner not in allowed_owners:
+                raise ValueError(
+                    f"hook batch cannot append {draft.type}; owner is {owner}"
+                )
+        result = self._repository.append_batch(
+            engagement_id, validated, expected_revision=expected_revision
+        )
+        return _mutation_result(self._repository, engagement_id, result)
+
     def request_close(
         self,
         engagement_id: UUID,
@@ -903,6 +932,23 @@ class EngagementJournalService:
     ) -> EvidenceSlice:
         return self._repository.read_evidence_slice(
             engagement_id, evidence_id, offset=offset, limit=limit
+        )
+
+    def write_evidence(
+        self,
+        engagement_id: UUID,
+        data: bytes,
+        *,
+        media_type: str,
+        representation: str,
+        capture_limitations: tuple[Any, ...] = (),
+    ) -> EvidenceReference:
+        return self._repository.write_evidence(
+            engagement_id,
+            data,
+            media_type=media_type,
+            representation=representation,
+            capture_limitations=capture_limitations,
         )
 
     def load_projection(
