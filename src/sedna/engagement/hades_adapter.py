@@ -496,11 +496,13 @@ class HadesEngagementAdapter:
         except Exception:
             return self._error("invalid_input", retryable=False)
         try:
+            scope: AuthorizationScope | None = None
+            if payload.action == "create":
+                scope = self._scope(payload.authorization)
             if payload.action in {"resume", "close", "reopen"}:
                 return self._handle_settlement_action(payload, lane)
             with self._invoke()[2] as service:
                 if payload.action == "create":
-                    scope = self._scope(payload.authorization)
                     created = service.create_engagement(
                         display_name=payload.display_name or "",
                         objective=payload.objective or "",
@@ -1960,6 +1962,17 @@ def _mapped_error(exc: Exception) -> dict[str, Any]:
         return {"ok": False, "error": {"code": "engagement_not_found", "retryable": False}}
     if isinstance(exc, EngagementAmbiguousError):
         return {"ok": False, "error": {"code": "engagement_ambiguous", "retryable": False}}
+    host_code = getattr(exc, "code", None)
+    if isinstance(host_code, str) and host_code in {
+        "invalid_input",
+        "invalid_target",
+        "knowledge_root_required",
+    }:
+        return {"ok": False, "error": {"code": host_code, "retryable": False}}
+    if "invalid_target" in str(exc).lower():
+        return {"ok": False, "error": {"code": "invalid_target", "retryable": False}}
+    if "unauthorized" in str(exc).lower():
+        return {"ok": False, "error": {"code": "unauthorized_scope", "retryable": False}}
     if "proposal" in name.lower() or "proposal" in str(exc).lower():
         return {"ok": False, "error": {"code": "proposal_not_found", "retryable": False}}
     if "revision" in name.lower() or "conflict" in name.lower():

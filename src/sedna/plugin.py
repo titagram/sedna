@@ -12,6 +12,7 @@ from typing import Annotated, Any, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from sedna.engagement.hades_adapter import HadesEngagementAdapter
 from sedna.knowledge.hades_runtime import HadesKnowledgeRuntime
 from sedna.knowledge.retrieval import (
     AuthorizationScope,
@@ -239,6 +240,10 @@ def register(ctx: Any) -> None:
         input_model=_MaintenanceInput,
         handler=_maintenance_handler,
     )
+    HadesEngagementAdapter(
+        ctx,
+        root_resolver=lambda: _knowledge_root(ctx, None),
+    ).register()
 
 
 def _register_knowledge_tool(
@@ -470,14 +475,20 @@ def _default_knowledge_root() -> Path:
 
 def _knowledge_root(ctx: Any, explicit: str | None) -> Path:
     if explicit is not None:
-        return _validated_root(explicit, error_code="invalid_input")
+        root = _validated_root(explicit, error_code="invalid_input")
+        if not root.is_absolute():
+            raise _ToolBoundaryError("invalid_input")
+        return root
     try:
         configured = ctx.sedna_knowledge_root
     except AttributeError:
         return _default_knowledge_root()
     except Exception as error:
         raise _ToolBoundaryError("knowledge_runtime_unavailable") from error
-    return _validated_root(configured, error_code="invalid_input")
+    root = _validated_root(configured, error_code="invalid_input")
+    if not root.is_absolute():
+        raise _ToolBoundaryError("invalid_input")
+    return root
 
 
 def _require_external_knowledge_root(source_path: Path, knowledge_root: Path) -> None:

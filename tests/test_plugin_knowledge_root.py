@@ -24,9 +24,13 @@ class _Context:
         if configured_root is not None:
             self.sedna_knowledge_root = configured_root
         self.tools: list[dict[str, Any]] = []
+        self.hooks: dict[str, list] = {}
 
     def register_tool(self, **kwargs: Any) -> None:
         self.tools.append(kwargs)
+
+    def register_hook(self, name: str, callback) -> None:
+        self.hooks.setdefault(name, []).append(callback)
 
 
 def _call(context: _Context, name: str, payload: object) -> dict[str, Any]:

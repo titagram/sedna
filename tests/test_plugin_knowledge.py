@@ -29,6 +29,7 @@ class _FakeContext:
         if knowledge_root is not None:
             self.sedna_knowledge_root = knowledge_root
         self.tools: list[dict[str, Any]] = []
+        self.hooks: dict[str, list] = {}
 
     @property
     def llm(self) -> object:
@@ -38,6 +39,9 @@ class _FakeContext:
 
     def register_tool(self, **kwargs: Any) -> None:
         self.tools.append(kwargs)
+
+    def register_hook(self, name: str, callback) -> None:
+        self.hooks.setdefault(name, []).append(callback)
 
 
 class _SingleLookupHost:

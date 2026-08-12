@@ -1,8 +1,8 @@
 manifest_version: 1
 name: sedna
-version: "0.1.0"
+version: "0.2.0"
 kind: standalone
-description: "HTB/CTF strategic knowledge learning, retrieval, and safe Nmap wrappers."
+description: "HTB/CTF strategic knowledge learning, retrieval, safe Nmap wrappers (deprecated operational compatibility), and persistent engagement journals."
 author: Gabriele
 provides_tools:
   - sedna_nmap_tcp_discovery
@@ -11,3 +11,16 @@ provides_tools:
   - sedna_retrieve_knowledge
   - sedna_get_knowledge_artifact
   - sedna_knowledge_maintenance
+  - sedna_manage_engagement
+  - sedna_record_decision
+  - sedna_add_source
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+  - pre_llm_call
+  - on_session_start
+  - on_session_end
+  - on_session_finalize
+  - on_session_reset
+  - subagent_start
+  - subagent_stop
