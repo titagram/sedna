@@ -177,3 +177,38 @@ Third-party corpora are evaluated as pinned, untrusted reference sources rather
 than installed as agent instructions. See the
 [Claude-Red integration assessment](docs/architecture/2026-08-06-claude-red-integration-assessment.md)
 for the proposed source adapter, Hades boundary, quality gates, and pilot rollout.
+
+## M6A Engagement Journal
+
+Since `0.2.0`, the plugin registers persistent engagement control tools
+(`sedna_manage_engagement`, `sedna_record_decision`, `sedna_add_source`) and nine
+observer hooks that retain host tool calls, results, decisions, and session checkpoints
+inside a crash-safe local journal per engagement.
+
+- **Root layout.** Engagements live under the selected knowledge root in
+  `engagements/<engagement-uuid>/`: `events.jsonl` (append-only, hash-chained events),
+  `manifest.json`, `engagement-state.json` (M6A projection; M6B owns a richer `state.json`),
+  `evidence/` (private blobs, session logbooks), and a `journal-head.json` commit anchor.
+- **Explicit proofs.** `create` accepts explicit `required_proofs` (flag/access/custom).
+  An empty list means *no proofs declared*, never "already complete".
+- **Privacy.** Evidence blobs and logbooks are private to the engagement. Provider or host
+  secrets are redacted before persistence and carry `capture_limitations`; proofs never
+  appear in manifests, semantic bundles, retrieval inputs, `sources.md`, or public tool
+  responses.
+- **Session logbooks.** Each host session gets an inert, fence-protected rendered logbook
+  with inline evidence and revision markers; the projection is rebuilt after every
+  authoritative append.
+- **Hooks.** Control tools emit only a versioned `control_tool_invoked` marker; operational
+  tools are correlated, argument-sidecarred, and completed with their original result.
+  Correlation is by stable tool-call identity when available, otherwise bounded and
+  explicitly uncertain.
+- **Recovery.** A partial trailing JSON record (host crash mid-write) is recovered
+  atomically into a typed `recovery_warning` with quarantined tail evidence; orphaned
+  in-flight calls are terminated explicitly via `resolve_call`.
+- **Boundaries.** All paths are absolute; relative roots fail closed. The M6A adapter
+  performs one settlement per operation through an optional host port (M6B), and `closing`
+  state awaits the M6C finalizer; M6A itself has no planner and no final proof
+  verification.
+
+The LLM-facing operating contract with complete JSON examples is in the
+[Sedna engagement tools guide](docs/llm/sedna-engagement-tools.md).
