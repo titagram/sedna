@@ -466,3 +466,101 @@ def test_projection_rejects_conflicting_duplicate_nested_step_ids():
 
     with pytest.raises(ValueError, match="unique"):
         project_semantic_bundle(corrupt_bundle)
+
+
+def _bundle_with_example(
+    command: str = "sedna-command-not-searchable-7f31 {{target}}",
+) -> SemanticKnowledgeBundle:
+    from sedna.knowledge.schema.execution import (
+        ExecutionExample,
+        ExecutionPlaceholder,
+    )
+
+    bundle = _bundle()
+    example = ExecutionExample(
+        schema_version="1",
+        example_id="execution-example-probe",
+        parent_artifact_id="reference-http",
+        command_template=command,
+        placeholders=(
+            ExecutionPlaceholder(
+                name="target",
+                kind="target",
+                binding_policy="authorized_scope",
+                role="authorized HTTP target",
+            ),
+        ),
+        capability_hint="http.inspect",
+        purpose="Inspect HTTP response metadata.",
+        observed_role="Gathered response evidence in the source case.",
+        source_refs=(_source_ref(),),
+        extraction=_extraction(),
+        requires_validation=True,
+    )
+    manifest = bundle.compilation_manifest.model_copy(
+        update={
+            "emitted_execution_example_ids": (example.example_id,),
+            "execution_example_schema_version": "1",
+        }
+    )
+    return bundle.model_copy(
+        update={
+            "compilation_manifest": manifest,
+            "execution_examples": (example,),
+        }
+    )
+
+
+def test_execution_example_marker_never_appears_in_searchable_projection() -> None:
+    from sedna.knowledge.retrieval.projection import project_semantic_bundle
+
+    bundle = _bundle_with_example()
+    projection = project_semantic_bundle(bundle)
+    marker = "sedna-command-not-searchable-7f31"
+    blob = json.dumps(
+        [row.model_dump(mode="json") for row in projection],
+        ensure_ascii=False,
+    )
+    assert marker not in blob
+
+
+def test_execution_example_locators_are_projected_by_id_only() -> None:
+    from sedna.knowledge.retrieval.models import ExecutionExampleLocator
+    from sedna.knowledge.retrieval.projection import (
+        project_execution_example_locators,
+    )
+
+    bundle = _bundle_with_example()
+    locators = project_execution_example_locators(bundle)
+    assert locators == (
+        ExecutionExampleLocator(
+            example_id="execution-example-probe",
+            parent_artifact_id="reference-http",
+            source_id=bundle.source_id,
+        ),
+    )
+
+
+def test_legacy_bundle_projects_zero_locators_and_null_capability() -> None:
+    from sedna.knowledge.retrieval.projection import (
+        project_execution_example_locators,
+        project_source_state,
+    )
+
+    legacy = _bundle().model_copy(
+        update={
+            "schema_version": "2.4.0",
+            "compilation_manifest": _bundle().compilation_manifest.model_copy(
+                update={
+                    "compiler_version": "8",
+                    "extractor_prompt_version": "1",
+                    "critic_prompt_version": "1",
+                    "repair_prompt_version": "1",
+                }
+            ),
+        }
+    )
+    state = project_source_state(legacy)
+    assert project_execution_example_locators(legacy) == ()
+    assert state.execution_example_schema_version is None
+    assert state.execution_examples == ()

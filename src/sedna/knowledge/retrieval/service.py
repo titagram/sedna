@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import cast
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
@@ -11,6 +12,9 @@ from sedna.knowledge.retrieval import ranking
 from sedna.knowledge.retrieval.models import (
     AuthorizationState,
     EpistemicLane,
+    ExecutionExampleCoverageCode,
+    ExecutionExampleCoverageGap,
+    ExecutionExampleDrilldown,
     IndexCandidate,
     IndexedArtifact,
     KnowledgeGap,
@@ -27,6 +31,7 @@ _ARTIFACT_TYPES = (ReferenceArtifact, KnowledgeCase, CaseStep, DecisionRule)
 _RESULT_REJECTION_LIMIT = 64
 _GAP_ITEM_LIMIT = 32
 _OBSERVED_DOMAIN_LIMIT = 2048
+_LEGACY_SEMANTIC_SCHEMA = "2.4.0"
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +40,72 @@ class KnowledgeRetrievalService:
 
     index: RetrievalIndex
     revision_guard: Callable[[], str] | None = None
+    execution_example_loader: Callable[..., tuple[object, ...]] | None = None
+
+    def get_execution_examples(self, parent_artifact_id: str) -> ExecutionExampleDrilldown:
+        """Return one parent's bundle-owned examples or an exact typed coverage gap."""
+        canonical_parent = _strict_artifact_id(parent_artifact_id)
+        try:
+            revision = self._read_revision()
+            locators = self.index.get_execution_example_locators(canonical_parent)
+            if locators:
+                if self.execution_example_loader is None:
+                    raise ValueError("execution example loader is not configured")
+                source_id = locators[0].source_id
+                if any(locator.source_id != source_id for locator in locators):
+                    raise ValueError("locators span multiple sources")
+                example_ids = tuple(locator.example_id for locator in locators)
+                examples = tuple(
+                    self.execution_example_loader(
+                        source_id,
+                        parent_artifact_id=canonical_parent,
+                        example_ids=example_ids,
+                    )
+                )
+                self._require_revision(revision)
+                self._validate_drilldown(canonical_parent, source_id, example_ids, examples)
+                return ExecutionExampleDrilldown(
+                    parent_artifact_id=canonical_parent,
+                    examples=examples,
+                )
+            capability = self.index.get_source_capability(canonical_parent)
+            if capability == _LEGACY_SEMANTIC_SCHEMA:
+                return ExecutionExampleDrilldown(
+                    parent_artifact_id=canonical_parent,
+                    coverage_gap=ExecutionExampleCoverageGap(
+                        code=ExecutionExampleCoverageCode.LEGACY_BUNDLE_WITHOUT_EXAMPLES,
+                        source_id=canonical_parent,
+                        semantic_schema_version=capability,
+                        explanation=(
+                            "the legacy bundle could not represent execution examples"
+                        ),
+                    ),
+                )
+            self._require_revision(revision)
+            return ExecutionExampleDrilldown(parent_artifact_id=canonical_parent)
+        except Exception:
+            raise RuntimeError("execution example drill-down failed") from None
+
+    def _validate_drilldown(
+        self,
+        parent_artifact_id: str,
+        source_id: str,
+        example_ids: tuple[str, ...],
+        examples: tuple[object, ...],
+    ) -> None:
+
+        canonical = tuple(
+            _strict_example(example) for example in examples
+        )
+        if any(
+            example.parent_artifact_id != parent_artifact_id
+            or example.example_id not in example_ids
+            for example in canonical
+        ):
+            raise ValueError("execution example drill-down identity mismatch")
+        if set(example_ids) != {example.example_id for example in canonical}:
+            raise ValueError("execution example IDs must exactly match the locators")
+        del source_id
 
     def retrieve(self, query: RetrievalQuery) -> RetrievalResult:
         """Return lane-local knowledge or an explicit pre-backend/knowledge gap."""
@@ -244,6 +315,21 @@ def _strict_artifact_id(artifact_id: str) -> str:
         return _ARTIFACT_ID.validate_python(artifact_id)
     except ValidationError as error:
         raise ValueError("artifact_id must be a bounded canonical identifier") from error
+
+
+def _strict_example(example: object):
+    from sedna.knowledge.schema.execution import ExecutionExample
+
+    if type(example) is ExecutionExample:
+        return example
+    if not isinstance(example, BaseModel):
+        raise ValueError("execution example must be a strict model")
+    model = cast(BaseModel, example)
+    payload = model.model_dump(mode="json", warnings="error")
+    try:
+        return ExecutionExample.model_validate(payload)
+    except (TypeError, ValueError) as error:
+        raise ValueError("execution example must be a strict canonical record") from error
 
 
 def _artifact_identity(artifact: BaseModel) -> str:

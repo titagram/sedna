@@ -496,3 +496,84 @@ def test_get_artifact_masks_backend_errors_and_rejects_unsafe_or_wrong_output() 
     wrong = cast(IndexedArtifact, _reference("different-reference"))
     with pytest.raises(RuntimeError, match="knowledge artifact lookup failed"):
         _service(_RecordingIndex(artifact=wrong)).get_artifact("lookup-reference")
+
+
+def test_get_execution_examples_drilldown_returns_examples_or_gap() -> None:
+    from sedna.knowledge.retrieval.models import (
+        ExecutionExampleCoverageGap,
+        ExecutionExampleDrilldown,
+        ExecutionExampleLocator,
+    )
+    from sedna.knowledge.schema.execution import ExecutionExample
+
+    class _DrillIndex(_RecordingIndex):
+        def __init__(self, locators: tuple, *, source_capability: str) -> None:
+            super().__init__()
+            self.locators = locators
+            self.source_capability = source_capability
+
+        def get_execution_example_locators(self, parent_artifact_id: str):
+            return self.locators
+
+        def get_source_capability(self, source_id: str) -> str:
+            return self.source_capability
+
+    locator = ExecutionExampleLocator(
+        example_id="execution-example-probe",
+        parent_artifact_id="reference-http",
+        source_id="source-a",
+    )
+    example = ExecutionExample(
+        schema_version="1",
+        example_id="execution-example-probe",
+        parent_artifact_id="reference-http",
+        command_template="curl -i {{target}}",
+        placeholders=(
+            {
+                "name": "target",
+                "kind": "target",
+                "binding_policy": "authorized_scope",
+                "role": "authorized HTTP target",
+            },
+        ),
+        capability_hint="http.inspect",
+        purpose="Inspect HTTP response metadata.",
+        observed_role="Gathered response evidence in the source case.",
+        source_refs=(
+            {
+                "source_id": "source-a",
+                "path": "walkthrough.md",
+                "location": {"page": 1},
+            },
+        ),
+        extraction={
+            "schema_version": "1",
+            "parser_id": "p",
+            "parser_version": "1",
+            "extractor_id": "e",
+            "extractor_version": "1",
+            "model_id": "m",
+            "model_version": "1",
+        },
+        requires_validation=True,
+    )
+
+    from sedna.knowledge.retrieval.service import KnowledgeRetrievalService as DrillService
+
+    service = DrillService(
+        index=_DrillIndex((locator,), source_capability="1"),
+        execution_example_loader=lambda source_id, parent_artifact_id, example_ids: (
+            (example,) if parent_artifact_id == "reference-http" else ()
+        ),
+    )
+    drilldown = service.get_execution_examples("reference-http")
+    assert isinstance(drilldown, ExecutionExampleDrilldown)
+    assert [item.example_id for item in drilldown.examples] == [example.example_id]
+
+    legacy = DrillService(
+        index=_DrillIndex((), source_capability="2.4.0"),
+    )
+    gap = legacy.get_execution_examples("reference-http")
+    assert gap.coverage_gap is not None
+    assert gap.coverage_gap.code.value == "legacy_bundle_without_examples"
+    assert isinstance(gap.coverage_gap, ExecutionExampleCoverageGap)

@@ -10,7 +10,12 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from sedna.knowledge.parsing.sanitize import sanitize_searchable_text
-from sedna.knowledge.retrieval.models import IndexedArtifactState, IndexedSourceState
+from sedna.knowledge.retrieval.models import (
+    ExecutionExampleLocator,
+    IndexedArtifactState,
+    IndexedExecutionExampleState,
+    IndexedSourceState,
+)
 from sedna.knowledge.schema import (
     ArtifactType,
     CaseStep,
@@ -31,7 +36,7 @@ from sedna.knowledge.schema.common import SearchableNonEmptyString, SearchableSt
 from sedna.knowledge.schema.context import ContextRelation
 
 _MAX_FTS_COLUMN_CHARS = 8_192
-SOURCE_PROJECTION_VERSION = "canonical-projection-v2"
+SOURCE_PROJECTION_VERSION = "canonical-projection-v3"
 
 
 class ProjectedFacet(BaseModel):
@@ -181,6 +186,18 @@ def project_semantic_bundle(bundle: SemanticKnowledgeBundle) -> tuple[ProjectedA
 def project_source_state(bundle: SemanticKnowledgeBundle) -> IndexedSourceState:
     """Bind one canonical source hash to its deterministic complete artifact projection."""
     projection = project_semantic_bundle(bundle)
+    examples = tuple(
+        sorted(
+            (
+                IndexedExecutionExampleState(
+                    example_id=example.example_id,
+                    parent_artifact_id=example.parent_artifact_id,
+                )
+                for example in bundle.execution_examples
+            ),
+            key=lambda item: item.example_id,
+        )
+    )
     return IndexedSourceState.from_artifacts(
         source_id=bundle.source_id,
         source_sha256=bundle.source_sha256,
@@ -188,7 +205,27 @@ def project_source_state(bundle: SemanticKnowledgeBundle) -> IndexedSourceState:
         artifacts=tuple(
             _projected_artifact_state(bundle.source_id, artifact) for artifact in projection
         ),
+        execution_examples=examples,
+        semantic_schema_version=bundle.schema_version,
+        execution_example_schema_version=(
+            bundle.compilation_manifest.execution_example_schema_version
+        ),
     )
+
+
+def project_execution_example_locators(
+    bundle: SemanticKnowledgeBundle,
+) -> tuple[ExecutionExampleLocator, ...]:
+    """Project ID-only lookup locators; command text is never projected."""
+    locators = tuple(
+        ExecutionExampleLocator(
+            example_id=example.example_id,
+            parent_artifact_id=example.parent_artifact_id,
+            source_id=bundle.source_id,
+        )
+        for example in bundle.execution_examples
+    )
+    return tuple(sorted(locators, key=lambda item: item.example_id))
 
 
 def _projected_artifact_state(

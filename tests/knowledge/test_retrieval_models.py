@@ -920,6 +920,14 @@ class _IndexDouble:
     def get_artifact(self, artifact_id: str) -> object | None:
         return None
 
+    def get_execution_example_locators(self, parent_artifact_id: str) -> tuple[object, ...]:
+        del parent_artifact_id
+        return ()
+
+    def get_source_capability(self, source_id: str) -> object | None:
+        del source_id
+        return None
+
     def list_source_states(
         self,
         *,
@@ -953,3 +961,54 @@ class _IndexDouble:
         traceback: object | None,
     ) -> None:
         return None
+
+
+def test_source_projection_digest_changes_when_example_states_change() -> None:
+    from sedna.knowledge.retrieval.models import (
+        IndexedArtifactState,
+        IndexedExecutionExampleState,
+        IndexedSourceState,
+        source_projection_digest,
+    )
+
+    artifact = IndexedArtifactState(
+        artifact_id="reference-http",
+        projection_digest="a" * 64,
+        asserted_projection_digest="a" * 64,
+    )
+    first = IndexedSourceState.from_artifacts(
+        source_id="source-a",
+        source_sha256="b" * 64,
+        projection_version="canonical-projection-v3",
+        artifacts=(artifact,),
+        execution_examples=(
+            IndexedExecutionExampleState(
+                example_id="example-1", parent_artifact_id="reference-http"
+            ),
+        ),
+        semantic_schema_version="2.5.0",
+        execution_example_schema_version="1",
+    )
+    second = IndexedSourceState.from_artifacts(
+        source_id="source-a",
+        source_sha256="b" * 64,
+        projection_version="canonical-projection-v3",
+        artifacts=(artifact,),
+        execution_examples=(
+            IndexedExecutionExampleState(
+                example_id="example-2", parent_artifact_id="reference-http"
+            ),
+        ),
+        semantic_schema_version="2.5.0",
+        execution_example_schema_version="1",
+    )
+    assert first.projection_digest != second.projection_digest
+    assert source_projection_digest(
+        "source-a",
+        "b" * 64,
+        "canonical-projection-v3",
+        (artifact,),
+        execution_examples=first.execution_examples,
+        semantic_schema_version="2.5.0",
+        execution_example_schema_version="1",
+    ) == first.projection_digest

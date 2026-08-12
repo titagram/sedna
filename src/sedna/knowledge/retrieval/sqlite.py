@@ -21,10 +21,12 @@ from pydantic import TypeAdapter, ValidationError
 
 from sedna.knowledge.retrieval.models import (
     EpistemicLane,
+    ExecutionExampleLocator,
     IndexAudit,
     IndexCandidate,
     IndexedArtifact,
     IndexedArtifactState,
+    IndexedExecutionExampleState,
     IndexedSourceState,
     IndexStateSnapshot,
     RetrievalQuery,
@@ -42,8 +44,9 @@ from sedna.knowledge.schema import (
     ReferenceArtifact,
     SemanticKnowledgeBundle,
 )
+from sedna.knowledge.semantic.compiler import SEMANTIC_SCHEMA_VERSION
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _MAX_LIMIT = 100
 _FTS_FIELDS = (
     "statement",
@@ -61,7 +64,9 @@ CREATE TABLE indexed_sources (
     source_sha256 TEXT NOT NULL CHECK(length(source_sha256) = 64),
     artifact_count INTEGER NOT NULL CHECK(artifact_count >= 0),
     projection_version TEXT NOT NULL,
-    projection_digest TEXT NOT NULL CHECK(length(projection_digest) = 64)
+    projection_digest TEXT NOT NULL CHECK(length(projection_digest) = 64),
+    semantic_schema_version TEXT NOT NULL,
+    execution_example_schema_version TEXT
 );
 
 CREATE TABLE artifacts (
@@ -117,6 +122,15 @@ CREATE TABLE artifact_sources (
     )
 );
 
+CREATE TABLE execution_example_lookup (
+    example_id TEXT PRIMARY KEY,
+    parent_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+    owner_source_id TEXT NOT NULL REFERENCES indexed_sources(source_id) ON DELETE CASCADE
+);
+
+CREATE INDEX execution_example_parent_idx
+ON execution_example_lookup(parent_artifact_id, example_id);
+
 CREATE TABLE index_metadata (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     generation INTEGER NOT NULL CHECK(generation >= 0)
@@ -154,6 +168,15 @@ _REQUIRED_SCHEMA_COLUMNS = {
             "artifact_count",
             "projection_version",
             "projection_digest",
+            "semantic_schema_version",
+            "execution_example_schema_version",
+        }
+    ),
+    "execution_example_lookup": frozenset(
+        {
+            "example_id",
+            "parent_artifact_id",
+            "owner_source_id",
         }
     ),
     "artifacts": frozenset(
@@ -420,6 +443,42 @@ class SQLiteRetrievalIndex:
                 self._clear_unavailable_marker()
                 self._durable_unavailable = False
                 return audit
+
+    def get_execution_example_locators(
+        self, parent_artifact_id: str
+    ) -> tuple[ExecutionExampleLocator, ...]:
+        """Return ID-only lookup rows for one exact parent; command text is never stored."""
+        self._require_available()
+        parent_artifact_id = _validated_identifier(parent_artifact_id, "artifact_id")
+        with self._read_snapshot() as connection:
+            rows = connection.execute(
+                "SELECT example_id, parent_artifact_id, owner_source_id "
+                "FROM execution_example_lookup WHERE parent_artifact_id = ? "
+                "ORDER BY example_id",
+                (parent_artifact_id,),
+            ).fetchall()
+        return tuple(
+            ExecutionExampleLocator(
+                example_id=row[0],
+                parent_artifact_id=row[1],
+                source_id=row[2],
+            )
+            for row in rows
+        )
+
+    def get_source_capability(self, source_id: str) -> str | None:
+        """Return the indexed source's semantic schema version, or None when absent."""
+        self._require_available()
+        source_id = _validated_source_id(source_id)
+        with self._read_snapshot() as connection:
+            row = connection.execute(
+                "SELECT semantic_schema_version FROM indexed_sources "
+                "WHERE source_id = ?",
+                (source_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return row[0]
 
     def get_artifact(self, artifact_id: str) -> IndexedArtifact | None:
         """Return one deeply reconstructed canonical artifact by exact identity."""
@@ -773,6 +832,16 @@ class SQLiteRetrievalIndex:
         asserted_projection_version: str,
         asserted_projection_digest: str,
     ) -> IndexedSourceState:
+        capability = connection.execute(
+            "SELECT semantic_schema_version, execution_example_schema_version "
+            "FROM indexed_sources WHERE source_id = ?",
+            (source_id,),
+        ).fetchone()
+        example_rows = connection.execute(
+            "SELECT example_id, parent_artifact_id FROM execution_example_lookup "
+            "WHERE owner_source_id = ? ORDER BY example_id",
+            (source_id,),
+        ).fetchall()
         artifacts = tuple(
             IndexedArtifactState(
                 artifact_id=row["artifact_id"],
@@ -792,6 +861,23 @@ class SQLiteRetrievalIndex:
             asserted_artifact_count=asserted_artifact_count,
             asserted_projection_version=asserted_projection_version,
             asserted_projection_digest=asserted_projection_digest,
+            execution_examples=tuple(
+                IndexedExecutionExampleState(
+                    example_id=row["example_id"],
+                    parent_artifact_id=row["parent_artifact_id"],
+                )
+                for row in example_rows
+            ),
+            semantic_schema_version=(
+                capability["semantic_schema_version"]
+                if capability is not None
+                else SEMANTIC_SCHEMA_VERSION
+            ),
+            execution_example_schema_version=(
+                capability["execution_example_schema_version"]
+                if capability is not None
+                else None
+            ),
         )
 
     @contextmanager
@@ -821,6 +907,10 @@ class SQLiteRetrievalIndex:
         connection.execute(
             "DELETE FROM artifact_fts WHERE artifact_id IN "
             "(SELECT artifact_id FROM artifacts WHERE owner_source_id = ?)",
+            (source_id,),
+        )
+        connection.execute(
+            "DELETE FROM execution_example_lookup WHERE owner_source_id = ?",
             (source_id,),
         )
         connection.execute("DELETE FROM artifacts WHERE owner_source_id = ?", (source_id,))
@@ -855,8 +945,9 @@ class SQLiteRetrievalIndex:
             """
             INSERT INTO indexed_sources(
                 source_id, source_sha256, artifact_count,
-                projection_version, projection_digest
-            ) VALUES (?, ?, ?, ?, ?)
+                projection_version, projection_digest,
+                semantic_schema_version, execution_example_schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 source_id,
@@ -864,6 +955,8 @@ class SQLiteRetrievalIndex:
                 len(projection),
                 source_state.projection_version,
                 source_state.projection_digest,
+                source_state.semantic_schema_version,
+                source_state.execution_example_schema_version,
             ),
         )
         digest_by_artifact = {
@@ -970,6 +1063,17 @@ class SQLiteRetrievalIndex:
                     (link.from_artifact_id, link.relation, link.to_artifact_id)
                     for link in artifact.links
                 ),
+            )
+
+
+        for example in source_state.execution_examples:
+            connection.execute(
+                """
+                INSERT INTO execution_example_lookup(
+                    example_id, parent_artifact_id, owner_source_id
+                ) VALUES (?, ?, ?)
+                """,
+                (example.example_id, example.parent_artifact_id, source_id),
             )
 
     def _reconstruct_artifact(self, artifact_id: str, canonical_json: str) -> IndexedArtifact:

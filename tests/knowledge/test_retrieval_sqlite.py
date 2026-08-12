@@ -104,7 +104,7 @@ def test_schema_uses_fts5_foreign_keys_indexes_and_a_version(tmp_path: Path) -> 
         connection = index._connection
         assert connection is not None
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         tables = {
             row[0]: row[1]
             for row in connection.execute(
@@ -117,6 +117,7 @@ def test_schema_uses_fts5_foreign_keys_indexes_and_a_version(tmp_path: Path) -> 
             "artifact_links",
             "artifact_sources",
             "indexed_sources",
+            "execution_example_lookup",
         } <= tables.keys()
         assert "USING fts5" in tables["artifact_fts"]
         indexes = {
@@ -129,6 +130,7 @@ def test_schema_uses_fts5_foreign_keys_indexes_and_a_version(tmp_path: Path) -> 
             "facet_values_lookup_idx",
             "artifact_links_target_idx",
             "artifact_sources_source_idx",
+            "execution_example_parent_idx",
         } <= indexes
         assert [
             row[0] for row in connection.execute("SELECT DISTINCT canonical_path FROM artifacts")

@@ -29,7 +29,9 @@ from sedna.knowledge.schema import (
     SourceRef,
 )
 from sedna.knowledge.schema.common import SearchableNonEmptyString, SearchableString
+from sedna.knowledge.schema.execution import ExecutionExample
 from sedna.knowledge.schema.manifest import Sha256
+from sedna.knowledge.semantic.compiler import SEMANTIC_SCHEMA_VERSION
 
 Term: TypeAlias = Annotated[SearchableNonEmptyString, Field(max_length=512)]
 FacetNamespace: TypeAlias = Annotated[SearchableNonEmptyString, Field(max_length=128)]
@@ -867,6 +869,15 @@ class IndexedArtifactState(BaseModel):
     asserted_projection_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 
+class IndexedExecutionExampleState(BaseModel):
+    """Backend-neutral identity of one indexed execution-example lookup row."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    example_id: Annotated[SearchableNonEmptyString, Field(max_length=2048)]
+    parent_artifact_id: Annotated[SearchableNonEmptyString, Field(max_length=2048)]
+
+
 class IndexedSourceState(BaseModel):
     """Bounded, backend-neutral identity of one complete source projection."""
 
@@ -880,6 +891,15 @@ class IndexedSourceState(BaseModel):
     asserted_artifact_count: int = Field(ge=0, le=10_000_000)
     asserted_projection_version: Annotated[SearchableNonEmptyString, Field(max_length=128)]
     asserted_projection_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    semantic_schema_version: Annotated[SearchableNonEmptyString, Field(max_length=128)] = (
+        SEMANTIC_SCHEMA_VERSION
+    )
+    execution_example_schema_version: Annotated[
+        SearchableNonEmptyString | None, Field(max_length=128)
+    ] = None
+    execution_examples: tuple[IndexedExecutionExampleState, ...] = Field(
+        default=(), max_length=_MAX_SOURCE_ARTIFACTS
+    )
     artifacts: tuple[IndexedArtifactState, ...] = Field(
         default=(), max_length=_MAX_SOURCE_ARTIFACTS
     )
@@ -899,11 +919,22 @@ class IndexedSourceState(BaseModel):
             raise ValueError("indexed artifact states must have unique artifact IDs")
         if self.artifact_count != len(self.artifacts):
             raise ValueError("indexed artifact count must match its exact artifact states")
+        if self.execution_examples != tuple(
+            sorted(self.execution_examples, key=lambda item: item.example_id)
+        ):
+            raise ValueError("indexed execution example states must be sorted by example_id")
+        if len({item.example_id for item in self.execution_examples}) != len(
+            self.execution_examples
+        ):
+            raise ValueError("indexed execution example states must have unique example IDs")
         if self.projection_digest != source_projection_digest(
             self.source_id,
             self.source_sha256,
             self.projection_version,
             self.artifacts,
+            execution_examples=self.execution_examples,
+            semantic_schema_version=self.semantic_schema_version,
+            execution_example_schema_version=self.execution_example_schema_version,
         ):
             raise ValueError("indexed source projection digest must match its artifact states")
         return self
@@ -919,6 +950,9 @@ class IndexedSourceState(BaseModel):
         asserted_artifact_count: int | None = None,
         asserted_projection_version: str | None = None,
         asserted_projection_digest: str | None = None,
+        execution_examples: tuple[IndexedExecutionExampleState, ...] = (),
+        semantic_schema_version: str = SEMANTIC_SCHEMA_VERSION,
+        execution_example_schema_version: str | None = None,
     ) -> IndexedSourceState:
         ordered = tuple(sorted(artifacts, key=lambda item: item.artifact_id))
         actual_digest = source_projection_digest(
@@ -926,6 +960,9 @@ class IndexedSourceState(BaseModel):
             source_sha256,
             projection_version,
             ordered,
+            execution_examples=execution_examples,
+            semantic_schema_version=semantic_schema_version,
+            execution_example_schema_version=execution_example_schema_version,
         )
         return cls(
             source_id=source_id,
@@ -944,6 +981,9 @@ class IndexedSourceState(BaseModel):
             asserted_projection_digest=(
                 actual_digest if asserted_projection_digest is None else asserted_projection_digest
             ),
+            semantic_schema_version=semantic_schema_version,
+            execution_example_schema_version=execution_example_schema_version,
+            execution_examples=execution_examples,
             artifacts=ordered,
         )
 
@@ -990,6 +1030,10 @@ def source_projection_digest(
     source_sha256: str,
     projection_version: str,
     artifacts: Iterable[IndexedArtifactState],
+    *,
+    execution_examples: Iterable[IndexedExecutionExampleState] = (),
+    semantic_schema_version: str = SEMANTIC_SCHEMA_VERSION,
+    execution_example_schema_version: str | None = None,
 ) -> str:
     """Compute the backend-neutral aggregate digest for exact artifact projections."""
     payload = json.dumps(
@@ -997,6 +1041,17 @@ def source_projection_digest(
             "source_id": source_id,
             "source_sha256": source_sha256,
             "projection_version": projection_version,
+            "semantic_schema_version": semantic_schema_version,
+            "execution_example_schema_version": execution_example_schema_version,
+            "execution_examples": [
+                {
+                    "example_id": example.example_id,
+                    "parent_artifact_id": example.parent_artifact_id,
+                }
+                for example in sorted(
+                    execution_examples, key=lambda item: item.example_id
+                )
+            ],
             "artifacts": [
                 {
                     "artifact_id": artifact.artifact_id,
@@ -1067,7 +1122,53 @@ def _target_ip_address(
     return None
 
 
+
+
+class ExecutionExampleLocator(BaseModel):
+    """ID-only lookup identity for one bundle-owned execution example."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    example_id: Annotated[SearchableNonEmptyString, Field(max_length=2048)]
+    parent_artifact_id: Annotated[SearchableNonEmptyString, Field(max_length=2048)]
+    source_id: Annotated[SearchableNonEmptyString, Field(max_length=512)]
+
+
+class ExecutionExampleCoverageCode(StrEnum):
+    LEGACY_BUNDLE_WITHOUT_EXAMPLES = "legacy_bundle_without_examples"
+    SOURCE_EXAMPLES_UNAVAILABLE = "source_examples_unavailable"
+
+
+class ExecutionExampleCoverageGap(BaseModel):
+    """A typed coverage gap when no example drill-down is possible."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    code: ExecutionExampleCoverageCode
+    source_id: Annotated[SearchableNonEmptyString, Field(max_length=512)]
+    semantic_schema_version: Annotated[SearchableNonEmptyString, Field(max_length=128)]
+    explanation: Annotated[SearchableNonEmptyString, Field(max_length=2048)]
+
+
+class ExecutionExampleDrilldown(BaseModel):
+    """One parent's bundle-owned examples or an exact typed coverage gap."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    parent_artifact_id: Annotated[SearchableNonEmptyString, Field(max_length=2048)]
+    examples: tuple[ExecutionExample, ...] = ()
+    coverage_gap: ExecutionExampleCoverageGap | None = None
+
+    @model_validator(mode="after")
+    def validate_exclusive(self) -> ExecutionExampleDrilldown:
+        if self.examples and self.coverage_gap is not None:
+            raise ValueError("examples and coverage gap are mutually exclusive")
+        return self
+
+
+
 @runtime_checkable
+
 class RetrievalIndex(Protocol):
     """Backend-neutral protocol for disposable projections of canonical bundles."""
 
@@ -1087,6 +1188,12 @@ class RetrievalIndex(Protocol):
     ) -> IndexAudit: ...
 
     def get_artifact(self, artifact_id: str) -> IndexedArtifact | None: ...
+
+    def get_execution_example_locators(
+        self, parent_artifact_id: str
+    ) -> tuple[ExecutionExampleLocator, ...]: ...
+
+    def get_source_capability(self, source_id: str) -> str | None: ...
 
     def list_source_states(
         self,
