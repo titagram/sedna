@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -16,15 +17,21 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sedna.engagement.events import (
     CONTROL_TOOL_NAMES,
     CONTROL_TOOL_POLICY_VERSION,
+    ClosureCancelledPayload,
     ControlToolInvokedPayload,
     EvidenceAttachedPayload,
+    EvidenceCaptureFailedPayload,
     JournalEventDraft,
     SessionCheckpointedPayload,
     SessionFinalizedPayload,
     SessionStartedPayload,
+    SystemCorrelation,
     ToolCallCompletedPayload,
     ToolCallStartedPayload,
     ToolCorrelation,
+    UncertainCorrelationPayload,
+    UnmatchedToolCompletionPayload,
+    UnplannedActionPayload,
 )
 from sedna.engagement.models import (
     MAX_HEALTH_ENTRIES_PER_STORE,
@@ -51,7 +58,9 @@ from sedna.engagement.normalization import (
 )
 from sedna.engagement.service import (
     EngagementJournalService,
+    EngagementSettlementOutcome,
     EngagementSettlementPortFactory,
+    SettlementReason,
 )
 from sedna.engagement.sources import (
     SharedSourceEntry,
@@ -381,16 +390,24 @@ class HadesEngagementAdapter:
 
     # -- invocation helpers -----------------------------------------------
 
-    def _invoke(self) -> tuple[Path, str, Any]:
+    def _pin_root(self) -> Path:
+        """Resolve and retain the active root exactly once per invocation."""
         root = self._root_resolver()
         if not isinstance(root, Path):
             raise ValueError("root resolver must return a Path")
         root = root.resolve()
-        store_digest = sha256(str(root).encode("utf-8")).hexdigest()
-        service = EngagementJournalService.open(
-            root, clock=self._clock, uuid_factory=uuid4
+        self._pinned_root = root
+        return root
+
+    def _open_service(self) -> Any:
+        return EngagementJournalService.open(
+            self._pinned_root, clock=self._clock, uuid_factory=uuid4
         )
-        return root, store_digest, service
+
+    def _invoke(self) -> tuple[Path, str, Any]:
+        root = self._pin_root()
+        store_digest = sha256(str(root).encode("utf-8")).hexdigest()
+        return root, store_digest, self._open_service()
 
     def _lane(self, *, session_id: str | None, task_id: str | None) -> Any | None:
         from sedna.engagement.models import ExecutionLaneKey
@@ -447,6 +464,25 @@ class HadesEngagementAdapter:
     def _error(self, code: str, *, retryable: bool = False) -> dict[str, Any]:
         return {"ok": False, "error": {"code": code, "retryable": retryable}}
 
+    def _lane_engagement_id(
+        self,
+        service: EngagementJournalService,
+        explicit: UUID | None,
+        lane: Any,
+    ) -> tuple[UUID | None, bool]:
+        """Resolve an engagement id from the payload or the exact lane binding.
+
+        Returns ``(engagement_id, explicit)``; ``explicit`` is True when the
+        caller supplied a UUID that must equal the lane binding.
+        """
+        if explicit is not None:
+            resolved = service.resolve_lane_binding(lane)
+            if resolved.engagement_id is not None and explicit != resolved.engagement_id:
+                return None, True
+            return explicit, True
+        resolved = service.resolve_lane_binding(lane)
+        return resolved.engagement_id, False
+
     # -- control tool handlers --------------------------------------------
 
     def _handle_manage(self, **kwargs: Any) -> dict[str, Any]:
@@ -460,6 +496,8 @@ class HadesEngagementAdapter:
         except Exception:
             return self._error("invalid_input", retryable=False)
         try:
+            if payload.action in {"resume", "close", "reopen"}:
+                return self._handle_settlement_action(payload, lane)
             with self._invoke()[2] as service:
                 if payload.action == "create":
                     scope = self._scope(payload.authorization)
@@ -513,43 +551,14 @@ class HadesEngagementAdapter:
                             ),
                         }
                     )
-                if payload.action == "close":
-                    if payload.engagement_id is None:
-                        return self._error("engagement_not_found")
-                    result = service.request_close(
-                        payload.engagement_id,
-                        lane=lane,
-                        reason=payload.reason or "manual close",
-                    )
-                    return self._result(
-                        {
-                            "ok": True,
-                            "engagement": self._summary(
-                                service, result.engagement_id
-                            ).model_dump(mode="json"),
-                        }
-                    )
-                if payload.action == "reopen":
-                    if payload.engagement_id is None:
-                        return self._error("engagement_not_found")
-                    result = service.reopen_engagement(
-                        payload.engagement_id,
-                        lane=lane,
-                        reason=payload.reason or "manual reopen",
-                    )
-                    return self._result(
-                        {
-                            "ok": True,
-                            "engagement": self._summary(
-                                service, result.engagement_id
-                            ).model_dump(mode="json"),
-                        }
-                    )
                 if payload.action == "abandon":
-                    if payload.engagement_id is None:
+                    engagement_id, _ = self._lane_engagement_id(
+                        service, payload.engagement_id, lane
+                    )
+                    if engagement_id is None:
                         return self._error("engagement_not_found")
                     result = service.abandon_engagement(
-                        payload.engagement_id,
+                        engagement_id,
                         lane=lane,
                         reason=payload.reason or "manual abandon",
                     )
@@ -562,13 +571,20 @@ class HadesEngagementAdapter:
                         }
                     )
                 if payload.action == "resolve_call":
-                    if payload.engagement_id is None or not payload.call_id:
+                    if not (payload.call_id and payload.resolution and payload.reason):
+                        return self._error("call_not_found")
+                    engagement_id, explicit = self._lane_engagement_id(
+                        service, payload.engagement_id, lane
+                    )
+                    if engagement_id is None:
+                        if explicit:
+                            return self._error("engagement_conflict", retryable=False)
                         return self._error("call_not_found")
                     result = service.terminate_tool_call(
-                        payload.engagement_id,
+                        engagement_id,
                         payload.call_id,
-                        resolution=payload.resolution or "abandoned",
-                        reason=payload.reason or "operator resolution",
+                        resolution=payload.resolution,
+                        reason=payload.reason,
                         lane=lane,
                     )
                     return self._result(
@@ -582,6 +598,85 @@ class HadesEngagementAdapter:
                 return self._error("invalid_transition", retryable=False)
         except Exception as exc:
             return _mapped_error(exc)
+
+    def _handle_settlement_action(
+        self, payload: _ManageEngagementInput, lane: Any
+    ) -> dict[str, Any]:
+        """No-lock settlement sequence for resume, close, and reopen."""
+        root = self._pin_root()
+        if payload.action == "resume":
+            with self._open_service() as service:
+                result = service.resume_engagement(
+                    lane=lane,
+                    engagement_id=payload.engagement_id,
+                    display_name=payload.display_name,
+                    scope=(
+                        self._scope(payload.authorization)
+                        if payload.authorization
+                        else None
+                    ),
+                )
+            outcome = self._settle(root, result.engagement_id, "resume")
+            if outcome.status != "complete":
+                return self._settlement_error(outcome)
+            store_digest = sha256(str(root).encode("utf-8")).hexdigest()
+            with self._open_service() as service:
+                self._rebuild_logbook(
+                    service,
+                    result.engagement_id,
+                    store_digest,
+                    lane.session_id,
+                )
+                return self._result(
+                    {
+                        "ok": True,
+                        "engagement": self._summary(
+                            service, result.engagement_id
+                        ).model_dump(mode="json"),
+                    }
+                )
+        reason: SettlementReason = (
+            "close" if payload.action == "close" else "reopen"
+        )
+        with self._open_service() as service:
+            engagement_id, explicit = self._lane_engagement_id(
+                service, payload.engagement_id, lane
+            )
+            if engagement_id is None:
+                if explicit:
+                    return self._error("engagement_conflict", retryable=False)
+                return self._error("engagement_not_found")
+        outcome = self._settle(root, engagement_id, reason)
+        if outcome.status != "complete":
+            return self._settlement_error(outcome)
+        with self._open_service() as service:
+            snapshot = service.load_snapshot(engagement_id)
+            if payload.action == "close":
+                result = service.request_close(
+                    engagement_id,
+                    lane=lane,
+                    reason=payload.reason or "manual close",
+                    expected_revision=snapshot.revision,
+                )
+            else:
+                result = service.reopen_engagement(
+                    engagement_id,
+                    lane=lane,
+                    reason=payload.reason or "manual reopen",
+                    expected_revision=snapshot.revision,
+                )
+            store_digest = sha256(str(root).encode("utf-8")).hexdigest()
+            self._rebuild_logbook(
+                service, engagement_id, store_digest, lane.session_id
+            )
+            return self._result(
+                {
+                    "ok": True,
+                    "engagement": self._summary(
+                        service, result.engagement_id
+                    ).model_dump(mode="json"),
+                }
+            )
 
     def _handle_decision(self, **kwargs: Any) -> dict[str, Any]:
         session_id = kwargs.pop("session_id", None)
@@ -611,6 +706,12 @@ class HadesEngagementAdapter:
                     strategy=payload.custom_strategy,
                     rationale=payload.rationale,
                     host_adapted_command=payload.host_adapted_command,
+                )
+                self._rebuild_logbook(
+                    service,
+                    engagement_id,
+                    sha256(str(self._pinned_root).encode("utf-8")).hexdigest(),
+                    session_id,
                 )
                 return self._result(
                     {
@@ -676,22 +777,49 @@ class HadesEngagementAdapter:
             return None
         store_digest = self._pinned_store_digest()
         if tool_name in CONTROL_TOOL_NAMES:
-            self._record_control_invocation(tool_name, session_id, task_id, kwargs)
+            self._record_control_invocation(
+                tool_name, session_id, task_id, kwargs, store_digest
+            )
             return None
         lane = self._lane(session_id=session_id, task_id=task_id)
         if lane is None:
             self._health.record(store_digest, session_id, "unbound_lane")
             return None
         try:
-            with self._invoke()[2] as service:
+            with self._open_service() as service:
                 resolved = service.resolve_lane_binding(lane)
                 if resolved.engagement_id is None:
-                    self._health.record(store_digest, session_id, "unbound_lane")
-                    return None
-                engagement_id = resolved.engagement_id
+                    engagement_id = self._child_link_engagement(
+                        service, session_id
+                    )
+                    if engagement_id is None:
+                        self._health.record(
+                            store_digest, session_id, "unbound_lane"
+                        )
+                        return None
+                    service.bind_lane(
+                        engagement_id,
+                        lane,
+                        reason="child session inheritance",
+                    )
+                else:
+                    engagement_id = resolved.engagement_id
                 sanitized = sanitize_host_arguments(args)
                 correlation = self._correlation(
                     lane, tool_name, sanitized, kwargs
+                )
+                snapshot = service.load_snapshot(engagement_id)
+                if (
+                    correlation.stable_key is not None
+                    and self._find_stable_start(service, correlation) is not None
+                ):
+                    # Exact duplicate stable pre: no-op, and never cancels a
+                    # closure that was requested after the original capture.
+                    return None
+                call_id = correlation.call_id or f"call-{uuid4().hex * 2}"
+                drafts: list[JournalEventDraft] = []
+                self._ensure_session_started(
+                    service, engagement_id, lane
                 )
                 if (
                     isinstance(sanitized, SanitizedHostValue)
@@ -703,30 +831,81 @@ class HadesEngagementAdapter:
                         media_type="application/json",
                         representation="sanitized_host_json",
                     )
-                    evidence_draft = JournalEventDraft(
-                        lane=lane,
-                        actor="host_agent",
-                        type="evidence_attached",
-                        payload=EvidenceAttachedPayload(evidence=reference),
+                    drafts.append(
+                        JournalEventDraft(
+                            lane=lane,
+                            actor="host_agent",
+                            type="evidence_attached",
+                            payload=EvidenceAttachedPayload(evidence=reference),
+                        )
                     )
                 else:
-                    evidence_draft = None
-                call_id = correlation.call_id or f"call-{uuid4().hex * 2}"
-                start = JournalEventDraft(
-                    lane=lane,
-                    actor="host_agent",
-                    type="tool_call_started",
-                    payload=ToolCallStartedPayload(
-                        call_id=call_id,
-                        tool_name=tool_name,
-                        correlation=correlation,
-                        safe_arguments={},
-                    ),
+                    reason = (
+                        sanitized.reason_code
+                        if isinstance(sanitized, NormalizationFailure)
+                        else "unsupported_value"
+                    )
+                    drafts.append(
+                        JournalEventDraft(
+                            lane=lane,
+                            actor="host_agent",
+                            type="evidence_capture_failed",
+                            payload=EvidenceCaptureFailedPayload(
+                                call_id=call_id,
+                                capture_role="arguments",
+                                reason_code=reason,
+                            ),
+                        )
+                    )
+                closure = snapshot.state.closure
+                if snapshot.state.status == "closing" and closure is not None:
+                    drafts.append(
+                        JournalEventDraft(
+                            lane=None,
+                            actor="system",
+                            type="closure_cancelled",
+                            payload=ClosureCancelledPayload(
+                                closure_event_id=closure.event_id,
+                                reason="new host tool call while closing",
+                            ),
+                            system_correlation=SystemCorrelation(
+                                source="lifecycle",
+                                operation_id=uuid4(),
+                            ),
+                        )
+                    )
+                drafts.append(
+                    JournalEventDraft(
+                        lane=lane,
+                        actor="host_agent",
+                        type="tool_call_started",
+                        payload=ToolCallStartedPayload(
+                            call_id=call_id,
+                            tool_name=tool_name,
+                            correlation=correlation,
+                            safe_arguments={},
+                        ),
+                    )
                 )
-                drafts = [draft for draft in (evidence_draft, start) if draft is not None]
+                if not any(
+                    decision.lane.stable_key == lane.stable_key
+                    for decision in snapshot.state.active_decisions
+                ):
+                    drafts.append(
+                        JournalEventDraft(
+                            lane=lane,
+                            actor="host_agent",
+                            type="unplanned_action",
+                            payload=UnplannedActionPayload(
+                                call_id=call_id,
+                                reason=(
+                                    "bound lane has no recorded decision for "
+                                    "this tool call"
+                                ),
+                            ),
+                        )
+                    )
                 if correlation.kind.value == "uncertain":
-                    from sedna.engagement.events import UncertainCorrelationPayload
-
                     drafts.append(
                         JournalEventDraft(
                             lane=lane,
@@ -734,11 +913,17 @@ class HadesEngagementAdapter:
                             type="uncertain_correlation",
                             payload=UncertainCorrelationPayload(
                                 call_id=call_id,
-                                reason_code=correlation.reason or "missing_stable_identity",
+                                reason_code=(
+                                    correlation.reason
+                                    or "missing_stable_identity"
+                                ),
                             ),
                         )
                     )
                 service.append_hook_events(engagement_id, tuple(drafts))
+                self._rebuild_logbook(
+                    service, engagement_id, store_digest, session_id
+                )
         except Exception:
             self._health.record(store_digest, session_id, "journal_unavailable")
 
@@ -748,32 +933,44 @@ class HadesEngagementAdapter:
         session_id: str,
         task_id: str | None,
         kwargs: dict[str, Any],
+        store_digest: str,
     ) -> None:
         lane = self._lane(session_id=session_id, task_id=task_id)
         if lane is None:
             return None
-        with self._invoke()[2] as service:
-            resolved = service.resolve_lane_binding(lane)
-            if resolved.engagement_id is None:
-                return None
-            sanitized = sanitize_host_arguments(kwargs.get("args") or {})
-            correlation = self._correlation(lane, tool_name, sanitized, kwargs)
-            draft = JournalEventDraft(
-                lane=lane,
-                actor="host_agent",
-                type="control_tool_invoked",
-                payload=ControlToolInvokedPayload(
-                    control_tool=tool_name,
-                    policy_version=CONTROL_TOOL_POLICY_VERSION,
-                    correlation=correlation,
-                ),
-                idempotency_key=(
-                    f"control:{CONTROL_TOOL_POLICY_VERSION}:"
-                    f"{correlation.stable_key or correlation.reason or 'uncertain'}:"
-                    f"{tool_name}"
-                ),
-            )
-            service.append_hook_events(resolved.engagement_id, (draft,))
+        try:
+            with self._open_service() as service:
+                resolved = service.resolve_lane_binding(lane)
+                if resolved.engagement_id is None:
+                    return None
+                sanitized = sanitize_host_arguments(kwargs.get("args") or {})
+                correlation = self._correlation(
+                    lane, tool_name, sanitized, kwargs
+                )
+                draft = JournalEventDraft(
+                    lane=lane,
+                    actor="host_agent",
+                    type="control_tool_invoked",
+                    payload=ControlToolInvokedPayload(
+                        control_tool=tool_name,
+                        policy_version=CONTROL_TOOL_POLICY_VERSION,
+                        correlation=correlation,
+                    ),
+                    idempotency_key=(
+                        f"control:{CONTROL_TOOL_POLICY_VERSION}:"
+                        f"{correlation.stable_key or correlation.reason or 'uncertain'}:"
+                        f"{tool_name}"
+                    ),
+                )
+                service.append_hook_events(resolved.engagement_id, (draft,))
+                self._rebuild_logbook(
+                    service,
+                    resolved.engagement_id,
+                    store_digest,
+                    session_id,
+                )
+        except Exception:
+            self._health.record(store_digest, session_id, "journal_unavailable")
 
     def _correlation(
         self,
@@ -824,51 +1021,243 @@ class HadesEngagementAdapter:
         lane = self._lane(session_id=session_id, task_id=task_id)
         if lane is None:
             return None
-        with self._invoke()[2] as service:
-            resolved = service.resolve_lane_binding(lane)
-            if resolved.engagement_id is None:
-                return None
-            engagement_id = resolved.engagement_id
-            sanitized = sanitize_host_arguments(args or {})
-            correlation = self._correlation(lane, tool_name, sanitized, kwargs)
-            call_id = self._find_start_call_id(service, engagement_id, correlation)
-            if call_id is None:
-                call_id = correlation.call_id or f"call-{uuid4().hex * 2}"
-            normalized = normalize_host_payload(result)
-            if isinstance(normalized, NormalizationFailure):
-                from sedna.engagement.events import EvidenceCaptureFailedPayload
+        store_digest = self._pinned_store_digest()
+        try:
+            with self._open_service() as service:
+                sanitized = sanitize_host_arguments(args or {})
+                correlation = self._correlation(
+                    lane, tool_name, sanitized, kwargs
+                )
+                status = _host_technical_status(
+                    kwargs.get("tool_status") or kwargs.get("status"),
+                    result,
+                )
+                if correlation.stable_key is not None:
+                    start = self._find_stable_start(service, correlation)
+                    if start is None:
+                        self._health.record(
+                            store_digest, session_id, "unmatched_completion"
+                        )
+                        return None
+                    engagement_id, call_id = start
+                    terminal = self._terminal_kind(
+                        service, engagement_id, call_id
+                    )
+                    if terminal == "tool_call_completed":
+                        # Duplicate stable post delivery: idempotent no-op.
+                        return None
+                    if terminal == "tool_call_terminated":
+                        self._append_unmatched(
+                            service,
+                            engagement_id,
+                            lane,
+                            correlation,
+                            status,
+                            duration_ms,
+                            "call_already_terminated",
+                        )
+                        self._rebuild_logbook(
+                            service, engagement_id, store_digest, session_id
+                        )
+                        return None
+                else:
+                    candidates = self._uncertain_candidates(service, lane)
+                    if len(candidates) == 1:
+                        engagement_id, call_id = candidates[0]
+                    else:
+                        engagements = {eid for eid, _ in candidates}
+                        if len(engagements) == 1:
+                            self._append_unmatched(
+                                service,
+                                next(iter(engagements)),
+                                lane,
+                                correlation,
+                                status,
+                                duration_ms,
+                                "ambiguous_within_engagement",
+                            )
+                            self._rebuild_logbook(
+                                service,
+                                next(iter(engagements)),
+                                store_digest,
+                                session_id,
+                            )
+                        else:
+                            self._health.record(
+                                store_digest,
+                                session_id,
+                                "unmatched_completion",
+                            )
+                        return None
+                self._complete_call(
+                    service,
+                    engagement_id,
+                    lane,
+                    call_id,
+                    correlation,
+                    result,
+                    status,
+                    duration_ms,
+                    store_digest,
+                    session_id,
+                )
+        except Exception:
+            self._health.record(store_digest, session_id, "journal_unavailable")
 
-                failed = JournalEventDraft(
+    def _find_stable_start(
+        self,
+        service: EngagementJournalService,
+        correlation: ToolCorrelation,
+    ) -> tuple[UUID, str] | None:
+        """Locate a stable start across all engagement journals."""
+        if correlation.stable_key is None:
+            return None
+        for engagement_id in service.list_snapshot_ids():
+            snapshot = service.load_snapshot(engagement_id)
+            for event in reversed(snapshot.events):
+                if event.type.value != "tool_call_started":
+                    continue
+                if (
+                    event.payload.correlation.stable_key
+                    == correlation.stable_key
+                ):
+                    return engagement_id, event.payload.call_id
+        return None
+
+    def _terminal_kind(
+        self,
+        service: EngagementJournalService,
+        engagement_id: UUID,
+        call_id: str,
+    ) -> str | None:
+        """Return the terminal event kind for a call, or None while in flight."""
+        snapshot = service.load_snapshot(engagement_id)
+        for event in snapshot.events:
+            if event.type.value not in {
+                "tool_call_completed",
+                "tool_call_terminated",
+            }:
+                continue
+            if event.payload.call_id == call_id:
+                return event.type.value
+        return None
+
+    def _uncertain_candidates(
+        self,
+        service: EngagementJournalService,
+        lane: Any,
+    ) -> list[tuple[UUID, str]]:
+        """In-flight uncertain starts on the same lane across engagements."""
+        matches: list[tuple[UUID, str]] = []
+        for engagement_id in service.list_snapshot_ids():
+            snapshot = service.load_snapshot(engagement_id)
+            for event in snapshot.events:
+                if event.type.value != "tool_call_started":
+                    continue
+                correlation = event.payload.correlation
+                if correlation.kind.value != "uncertain":
+                    continue
+                if correlation.lane_key != lane.stable_key:
+                    continue
+                if event.payload.call_id in snapshot.state.in_flight_call_ids:
+                    matches.append(
+                        (engagement_id, event.payload.call_id)
+                    )
+        return matches
+
+    def _append_unmatched(
+        self,
+        service: EngagementJournalService,
+        engagement_id: UUID,
+        lane: Any,
+        correlation: ToolCorrelation,
+        status: str,
+        duration_ms: int | None,
+        reason_code: str,
+    ) -> None:
+        bounded_duration = _bounded_duration(duration_ms)
+        service.append_hook_events(
+            engagement_id,
+            (
+                JournalEventDraft(
                     lane=lane,
                     actor="host_agent",
-                    type="evidence_capture_failed",
-                    payload=EvidenceCaptureFailedPayload(
-                        call_id=call_id,
-                        capture_role="result",
-                        reason_code="normalization_limit_exceeded",
+                    type="unmatched_tool_completion",
+                    payload=UnmatchedToolCompletionPayload(
+                        correlation=correlation,
+                        technical_status=status,
+                        duration_ms=bounded_duration,
+                        reason_code=reason_code,
                     ),
-                )
-                completed = self._completion_draft(lane, call_id, "unknown", duration_ms)
-                service.append_hook_events(engagement_id, (failed, completed))
-                return None
-            if normalized.representation == "host_returned_no_result":
-                completed = self._completion_draft(lane, call_id, "unknown", duration_ms)
-                service.append_hook_events(engagement_id, (completed,))
-                return None
-            reference = service.write_evidence(
-                engagement_id,
-                normalized.canonical_bytes or b"",
-                media_type=_media_type(normalized.representation),
-                representation=normalized.representation,
-            )
-            attached = JournalEventDraft(
+                ),
+            ),
+        )
+    def _complete_call(
+        self,
+        service: EngagementJournalService,
+        engagement_id: UUID,
+        lane: Any,
+        call_id: str,
+        correlation: ToolCorrelation,
+        result: Any,
+        status: str,
+        duration_ms: int | None,
+        store_digest: str,
+        session_id: str,
+    ) -> None:
+        normalized = normalize_host_payload(result)
+        if isinstance(normalized, NormalizationFailure):
+            failed = JournalEventDraft(
                 lane=lane,
                 actor="host_agent",
-                type="evidence_attached",
-                payload=EvidenceAttachedPayload(evidence=reference),
+                type="evidence_capture_failed",
+                payload=EvidenceCaptureFailedPayload(
+                    call_id=call_id,
+                    capture_role="result",
+                    reason_code=normalized.reason_code,
+                ),
             )
-            completed = self._completion_draft(lane, call_id, "returned", duration_ms)
-            service.append_hook_events(engagement_id, (attached, completed))
+            completed = self._completion_draft(
+                lane, call_id, correlation, status, duration_ms
+            )
+            service.append_hook_events(engagement_id, (failed, completed))
+            self._rebuild_logbook(
+                service, engagement_id, store_digest, session_id
+            )
+            return None
+        if normalized.representation == "host_returned_no_result":
+            completed = self._completion_draft(
+                lane, call_id, correlation, "unknown", duration_ms
+            )
+            service.append_hook_events(engagement_id, (completed,))
+            self._rebuild_logbook(
+                service, engagement_id, store_digest, session_id
+            )
+            return None
+        reference = service.write_evidence(
+            engagement_id,
+            normalized.canonical_bytes or b"",
+            media_type=_media_type(normalized.representation),
+            representation=normalized.representation,
+        )
+        attached = JournalEventDraft(
+            lane=lane,
+            actor="host_agent",
+            type="evidence_attached",
+            payload=EvidenceAttachedPayload(evidence=reference),
+        )
+        completed = self._completion_draft(
+            lane,
+            call_id,
+            correlation,
+            status,
+            duration_ms,
+            possible_terminal_evidence=_flag_shaped(result),
+        )
+        service.append_hook_events(engagement_id, (attached, completed))
+        self._rebuild_logbook(
+            service, engagement_id, store_digest, session_id
+        )
 
     def _find_start_call_id(
         self,
@@ -878,33 +1267,31 @@ class HadesEngagementAdapter:
     ) -> str | None:
         if correlation.stable_key is None:
             return None
-        snapshot = service.load_snapshot(engagement_id)
-        for event in reversed(snapshot.events):
-            if event.type.value != "tool_call_started":
-                continue
-            if event.payload.correlation.stable_key == correlation.stable_key:
-                return event.payload.call_id
-        return None
+        start = self._find_stable_start(service, correlation)
+        if start is None:
+            return None
+        return start[1]
 
     def _completion_draft(
         self,
         lane: Any,
         call_id: str,
+        correlation: ToolCorrelation,
         status: str,
         duration_ms: int | None,
+        *,
+        possible_terminal_evidence: bool = False,
     ) -> JournalEventDraft:
-        bounded_duration = 0
-        if duration_ms is not None:
-            bounded_duration = max(0, min(int(duration_ms), MAX_TOOL_DURATION_MS))
         return JournalEventDraft(
             lane=lane,
             actor="host_agent",
             type="tool_call_completed",
             payload=ToolCallCompletedPayload(
                 call_id=call_id,
-                correlation=ToolCorrelation.uncertain("missing_stable_identity"),
+                correlation=correlation,
                 technical_status=status,
-                duration_ms=bounded_duration,
+                duration_ms=_bounded_duration(duration_ms),
+                possible_terminal_evidence=possible_terminal_evidence,
             ),
         )
 
@@ -917,7 +1304,7 @@ class HadesEngagementAdapter:
         if health is None:
             return None
         code, _ = health
-        if code in {"journal_unavailable", "journal_corrupt", "settlement_unavailable"}:
+        if code in {"journal_unavailable", "journal_corrupt"}:
             return {
                 "context": (
                     "Engagement journaling is not reliably journaled; "
@@ -926,35 +1313,89 @@ class HadesEngagementAdapter:
                 "kind": "sedna_engagement_health_v1",
                 "code": code,
             }
+        if code == "settlement_unavailable":
+            return {
+                "context": (
+                    "settlement unavailable: evidence may remain unsettled"
+                ),
+                "kind": "sedna_engagement_health_v1",
+                "code": code,
+            }
         return None
 
     # -- session and child hooks (fail-open) ------------------------------
 
-    def _on_session_start(self, session_id: str, task_id: str | None = None, **kwargs: Any) -> None:
+    def _on_session_start(
+        self,
+        session_id: str,
+        task_id: str | None = None,
+        model: str | None = None,
+        platform: str | None = None,
+        **kwargs: Any,
+    ) -> None:
         try:
-            self._record_session_start(session_id, task_id)
+            self._record_session_start(session_id, task_id, model, platform)
         except Exception:
             return None
 
-    def _record_session_start(self, session_id: str, task_id: str | None) -> None:
+    def _record_session_start(
+        self,
+        session_id: str,
+        task_id: str | None,
+        model: str | None = None,
+        platform: str | None = None,
+    ) -> None:
         lane = self._lane(session_id=session_id, task_id=task_id)
         if lane is None:
             return None
-        with self._invoke()[2] as service:
-            resolved = service.resolve_lane_binding(lane)
-            if resolved.engagement_id is None:
-                return None
-            draft = JournalEventDraft(
-                lane=lane,
-                actor="host_agent",
-                type="session_started",
-                payload=SessionStartedPayload(
-                    model="unknown",
-                    platform="cli",
-                ),
-                idempotency_key=f"session-start:{lane.stable_key}",
-            )
-            service.append_hook_events(resolved.engagement_id, (draft,))
+        try:
+            store_digest = self._pinned_store_digest()
+            with self._open_service() as service:
+                resolved = service.resolve_lane_binding(lane)
+                if resolved.engagement_id is None:
+                    return None
+                self._ensure_session_started(
+                    service,
+                    resolved.engagement_id,
+                    lane,
+                    model=model,
+                    platform=platform,
+                )
+                self._rebuild_logbook(
+                    service,
+                    resolved.engagement_id,
+                    store_digest,
+                    session_id,
+                )
+        except Exception:
+            return None
+
+    def _ensure_session_started(
+        self,
+        service: EngagementJournalService,
+        engagement_id: UUID,
+        lane: Any,
+        *,
+        model: str | None = None,
+        platform: str | None = None,
+    ) -> None:
+        """Append one idempotent session_started unless already present."""
+        key = f"session-start:{lane.stable_key}"
+        snapshot = service.load_snapshot(engagement_id)
+        if any(event.idempotency_key == key for event in snapshot.events):
+            return None
+        draft = JournalEventDraft(
+            lane=lane,
+            actor="host_agent",
+            type="session_started",
+            payload=SessionStartedPayload(
+                model=_bounded_identity_128(model),
+                platform=_bounded_identity_128(platform),
+            ),
+            idempotency_key=key,
+        )
+        service.append_hook_events(engagement_id, (draft,))
+        return None
 
     def _on_session_end(
         self,
@@ -966,7 +1407,9 @@ class HadesEngagementAdapter:
         **kwargs: Any,
     ) -> None:
         try:
-            self._record_session_end(session_id, task_id, completed, interrupted, reason)
+            self._record_session_end(
+                session_id, task_id, completed, interrupted, reason, kwargs
+            )
         except Exception:
             return None
 
@@ -977,30 +1420,54 @@ class HadesEngagementAdapter:
         completed: bool,
         interrupted: bool,
         reason: str | None,
+        kwargs: dict[str, Any],
     ) -> None:
         if completed and interrupted:
             return None
         lane = self._lane(session_id=session_id, task_id=task_id)
         if lane is None:
             return None
-        with self._invoke()[2] as service:
-            resolved = service.resolve_lane_binding(lane)
-            if resolved.engagement_id is None:
-                return None
-            draft = JournalEventDraft(
-                lane=lane,
-                actor="host_agent",
-                type="session_checkpointed",
-                payload=SessionCheckpointedPayload(
-                    completed=completed,
-                    interrupted=interrupted,
-                    reason=(reason or "session ended")[:2048],
-                ),
-            )
-            service.append_hook_events(resolved.engagement_id, (draft,))
+        identity = (
+            kwargs.get("turn_id")
+            or kwargs.get("api_request_id")
+            or kwargs.get("callback_id")
+            or "no-identity"
+        )
+        try:
+            store_digest = self._pinned_store_digest()
+            with self._open_service() as service:
+                resolved = service.resolve_lane_binding(lane)
+                if resolved.engagement_id is None:
+                    return None
+                draft = JournalEventDraft(
+                    lane=lane,
+                    actor="host_agent",
+                    type="session_checkpointed",
+                    payload=SessionCheckpointedPayload(
+                        completed=completed,
+                        interrupted=interrupted,
+                        reason=(reason or "session ended")[:2048],
+                    ),
+                    idempotency_key=(
+                        f"session-end:{lane.stable_key}:{identity}"
+                    ),
+                )
+                service.append_hook_events(resolved.engagement_id, (draft,))
+                self._rebuild_logbook(
+                    service,
+                    resolved.engagement_id,
+                    store_digest,
+                    session_id,
+                )
+        except Exception:
+            return None
 
     def _on_session_finalize(
-        self, session_id: str, platform: str | None = None, reason: str | None = None, **kwargs: Any
+        self,
+        session_id: str,
+        platform: str | None = None,
+        reason: str | None = None,
+        **kwargs: Any,
     ) -> None:
         try:
             self._record_session_finalize(session_id, platform, reason)
@@ -1010,26 +1477,132 @@ class HadesEngagementAdapter:
     def _record_session_finalize(
         self, session_id: str, platform: str | None, reason: str | None
     ) -> None:
-        lane = self._lane(session_id=session_id, task_id=None)
-        if lane is None:
+        if not session_id:
             return None
         store_digest = self._pinned_store_digest()
-        with self._invoke()[2] as service:
-            resolved = service.resolve_lane_binding(lane)
-            if resolved.engagement_id is None:
-                self._health.record(store_digest, session_id, "unbound_lane")
+        self._health.purge(store_digest, session_id)
+        try:
+            root = self._pin_root()
+            with self._open_service() as service:
+                engagement_ids = self._session_engagement_ids(
+                    service, session_id
+                )
+            if not engagement_ids:
                 return None
-            draft = JournalEventDraft(
-                lane=lane,
-                actor="host_agent",
-                type="session_finalized",
-                payload=SessionFinalizedPayload(
-                    reason=(reason or "finalized")[:2048],
-                    settlement_status="not_configured",
-                ),
+            outcomes: dict[UUID, EngagementSettlementOutcome] = {}
+            if self._settlement_port_factory is None:
+                outcomes = {
+                    engagement_id: EngagementSettlementOutcome(
+                        status="complete", pending_range_count=0
+                    )
+                    for engagement_id in engagement_ids
+                }
+            else:
+                with self._settlement_port_factory.open(root) as port:
+                    for engagement_id in engagement_ids:
+                        try:
+                            outcomes[engagement_id] = port.settle(
+                                engagement_id, reason="session_finalize"
+                            )
+                        except Exception:
+                            outcomes[engagement_id] = EngagementSettlementOutcome(
+                                status="unavailable",
+                                pending_range_count=0,
+                                safe_code="settlement_unavailable",
+                            )
+            with self._open_service() as service:
+                for engagement_id in engagement_ids:
+                    outcome = outcomes[engagement_id]
+                    lane = self._lowest_session_lane(
+                        service, engagement_id, session_id
+                    )
+                    if lane is None:
+                        continue
+                    snapshot = service.load_snapshot(engagement_id)
+                    payload = self._finalized_payload(outcome, reason)
+                    service.append_hook_events(
+                        engagement_id,
+                        (
+                            JournalEventDraft(
+                                lane=lane,
+                                actor="host_agent",
+                                type="session_finalized",
+                                payload=payload,
+                                idempotency_key=(
+                                    f"session-finalize:{engagement_id}:"
+                                    f"{session_id}"
+                                ),
+                            ),
+                        ),
+                        expected_revision=snapshot.revision,
+                    )
+                    self._rebuild_logbook(
+                        service, engagement_id, store_digest, session_id
+                    )
+                    if outcome.status != "complete":
+                        self._health.record(
+                            store_digest,
+                            session_id,
+                            {
+                                "incomplete": "settlement_incomplete",
+                                "failed": "settlement_failed",
+                            }.get(
+                                outcome.status, "settlement_unavailable"
+                            ),
+                        )
+        except Exception:
+            self._health.record(store_digest, session_id, "journal_unavailable")
+
+    def _finalized_payload(
+        self,
+        outcome: EngagementSettlementOutcome,
+        reason: str | None,
+    ) -> SessionFinalizedPayload:
+        if outcome.status == "complete":
+            return SessionFinalizedPayload(
+                reason=(reason or "finalized")[:2048],
+                settlement_status="complete",
             )
-            service.append_hook_events(resolved.engagement_id, (draft,))
-            self._health.purge(store_digest, session_id)
+        return SessionFinalizedPayload(
+            reason=f"settlement_{outcome.status}"[:2048],
+            settlement_status=outcome.status,
+            pending_range_count=outcome.pending_range_count,
+            next_pending_offset=outcome.next_pending_offset,
+            next_pending_subject=outcome.next_pending_subject,
+            pending_inventory_sha256=outcome.pending_inventory_sha256,
+            safe_code=outcome.safe_code,
+        )
+
+    def _session_engagement_ids(
+        self, service: EngagementJournalService, session_id: str
+    ) -> tuple[UUID, ...]:
+        """Distinct engagements with any lane bound to this host session."""
+        ids: set[UUID] = set()
+        for engagement_id in service.list_snapshot_ids():
+            snapshot = service.load_snapshot(engagement_id)
+            if any(
+                binding.lane.session_id == session_id
+                for binding in snapshot.state.bound_lanes
+            ):
+                ids.add(engagement_id)
+        return tuple(sorted(ids))
+
+    def _lowest_session_lane(
+        self,
+        service: EngagementJournalService,
+        engagement_id: UUID,
+        session_id: str,
+    ) -> Any | None:
+        """Lexicographically lowest already-exact bound lane for session."""
+        snapshot = service.load_snapshot(engagement_id)
+        lanes = [
+            binding.lane
+            for binding in snapshot.state.bound_lanes
+            if binding.lane.session_id == session_id
+        ]
+        if not lanes:
+            return None
+        return min(lanes, key=lambda item: item.stable_key)
 
     def _on_session_reset(
         self,
@@ -1041,14 +1614,273 @@ class HadesEngagementAdapter:
         self._health.purge(store_digest, session_id)
 
     def _subagent_start(self, **kwargs: Any) -> None:
-        return None
+        try:
+            self._record_subagent_start(kwargs)
+        except Exception:
+            return None
+
+    def _record_subagent_start(self, kwargs: dict[str, Any]) -> None:
+        parent_session_id = kwargs.get("parent_session_id")
+        child_session_id = kwargs.get("child_session_id")
+        if not parent_session_id or not child_session_id:
+            return None
+        store_digest = self._pinned_store_digest()
+        try:
+            with self._open_service() as service:
+                resolved = service.link_child_session(
+                    parent_session_id=parent_session_id,
+                    parent_task_id=kwargs.get("parent_task_id"),
+                    child_session_id=child_session_id,
+                    child_subagent_id=kwargs.get("child_subagent_id"),
+                )
+                if resolved.engagement_id is None:
+                    code = (
+                        "ambiguous_binding"
+                        if resolved.mode == "ambiguous"
+                        else "unbound_lane"
+                    )
+                    self._health.record(
+                        store_digest, parent_session_id, code
+                    )
+                else:
+                    self._rebuild_logbook(
+                        service,
+                        resolved.engagement_id,
+                        store_digest,
+                        parent_session_id,
+                    )
+        except Exception:
+            self._health.record(
+                store_digest, parent_session_id, "journal_unavailable"
+            )
 
     def _subagent_stop(self, **kwargs: Any) -> None:
+        try:
+            self._record_subagent_stop(kwargs)
+        except Exception:
+            return None
+
+    def _record_subagent_stop(self, kwargs: dict[str, Any]) -> None:
+        parent_session_id = kwargs.get("parent_session_id")
+        child_session_id = kwargs.get("child_session_id")
+        if not parent_session_id or not child_session_id:
+            return None
+        store_digest = self._pinned_store_digest()
+        completed, interrupted, reason, unknown = _map_child_status(
+            kwargs.get("child_status")
+        )
+        try:
+            with self._open_service() as service:
+                child_link = self._resolve_child_link(
+                    service,
+                    parent_session_id,
+                    child_session_id,
+                    kwargs.get("child_subagent_id"),
+                )
+                if child_link is None:
+                    self._health.record(
+                        store_digest, parent_session_id, "unbound_lane"
+                    )
+                    return None
+                engagement_id, ambiguous = child_link
+                if ambiguous:
+                    self._health.record(
+                        store_digest, parent_session_id, "ambiguous_binding"
+                    )
+                    return None
+                child_task_id = kwargs.get("task_id")
+                child_lane = (
+                    self._lane(
+                        session_id=child_session_id, task_id=child_task_id
+                    )
+                    if child_task_id
+                    else None
+                )
+                checkpoint_lane = child_lane or self._parent_bound_lane(
+                    service, engagement_id, parent_session_id
+                )
+                if checkpoint_lane is None:
+                    return None
+                service.append_hook_events(
+                    engagement_id,
+                    (
+                        JournalEventDraft(
+                            lane=checkpoint_lane,
+                            actor="host_agent",
+                            type="session_checkpointed",
+                            payload=SessionCheckpointedPayload(
+                                completed=completed,
+                                interrupted=interrupted,
+                                reason=reason[:2048],
+                            ),
+                            idempotency_key=(
+                                f"child-stop:{parent_session_id}:"
+                                f"{child_session_id}"
+                            ),
+                        ),
+                    ),
+                )
+                self._rebuild_logbook(
+                    service, engagement_id, store_digest, parent_session_id
+                )
+                if unknown:
+                    self._health.record(
+                        store_digest, parent_session_id, "unknown_child_status"
+                    )
+                if child_lane is not None and not self._lane_has_in_flight(
+                    service, engagement_id, child_lane
+                ):
+                    service.unbind_lane(
+                        engagement_id,
+                        child_lane,
+                        reason="child session ended",
+                    )
+        except Exception:
+            self._health.record(
+                store_digest, parent_session_id, "journal_unavailable"
+            )
+
+    def _resolve_child_link(
+        self,
+        service: EngagementJournalService,
+        parent_session_id: str,
+        child_session_id: str,
+        child_subagent_id: str | None,
+    ) -> tuple[UUID, bool] | None:
+        """Resolve a unique prior child_lane_linked relation.
+
+        Returns ``(engagement_id, ambiguous)`` or None when unbound.
+        """
+        matches: list[UUID] = []
+        for engagement_id in service.list_snapshot_ids():
+            snapshot = service.load_snapshot(engagement_id)
+            for event in snapshot.events:
+                if event.type.value != "child_lane_linked":
+                    continue
+                payload = event.payload
+                if (
+                    payload.parent_session_id != parent_session_id
+                    or payload.child_session_id != child_session_id
+                ):
+                    continue
+                if (
+                    child_subagent_id is not None
+                    and payload.child_subagent_id != child_subagent_id
+                ):
+                    continue
+                matches.append(engagement_id)
+        if not matches:
+            return None
+        if len(matches) > 1:
+            return matches[0], True
+        return matches[0], False
+
+    def _parent_bound_lane(
+        self,
+        service: EngagementJournalService,
+        engagement_id: UUID,
+        session_id: str,
+    ) -> Any | None:
+        return self._lowest_session_lane(
+            service, engagement_id, session_id
+        )
+
+    def _lane_has_in_flight(
+        self,
+        service: EngagementJournalService,
+        engagement_id: UUID,
+        lane: Any,
+    ) -> bool:
+        snapshot = service.load_snapshot(engagement_id)
+        started: dict[str, Any] = {
+            event.payload.call_id: event.lane
+            for event in snapshot.events
+            if event.type.value == "tool_call_started"
+        }
+        return any(
+            call_id in started
+            and started[call_id] is not None
+            and started[call_id].stable_key == lane.stable_key
+            for call_id in snapshot.state.in_flight_call_ids
+        )
+
+    def _child_link_engagement(
+        self, service: EngagementJournalService, session_id: str
+    ) -> UUID | None:
+        """Unique engagement linked to this child session, or None."""
+        matches: set[UUID] = set()
+        for engagement_id in service.list_snapshot_ids():
+            snapshot = service.load_snapshot(engagement_id)
+            for event in snapshot.events:
+                if event.type.value != "child_lane_linked":
+                    continue
+                if event.payload.child_session_id == session_id:
+                    matches.add(engagement_id)
+        if len(matches) == 1:
+            return next(iter(matches))
         return None
 
     def _pinned_store_digest(self) -> str:
-        root = self._root_resolver()
+        root = getattr(self, "_pinned_root", None)
+        if root is None:
+            root = self._pin_root()
         return sha256(str(root).encode("utf-8")).hexdigest()
+
+    def _rebuild_logbook(
+        self,
+        service: EngagementJournalService,
+        engagement_id: UUID,
+        store_digest: str | None,
+        session_id: str | None,
+    ) -> None:
+        """Rebuild the revision-CAS logbook; conflict is fail-open health."""
+        if store_digest is None or session_id is None:
+            return None
+        try:
+            service.rebuild_logbooks(engagement_id)
+        except Exception:
+            self._health.record(
+                store_digest, session_id, "logbook_rebuild_conflict"
+            )
+        return None
+
+    def _settle(
+        self, root: Path, engagement_id: UUID, reason: SettlementReason
+    ) -> EngagementSettlementOutcome:
+        """Settle outside every journal lock; unavailable on port failure."""
+        if self._settlement_port_factory is None:
+            return EngagementSettlementOutcome(status="complete", pending_range_count=0)
+        with self._settlement_port_factory.open(root) as port:
+            try:
+                return port.settle(engagement_id, reason=reason)
+            except Exception:
+                return EngagementSettlementOutcome(
+                    status="unavailable",
+                    pending_range_count=0,
+                    safe_code="settlement_unavailable",
+                )
+
+    def _settlement_error(self, outcome: EngagementSettlementOutcome) -> dict[str, Any]:
+        """One typed non-complete envelope without snapshot/status/frontier."""
+        code = outcome.safe_code or {
+            "incomplete": "evidence_budget_exhausted",
+            "failed": "interpretation_failed",
+        }.get(outcome.status, "settlement_unavailable")
+        return {
+            "ok": False,
+            "error": {"code": code, "retryable": True},
+            "settlement": {
+                "status": outcome.status,
+                "pending_range_count": outcome.pending_range_count,
+                "next_pending_offset": outcome.next_pending_offset,
+                "next_pending_subject": (
+                    str(outcome.next_pending_subject)
+                    if outcome.next_pending_subject is not None
+                    else None
+                ),
+                "pending_inventory_sha256": outcome.pending_inventory_sha256,
+            },
+        }
 
 
 def _media_type(representation: str) -> str:
@@ -1057,6 +1889,64 @@ def _media_type(representation: str) -> str:
     if representation in {"sanitized_host_json", "canonical_host_json"}:
         return "application/json"
     return "application/octet-stream"
+
+
+_HOST_TECHNICAL_STATUSES = frozenset(
+    {"returned", "blocked", "cancelled", "error", "unknown"}
+)
+
+
+def _bounded_identity_128(value: Any) -> str:
+    """Normalize a bounded 1..128 character host identity with 'unknown'."""
+    if not isinstance(value, str):
+        return "unknown"
+    normalized = value.strip()[:128]
+    return normalized or "unknown"
+
+
+_CHILD_STATUS_MAP: dict[str, tuple[bool, bool]] = {
+    "ok": (True, False),
+    "timeout": (False, True),
+    "interrupted": (False, True),
+    "error": (False, False),
+}
+
+
+def _map_child_status(
+    status: Any,
+) -> tuple[bool, bool, str, bool]:
+    """Map child_status to completed/interrupted plus a bounded reason."""
+    if isinstance(status, str) and status in _CHILD_STATUS_MAP:
+        completed, interrupted = _CHILD_STATUS_MAP[status]
+        reason = {
+            "ok": "child session completed",
+            "timeout": "child session timed out",
+            "interrupted": "child session interrupted",
+            "error": "child session errored",
+        }[status]
+        return completed, interrupted, reason, False
+    return False, False, "unknown child status", True
+
+
+def _host_technical_status(raw_status: Any, result: Any) -> str:
+    if isinstance(raw_status, str) and raw_status in _HOST_TECHNICAL_STATUSES:
+        return raw_status
+    return "returned" if result is not None else "unknown"
+
+
+def _bounded_duration(duration_ms: int | None) -> int:
+    if duration_ms is None:
+        return 0
+    return max(0, min(int(duration_ms), MAX_TOOL_DURATION_MS))
+
+
+def _flag_shaped(value: Any) -> bool:
+    """Simple flag-shaped text detection; never used for strategic outcome."""
+    if not isinstance(value, str):
+        return False
+    return bool(
+        re.search(r"[A-Za-z0-9_]+{[^}\n]{1,256}}", value)
+    )
 
 
 def _mapped_error(exc: Exception) -> dict[str, Any]:

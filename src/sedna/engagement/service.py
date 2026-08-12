@@ -428,6 +428,8 @@ class EngagementJournalService:
                         for ref in item.state.scope_references
                     )
                 ]
+            else:
+                candidates = resumable
             if len(candidates) > 1:
                 raise EngagementAmbiguousError(
                     _engagement_list_items(candidates)
@@ -475,6 +477,15 @@ class EngagementJournalService:
 
     def inspect_engagement(self, engagement_id: UUID) -> EngagementSnapshot:
         return self._repository.load_snapshot(engagement_id)
+
+    def list_snapshot_ids(self) -> tuple[UUID, ...]:
+        return self._repository.list_snapshot_ids()
+
+    def rebuild_logbooks(self, engagement_id: UUID) -> tuple[Path, ...]:
+        """Rebuild and atomically publish the session logbook projection."""
+        from sedna.engagement.logbook import rebuild_session_logbooks
+
+        return rebuild_session_logbooks(self._repository, engagement_id)
 
     def list_engagements(
         self,
