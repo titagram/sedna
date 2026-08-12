@@ -909,11 +909,11 @@ def test_prompt_versions_and_instructions_cover_revised_example_contract():
         REPAIR_PROMPT_VERSION,
     ) == (
         "sedna-semantic-extractor",
-        "1",
+        "2",
         "sedna-semantic-critic",
-        "1",
+        "2",
         "sedna-semantic-repair",
-        "1",
+        "2",
     )
 
     extractor = " ".join(EXTRACTOR_PROMPT.casefold().split())

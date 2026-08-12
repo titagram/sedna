@@ -616,7 +616,7 @@ def test_repaired_unsafe_material_quarantine_rejects_repair_count_tamper(
         def reject_unsafe(*args: object, **kwargs: object) -> tuple[object, ...]:
             raise ValueError("unsafe canonical material")
 
-        monkeypatch.setattr(compiler_module, "materialize_bundle", reject_unsafe)
+        monkeypatch.setattr(compiler_module, "materialize_semantic_content", reject_unsafe)
         quarantined = service.compile_and_store(prepared)
         unchanged = service.compile_and_store(prepared)
 

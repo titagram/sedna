@@ -14,6 +14,7 @@ from sedna.knowledge.schema import (
     VerificationStatus,
     foundation_manifest_digest,
 )
+from sedna.knowledge.schema.execution import ExecutionExample
 from sedna.knowledge.schema.semantic import (
     CANONICAL_FINDING_MESSAGES,
     SemanticCallMetadata,
@@ -41,7 +42,7 @@ from sedna.knowledge.semantic.llm import (
 )
 from sedna.knowledge.semantic.materialize import (
     CanonicalArtifact,
-    materialize_bundle,
+    materialize_semantic_content,
     validate_segment_accounting,
 )
 from sedna.knowledge.semantic.prompts import (
@@ -53,8 +54,9 @@ from sedna.knowledge.semantic.prompts import (
     REPAIR_PROMPT_VERSION,
 )
 
-SEMANTIC_SCHEMA_VERSION = "2.4.0"
-SEMANTIC_COMPILER_VERSION = "8"
+SEMANTIC_SCHEMA_VERSION = "2.5.0"
+SEMANTIC_COMPILER_VERSION = "9"
+EXECUTION_EXAMPLE_SCHEMA_VERSION = "1"
 
 
 class SemanticCompiler:
@@ -178,12 +180,14 @@ class SemanticCompiler:
         calls: tuple[SemanticCallMetadata, ...],
     ) -> SemanticCompilationResult:
         try:
-            artifacts = materialize_bundle(
+            content = materialize_semantic_content(
                 prepared,
                 final_drafts,
                 self._call_metadata(extraction, "sedna.semantic.extract"),
                 VerificationStatus.VERIFIED,
             )
+            artifacts = content.artifacts
+            execution_examples = content.execution_examples
         except (TypeError, ValueError):
             return self._canonical_material_quarantine(
                 prepared,
@@ -206,6 +210,7 @@ class SemanticCompiler:
                 extraction,
                 critic,
                 artifacts,
+                execution_examples=execution_examples,
                 repair_count=repair_count,
                 started_at=started_at,
             )
@@ -355,6 +360,7 @@ class SemanticCompiler:
         critic: StructuredResult[CriticVerdict],
         artifacts: tuple[CanonicalArtifact, ...],
         *,
+        execution_examples: tuple[ExecutionExample, ...] = (),
         repair_count: int,
         started_at: datetime,
     ) -> SemanticKnowledgeBundle:
@@ -375,6 +381,9 @@ class SemanticCompiler:
                 (artifact for artifact in artifacts if isinstance(artifact, DecisionRule)),
                 key=lambda artifact: artifact.rule_id,
             )
+        )
+        emitted_example_ids = tuple(
+            sorted(example.example_id for example in execution_examples)
         )
         emitted_ids = tuple(
             sorted(
@@ -402,6 +411,12 @@ class SemanticCompiler:
                 extractor_prompt_version=EXTRACTOR_PROMPT_VERSION,
                 critic_prompt_version=CRITIC_PROMPT_VERSION,
                 repair_prompt_version=REPAIR_PROMPT_VERSION,
+                execution_example_schema_version=(
+                    EXECUTION_EXAMPLE_SCHEMA_VERSION
+                    if emitted_example_ids
+                    else None
+                ),
+                emitted_execution_example_ids=emitted_example_ids,
                 extractor_model_id=extraction.model,
                 critic_model_id=critic.model,
                 disposition="verified",

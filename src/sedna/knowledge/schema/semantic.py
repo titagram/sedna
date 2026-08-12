@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from sedna.knowledge.schema.case import KnowledgeCase
 from sedna.knowledge.schema.common import ExtractionMetadata, SearchableNonEmptyString, SourceRef
+from sedna.knowledge.schema.execution import ExecutionExample
 from sedna.knowledge.schema.manifest import Sha256
 from sedna.knowledge.schema.reference import ReferenceArtifact
 from sedna.knowledge.schema.rule import DecisionRule
@@ -100,6 +101,8 @@ class SemanticCompilationManifest(BaseModel):
     disposition: CompilationDisposition
     repair_count: int = Field(ge=0, le=1)
     emitted_artifact_ids: tuple[NonEmptyString, ...] = ()
+    execution_example_schema_version: NonEmptyString | None = None
+    emitted_execution_example_ids: tuple[NonEmptyString, ...] = ()
     started_at: datetime
     completed_at: datetime
 
@@ -110,6 +113,22 @@ class SemanticCompilationManifest(BaseModel):
             raise ValueError("emitted artifact IDs must be sorted")
         if len(set(self.emitted_artifact_ids)) != len(self.emitted_artifact_ids):
             raise ValueError("emitted artifact IDs must be unique")
+        if (
+            tuple(sorted(self.emitted_execution_example_ids))
+            != self.emitted_execution_example_ids
+        ):
+            raise ValueError("emitted execution-example IDs must be sorted")
+        if (
+            len(set(self.emitted_execution_example_ids))
+            != len(self.emitted_execution_example_ids)
+        ):
+            raise ValueError("emitted execution-example IDs must be unique")
+        if (
+            self.execution_example_schema_version is None
+        ) != (not self.emitted_execution_example_ids):
+            raise ValueError(
+                "execution-example schema version must match emitted example IDs"
+            )
         if self.completed_at < self.started_at:
             raise ValueError("completed_at must not precede started_at")
         return self
@@ -185,6 +204,7 @@ class SemanticKnowledgeBundle(BaseModel):
     references: tuple[ReferenceArtifact, ...] = ()
     cases: tuple[KnowledgeCase, ...] = ()
     guidance: tuple[DecisionRule, ...] = ()
+    execution_examples: tuple[ExecutionExample, ...] = ()
 
     @model_validator(mode="after")
     def validate_bundle(self) -> SemanticKnowledgeBundle:
@@ -194,6 +214,9 @@ class SemanticKnowledgeBundle(BaseModel):
         self._validate_sorted_unique(self.references, "artifact_id", "references")
         self._validate_sorted_unique(self.cases, "case_id", "cases")
         self._validate_sorted_unique(self.guidance, "rule_id", "guidance")
+        self._validate_sorted_unique(
+            self.execution_examples, "example_id", "execution_examples"
+        )
 
         if (
             self.compilation_manifest.source_id != self.source_id
@@ -206,25 +229,50 @@ class SemanticKnowledgeBundle(BaseModel):
         for knowledge_case in self.cases:
             for step in knowledge_case.steps:
                 self._validate_bundle_source_provenance(step.source_refs, "nested case step")
+        for example in self.execution_examples:
+            self._validate_bundle_source_provenance(
+                example.source_refs, "execution example"
+            )
 
         nested_ids = (
             tuple(reference.artifact_id for reference in self.references)
             + tuple(knowledge_case.case_id for knowledge_case in self.cases)
             + tuple(step.step_id for knowledge_case in self.cases for step in knowledge_case.steps)
             + tuple(rule.rule_id for rule in self.guidance)
+            + tuple(example.example_id for example in self.execution_examples)
         )
         if len(set(nested_ids)) != len(nested_ids):
             raise ValueError("artifact IDs must be unique across the semantic bundle")
         if set(self.compilation_manifest.emitted_artifact_ids) != set(nested_ids):
             raise ValueError("compilation manifest IDs must exactly match bundle artifact IDs")
+        parent_ids = {
+            reference.artifact_id for reference in self.references
+        } | {
+            step.step_id
+            for knowledge_case in self.cases
+            for step in knowledge_case.steps
+        }
+        for example in self.execution_examples:
+            if example.parent_artifact_id not in parent_ids:
+                raise ValueError(
+                    "execution example parent must be a bundle reference or case step"
+                )
+        if (
+            set(self.compilation_manifest.emitted_execution_example_ids)
+            != {example.example_id for example in self.execution_examples}
+        ):
+            raise ValueError(
+                "compilation manifest example IDs must exactly match bundle examples"
+            )
         return self
 
     @staticmethod
     def _validate_sorted_unique(
         artifacts: tuple[ReferenceArtifact, ...]
         | tuple[KnowledgeCase, ...]
-        | tuple[DecisionRule, ...],
-        attribute: Literal["artifact_id", "case_id", "rule_id"],
+        | tuple[DecisionRule, ...]
+        | tuple[ExecutionExample, ...],
+        attribute: Literal["artifact_id", "case_id", "rule_id", "example_id"],
         field_name: str,
     ) -> None:
         identifiers = tuple(getattr(artifact, attribute) for artifact in artifacts)

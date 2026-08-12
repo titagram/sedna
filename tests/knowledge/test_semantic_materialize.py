@@ -22,12 +22,17 @@ from sedna.knowledge.semantic import (
     DraftCaseStep,
     DraftCitation,
     DraftContextAssertion,
+    DraftExecutionExample,
     DraftGuidance,
     DraftReference,
     DraftTypedContext,
     SemanticDraftBundle,
 )
-from sedna.knowledge.semantic.materialize import materialize_bundle
+from sedna.knowledge.semantic.materialize import (
+    MaterializedSemanticContent,
+    materialize_bundle,
+    materialize_semantic_content,
+)
 
 
 def _prepared_source(
@@ -97,8 +102,16 @@ def _reference(
     )
 
 
-def _bundle(*artifacts: object, ignored: tuple[int, ...] = ()) -> SemanticDraftBundle:
-    return SemanticDraftBundle(artifacts=artifacts, ignored_segment_indexes=ignored)  # type: ignore[arg-type]
+def _bundle(
+    *artifacts: object, ignored: tuple[int, ...] = (), execution: object = ()
+) -> SemanticDraftBundle:
+    if isinstance(execution, DraftExecutionExample):
+        execution = (execution,)
+    return SemanticDraftBundle(
+        artifacts=artifacts,  # type: ignore[arg-type]
+        ignored_segment_indexes=ignored,
+        execution_examples=execution,  # type: ignore[arg-type]
+    )
 
 
 def test_materialize_resolves_exact_segment_provenance_and_host_metadata():
@@ -397,3 +410,95 @@ def test_materialize_sorts_reference_and_guidance_sets_without_rejecting_case_lo
         "service discovered",
         "web endpoint available",
     )
+
+
+def _draft_example(
+    local_id: str = "example-1", parent: str = "http-reference", **overrides
+) -> DraftExecutionExample:
+    payload = {
+        "local_id": local_id,
+        "parent_local_id": parent,
+        "command_template": "curl -i {{target}}",
+        "placeholders": (
+            {
+                "name": "target",
+                "kind": "target",
+                "binding_policy": "authorized_scope",
+                "role": "authorized HTTP target",
+            },
+        ),
+        "capability_hint": "http.inspect",
+        "purpose": "Inspect HTTP response metadata.",
+        "observed_role": "Gathered response evidence in the source case.",
+        "prerequisites": (
+            {
+                "statement": "An authorized HTTP target is available.",
+                "citations": (DraftCitation(segment_indexes=(0,)),),
+            },
+        ),
+        "platform_constraints": (
+            {
+                "dimension": "execution_environment",
+                "relation": "compatible",
+                "value": "network-reachable HTTP service",
+                "citations": (DraftCitation(segment_indexes=(1,)),),
+            },
+        ),
+        "citations": (DraftCitation(segment_indexes=(1,)),),
+    }
+    payload.update(overrides)
+    return DraftExecutionExample.model_validate(payload)
+
+
+def _content_with_example() -> MaterializedSemanticContent:
+    return materialize_semantic_content(
+        _prepared_source(),
+        _bundle(_reference(), execution=DraftExecutionExample.model_validate(_draft_example())),
+        _call_metadata(),
+        VerificationStatus.VERIFIED,
+    )
+
+
+def test_execution_example_ids_are_deterministic_and_content_scoped():
+    first = _content_with_example()
+    second = _content_with_example()
+    assert first.execution_examples == second.execution_examples
+    assert first.execution_examples[0].example_id.startswith("execution-example-")
+
+
+def test_execution_example_parent_is_canonical_and_draft_ids_never_cross():
+    content = _content_with_example()
+    reference = content.artifacts[0]
+    assert content.execution_examples[0].parent_artifact_id == reference.artifact_id
+    assert reference.artifact_id != "http-reference"
+
+
+def test_changing_example_content_changes_the_id():
+    base = _content_with_example().execution_examples[0]
+    changed = materialize_semantic_content(
+        _prepared_source(),
+        _bundle(
+            _reference(),
+            execution=DraftExecutionExample.model_validate(
+                _draft_example(observed_role="A different observed role.")
+            ),
+        ),
+        _call_metadata(),
+        VerificationStatus.VERIFIED,
+    ).execution_examples[0]
+    assert changed.example_id != base.example_id
+
+
+def test_draft_final_flag_in_command_is_rejected_at_materialization():
+    with pytest.raises(Exception, match="flag"):
+        materialize_semantic_content(
+            _prepared_source(),
+            _bundle(
+                _reference(),
+                execution=DraftExecutionExample.model_validate(
+                    _draft_example(command_template="cat {{path}} && echo HTB{fake}")
+                ),
+            ),
+            _call_metadata(),
+            VerificationStatus.VERIFIED,
+        )

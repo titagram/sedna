@@ -422,7 +422,7 @@ def test_unsafe_canonical_material_is_quarantined(monkeypatch: pytest.MonkeyPatc
     def reject_unsafe(*args: object, **kwargs: object) -> tuple[object, ...]:
         raise ValueError("unsafe canonical material")
 
-    monkeypatch.setattr(compiler_module, "materialize_bundle", reject_unsafe)
+    monkeypatch.setattr(compiler_module, "materialize_semantic_content", reject_unsafe)
     result = compiler.compile(_prepared_source())
 
     assert result.disposition == "quarantined"
@@ -458,7 +458,7 @@ def test_unsafe_canonical_material_after_repair_records_the_four_call_path(
     def reject_unsafe(*args: object, **kwargs: object) -> tuple[object, ...]:
         raise ValueError("unsafe canonical material")
 
-    monkeypatch.setattr(compiler_module, "materialize_bundle", reject_unsafe)
+    monkeypatch.setattr(compiler_module, "materialize_semantic_content", reject_unsafe)
     result = compiler.compile(_prepared_source())
 
     assert result.disposition == "quarantined"
@@ -520,7 +520,7 @@ def test_unexpected_materializer_failure_is_a_typed_failure(monkeypatch: pytest.
     def fail_materialization(*args: object, **kwargs: object) -> tuple[object, ...]:
         raise RuntimeError("materializer implementation failure")
 
-    monkeypatch.setattr(compiler_module, "materialize_bundle", fail_materialization)
+    monkeypatch.setattr(compiler_module, "materialize_semantic_content", fail_materialization)
     result = compiler.compile(_prepared_source())
 
     assert result.disposition == "failed"

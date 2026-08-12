@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import TypeVar
 
 from sedna.knowledge.parsing import PreparedSource
@@ -29,6 +30,12 @@ from sedna.knowledge.schema import (
     TypedContext,
     VerificationStatus,
 )
+from sedna.knowledge.schema.execution import (
+    ExecutionCondition,
+    ExecutionExample,
+    ExecutionPlaceholder,
+    ExecutionPlatformConstraint,
+)
 from sedna.knowledge.schema.semantic import SemanticCallMetadata
 from sedna.knowledge.semantic.drafts import (
     DraftApplicabilityContext,
@@ -36,6 +43,7 @@ from sedna.knowledge.semantic.drafts import (
     DraftCaseStep,
     DraftCitation,
     DraftContextAssertion,
+    DraftExecutionExample,
     DraftGuidance,
     DraftReference,
     SemanticDraftBundle,
@@ -46,17 +54,36 @@ CanonicalArtifact = ReferenceArtifact | KnowledgeCase | DecisionRule
 T = TypeVar("T")
 
 
+@dataclass(frozen=True, slots=True)
+class MaterializedSemanticContent:
+    """Canonical artifacts plus their bundle-owned execution examples."""
+
+    artifacts: tuple[CanonicalArtifact, ...]
+    execution_examples: tuple[ExecutionExample, ...]
+
+
 def materialize_bundle(
     prepared: PreparedSource,
     drafts: SemanticDraftBundle,
     call_metadata: SemanticCallMetadata,
     verification_status: VerificationStatus,
 ) -> tuple[CanonicalArtifact, ...]:
-    """Materialize validated drafts with exact source evidence and stable identities.
+    """Materialize validated drafts with exact source evidence and stable identities."""
+    return materialize_semantic_content(
+        prepared,
+        drafts,
+        call_metadata,
+        verification_status,
+    ).artifacts
 
-    Draft-local identifiers never cross this boundary.  The caller supplies the adjudicated
-    status because extractor output is not permitted to declare canonical verification.
-    """
+
+def materialize_semantic_content(
+    prepared: PreparedSource,
+    drafts: SemanticDraftBundle,
+    call_metadata: SemanticCallMetadata,
+    verification_status: VerificationStatus,
+) -> MaterializedSemanticContent:
+    """Materialize canonical artifacts and their execution examples together."""
     prepared = validate_prepared_source(prepared)
     drafts = SemanticDraftBundle.model_validate(drafts.model_dump(mode="json"))
     call_metadata = SemanticCallMetadata.model_validate(call_metadata.model_dump(mode="json"))
@@ -65,8 +92,32 @@ def materialize_bundle(
     drafts.validate_against_segment_count(len(prepared.segments))
     validate_segment_accounting(prepared, drafts)
 
+    artifacts, local_to_canonical = _materialize_artifacts_with_local_ids(
+        prepared,
+        drafts,
+        call_metadata,
+        verification_status,
+    )
+    examples = _materialize_execution_examples(
+        prepared,
+        drafts.execution_examples,
+        local_to_canonical,
+        call_metadata,
+    )
+    return MaterializedSemanticContent(
+        artifacts=artifacts,
+        execution_examples=examples,
+    )
+
+
+def _materialize_artifacts_with_local_ids(
+    prepared: PreparedSource,
+    drafts: SemanticDraftBundle,
+    call_metadata: SemanticCallMetadata,
+    verification_status: VerificationStatus,
+) -> tuple[tuple[CanonicalArtifact, ...], Mapping[str, str]]:
     extraction = _extraction_metadata(prepared, call_metadata)
-    artifacts = tuple(
+    materialized = tuple(
         _materialize_artifact(
             prepared,
             draft,
@@ -75,7 +126,146 @@ def materialize_bundle(
         )
         for draft in drafts.artifacts
     )
-    return _deduplicate_and_sort(artifacts)
+    artifacts = _deduplicate_and_sort(tuple(item[0] for item in materialized))
+    local_to_canonical: dict[str, str] = {}
+    for draft, (artifact, local_map) in zip(drafts.artifacts, materialized, strict=True):
+        local_to_canonical.update(local_map)
+        local_to_canonical[draft.local_id] = artifact_id_for(artifact)
+    return artifacts, local_to_canonical
+
+
+def artifact_id_for(artifact: CanonicalArtifact) -> str:
+    if isinstance(artifact, ReferenceArtifact):
+        return artifact.artifact_id
+    if isinstance(artifact, KnowledgeCase):
+        return artifact.case_id
+    return artifact.rule_id
+
+
+def _materialize_execution_examples(
+    prepared: PreparedSource,
+    drafts: tuple[DraftExecutionExample, ...],
+    local_to_canonical: Mapping[str, str],
+    call_metadata: SemanticCallMetadata,
+) -> tuple[ExecutionExample, ...]:
+    extraction = _extraction_metadata(prepared, call_metadata)
+    examples: list[ExecutionExample] = []
+    for draft in drafts:
+        if draft.parent_local_id not in local_to_canonical:
+            raise ValueError(
+                "execution example parent must be a materialized reference or case step"
+            )
+        parent = local_to_canonical[draft.parent_local_id]
+        source_refs = _resolve_citations(prepared, draft.citations)
+        applicability = _materialize_applicability(prepared, draft.applicability)
+        prerequisites = tuple(
+            ExecutionCondition(
+                statement=condition.statement,
+                source_refs=_resolve_citations(prepared, condition.citations),
+            )
+            for condition in draft.prerequisites
+        )
+        platform_constraints = tuple(
+            ExecutionPlatformConstraint(
+                dimension=constraint.dimension,
+                relation=constraint.relation,
+                value=constraint.value,
+                source_refs=_resolve_citations(prepared, constraint.citations),
+            )
+            for constraint in draft.platform_constraints
+        )
+        placeholders = tuple(
+            ExecutionPlaceholder(
+                name=placeholder.name,
+                kind=placeholder.kind,
+                binding_policy=placeholder.binding_policy,
+                role=placeholder.role,
+            )
+            for placeholder in draft.placeholders
+        )
+        example_id = stable_execution_example_id(
+            prepared.manifest.source_id,
+            parent,
+            draft.command_template,
+            placeholders,
+            draft.capability_hint,
+            draft.purpose,
+            draft.observed_role,
+            prerequisites,
+            applicability,
+            platform_constraints,
+            source_refs,
+        )
+        examples.append(
+            ExecutionExample(
+                schema_version="1",
+                example_id=example_id,
+                parent_artifact_id=parent,
+                command_template=draft.command_template,
+                placeholders=placeholders,
+                capability_hint=draft.capability_hint,
+                purpose=draft.purpose,
+                observed_role=draft.observed_role,
+                prerequisites=prerequisites,
+                applicability=applicability,
+                platform_constraints=platform_constraints,
+                source_refs=source_refs,
+                extraction=extraction,
+                requires_validation=True,
+            )
+        )
+    return _sorted_models(examples)
+
+
+def stable_execution_example_id(
+    source_id: str,
+    parent_artifact_id: str,
+    command_template: str,
+    placeholders: tuple[ExecutionPlaceholder, ...],
+    capability_hint: str,
+    purpose: str,
+    observed_role: str,
+    prerequisites: tuple[ExecutionCondition, ...],
+    applicability: ApplicabilityContext,
+    platform_constraints: tuple[ExecutionPlatformConstraint, ...],
+    source_refs: tuple[SourceRef, ...],
+) -> str:
+    """Content-addressed example identity; never includes the parent's draft ID."""
+    canonical = {
+        "source_id": source_id,
+        "parent_artifact_id": parent_artifact_id,
+        "command_template": command_template,
+        "placeholders": _primitive(
+            tuple(sorted(placeholders, key=lambda placeholder: placeholder.name))
+        ),
+        "capability_hint": capability_hint,
+        "purpose": purpose,
+        "observed_role": observed_role,
+        "prerequisites": _primitive(
+            tuple(
+                {
+                    "statement": condition.statement,
+                    "source_refs": _primitive(_sorted_source_refs(condition.source_refs)),
+                }
+                for condition in prerequisites
+            )
+        ),
+        "applicability": _primitive(applicability),
+        "platform_constraints": _primitive(
+            tuple(
+                {
+                    "dimension": constraint.dimension,
+                    "relation": constraint.relation,
+                    "value": constraint.value,
+                    "source_refs": _primitive(_sorted_source_refs(constraint.source_refs)),
+                }
+                for constraint in platform_constraints
+            )
+        ),
+        "source_refs": _primitive(_sorted_source_refs(source_refs)),
+    }
+    digest = hashlib.sha256(_canonical_json(canonical).encode("utf-8")).hexdigest()[:24]
+    return f"execution-example-{digest}"
 
 
 def stable_artifact_id(
@@ -102,7 +292,7 @@ def _materialize_artifact(
     draft: DraftReference | DraftCase | DraftGuidance,
     extraction: ExtractionMetadata,
     verification_status: VerificationStatus,
-) -> CanonicalArtifact:
+) -> tuple[CanonicalArtifact, Mapping[str, str]]:
     applicability = _materialize_applicability(prepared, draft.applicability)
     source_refs = _resolve_citations(prepared, draft.citations)
     assessment = _assessment(prepared, draft.knowledge_role, verification_status)
@@ -143,7 +333,7 @@ def _materialize_artifact(
             source_refs=source_refs,
             extraction=extraction,
             **content,
-        )
+        ), {}
 
     if isinstance(draft, DraftGuidance):
         content = {
@@ -176,7 +366,7 @@ def _materialize_artifact(
             source_refs=source_refs,
             extraction=extraction,
             **content,
-        )
+        ), {}
 
     steps = tuple(
         _materialize_case_step(
@@ -207,6 +397,10 @@ def _materialize_artifact(
         source_refs,
         applicability,
     )
+    step_map = {
+        step_draft.local_id: step.step_id
+        for step_draft, step in zip(draft.steps, steps, strict=True)
+    }
     return KnowledgeCase(
         artifact_type=draft.artifact_type,
         case_id=case_id,
@@ -215,7 +409,7 @@ def _materialize_artifact(
         source_refs=source_refs,
         extraction=extraction,
         **content,
-    )
+    ), step_map
 
 
 def _materialize_case_step(
@@ -373,6 +567,13 @@ def _all_cited_indexes(drafts: SemanticDraftBundle) -> tuple[int, ...]:
             for step in draft.steps:
                 indexes.extend(_indexes_from_citations(step.citations))
                 indexes.extend(_indexes_from_context(step.applicability))
+    for example in drafts.execution_examples:
+        indexes.extend(_indexes_from_citations(example.citations))
+        indexes.extend(_indexes_from_context(example.applicability))
+        for condition in example.prerequisites:
+            indexes.extend(_indexes_from_citations(condition.citations))
+        for constraint in example.platform_constraints:
+            indexes.extend(_indexes_from_citations(constraint.citations))
     return tuple(indexes)
 
 
