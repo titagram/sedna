@@ -134,6 +134,16 @@ from sedna.engagement.logbook import (
     LogbookProjectionConflict,
     render_session_logbook,
 )
+from sedna.engagement.sources import (
+    SharedSourceEntry,
+    SharedSourceRegistry,
+    SourceOrigin,
+    SourceRegistryConflict,
+    SourceRegistryLimitError,
+    SourceRegistryResult,
+    SourceRegistrySnapshot,
+    SourceStatus,
+)
 
 __all__ = [
     "ALWAYS_REDACTED_HOST_KEYS",
@@ -244,6 +254,14 @@ __all__ = [
     "SessionStartedPayload",
     "SettlementSafeCode",
     "Sha256Hex",
+    "SharedSourceEntry",
+    "SharedSourceRegistry",
+    "SourceOrigin",
+    "SourceRegistryConflict",
+    "SourceRegistryLimitError",
+    "SourceRegistryResult",
+    "SourceRegistrySnapshot",
+    "SourceStatus",
     "SourceSuggestedPayload",
     "SystemCorrelation",
     "ToolCallCompletedPayload",
