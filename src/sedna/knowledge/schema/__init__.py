@@ -16,6 +16,14 @@ from sedna.knowledge.schema.common import (
     VerificationStatus,
     verification_from_legacy_review,
 )
+from sedna.knowledge.schema.execution import (
+    ExecutionCondition,
+    ExecutionExample,
+    ExecutionPlaceholder,
+    ExecutionPlatformConstraint,
+    PlaceholderBindingPolicy,
+    PlaceholderKind,
+)
 from sedna.knowledge.schema.context import (
     ApplicabilityContext,
     ContextAssertion,
@@ -81,6 +89,10 @@ __all__ = [
     "DecisionRule",
     "DocumentType",
     "EpistemicAssessment",
+    "ExecutionCondition",
+    "ExecutionExample",
+    "ExecutionPlaceholder",
+    "ExecutionPlatformConstraint",
     "DocumentManifest",
     "ExtractionMetadata",
     "foundation_manifest_digest",
@@ -89,6 +101,8 @@ __all__ = [
     "KnowledgeRole",
     "KnowledgeCase",
     "Origin",
+    "PlaceholderBindingPolicy",
+    "PlaceholderKind",
     "ObservedOutcome",
     "ReviewStatus",
     "ReferenceArtifact",

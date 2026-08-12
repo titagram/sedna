@@ -14,9 +14,17 @@ from sedna.knowledge.schema.common import (
     Origin,
     SearchableNonEmptyString,
     SearchableString,
+    SourceLocation,
     SourceQuality,
+    SourceRef,
 )
 from sedna.knowledge.schema.context import ContextRelation
+from sedna.knowledge.schema.execution import (
+    ExecutionPlatformConstraint,
+    _ordered_placeholders,
+    _validate_command_template,
+    _validate_platform_prose,
+)
 from sedna.knowledge.schema.semantic import (
     SemanticCallMetadata,
     SemanticKnowledgeBundle,
@@ -281,12 +289,142 @@ DraftArtifact = Annotated[
 ]
 
 
+class DraftExecutionPlaceholder(BaseModel):
+    """A draft placeholder with the same binding policy as its canonical form."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
+    kind: Literal[
+        "target",
+        "port",
+        "username",
+        "credential_ref",
+        "source_case_credential",
+        "wordlist",
+        "path",
+        "value",
+    ]
+    binding_policy: Literal["authorized_scope", "host_supplied", "never_auto_bind"]
+    role: SearchableNonEmptyString
+
+    @model_validator(mode="after")
+    def validate_binding_policy(self) -> Self:
+        if self.kind == "target" and self.binding_policy != "authorized_scope":
+            raise ValueError("target placeholders require authorized_scope")
+        if (
+            self.kind == "source_case_credential"
+            and self.binding_policy != "never_auto_bind"
+        ):
+            raise ValueError(
+                "source-case credentials can never request automatic binding"
+            )
+        return self
+
+
+class DraftExecutionCondition(BaseModel):
+    """A draft prerequisite cited into the compiler input's segments."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    statement: SearchableNonEmptyString
+    citations: tuple[DraftCitation, ...] = Field(min_length=1)
+
+
+class DraftExecutionPlatformConstraint(BaseModel):
+    """A draft platform assertion with draft segment citations."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    dimension: Literal[
+        "os_family",
+        "os_version",
+        "cpu_architecture",
+        "execution_environment",
+    ]
+    relation: Literal["required", "compatible", "incompatible"]
+    value: SearchableNonEmptyString
+    citations: tuple[DraftCitation, ...] = Field(min_length=1)
+
+
+class DraftExecutionExample(BaseModel):
+    """A draft executable example awaiting canonical materialization."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    local_id: DraftLocalId
+    parent_local_id: DraftLocalId
+    command_template: Annotated[str, Field(min_length=1, max_length=8192)]
+    placeholders: tuple[DraftExecutionPlaceholder, ...]
+    capability_hint: SearchableNonEmptyString
+    purpose: SearchableNonEmptyString
+    observed_role: SearchableNonEmptyString
+    applicability: DraftApplicabilityContext = Field(
+        default_factory=DraftApplicabilityContext
+    )
+    prerequisites: tuple[DraftExecutionCondition, ...] = ()
+    platform_constraints: tuple[DraftExecutionPlatformConstraint, ...] = ()
+    citations: tuple[DraftCitation, ...] = Field(min_length=1)
+    requires_validation: Literal[True] = True
+
+    @model_validator(mode="after")
+    def validate_example(self) -> Self:
+        if not _SAFE_DRAFT_LOCAL_ID.fullmatch(self.local_id):
+            raise ValueError("draft local_id must be a safe path segment")
+        if not _SAFE_DRAFT_LOCAL_ID.fullmatch(self.parent_local_id):
+            raise ValueError("draft parent_local_id must be a safe path segment")
+        _validate_command_template(self.command_template)
+        ordered = _ordered_placeholders(self.placeholders)
+        object.__setattr__(self, "placeholders", ordered)
+        declared = {placeholder.name for placeholder in ordered}
+        tokens = set(re.findall(r"\{\{\s*([a-z][a-z0-9_]{0,63})\s*\}\}", self.command_template))
+        if tokens != declared:
+            raise ValueError(
+                "template placeholders must exactly cover the declared placeholders"
+            )
+        _validate_platform_prose(
+            self.purpose,
+            self.capability_hint,
+            self.observed_role,
+            _platform_constraints_canonical(self.platform_constraints),
+        )
+        constraint_entries = {
+            (constraint.dimension, constraint.relation, constraint.value)
+            for constraint in self.platform_constraints
+        }
+        if len(constraint_entries) != len(self.platform_constraints):
+            raise ValueError(
+                "platform constraints must be unique by dimension, relation, and value"
+            )
+        return self
+
+
+def _platform_constraints_canonical(
+    constraints: tuple[DraftExecutionPlatformConstraint, ...],
+) -> tuple[ExecutionPlatformConstraint, ...]:
+    marker = SourceRef(
+        source_id="prose-check",
+        path="prose-check",
+        location=SourceLocation(section="prose-check"),
+    )
+    return tuple(
+        ExecutionPlatformConstraint(
+            dimension=constraint.dimension,
+            relation=constraint.relation,
+            value=constraint.value,
+            source_refs=(marker,),
+        )
+        for constraint in constraints
+    )
+
+
 class SemanticDraftBundle(BaseModel):
     """Extractor or repair output before canonical identity and provenance assignment."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     artifacts: tuple[DraftArtifact, ...] = ()
+    execution_examples: tuple[DraftExecutionExample, ...] = ()
     ignored_segment_indexes: tuple[int, ...] = ()
 
     @model_validator(mode="after")
@@ -298,9 +436,24 @@ class SemanticDraftBundle(BaseModel):
             for artifact in self.artifacts
             if isinstance(artifact, DraftCase)
             for step in artifact.steps
-        )
+        ) + tuple(example.local_id for example in self.execution_examples)
         if len(set(local_ids)) != len(local_ids):
             raise ValueError("draft local IDs must be unique within a bundle")
+        parent_ids = {
+            artifact.local_id
+            for artifact in self.artifacts
+            if isinstance(artifact, DraftReference)
+        } | {
+            step.local_id
+            for artifact in self.artifacts
+            if isinstance(artifact, DraftCase)
+            for step in artifact.steps
+        }
+        for example in self.execution_examples:
+            if example.parent_local_id not in parent_ids:
+                raise ValueError(
+                    "execution example parent must be a reference or case-step local ID"
+                )
         return self
 
     def validate_against_segment_count(self, segment_count: int) -> None:
@@ -316,6 +469,13 @@ class SemanticDraftBundle(BaseModel):
                 for step in artifact.steps:
                     indexes.extend(_citation_indexes(step.citations))
                     indexes.extend(_applicability_indexes(step.applicability))
+        for example in self.execution_examples:
+            indexes.extend(_citation_indexes(example.citations))
+            indexes.extend(_applicability_indexes(example.applicability))
+            for condition in example.prerequisites:
+                indexes.extend(_citation_indexes(condition.citations))
+            for constraint in example.platform_constraints:
+                indexes.extend(_citation_indexes(constraint.citations))
         return tuple(indexes)
 
 
