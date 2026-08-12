@@ -1,0 +1,1044 @@
+"""Immutable, bounded contracts for adaptive engagement planning."""
+
+from __future__ import annotations
+
+from enum import StrEnum
+from hashlib import sha256
+from typing import Annotated, Literal, Self, TypeAlias
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
+
+from sedna.engagement import (
+    MAX_HOST_RESULT_BYTES,
+    MAX_JOURNAL_BATCH_EVENTS,
+    MAX_REQUIRED_PROOFS,
+    MAX_SETTLEMENT_PENDING_RANGES,
+    EvidenceId,
+    JournalRevision,
+    PendingSubjectCursor,
+    ProofRequirement,
+    SettlementReason,
+)
+
+ProofRequirementId: TypeAlias = Annotated[
+    str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")
+]
+Sha256Hex: TypeAlias = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+ShortText: TypeAlias = Annotated[str, Field(min_length=1, max_length=2048)]
+MediaType: TypeAlias = Annotated[str, Field(min_length=1, max_length=255)]
+
+MAX_ATTEMPTS_PER_VARIANT = 8
+MAX_HOT_ATTEMPTS = 256
+MAX_RECENT_EVENTS = 64
+MAX_RECENT_EVENT_TEXT_BYTES = 64 * 1024
+MAX_PLANNER_REQUEST_BYTES = 512 * 1024
+MAX_PLANNING_EVENT_BATCH = MAX_JOURNAL_BATCH_EVENTS - 1
+MAX_PLANNING_PAYLOAD_BYTES = 60 * 1024
+MAX_PLANNING_RESULT_BYTES = MAX_HOST_RESULT_BYTES - 16 * 1024
+EVIDENCE_SLICE_BYTES = 32 * 1024
+MAX_EVIDENCE_SLICES_PER_SETTLEMENT = 64
+MAX_EVIDENCE_BYTES_PER_SETTLEMENT = 2 * 1024 * 1024
+
+
+class OutcomeCategory(StrEnum):
+    PROGRESS = "progress"
+    PARTIAL_PROGRESS = "partial_progress"
+    NO_EFFECT = "no_effect"
+    NEGATIVE_EVIDENCE = "negative_evidence"
+    INCOMPATIBLE = "incompatible"
+    EXECUTION_ERROR = "execution_error"
+    AMBIGUOUS = "ambiguous"
+
+
+class StrategyStatus(StrEnum):
+    AVAILABLE = "available"
+    DEFERRED = "deferred"
+    BLOCKED = "blocked"
+    EXHAUSTED = "exhausted"
+    COMPLETED = "completed"
+    ARCHIVED = "archived"
+    SUPERSEDED = "superseded"
+
+
+class RetryPredicateKind(StrEnum):
+    FACT_PRESENT = "fact_present"
+    FACT_CHANGED = "fact_changed"
+    PREREQUISITE_SATISFIED = "prerequisite_satisfied"
+    EVIDENCE_CATEGORY_PRESENT = "evidence_category_present"
+    CREDENTIAL_AVAILABLE = "credential_available"
+    STATE_REVISION_AFTER = "state_revision_after"
+
+
+class ObservationDraft(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    kind: Literal["text", "facet", "access", "secret", "incompatibility"]
+    text: Annotated[str, Field(min_length=1, max_length=8192)]
+    event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=32)]
+
+    @model_validator(mode="after")
+    def _event_ids_are_sorted_unique(self) -> Self:
+        if self.event_ids != tuple(sorted(self.event_ids, key=str)) or len(self.event_ids) != len(
+            set(self.event_ids)
+        ):
+            raise ValueError("event_ids_required")
+        return self
+
+
+class HypothesisDraft(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    text: Annotated[str, Field(min_length=1, max_length=8192)]
+    confidence: float
+    event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=32)]
+
+    @model_validator(mode="after")
+    def _grounding_and_confidence(self) -> Self:
+        if self.event_ids != tuple(sorted(self.event_ids, key=str)) or len(self.event_ids) != len(
+            set(self.event_ids)
+        ):
+            raise ValueError("event_ids_required")
+        if not 0 <= self.confidence <= 1 or self.confidence != self.confidence:
+            raise ValueError("finite_confidence_required")
+        return self
+
+
+class ProofValueReference(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    proof_event_id: UUID
+    proof_requirement_id: ProofRequirementId
+    assessment_generation: Annotated[int, Field(ge=1)]
+    assessment: Literal["supported", "contradicted"]
+    evidence_id: EvidenceId
+    candidate_start: Annotated[int, Field(ge=0)]
+    candidate_end: Annotated[int, Field(gt=0)]
+    value_sha256: Sha256Hex
+
+    @model_validator(mode="after")
+    def _candidate_range_is_positive(self) -> Self:
+        if self.candidate_end <= self.candidate_start:
+            raise ValueError("proof_value_range_must_be_positive")
+        return self
+
+
+class ProofRejectionRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    proof_requirement_id: ProofRequirementId
+    assessment_generation: Annotated[int, Field(ge=1)]
+    rejection_event_id: UUID
+    rejected_proof_event_id: UUID
+    rejected_value_sha256: Sha256Hex
+
+
+class ProofProgress(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    proof_requirement_id: ProofRequirementId
+    assessment_generation: Annotated[int, Field(ge=1)] = 1
+    generation_started_event_id: UUID | None = None
+    status: Literal["pending", "supported", "contradicted"]
+    supporting_event_ids: Annotated[tuple[UUID, ...], Field(max_length=32)] = ()
+    contradicting_event_ids: Annotated[tuple[UUID, ...], Field(max_length=32)] = ()
+    value_references: Annotated[tuple[ProofValueReference, ...], Field(max_length=16)] = ()
+    historical_assessment_count: Annotated[int, Field(ge=0)] = 0
+    historical_assessment_digest: Sha256Hex
+    rejected_value_sha256s: Annotated[tuple[Sha256Hex, ...], Field(max_length=32)] = ()
+    rejected_value_overflow_count: Annotated[int, Field(ge=0)] = 0
+    rejected_value_overflow_digest: Sha256Hex
+
+    @model_validator(mode="after")
+    def _event_ids_are_sorted_and_status_is_grounded(self) -> Self:
+        for name, event_ids in (
+            ("supporting_event_ids", self.supporting_event_ids),
+            ("contradicting_event_ids", self.contradicting_event_ids),
+        ):
+            is_sorted_unique = event_ids == tuple(sorted(event_ids, key=str))
+            if not is_sorted_unique or len(event_ids) != len(set(event_ids)):
+                raise ValueError(f"{name}_not_sorted_unique")
+        if self.status == "pending" and (self.supporting_event_ids or self.contradicting_event_ids):
+            raise ValueError("pending_proof_has_assessment_events")
+        if self.status == "supported" and not self.supporting_event_ids:
+            raise ValueError("supported_proof_requires_support")
+        if self.status == "contradicted" and not self.contradicting_event_ids:
+            raise ValueError("contradicted_proof_requires_contradiction")
+        for reference in self.value_references:
+            if (
+                reference.proof_requirement_id != self.proof_requirement_id
+                or reference.assessment_generation != self.assessment_generation
+            ):
+                raise ValueError("proof_value_reference_binding_mismatch")
+            is_missing_support = (
+                reference.assessment == "supported"
+                and reference.proof_event_id not in self.supporting_event_ids
+            )
+            if is_missing_support:
+                raise ValueError("proof_value_reference_event_mismatch")
+            if (
+                reference.assessment == "contradicted"
+                and reference.proof_event_id not in self.contradicting_event_ids
+            ):
+                raise ValueError("proof_value_reference_event_mismatch")
+        if len(self.rejected_value_sha256s) != len(set(self.rejected_value_sha256s)):
+            raise ValueError("rejected_values_not_unique")
+        return self
+
+
+class ObjectiveProgress(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    requirements: Annotated[tuple[ProofProgress, ...], Field(max_length=MAX_REQUIRED_PROOFS)] = ()
+
+    @model_validator(mode="after")
+    def _requirements_are_sorted_unique(self) -> Self:
+        ids = tuple(item.proof_requirement_id for item in self.requirements)
+        if ids != tuple(sorted(ids)) or len(ids) != len(set(ids)):
+            raise ValueError("requirements_not_sorted_unique")
+        return self
+
+
+class SituationProjection(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    engagement_id: UUID
+    authoritative_journal_revision: JournalRevision
+    material_event_revision: Annotated[int, Field(ge=0)]
+    state_digest: Sha256Hex
+    objective_progress: ObjectiveProgress
+    facts: Annotated[tuple[ObservedFact, ...], Field(max_length=64)] = ()
+    facets: Annotated[tuple[ObservedFacet, ...], Field(max_length=64)] = ()
+    hypotheses: Annotated[tuple[SituationHypothesis, ...], Field(max_length=64)] = ()
+    research_sources: Annotated[tuple[ResearchSourceAssessment, ...], Field(max_length=64)] = ()
+    access_states: Annotated[tuple[AccessState, ...], Field(max_length=64)] = ()
+    interpretations: Annotated[tuple[EvidenceInterpretationState, ...], Field(max_length=64)] = ()
+    secret_references: Annotated[tuple[SecretReference, ...], Field(max_length=64)] = ()
+    attempts: Annotated[tuple[AttemptSummary, ...], Field(max_length=64)] = ()
+    incompatibilities: Annotated[tuple[Incompatibility, ...], Field(max_length=64)] = ()
+
+    @model_validator(mode="after")
+    def _material_revision_is_not_ahead(self) -> Self:
+        if self.material_event_revision > self.authoritative_journal_revision.sequence:
+            raise ValueError("material_revision_after_authoritative_revision")
+        return self
+
+
+class FrontierProposalDraft(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    proposal_id: None = None
+    family_runtime_key: Annotated[str, Field(min_length=1, max_length=128)]
+    variant_runtime_key: Annotated[str, Field(min_length=1, max_length=128)]
+    title: ShortText
+    score: Annotated[int, Field(ge=0, le=100)]
+    confidence: Annotated[int, Field(ge=0, le=100)]
+    rationale: ShortText
+
+
+class FrontierProposal(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    proposal_id: UUID
+    family_id: UUID
+    variant_id: UUID
+    title: ShortText
+    score: Annotated[int, Field(ge=0, le=100)]
+    confidence: Annotated[int, Field(ge=0, le=100)]
+    rationale: ShortText
+
+
+class FrontierProjection(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    frontier_id: UUID
+    engagement_id: UUID
+    state_digest: Sha256Hex
+    input_ledger_digest: Sha256Hex
+    resulting_ledger_digest: Sha256Hex
+    proposals: Annotated[tuple[FrontierProposal, ...], Field(max_length=8)] = ()
+    constrained_rationale: ShortText | None = None
+
+    @model_validator(mode="after")
+    def _proposals_are_viable_and_score_ordered(self) -> Self:
+        proposal_ids = tuple(proposal.proposal_id for proposal in self.proposals)
+        if len(proposal_ids) != len(set(proposal_ids)):
+            raise ValueError("frontier_proposal_ids_not_unique")
+        scores = tuple(proposal.score for proposal in self.proposals)
+        if scores != tuple(sorted(scores, reverse=True)):
+            raise ValueError("frontier_proposals_not_score_ordered")
+        if len(self.proposals) < 3 and self.constrained_rationale is None:
+            raise ValueError("frontier_requires_constrained_rationale")
+        if len(self.proposals) >= 3 and self.constrained_rationale is not None:
+            raise ValueError("frontier_unexpected_constrained_rationale")
+        return self
+
+
+class PlannerFinding(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    code: Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
+    summary: ShortText
+    material: bool
+
+
+class PlannerCriticVerdict(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    accepted: bool
+    findings: Annotated[tuple[PlannerFinding, ...], Field(max_length=64)] = ()
+
+    @model_validator(mode="after")
+    def _acceptance_matches_material_findings(self) -> Self:
+        has_material_finding = any(finding.material for finding in self.findings)
+        if self.accepted == has_material_finding:
+            raise ValueError("critic_acceptance_policy")
+        return self
+
+
+class StrategyReconciliation(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    input_family_ids: Annotated[tuple[UUID, ...], Field(max_length=32)]
+    input_variant_ids: Annotated[tuple[UUID, ...], Field(max_length=64)]
+    retained_family_ids: Annotated[tuple[UUID, ...], Field(max_length=32)]
+    retained_variant_ids: Annotated[tuple[UUID, ...], Field(max_length=64)]
+
+    @model_validator(mode="after")
+    def _reject_silent_loss(self) -> Self:
+        for input_ids, retained_ids in (
+            (self.input_family_ids, self.retained_family_ids),
+            (self.input_variant_ids, self.retained_variant_ids),
+        ):
+            if len(input_ids) != len(set(input_ids)) or len(retained_ids) != len(set(retained_ids)):
+                raise ValueError("strategy_reconciliation_ids_not_unique")
+            if set(input_ids) != set(retained_ids):
+                raise ValueError("strategy_reconciliation_silent_loss")
+        return self
+
+
+class PlanningCallMetadata(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    purpose: Literal["observe", "plan", "critic", "repair"]
+    provider: Annotated[str, Field(min_length=1, max_length=256)]
+    model: Annotated[str, Field(min_length=1, max_length=256)]
+    agent_id: Annotated[str, Field(min_length=1, max_length=256)]
+    prompt_id: Annotated[str, Field(min_length=1, max_length=512)]
+    prompt_version: Annotated[str, Field(min_length=1, max_length=512)]
+    response_schema_version: Annotated[str, Field(min_length=1, max_length=512)]
+    input_digest: Sha256Hex
+    input_tokens: Annotated[int, Field(ge=0)]
+    output_tokens: Annotated[int, Field(ge=0)]
+    elapsed_ms: Annotated[int, Field(ge=0)]
+
+
+class LocalEventIdBinding(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    local_id: Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
+    event_id: UUID
+
+
+class ProofIndexRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    proof_requirement_id: ProofRequirementId
+    assessment_generation: Annotated[int, Field(ge=1)]
+    rejection_inventory_digest: Sha256Hex
+
+
+class _ConversionEnvelope(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    local_event_bindings: Annotated[tuple[LocalEventIdBinding, ...], Field(max_length=512)]
+    valid_event_ids: Annotated[tuple[UUID, ...], Field(max_length=512)]
+    valid_evidence_ids: Annotated[tuple[EvidenceId, ...], Field(max_length=512)]
+    valid_scope_reference_ids: Annotated[tuple[str, ...], Field(max_length=512)] = ()
+    valid_proof_indexes: Annotated[tuple[ProofIndexRecord, ...], Field(max_length=64)] = ()
+    proof_candidate_admissions: Annotated[
+        tuple[ProofCandidateAdmission, ...], Field(max_length=64)
+    ] = ()
+    valid_decision_ids: Annotated[tuple[UUID, ...], Field(max_length=512)] = ()
+    valid_proposal_ids: Annotated[tuple[UUID, ...], Field(max_length=512)] = ()
+    valid_family_ids: Annotated[tuple[UUID, ...], Field(max_length=64)] = ()
+    valid_variant_ids: Annotated[tuple[UUID, ...], Field(max_length=128)] = ()
+    valid_knowledge_ids: Annotated[tuple[str, ...], Field(max_length=512)] = ()
+    valid_source_ids: Annotated[tuple[str, ...], Field(max_length=512)] = ()
+
+    @model_validator(mode="after")
+    def _bindings_and_indexes_are_deterministic(self) -> Self:
+        binding_keys = tuple(binding.local_id for binding in self.local_event_bindings)
+        bindings_are_sorted_unique = binding_keys == tuple(sorted(binding_keys)) and len(
+            binding_keys
+        ) == len(set(binding_keys))
+        if not bindings_are_sorted_unique:
+            raise ValueError("local_event_bindings_not_sorted_unique")
+        event_ids = tuple(sorted(self.valid_event_ids, key=str))
+        if self.valid_event_ids != event_ids or len(event_ids) != len(set(event_ids)):
+            raise ValueError("valid_event_ids_not_sorted_unique")
+        if self.valid_evidence_ids != tuple(sorted(set(self.valid_evidence_ids))):
+            raise ValueError("valid_evidence_ids_not_sorted_unique")
+        indexed_uuid_tuples = (
+            self.valid_decision_ids,
+            self.valid_proposal_ids,
+            self.valid_family_ids,
+            self.valid_variant_ids,
+        )
+        has_unsorted_uuid_index = any(
+            values != tuple(sorted(values, key=str)) or len(values) != len(set(values))
+            for values in indexed_uuid_tuples
+        )
+        if has_unsorted_uuid_index:
+            raise ValueError("valid_uuid_index_not_sorted_unique")
+        indexed_text_tuples = (
+            self.valid_scope_reference_ids,
+            self.valid_knowledge_ids,
+            self.valid_source_ids,
+        )
+        if any(values != tuple(sorted(set(values))) for values in indexed_text_tuples):
+            raise ValueError("valid_text_index_not_sorted_unique")
+        proof_keys = tuple(
+            (item.proof_requirement_id, item.assessment_generation)
+            for item in self.valid_proof_indexes
+        )
+        if proof_keys != tuple(sorted(proof_keys)) or len(proof_keys) != len(set(proof_keys)):
+            raise ValueError("valid_proof_indexes_not_sorted_unique")
+        indexed_proofs = set(proof_keys)
+        for admission in self.proof_candidate_admissions:
+            admission_key = (admission.proof_requirement_id, admission.assessment_generation)
+            if admission_key not in indexed_proofs:
+                raise ValueError("proof_candidate_admission_not_in_index")
+        has_unindexed_binding = any(
+            binding.event_id not in self.valid_event_ids
+            for binding in self.local_event_bindings
+        )
+        if has_unindexed_binding:
+            raise ValueError("local_event_binding_not_in_index")
+        return self
+
+
+class ObservationEventConversion(_ConversionEnvelope):
+    batch: ObservationBatchDraft
+    call_metadata: PlanningCallMetadata
+
+
+class PlanningAttemptEventConversion(_ConversionEnvelope):
+    reconciliation: StrategyReconciliation
+    call_metadata: PlanningCallMetadata
+
+
+class StrategyReconciliationEventConversion(_ConversionEnvelope):
+    reconciliation: StrategyReconciliation
+    call_metadata: PlanningCallMetadata
+
+
+class ResearchEventConversion(_ConversionEnvelope):
+    research_sources: Annotated[tuple[ResearchSourceObservationDraft, ...], Field(max_length=64)]
+    call_metadata: PlanningCallMetadata
+
+
+class InterpretationAudit(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    subject: InterpretationSubject
+    call_metadata: PlanningCallMetadata
+    status: Literal["succeeded", "failed"]
+    safe_code: Literal[
+        "evidence_read_failed", "extractor_unavailable", "invalid_extractor_output"
+    ] | None = None
+
+    @model_validator(mode="after")
+    def _failure_code_matches_status(self) -> Self:
+        if (self.status == "failed") != (self.safe_code is not None):
+            raise ValueError("interpretation_audit_status_policy")
+        return self
+
+
+class PlanRequestAudit(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    call_metadata: PlanningCallMetadata
+    state_digest: Sha256Hex
+    ledger_digest: Sha256Hex
+
+
+class PlannerRepairAudit(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    call_metadata: PlanningCallMetadata
+    critic_finding_codes: Annotated[tuple[str, ...], Field(max_length=64)]
+
+
+class PlannerRejectionAudit(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    call_metadata: PlanningCallMetadata
+    safe_code: Literal["critic_rejected", "repair_exhausted", "result_too_large"]
+
+
+class ResearchPolicyDecision(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    decision_id: UUID
+    allowed: bool
+    rationale: ShortText
+
+
+class StrategyArchiveTransition(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    family_id: UUID
+    event_id: UUID
+    rationale: ShortText
+
+
+class StrategyReactivationTransition(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    family_id: UUID
+    event_id: UUID
+    rationale: ShortText
+
+
+class PlanningGap(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    code: Literal["no_viable_strategy", "planning_constraints"]
+    summary: ShortText
+
+
+class PlanningResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    status: Literal["success", "gap", "failed"]
+    engagement_id: UUID
+    current_authoritative_journal_revision: JournalRevision
+    frontier: FrontierProjection | None = None
+    gap: PlanningGap | None = None
+    failure_code: Literal[
+        "planning_failed", "settlement_unavailable", "result_too_large"
+    ] | None = None
+
+    @model_validator(mode="after")
+    def _exclusive_status_payload(self) -> Self:
+        payload_count = sum(
+            value is not None for value in (self.frontier, self.gap, self.failure_code)
+        )
+        expected = {
+            "success": self.frontier is not None,
+            "gap": self.gap is not None,
+            "failed": self.failure_code is not None,
+        }[self.status]
+        if not expected or payload_count != 1:
+            raise ValueError("planning_result_shape")
+        return self
+
+
+class StrategyFamilyState(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    family_id: UUID
+    runtime_key: Annotated[str, Field(min_length=1, max_length=128)]
+    status: StrategyStatus
+    variant_ids: tuple[UUID, ...] = ()
+
+    @model_validator(mode="after")
+    def _variant_ids_are_sorted_unique(self) -> Self:
+        is_sorted_unique = self.variant_ids == tuple(sorted(self.variant_ids, key=str))
+        if not is_sorted_unique or len(self.variant_ids) != len(set(self.variant_ids)):
+            raise ValueError("family_variant_ids_not_sorted_unique")
+        return self
+
+
+class AttemptState(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    attempt_event_id: UUID
+    outcome: OutcomeCategory
+    summary: ShortText
+
+
+class ArchivedStrategyState(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    family_id: UUID
+    summary: Annotated[str, Field(min_length=1, max_length=16 * 1024)]
+    archived_event_id: UUID
+
+
+class ExecutionVariantState(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    variant_id: UUID
+    family_id: UUID
+    runtime_key: Annotated[str, Field(min_length=1, max_length=128)]
+    status: StrategyStatus
+    recent_attempts: Annotated[
+        tuple[AttemptState, ...], Field(max_length=MAX_ATTEMPTS_PER_VARIANT)
+    ] = ()
+    historical_attempt_count: Annotated[int, Field(ge=0)] = 0
+    historical_attempt_digest: Sha256Hex = sha256(b"[]").hexdigest()
+
+    @model_validator(mode="after")
+    def _attempt_ids_are_unique(self) -> Self:
+        attempt_ids = tuple(attempt.attempt_event_id for attempt in self.recent_attempts)
+        if len(attempt_ids) != len(set(attempt_ids)):
+            raise ValueError("variant_attempt_ids_not_unique")
+        return self
+
+
+class StrategyLedger(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    families: Annotated[tuple[StrategyFamilyState, ...], Field(max_length=32)] = ()
+    variants: Annotated[tuple[ExecutionVariantState, ...], Field(max_length=64)] = ()
+    archive: Annotated[tuple[ArchivedStrategyState, ...], Field(max_length=16)] = ()
+
+    @model_validator(mode="after")
+    def _bind_families_and_variants(self) -> Self:
+        family_ids = tuple(item.family_id for item in self.families)
+        family_keys = tuple(item.runtime_key for item in self.families)
+        variant_ids = tuple(item.variant_id for item in self.variants)
+        variant_keys = tuple(item.runtime_key for item in self.variants)
+        if len(family_ids) != len(set(family_ids)) or len(family_keys) != len(set(family_keys)):
+            raise ValueError("duplicate_strategy_runtime_key")
+        if len(variant_ids) != len(set(variant_ids)) or len(variant_keys) != len(set(variant_keys)):
+            raise ValueError("duplicate_strategy_runtime_key")
+        declared = {item.family_id: set(item.variant_ids) for item in self.families}
+        for variant in self.variants:
+            family_variant_ids = declared.get(variant.family_id, set())
+            if variant.variant_id not in family_variant_ids:
+                raise ValueError("variant_family_not_declared")
+        hot_attempt_count = sum(len(variant.recent_attempts) for variant in self.variants)
+        if hot_attempt_count > MAX_HOT_ATTEMPTS:
+            raise ValueError("strategy_hot_attempt_limit")
+        return self
+
+
+class EvidenceSliceInput(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    evidence_id: EvidenceId
+    start: Annotated[int, Field(ge=0)]
+    end: Annotated[int, Field(gt=0, le=EVIDENCE_SLICE_BYTES)]
+    media_type: MediaType
+    content: bytes = Field(min_length=1, max_length=EVIDENCE_SLICE_BYTES)
+
+    @model_validator(mode="after")
+    def _range_matches_content(self) -> Self:
+        if self.end <= self.start or self.end - self.start != len(self.content):
+            raise ValueError("evidence_slice_range_mismatch")
+        return self
+
+
+class PrivateValueDraft(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    evidence_id: EvidenceId
+    candidate_start: Annotated[int, Field(ge=0)]
+    candidate_end: Annotated[int, Field(gt=0)]
+    claimed_utf8: Annotated[str, Field(min_length=1, max_length=8192)]
+
+    @model_validator(mode="after")
+    def _candidate_range_is_bounded(self) -> Self:
+        if self.candidate_end <= self.candidate_start:
+            raise ValueError("reference_validation_failed")
+        if self.candidate_end - self.candidate_start > 8192:
+            raise ValueError("reference_validation_failed")
+        return self
+
+    def resolve(self, evidence_slices: tuple[EvidenceSliceInput, ...]) -> Sha256Hex:
+        matches: list[bytes] = []
+        for evidence_slice in evidence_slices:
+            if evidence_slice.evidence_id != self.evidence_id:
+                continue
+            contains_candidate = (
+                evidence_slice.start <= self.candidate_start
+                and self.candidate_end <= evidence_slice.end
+            )
+            if not contains_candidate:
+                continue
+            offset_start = self.candidate_start - evidence_slice.start
+            offset_end = self.candidate_end - evidence_slice.start
+            candidate = evidence_slice.content[offset_start:offset_end]
+            if candidate == self.claimed_utf8.encode("utf-8"):
+                matches.append(candidate)
+        if len(matches) != 1:
+            raise ValueError("reference_validation_failed")
+        return sha256(matches[0]).hexdigest()
+
+
+class _GroundedDraft(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=32)]
+
+    @model_validator(mode="after")
+    def _event_ids_are_sorted_unique(self) -> Self:
+        if self.event_ids != tuple(sorted(self.event_ids, key=str)) or len(self.event_ids) != len(
+            set(self.event_ids)
+        ):
+            raise ValueError("event_ids_not_sorted_unique")
+        return self
+
+
+class FacetObservationDraft(_GroundedDraft):
+    key: ShortText
+    value: ShortText
+
+
+class AccessStateDeltaDraft(_GroundedDraft):
+    subject: ShortText
+    state: ShortText
+
+
+class SecretReferenceDraft(_GroundedDraft):
+    label: ShortText
+    value: PrivateValueDraft
+
+
+class IncompatibilityObservationDraft(_GroundedDraft):
+    subject: ShortText
+    explanation: ShortText
+
+
+class MissingInformationDraft(_GroundedDraft):
+    question: ShortText
+
+
+class ResearchSourceObservationDraft(_GroundedDraft):
+    source_id: Annotated[str, Field(min_length=1, max_length=512)]
+    assessment: Literal["useful", "not_useful", "inconclusive"]
+
+
+class InterpretationSubject(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    attachment_event_id: UUID
+    terminal_tool_event_id: UUID | None = None
+    evidence_id: EvidenceId
+
+
+class OutcomeAssessmentDraft(_GroundedDraft):
+    category: OutcomeCategory
+    summary: ShortText
+
+
+class ObservationBatchDraft(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    subject: InterpretationSubject | None = None
+    observations: Annotated[tuple[ObservationDraft, ...], Field(max_length=64)] = ()
+    facets: Annotated[tuple[FacetObservationDraft, ...], Field(max_length=64)] = ()
+    access_deltas: Annotated[tuple[AccessStateDeltaDraft, ...], Field(max_length=64)] = ()
+    secret_references: Annotated[tuple[SecretReferenceDraft, ...], Field(max_length=64)] = ()
+    incompatibilities: Annotated[
+        tuple[IncompatibilityObservationDraft, ...], Field(max_length=64)
+    ] = ()
+    missing_information: Annotated[
+        tuple[MissingInformationDraft, ...], Field(max_length=64)
+    ] = ()
+    research_sources: Annotated[
+        tuple[ResearchSourceObservationDraft, ...], Field(max_length=64)
+    ] = ()
+    outcomes: Annotated[tuple[OutcomeAssessmentDraft, ...], Field(max_length=64)] = ()
+    hypotheses: Annotated[tuple[HypothesisDraft, ...], Field(max_length=64)] = ()
+    objective_proofs: Annotated[tuple[ObjectiveProofDraft, ...], Field(max_length=64)] = ()
+
+
+class ObjectiveProofDraft(_GroundedDraft):
+    proof_requirement_id: ProofRequirementId
+    assessment: Literal["supported", "contradicted"]
+
+    def bind_manifest(self, requirements: tuple[ProofRequirement, ...]) -> Self:
+        matching = tuple(
+            requirement
+            for requirement in requirements
+            if requirement.proof_id == self.proof_requirement_id
+        )
+        if len(matching) != 1:
+            raise ValueError("proof_requirement_not_in_manifest")
+        return self
+
+
+class _DerivedSituationRecord(_GroundedDraft):
+    """Data-only, event-grounded state record for deterministic situation replay."""
+
+
+class ObservedFact(_DerivedSituationRecord):
+    text: ShortText
+
+
+class ObservedFacet(_DerivedSituationRecord):
+    key: ShortText
+    value: ShortText
+
+
+class SituationHypothesis(_DerivedSituationRecord):
+    text: ShortText
+    confidence: Annotated[float, Field(ge=0, le=1)]
+
+
+class ResearchSourceAssessment(_DerivedSituationRecord):
+    source_id: Annotated[str, Field(min_length=1, max_length=512)]
+    assessment: Literal["useful", "not_useful", "inconclusive"]
+
+
+class AccessState(_DerivedSituationRecord):
+    subject: ShortText
+    state: ShortText
+
+
+class EvidenceInterpretationState(_DerivedSituationRecord):
+    subject: InterpretationSubject
+    status: Literal["pending", "completed", "failed"]
+
+
+class SecretReference(_DerivedSituationRecord):
+    label: ShortText
+    evidence_id: EvidenceId
+    value_sha256: Sha256Hex
+
+
+class AttemptSummary(_DerivedSituationRecord):
+    attempt_event_id: UUID
+    outcome: OutcomeCategory
+    summary: ShortText
+
+
+class Incompatibility(_DerivedSituationRecord):
+    subject: ShortText
+    explanation: ShortText
+
+
+class RetryPredicate(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    kind: RetryPredicateKind
+    value: Annotated[str, Field(min_length=1, max_length=512)]
+
+
+class StrategyFamilyDraft(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    family_id: None = None
+    runtime_key: Annotated[str, Field(min_length=1, max_length=128)]
+    title: ShortText
+
+
+class ExecutionVariantDraft(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    variant_id: None = None
+    family_runtime_key: Annotated[str, Field(min_length=1, max_length=128)]
+    runtime_key: Annotated[str, Field(min_length=1, max_length=128)]
+    title: ShortText
+
+
+class StrategyArchive(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    entries: Annotated[tuple[ArchivedStrategyState, ...], Field(max_length=16)] = ()
+
+
+class ProofCandidateAdmission(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    proof_requirement_id: ProofRequirementId
+    assessment_generation: Annotated[int, Field(ge=1)]
+    candidate_sha256: Sha256Hex
+    decision: Literal["allowed", "previously_rejected"]
+    matched_rejection_event_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def _matched_event_policy(self) -> Self:
+        was_previously_rejected = self.decision == "previously_rejected"
+        has_matched_event = self.matched_rejection_event_id is not None
+        if was_previously_rejected != has_matched_event:
+            raise ValueError("proof_candidate_admission_policy")
+        return self
+
+
+class PendingEvidenceRange(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    evidence_id: EvidenceId
+    attachment_event_id: UUID
+    terminal_tool_event_id: UUID | None = None
+    start: Annotated[int, Field(ge=0)]
+    end: Annotated[int, Field(gt=0)]
+    media_type: MediaType
+    reason: Literal["budget_exhausted", "retryable_interpretation_failure", "read_failure"]
+
+    @model_validator(mode="after")
+    def _positive_range(self) -> Self:
+        if self.end <= self.start:
+            raise ValueError("pending_range_must_be_positive")
+        return self
+
+
+class _SettlementResultBase(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    engagement_id: UUID
+    reason: SettlementReason
+    authoritative_journal_revision: JournalRevision | None
+    situation: SituationProjection | None
+    required_proof_ids: Annotated[
+        tuple[ProofRequirementId, ...], Field(max_length=MAX_REQUIRED_PROOFS)
+    ] = ()
+    pending_ranges: Annotated[tuple[PendingEvidenceRange, ...], Field(max_length=512)] = ()
+    pending_total_count: Annotated[int, Field(ge=0, le=MAX_SETTLEMENT_PENDING_RANGES)] = 0
+    pending_inventory_sha256: Sha256Hex | None = None
+    next_pending_subject: PendingSubjectCursor | None = None
+    incomplete_reason: Literal["budget_exhausted", "interpretation_incomplete"] | None = None
+    all_required_proofs_satisfied: bool
+    possible_terminal_evidence: bool
+
+    @model_validator(mode="after")
+    def _bind_projection_ranges_and_proofs(self) -> Self:
+        if (self.situation is None) != (self.authoritative_journal_revision is None):
+            raise ValueError("settlement_projection_revision_pair_required")
+        if (
+            self.situation is not None
+            and self.authoritative_journal_revision
+            != self.situation.authoritative_journal_revision
+        ):
+            raise ValueError("settlement_projection_revision_mismatch")
+        range_keys = tuple(
+            (
+                str(item.attachment_event_id),
+                str(item.terminal_tool_event_id or ""),
+                str(item.evidence_id),
+                item.start,
+                item.end,
+            )
+            for item in self.pending_ranges
+        )
+        if range_keys != tuple(sorted(range_keys)) or len(range_keys) != len(set(range_keys)):
+            raise ValueError("pending_ranges_not_sorted_unique")
+        latest_end: dict[tuple[str, str, str], int] = {}
+        for attachment, terminal, evidence, start, end in range_keys:
+            subject = (attachment, terminal, evidence)
+            if start < latest_end.get(subject, 0):
+                raise ValueError("pending_ranges_overlap")
+            latest_end[subject] = end
+        if self.pending_total_count < len(self.pending_ranges):
+            raise ValueError("pending_total_smaller_than_page")
+        if (self.pending_total_count > 0) != (self.pending_inventory_sha256 is not None):
+            raise ValueError("pending_inventory_digest_policy")
+        has_next_page = self.pending_total_count > len(self.pending_ranges)
+        if has_next_page != (self.next_pending_subject is not None):
+            raise ValueError("pending_cursor_policy")
+        if self.required_proof_ids != tuple(sorted(set(self.required_proof_ids))):
+            raise ValueError("required_proof_ids_not_sorted_unique")
+        if self.situation is None:
+            if (
+                self.required_proof_ids
+                or self.all_required_proofs_satisfied
+                or self.possible_terminal_evidence
+            ):
+                raise ValueError("proof_state_requires_situation")
+            return self
+        progress = {
+            item.proof_requirement_id: item.status
+            for item in self.situation.objective_progress.requirements
+        }
+        if tuple(sorted(progress)) != self.required_proof_ids:
+            raise ValueError("settlement_manifest_proof_mismatch")
+        expected = bool(self.required_proof_ids) and all(
+            progress[proof_id] == "supported" for proof_id in self.required_proof_ids
+        )
+        if self.all_required_proofs_satisfied is not expected:
+            raise ValueError("settlement_proof_completion_mismatch")
+        return self
+
+
+class SettledSettlementResult(_SettlementResultBase):
+    status: Literal["settled"] = "settled"
+    authoritative_journal_revision: JournalRevision
+    situation: SituationProjection
+    pending_ranges: Annotated[tuple[PendingEvidenceRange, ...], Field(max_length=0)] = ()
+    pending_total_count: Literal[0] = 0
+    pending_inventory_sha256: None = None
+    next_pending_subject: None = None
+    incomplete_reason: None = None
+    failure_code: None = None
+    failure_summary: None = None
+
+
+class NothingPendingSettlementResult(_SettlementResultBase):
+    status: Literal["nothing_pending"] = "nothing_pending"
+    authoritative_journal_revision: JournalRevision
+    situation: SituationProjection
+    pending_ranges: Annotated[tuple[PendingEvidenceRange, ...], Field(max_length=0)] = ()
+    pending_total_count: Literal[0] = 0
+    pending_inventory_sha256: None = None
+    next_pending_subject: None = None
+    incomplete_reason: None = None
+    failure_code: None = None
+    failure_summary: None = None
+
+
+class FailedSettlementResult(_SettlementResultBase):
+    status: Literal["failed"] = "failed"
+    incomplete_reason: None = None
+    failure_code: Literal[
+        "journal_unavailable",
+        "journal_corrupt",
+        "evidence_read_failed",
+        "extractor_unavailable",
+        "invalid_extractor_output",
+        "journal_append_failed",
+        "concurrent_state_change",
+        "terminal_reconciliation_failed",
+    ]
+    failure_summary: ShortText
+
+    @model_validator(mode="after")
+    def _failure_projection_policy(self) -> Self:
+        journal_missing = self.failure_code in {"journal_unavailable", "journal_corrupt"}
+        if journal_missing != (self.situation is None):
+            raise ValueError("failed_settlement_projection_policy")
+        return self
+
+
+class IncompleteSettlementResult(_SettlementResultBase):
+    status: Literal["incomplete"] = "incomplete"
+    authoritative_journal_revision: JournalRevision
+    situation: SituationProjection
+    pending_ranges: Annotated[tuple[PendingEvidenceRange, ...], Field(min_length=1, max_length=512)]
+    pending_total_count: Annotated[int, Field(ge=1, le=MAX_SETTLEMENT_PENDING_RANGES)]
+    pending_inventory_sha256: Sha256Hex
+    incomplete_reason: Literal["budget_exhausted", "interpretation_incomplete"]
+    failure_code: None = None
+    failure_summary: None = None
+
+
+SettlementResult = Annotated[
+    SettledSettlementResult
+    | NothingPendingSettlementResult
+    | IncompleteSettlementResult
+    | FailedSettlementResult,
+    Field(discriminator="status"),
+]
+SettlementResultAdapter = TypeAdapter(SettlementResult)
+
+
+__all__ = [
+    "EVIDENCE_SLICE_BYTES", "MAX_EVIDENCE_BYTES_PER_SETTLEMENT", "MAX_PLANNING_EVENT_BATCH",
+    "MAX_PLANNING_PAYLOAD_BYTES", "MAX_PLANNING_RESULT_BYTES", "MAX_PLANNER_REQUEST_BYTES",
+    "MAX_RECENT_EVENTS", "MAX_RECENT_EVENT_TEXT_BYTES", "IncompleteSettlementResult",
+    "NothingPendingSettlementResult",
+    "ObjectiveProgress",
+    "OutcomeCategory",
+    "PendingEvidenceRange",
+    "ProofProgress",
+    "RetryPredicateKind",
+    "SituationProjection",
+    "StrategyStatus",
+    "ExecutionVariantState",
+    "StrategyFamilyState",
+    "StrategyLedger",
+]
