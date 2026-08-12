@@ -7,6 +7,7 @@ import errno
 import fcntl
 import json
 import os
+import re
 import stat
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
@@ -47,9 +48,12 @@ from sedna.engagement.models import (
     MAX_RECOVERABLE_TAIL_BYTES,
     MAX_TAIL_RECOVERY_INTENT_BYTES,
     EngagementManifest,
+    EvidenceId,
     EvidenceReference,
+    EvidenceSlice,
     ExecutionLaneKey,
     JournalRevision,
+    OrphanEvidencePage,
 )
 from sedna.engagement.reducer import reduce_engagement
 
@@ -274,14 +278,26 @@ class _EvidenceObjectStore:
         engagement_fd: int,
         *,
         fault: Callable[[str], None] | None = None,
+        max_item_bytes: int | None = None,
+        max_objects: int | None = None,
+        max_engagement_bytes: int | None = None,
     ) -> None:
         self._engagement_fd = engagement_fd
         self._fault = fault or (lambda _point: None)
+        self._max_item_bytes = (
+            MAX_EVIDENCE_ITEM_BYTES if max_item_bytes is None else max_item_bytes
+        )
+        self._max_objects = MAX_EVIDENCE_OBJECTS if max_objects is None else max_objects
+        self._max_engagement_bytes = (
+            MAX_EVIDENCE_ENGAGEMENT_BYTES
+            if max_engagement_bytes is None
+            else max_engagement_bytes
+        )
 
     def capture(self, data: bytes) -> EvidenceReference:
         if not isinstance(data, bytes):
             raise TypeError("evidence object store accepts normalized bytes only")
-        if len(data) > MAX_EVIDENCE_ITEM_BYTES:
+        if len(data) > self._max_item_bytes:
             raise ValueError("evidence item quota exceeded")
         digest = sha256(data).hexdigest()
         name = f"blob-{digest}.bin"
@@ -302,6 +318,42 @@ class _EvidenceObjectStore:
                         expected_digest = entry[
                             len(".pending-blob-") : -len(".bin")
                         ]
+                    elif _is_quarantine_payload_name(entry):
+                        fd = _open_regular(
+                            evidence_fd,
+                            entry,
+                            self._max_item_bytes,
+                            "quarantined evidence",
+                        )
+                        try:
+                            quarantine_stat = os.fstat(fd)
+                            objects.append(
+                                (
+                                    entry,
+                                    quarantine_stat.st_size,
+                                    (quarantine_stat.st_dev, quarantine_stat.st_ino),
+                                )
+                            )
+                        finally:
+                            os.close(fd)
+                        continue
+                    elif (
+                        _is_capture_intent_name(entry)
+                        or _is_logbook_temp_name(entry)
+                        or _is_logbook_canonical_name(entry)
+                    ):
+                        # Recognized non-payload Task 4 metadata: bounded pre-stat only.
+                        metadata_fd = _open_regular(
+                            evidence_fd,
+                            entry,
+                            MAX_DERIVED_PROJECTION_BYTES,
+                            "evidence metadata",
+                        )
+                        try:
+                            os.fstat(metadata_fd)
+                        finally:
+                            os.close(metadata_fd)
+                        continue
                     else:
                         raise JournalUnavailableError("invalid evidence directory entry")
                     if len(expected_digest) != 64 or any(
@@ -311,7 +363,7 @@ class _EvidenceObjectStore:
                     fd = _open_regular(
                         evidence_fd,
                         entry,
-                        MAX_EVIDENCE_ITEM_BYTES,
+                        self._max_item_bytes,
                         "evidence object",
                     )
                     try:
@@ -341,6 +393,10 @@ class _EvidenceObjectStore:
                 canonical_count = sum(
                     item.startswith("blob-") for item, _, _ in objects
                 )
+                quarantine_count = sum(
+                    item.startswith(".quarantine-") for item, _, _ in objects
+                )
+                object_count = canonical_count + quarantine_count
                 payload_by_identity = {
                     identity: size for _, size, identity in objects
                 }
@@ -348,9 +404,9 @@ class _EvidenceObjectStore:
                 existing = next(
                     (size for item, size, _ in objects if item == name), None
                 )
-                if canonical_count > MAX_EVIDENCE_OBJECTS:
+                if object_count > self._max_objects:
                     raise ValueError("evidence object quota exceeded")
-                if payload_bytes > MAX_EVIDENCE_ENGAGEMENT_BYTES:
+                if payload_bytes > self._max_engagement_bytes:
                     raise ValueError("evidence engagement quota exceeded")
                 if existing is not None:
                     found = _read_bounded(
@@ -375,7 +431,7 @@ class _EvidenceObjectStore:
                         os.unlink(pending_name, dir_fd=evidence_fd)
                         os.fsync(evidence_fd)
                 else:
-                    if canonical_count + 1 > MAX_EVIDENCE_OBJECTS:
+                    if object_count + 1 > self._max_objects:
                         raise ValueError("evidence object quota exceeded")
                     pending = next(
                         (
@@ -389,7 +445,7 @@ class _EvidenceObjectStore:
                         pending_data = _read_bounded(
                             evidence_fd,
                             pending_name,
-                            MAX_EVIDENCE_ITEM_BYTES,
+                            self._max_item_bytes,
                             "pending evidence object",
                         )
                         if pending_data != data:
@@ -406,7 +462,7 @@ class _EvidenceObjectStore:
                                 }.values()
                             )
                     additional = 0 if pending is not None else len(data)
-                    if payload_bytes + additional > MAX_EVIDENCE_ENGAGEMENT_BYTES:
+                    if payload_bytes + additional > self._max_engagement_bytes:
                         raise ValueError("evidence engagement quota exceeded")
                     if pending is None:
                         self._fault("evidence_before_temp_write")
@@ -439,7 +495,7 @@ class _EvidenceObjectStore:
                         found = _read_bounded(
                             evidence_fd,
                             name,
-                            MAX_EVIDENCE_ITEM_BYTES,
+                            self._max_item_bytes,
                             "evidence object",
                         )
                         if found != data:
@@ -466,7 +522,7 @@ class _EvidenceObjectStore:
     def load(self, digest: str, size: int) -> bytes:
         if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
             raise JournalUnavailableError("tail recovery evidence digest is invalid")
-        if not 0 <= size <= MAX_EVIDENCE_ITEM_BYTES:
+        if not 0 <= size <= self._max_item_bytes:
             raise JournalUnavailableError("tail recovery evidence size is invalid")
         with _locked_file(self._engagement_fd, ".evidence.lock"):
             evidence_fd = _open_or_create_directory(self._engagement_fd, "evidence", 0o700)
@@ -474,7 +530,7 @@ class _EvidenceObjectStore:
                 data = _read_bounded(
                     evidence_fd,
                     f"blob-{digest}.bin",
-                    MAX_EVIDENCE_ITEM_BYTES,
+                    self._max_item_bytes,
                     "tail recovery evidence",
                 )
             finally:
@@ -686,11 +742,18 @@ class EngagementJournalRepository:
         *,
         clock: Callable[[], datetime] | None = None,
         uuid_factory: Callable[[], UUID] | None = None,
+        evidence_quota: Any | None = None,
     ) -> None:
         _require_posix_primitives()
+        if evidence_quota is None:
+            from sedna.engagement.evidence import DEFAULT_EVIDENCE_QUOTA
+
+            evidence_quota = DEFAULT_EVIDENCE_QUOTA
+        self._evidence_quota = evidence_quota
         raw = os.fspath(knowledge_root)
         if not isinstance(raw, str) or "\0" in raw or not os.path.isabs(raw):
             raise ValueError("knowledge root must be an absolute NUL-free path")
+        self._knowledge_root = Path(raw)
         self._clock = clock or (lambda: datetime.now(UTC))
         self._uuid_factory = uuid_factory or uuid4
         self._closed = False
@@ -1791,6 +1854,95 @@ class EngagementJournalRepository:
         finally:
             os.close(engagement_fd)
 
+    def write_evidence(
+        self,
+        engagement_id: UUID,
+        data: bytes,
+        *,
+        media_type: str,
+        representation: str,
+        capture_limitations: tuple[Any, ...] = (),
+    ) -> EvidenceReference:
+        """Capture one normalized byte payload with a durable crash intent."""
+        from sedna.engagement.evidence import EvidenceStore
+
+        self._require_open()
+        self._complete_tail_recovery(engagement_id)
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            store = EvidenceStore(
+                engagement_fd,
+                quota=self._evidence_quota,
+                fault=self._fault,
+            )
+            result = store.capture_with_intent(
+                data,
+                media_type=media_type,
+                representation=representation,
+                capture_limitations=capture_limitations,
+            )
+        finally:
+            os.close(engagement_fd)
+        return result.reference
+
+    def read_evidence_slice(
+        self,
+        engagement_id: UUID,
+        evidence_id: EvidenceId,
+        *,
+        offset: int,
+        limit: int,
+    ) -> EvidenceSlice:
+        """Read one bounded verified slice from a referenced evidence sidecar."""
+        from sedna.engagement.evidence import read_evidence_slice as _read_slice
+
+        self._require_open()
+        self._complete_tail_recovery(engagement_id)
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            return _read_slice(
+                engagement_fd,
+                evidence_id,
+                offset=offset,
+                limit=limit,
+            )
+        finally:
+            os.close(engagement_fd)
+
+    def inventory_orphan_evidence(
+        self,
+        engagement_id: UUID,
+        *,
+        after_name: str | None = None,
+        limit: int = 256,
+    ) -> OrphanEvidencePage:
+        """Return a bounded page of sidecar objects unreferenced by the journal."""
+        from sedna.engagement.evidence import EvidenceStore
+
+        self._require_open()
+        self._complete_tail_recovery(engagement_id)
+        events = self.load_events(engagement_id)
+        referenced: set[str] = set()
+        for event in events:
+            payload = event.payload
+            kind = event.type.value
+            if kind == "evidence_attached":
+                referenced.add(payload.evidence.sha256)
+            elif kind == "recovery_warning":
+                evidence_id = payload.evidence_id
+                if evidence_id and evidence_id.startswith("evidence-sha256-"):
+                    referenced.add(evidence_id[len("evidence-sha256-") :])
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            store = EvidenceStore(engagement_fd, quota=self._evidence_quota)
+            return store.inventory_orphans(
+                referenced,
+                after_name=after_name,
+                limit=limit,
+            )
+        finally:
+            os.close(engagement_fd)
+
     def bind_lane(
         self,
         engagement_id: UUID,
@@ -2476,6 +2628,39 @@ def _is_uuid_name(value: str) -> bool:
         return str(UUID(value)) == value
     except ValueError:
         return False
+
+
+def _is_capture_intent_name(value: str) -> bool:
+    prefix = ".capture-"
+    if not value.startswith(prefix) or not value.endswith(".json"):
+        return False
+    identifier = value[len(prefix) : -len(".json")]
+    return _is_uuid_name(identifier)
+
+
+def _is_quarantine_payload_name(value: str) -> bool:
+    prefix = ".quarantine-"
+    if not value.startswith(prefix) or not value.endswith(".bin"):
+        return False
+    identifier = value[len(prefix) : -len(".bin")]
+    return _is_uuid_name(identifier)
+
+
+def _is_logbook_temp_name(value: str) -> bool:
+    prefix = ".logbook-"
+    if not value.startswith(prefix) or not value.endswith(".tmp"):
+        return False
+    identifier = value[len(prefix) : -len(".tmp")]
+    return _is_uuid_name(identifier)
+
+
+def _is_logbook_canonical_name(value: str) -> bool:
+    # YYYYMMDD-HHMMSSffffff-<slug>-<session-digest>.md
+    match = re.fullmatch(
+        r"[0-9]{8}-[0-9]{12}-[a-z0-9-]+-[0-9a-f]{64}\.md",
+        value,
+    )
+    return match is not None
 
 
 def _pending_create_id(value: str) -> UUID | None:

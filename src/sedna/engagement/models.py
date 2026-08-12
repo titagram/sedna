@@ -374,3 +374,14 @@ class EngagementState(BaseModel):
         if self.closure_ready and self.closure is None:
             raise ValueError("closure_ready requires a closure barrier")
         return self
+
+
+class OrphanEvidencePage(BaseModel):
+    """A frozen bounded page of orphan evidence names/digests."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    names: tuple[str, ...] = Field(max_length=256)
+    total_count: StrictInt = Field(ge=0, le=MAX_EVIDENCE_OBJECTS)
+    next_after_name: str | None = None
+    summary: tuple[tuple[Sha256Hex, StrictInt], ...] = ()

@@ -12,12 +12,15 @@ from hmac import new as new_hmac
 from secrets import token_bytes
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 MAX_HOST_VALUE_DEPTH = 32
 MAX_HOST_VALUE_NODES = 100_000
 MAX_HOST_SCALAR_BYTES = 64 * 1024 * 1024
 MAX_HOST_NORMALIZED_BYTES = 64 * 1024 * 1024
+MAX_SAFE_ARGUMENT_BYTES = 8 * 1024
+MAX_SAFE_ARGUMENT_DEPTH = 4
+MAX_SAFE_ARGUMENT_ITEMS = 64
 
 REDACTED_HOST_SECRET = "[REDACTED:provider-or-host-secret]"
 ALWAYS_REDACTED_HOST_KEYS = frozenset(
@@ -61,6 +64,15 @@ class NormalizationFailure(BaseModel):
     reason_code: Literal[
         "normalization_limit_exceeded", "unsupported_value", "serialization_failed"
     ]
+
+
+class ArgumentOmission(BaseModel):
+    """Typed record of sanitized argument records omitted by the bounded summary."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    omitted_count: StrictInt = Field(ge=0, le=MAX_HOST_VALUE_NODES)
+    omitted_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class SanitizedHostValue(BaseModel):
@@ -389,6 +401,100 @@ def normalize_host_payload(value: Any) -> SanitizedHostValue | NormalizationFail
     )
 
 
+def _record_depth(value: Any, active: set[int]) -> int:
+    if isinstance(value, dict):
+        identity = id(value)
+        if identity in active:
+            raise ValueError("unsupported value")
+        active.add(identity)
+        try:
+            return 1 + max(
+                (_record_depth(item, active) for item in value.values()),
+                default=0,
+            )
+        finally:
+            active.remove(identity)
+    if isinstance(value, list):
+        identity = id(value)
+        if identity in active:
+            raise ValueError("unsupported value")
+        active.add(identity)
+        try:
+            return 1 + max(
+                (_record_depth(item, active) for item in value),
+                default=0,
+            )
+        finally:
+            active.remove(identity)
+    return 1
+
+
+def bounded_safe_argument_summary(
+    value: Any,
+) -> tuple[Any, ArgumentOmission | None]:
+    """Admit complete sanitized records until a byte, depth, or item bound is crossed.
+
+    The returned summary is byte-stable and always fits ``MAX_SAFE_ARGUMENT_BYTES``;
+    any omitted sanitized records are covered by one typed omission digest.
+    """
+
+    def record_bytes(record: Any) -> int:
+        try:
+            return len(_canonical_json(record))
+        except _NormalizationError:
+            return MAX_SAFE_ARGUMENT_BYTES + 1
+
+    if isinstance(value, dict):
+        summary: dict[str, Any] = {}
+        omitted: list[Any] = []
+        remaining_bytes = MAX_SAFE_ARGUMENT_BYTES
+        remaining_items = MAX_SAFE_ARGUMENT_ITEMS
+        for key in sorted(value):
+            record = value[key]
+            if remaining_items <= 0:
+                omitted.append(record)
+                continue
+            if _record_depth(record, set()) > MAX_SAFE_ARGUMENT_DEPTH:
+                omitted.append(record)
+                continue
+            size = record_bytes(record)
+            if size > remaining_bytes:
+                omitted.append(record)
+                continue
+            summary[key] = record
+            remaining_bytes -= size
+            remaining_items -= 1
+        return summary, _argument_omission(omitted)
+    if isinstance(value, list):
+        summary_list: list[Any] = []
+        omitted = []
+        remaining_bytes = MAX_SAFE_ARGUMENT_BYTES
+        remaining_items = MAX_SAFE_ARGUMENT_ITEMS
+        for record in value:
+            if remaining_items <= 0:
+                omitted.append(record)
+                continue
+            if _record_depth(record, set()) > MAX_SAFE_ARGUMENT_DEPTH:
+                omitted.append(record)
+                continue
+            size = record_bytes(record)
+            if size > remaining_bytes:
+                omitted.append(record)
+                continue
+            summary_list.append(record)
+            remaining_bytes -= size
+            remaining_items -= 1
+        return summary_list, _argument_omission(omitted)
+    return value, None
+
+
+def _argument_omission(omitted: list[Any]) -> ArgumentOmission | None:
+    if not omitted:
+        return None
+    digest = sha256(_canonical_json(omitted)).hexdigest()
+    return ArgumentOmission(omitted_count=len(omitted), omitted_sha256=digest)
+
+
 __all__ = [
     "ALWAYS_REDACTED_HOST_KEYS",
     "CONTEXTUAL_HOST_SECRET_KEYS",
@@ -397,10 +503,15 @@ __all__ = [
     "MAX_HOST_SCALAR_BYTES",
     "MAX_HOST_VALUE_DEPTH",
     "MAX_HOST_VALUE_NODES",
+    "MAX_SAFE_ARGUMENT_BYTES",
+    "MAX_SAFE_ARGUMENT_DEPTH",
+    "MAX_SAFE_ARGUMENT_ITEMS",
+    "ArgumentOmission",
     "NormalizationFailure",
     "REDACTED_HOST_SECRET",
     "SOURCE_SECRET_KEYS",
     "SanitizedHostValue",
+    "bounded_safe_argument_summary",
     "normalize_host_payload",
     "sanitize_host_arguments",
 ]

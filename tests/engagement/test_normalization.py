@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 
 import pytest
 from pydantic import ValidationError
@@ -8,10 +9,13 @@ from pydantic import ValidationError
 from sedna.engagement import (
     MAX_HOST_VALUE_DEPTH,
     MAX_HOST_VALUE_NODES,
+    MAX_JOURNAL_EVENT_BYTES,
+    MAX_SAFE_ARGUMENT_BYTES,
     CorrelationKind,
     NormalizationFailure,
     SanitizedHostValue,
     ToolCorrelation,
+    bounded_safe_argument_summary,
     normalize_host_payload,
     sanitize_host_arguments,
 )
@@ -173,3 +177,121 @@ def test_payload_normalization_preserves_representation() -> None:
     assert structured.representation == "canonical_host_json"
     assert empty.canonical_bytes is None
     assert empty.representation == "host_returned_no_result"
+
+
+def test_safe_argument_summary_admits_complete_records_until_bounds() -> None:
+    sanitized = sanitize_host_arguments(
+        {
+            "command": "id",
+            "large": {"pad": "x" * 20_000},
+            "note": "kept",
+        }
+    )
+    assert isinstance(sanitized, SanitizedHostValue)
+    summary, omission = bounded_safe_argument_summary(sanitized.value)
+
+    assert summary == {"command": "id", "note": "kept"}
+    assert omission is not None
+    assert omission.omitted_count == 1
+    assert omission.omitted_sha256 == sha256(
+        json.dumps(
+            [{"pad": "x" * 20_000}],
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def test_safe_argument_summary_is_byte_stable_and_within_journal_bounds() -> None:
+    sanitized = sanitize_host_arguments(
+        {"command": "curl", "url": "https://192.0.2.44/", "b": [1, 2, 3]}
+    )
+    assert isinstance(sanitized, SanitizedHostValue)
+    first_summary, first_omission = bounded_safe_argument_summary(sanitized.value)
+    second_summary, second_omission = bounded_safe_argument_summary(sanitized.value)
+
+    assert first_summary == second_summary
+    assert first_omission == second_omission
+    encoded = json.dumps(
+        first_summary,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    assert len(encoded) <= MAX_SAFE_ARGUMENT_BYTES
+    assert len(encoded) <= MAX_JOURNAL_EVENT_BYTES
+
+
+def test_safe_argument_summary_omits_records_beyond_depth_and_items() -> None:
+    sanitized = sanitize_host_arguments(
+        {
+            "deep": {"a": {"b": {"c": {"d": {"e": "leaf"}}}}},
+            "f0": 0,
+            "f1": 1,
+            "f2": 2,
+            "f3": 3,
+        }
+    )
+    assert isinstance(sanitized, SanitizedHostValue)
+    summary, omission = bounded_safe_argument_summary(sanitized.value)
+
+    assert "deep" not in summary
+    assert omission is not None
+    assert omission.omitted_count >= 1
+    assert omission.omitted_sha256
+    assert summary["f0"] == 0
+
+
+def test_safe_argument_summary_omission_digest_is_deterministic_and_covers_omissions() -> None:
+    sanitized = sanitize_host_arguments(
+        {
+            "command": "id",
+            "deep": {"a": {"b": {"c": {"d": "leaf"}}}},
+        }
+    )
+    assert isinstance(sanitized, SanitizedHostValue)
+    first_summary, first_omission = bounded_safe_argument_summary(sanitized.value)
+    second_summary, second_omission = bounded_safe_argument_summary(sanitized.value)
+
+    assert first_summary == second_summary
+    assert first_omission == second_omission
+    assert first_omission is not None
+    assert first_omission.omitted_sha256 == sha256(
+        json.dumps(
+            [{"a": {"b": {"c": {"d": "leaf"}}}}],
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def test_safe_argument_summary_never_leaks_secret_or_secret_digest() -> None:
+    secret = "provider-secret-that-must-never-reach-disk"
+    sanitized = sanitize_host_arguments(
+        {
+            "provider": {"authorization": secret},
+            "deep": {"a": {"b": {"c": {"d": secret}}}},
+        }
+    )
+    assert isinstance(sanitized, SanitizedHostValue)
+    summary, omission = bounded_safe_argument_summary(sanitized.value)
+
+    rendered = json.dumps(summary, sort_keys=True)
+    assert secret not in rendered
+    assert sha256(secret.encode()).hexdigest() not in rendered
+    assert omission is not None
+    assert secret.encode() not in omission.omitted_sha256.encode()
+    assert sha256(secret.encode()).hexdigest() not in omission.omitted_sha256
+    assert "REDACTED" in rendered
+
+
+def test_safe_argument_summary_rejects_cycles_without_leakage() -> None:
+    cyclic: dict[str, object] = {"command": "id"}
+    cyclic["self"] = cyclic
+    with pytest.raises(ValueError, match="unsupported value"):
+        bounded_safe_argument_summary(cyclic)
