@@ -45,6 +45,7 @@ MAX_PLANNING_PAYLOAD_BYTES = 60 * 1024
 MAX_PLANNING_RESULT_BYTES = MAX_HOST_RESULT_BYTES - 16 * 1024
 EVIDENCE_SLICE_BYTES = 32 * 1024
 MAX_EVIDENCE_SLICES_PER_SETTLEMENT = 64
+MAX_SITUATION_INTERPRETATIONS = 100_000
 MAX_EVIDENCE_BYTES_PER_SETTLEMENT = 2 * 1024 * 1024
 
 
@@ -217,9 +218,14 @@ class SituationProjection(BaseModel):
     facts: Annotated[tuple[ObservedFact, ...], Field(max_length=64)] = ()
     facets: Annotated[tuple[ObservedFacet, ...], Field(max_length=64)] = ()
     hypotheses: Annotated[tuple[SituationHypothesis, ...], Field(max_length=64)] = ()
+    unresolved_information: Annotated[
+        tuple[UnresolvedInformation, ...], Field(max_length=64)
+    ] = ()
     research_sources: Annotated[tuple[ResearchSourceAssessment, ...], Field(max_length=64)] = ()
     access_states: Annotated[tuple[AccessState, ...], Field(max_length=64)] = ()
-    interpretations: Annotated[tuple[EvidenceInterpretationState, ...], Field(max_length=64)] = ()
+    interpretations: Annotated[
+        tuple[EvidenceInterpretationState, ...], Field(max_length=MAX_SITUATION_INTERPRETATIONS)
+    ] = ()
     secret_references: Annotated[tuple[SecretReference, ...], Field(max_length=64)] = ()
     attempts: Annotated[tuple[AttemptSummary, ...], Field(max_length=64)] = ()
     incompatibilities: Annotated[tuple[Incompatibility, ...], Field(max_length=64)] = ()
@@ -1075,7 +1081,7 @@ class EvidenceSliceInput(BaseModel):
 
     evidence_id: EvidenceId
     start: Annotated[int, Field(ge=0)]
-    end: Annotated[int, Field(gt=0, le=EVIDENCE_SLICE_BYTES)]
+    end: Annotated[int, Field(gt=0)]
     media_type: MediaType
     content: bytes = Field(min_length=1, max_length=EVIDENCE_SLICE_BYTES)
 
@@ -1232,6 +1238,10 @@ class SituationHypothesis(_DerivedSituationRecord):
     confidence: Annotated[float, Field(ge=0, le=1)]
 
 
+class UnresolvedInformation(_DerivedSituationRecord):
+    question: ShortText
+
+
 class ResearchSourceAssessment(_DerivedSituationRecord):
     source_id: Annotated[str, Field(min_length=1, max_length=512)]
     assessment: Literal["useful", "not_useful", "inconclusive"]
@@ -1243,6 +1253,9 @@ class AccessState(_DerivedSituationRecord):
 
 
 class EvidenceInterpretationState(_DerivedSituationRecord):
+    event_ids: Annotated[
+        tuple[UUID, ...], Field(min_length=1, max_length=MAX_SITUATION_INTERPRETATIONS)
+    ]
     subject: InterpretationSubject
     status: Literal["pending", "completed", "failed"]
 
@@ -1250,7 +1263,21 @@ class EvidenceInterpretationState(_DerivedSituationRecord):
 class SecretReference(_DerivedSituationRecord):
     label: ShortText
     evidence_id: EvidenceId
+    candidate_start: Annotated[int | None, Field(ge=0)] = None
+    candidate_end: Annotated[int | None, Field(gt=0)] = None
     value_sha256: Sha256Hex
+
+    @model_validator(mode="after")
+    def _private_locator_is_positive(self) -> Self:
+        if (self.candidate_start is None) != (self.candidate_end is None):
+            raise ValueError("secret_reference_range_pair_required")
+        if (
+            self.candidate_start is not None
+            and self.candidate_end is not None
+            and self.candidate_end <= self.candidate_start
+        ):
+            raise ValueError("secret_reference_range_must_be_positive")
+        return self
 
 
 class AttemptSummary(_DerivedSituationRecord):

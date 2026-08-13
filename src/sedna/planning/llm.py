@@ -97,7 +97,7 @@ class ObservationEvidenceSlice(_PlanningRequest):
     event_id: UUID
     evidence_id: EvidenceId
     start: Annotated[int, Field(ge=0)]
-    end: Annotated[int, Field(gt=0, le=EVIDENCE_SLICE_BYTES)]
+    end: Annotated[int, Field(gt=0)]
     media_type: MediaType
     content: bytes = Field(min_length=1, max_length=EVIDENCE_SLICE_BYTES)
 

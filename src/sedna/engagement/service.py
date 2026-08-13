@@ -917,7 +917,7 @@ class EngagementJournalService:
             authoritative_revision=snapshot.revision,
             through_revision=through_revision,
             items=page,
-            next_after_sequence=page[-1].event_sequence + 1 if page else after_sequence,
+            next_after_sequence=page[-1].event_sequence if page else after_sequence,
             complete=complete,
         )
 

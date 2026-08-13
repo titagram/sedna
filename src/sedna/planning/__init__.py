@@ -89,6 +89,12 @@ from sedna.planning.journal_events import (
     payloads_from_research_observations,
 )
 from sedna.planning.ports import TerminalReconciliationResult, TerminalSettlementPort
+from sedna.planning.service import PlanningService
+from sedna.planning.situation import (
+    SituationReducer,
+    proof_value_was_rejected,
+    transition_proof_generation,
+)
 
 __all__ = [
     "AccessState",
@@ -138,6 +144,7 @@ __all__ = [
     "payloads_from_reconciliation",
     "payloads_from_research_observations",
     "PlanningGap",
+    "PlanningService",
     "PlanningLlmAdapter",
     "PlanningLlmError",
     "PlanningResult",
@@ -165,10 +172,13 @@ __all__ = [
     "SettlementResult",
     "SettlementResultAdapter",
     "SituationProjection",
+    "SituationReducer",
     "StrategyLedger",
     "StrategyStatus",
     "TerminalReconciliationResult",
     "TerminalSettlementPort",
     "render_command_preview",
     "validate_command_suggestion",
+    "proof_value_was_rejected",
+    "transition_proof_generation",
 ]

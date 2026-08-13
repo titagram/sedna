@@ -104,6 +104,21 @@ def test_adapter_rejects_malformed_host_attribution() -> None:
         )
 
 
+def test_observation_slice_allows_absolute_offsets_beyond_one_chunk() -> None:
+    from sedna.planning.llm import ObservationEvidenceSlice
+
+    evidence_slice = ObservationEvidenceSlice(
+        event_id=UUID("00000000-0000-0000-0000-000000000001"),
+        evidence_id="evidence-sha256-" + "a" * 64,
+        start=32 * 1024,
+        end=32 * 1024 + 1,
+        media_type="text/plain",
+        content=b"z",
+    )
+
+    assert evidence_slice.end - evidence_slice.start == 1
+
+
 def test_adapter_serializes_binary_evidence_without_loss() -> None:
     from sedna.planning.llm import (
         ObservationEvidenceSlice,
