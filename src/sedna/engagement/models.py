@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import math
 import re
 import unicodedata
 from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import PurePosixPath
-from typing import Annotated, Any, Literal, TypeAlias
+from typing import Annotated, Any, Literal, Self, TypeAlias
 from uuid import UUID
 
 from pydantic import (
@@ -65,6 +67,10 @@ MAX_PUBLIC_INVENTORY_ITEMS = 64
 MAX_HEALTH_ENTRIES_PER_STORE = 512
 MAX_HEALTH_ENTRIES_TOTAL = 4_096
 MAX_HEALTH_OCCURRENCES = 2_147_483_647
+MAX_STRATEGY_ARCHIVE_RECORDS = 100_000
+MAX_STRATEGY_ARCHIVE_BYTES = 64 * 1024 * 1024
+MAX_STRATEGY_ARCHIVE_PAGE = 256
+MAX_STRATEGY_ARCHIVE_RECORD_BYTES = 64 * 1024
 
 
 class HostKind(StrEnum):
@@ -189,6 +195,113 @@ class JournalRevision(BaseModel):
 
     sequence: StrictInt = Field(ge=0, le=MAX_JOURNAL_EVENTS)
     event_hash: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
+def _validate_archive_json(
+    value: object, *, depth: int = 0, nodes: list[int] | None = None
+) -> None:
+    """Keep archive payloads data-only and small before they reach durable storage."""
+    if depth > 16:
+        raise ValueError("strategy archive payload is too deeply nested")
+    current_nodes = nodes if nodes is not None else [0]
+    current_nodes[0] += 1
+    if current_nodes[0] > 4096:
+        raise ValueError("strategy archive payload has too many values")
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, int) and not isinstance(value, bool):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("strategy archive payload contains a non-finite number")
+        return
+    if isinstance(value, str):
+        if len(value) > 8192:
+            raise ValueError("strategy archive payload string exceeds its bound")
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_archive_json(item, depth=depth + 1, nodes=current_nodes)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str) or not key or len(key) > 256:
+                raise ValueError("strategy archive payload has an invalid key")
+            _validate_archive_json(item, depth=depth + 1, nodes=current_nodes)
+        return
+    raise ValueError("strategy archive payload must contain only JSON data")
+
+
+class StrategyArchiveRecordDraft(BaseModel):
+    """A planning-owned, data-only cold strategy record.
+
+    M6A deliberately treats ``payload`` as bounded opaque JSON: it stores no planning model.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    entry_id: UUID
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _payload_is_bounded_json(self) -> Self:
+        _validate_archive_json(self.payload)
+        encoded = json.dumps(
+            self.payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if len(encoded) > MAX_STRATEGY_ARCHIVE_RECORD_BYTES:
+            raise ValueError("strategy archive record exceeds its byte bound")
+        return self
+
+
+class StrategyArchiveProjectionEnvelope(BaseModel):
+    """Header line for the fixed-name M6A strategy archive projection."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    schema_id: Annotated[str, Field(min_length=1, max_length=128)]
+    archive_revision: StrictInt = Field(ge=1)
+    authoritative_journal_revision: JournalRevision
+    entry_count: StrictInt = Field(ge=0, le=MAX_STRATEGY_ARCHIVE_RECORDS)
+    entries_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    byte_size: StrictInt = Field(ge=1, le=MAX_STRATEGY_ARCHIVE_BYTES)
+
+
+class StrategyArchivePage(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    envelope: StrategyArchiveProjectionEnvelope
+    records: Annotated[
+        tuple[StrategyArchiveRecordDraft, ...], Field(max_length=MAX_STRATEGY_ARCHIVE_PAGE)
+    ] = ()
+    next_after_entry_id: UUID | None = None
+    complete: bool
+    omitted_entries_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")] | None = None
+
+    @model_validator(mode="after")
+    def _page_cursor_is_consistent(self) -> Self:
+        if self.complete != (self.next_after_entry_id is None):
+            raise ValueError("strategy archive page cursor is inconsistent")
+        if (
+            self.records
+            and self.next_after_entry_id is not None
+            and self.next_after_entry_id != self.records[-1].entry_id
+        ):
+            raise ValueError("strategy archive next cursor must identify the final record")
+        if self.complete != (self.omitted_entries_sha256 is None):
+            raise ValueError("strategy archive omitted digest is inconsistent")
+        return self
+
+
+class StrategyArchiveCommitResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    envelope: StrategyArchiveProjectionEnvelope
+    file_name: Literal["strategy-archive.jsonl"] = "strategy-archive.jsonl"
 
 
 def scope_references(scope: AuthorizationScope) -> tuple[ScopeReference, ...]:

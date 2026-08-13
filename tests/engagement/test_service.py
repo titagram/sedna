@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 from contextlib import contextmanager
+from uuid import UUID
 
 import pytest
 from pydantic import BaseModel, ConfigDict
@@ -13,6 +14,7 @@ from sedna.engagement import (
     JournalRevision,
     ProofRequirement,
     RevisionConflictError,
+    StrategyArchiveRecordDraft,
 )
 from sedna.engagement.service import (
     EngagementAmbiguousError,
@@ -199,6 +201,28 @@ def test_public_facade_supports_snapshot_events_evidence_and_projection_cas(
         )
 
 
+def test_public_facade_exposes_fixed_strategy_archive(
+    tmp_path, manifest, lane, fixed_clock, fixed_uuid_factory
+) -> None:
+    record = StrategyArchiveRecordDraft(
+        entry_id=UUID("00000000-0000-4000-8000-000000000802"), payload={"cold": True}
+    )
+    with engagement_service(tmp_path, fixed_clock, fixed_uuid_factory) as service:
+        opened = service.create_from_manifest(manifest, lane=lane)
+        committed = service.commit_strategy_archive(
+            manifest.engagement_id,
+            schema_id="sedna.strategy-archive.v1",
+            records=(record,),
+            expected_archive_revision=None,
+            expected_journal_revision=opened.snapshot.revision,
+        )
+        page = service.load_strategy_archive(manifest.engagement_id)
+
+    assert committed.file_name == "strategy-archive.jsonl"
+    assert page is not None
+    assert page.records == (record,)
+
+
 def test_facade_pages_events_and_evidence_descriptors(
     tmp_path, manifest, lane, user_note_draft, tool_started, fixed_clock,
     fixed_uuid_factory,
@@ -241,6 +265,13 @@ def test_service_methods_keep_authoritative_keyword_names() -> None:
         "load_events": {"after_sequence", "through_revision", "limit"},
         "list_evidence_descriptors": {"after_sequence", "through_revision", "limit"},
         "commit_projection": {"name", "expected_revision"},
+        "commit_strategy_archive": {
+            "schema_id",
+            "records",
+            "expected_archive_revision",
+            "expected_journal_revision",
+        },
+        "load_strategy_archive": {"after_entry_id", "limit"},
         "load_projection": {"name", "model_type"},
         "terminate_tool_call": {"expected_revision", "resolution", "reason", "lane"},
         "request_close": {"expected_revision", "lane", "reason"},

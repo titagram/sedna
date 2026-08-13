@@ -1038,6 +1038,11 @@ class ExecutionVariantState(BaseModel):
         tuple[AttemptState, ...], Field(max_length=MAX_ATTEMPTS_PER_VARIANT)
     ] = ()
     historical_attempt_count: Annotated[int, Field(ge=0)] = 0
+    outcome_category_totals: dict[OutcomeCategory, Annotated[int, Field(ge=1)]] = Field(
+        default_factory=dict
+    )
+    historical_oldest_revision: JournalRevision | None = None
+    historical_newest_revision: JournalRevision | None = None
     historical_attempt_digest: Sha256Hex = sha256(b"[]").hexdigest()
 
     @model_validator(mode="after")
@@ -1045,6 +1050,16 @@ class ExecutionVariantState(BaseModel):
         attempt_ids = tuple(attempt.attempt_event_id for attempt in self.recent_attempts)
         if len(attempt_ids) != len(set(attempt_ids)):
             raise ValueError("variant_attempt_ids_not_unique")
+        if self.outcome_category_totals and sum(self.outcome_category_totals.values()) != (
+            self.historical_attempt_count + len(self.recent_attempts)
+        ):
+            raise ValueError("attempt_outcomes_do_not_match_count")
+        has_bounds = (
+            self.historical_oldest_revision is not None
+            and self.historical_newest_revision is not None
+        )
+        if (self.historical_attempt_count > 0) != has_bounds:
+            raise ValueError("historical_attempt_revisions_do_not_match_count")
         return self
 
 

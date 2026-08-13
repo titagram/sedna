@@ -17,6 +17,7 @@ from sedna.engagement import (
     EngagementAbandonedPayload,
     JournalEventDraft,
     JournalRevision,
+    StrategyArchiveRecordDraft,
     SystemCorrelation,
 )
 from sedna.engagement.reducer import EngagementReplayError
@@ -79,6 +80,251 @@ def test_create_commits_manifest_open_and_lane_binding_atomically(
     assert stat.S_IMODE((root / "journal-head.json").stat().st_mode) == 0o600
     assert (root / "engagement-state.json").is_file()
     assert not (root / "state.json").exists()
+
+
+def test_repository_strategy_archive_uses_fixed_confined_name_and_cas(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory
+) -> None:
+    with _repository(tmp_path / "knowledge", fixed_clock, fixed_uuid_factory) as repository:
+        opened = repository.create(manifest, initial_drafts(manifest, lane))
+        record = StrategyArchiveRecordDraft(
+            entry_id=UUID("00000000-0000-4000-8000-000000000801"),
+            payload={"cold": True},
+        )
+        committed = repository.commit_strategy_archive(
+            manifest.engagement_id,
+            schema_id="sedna.strategy-archive.v1",
+            records=(record,),
+            expected_archive_revision=None,
+            expected_journal_revision=opened.revision,
+        )
+        loaded = repository.load_strategy_archive(manifest.engagement_id)
+
+    assert committed.envelope.entry_count == 1
+    assert loaded is not None
+    assert loaded.records == (record,)
+
+
+def test_repository_strategy_archive_keeps_prior_projection_on_temp_write_fault(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory, monkeypatch
+) -> None:
+    with _repository(tmp_path / "knowledge", fixed_clock, fixed_uuid_factory) as repository:
+        opened = repository.create(manifest, initial_drafts(manifest, lane))
+        first = StrategyArchiveRecordDraft(
+            entry_id=UUID("00000000-0000-4000-8000-000000000803"), payload={"n": 1}
+        )
+        repository.commit_strategy_archive(
+            manifest.engagement_id,
+            schema_id="sedna.strategy-archive.v1",
+            records=(first,),
+            expected_archive_revision=None,
+            expected_journal_revision=opened.revision,
+        )
+        archive_path = (
+            _engagement_path(tmp_path / "knowledge", manifest.engagement_id)
+            / "strategy-archive.jsonl"
+        )
+        prior = archive_path.read_bytes()
+
+        def fail_on_temp_fsync(point: str) -> None:
+            if point == "strategy_archive_after_temp_fsync":
+                raise OSError("archive temp write fault")
+
+        monkeypatch.setattr(repository, "_fault", fail_on_temp_fsync)
+        with pytest.raises(OSError, match="archive temp"):
+            repository.commit_strategy_archive(
+                manifest.engagement_id,
+                schema_id="sedna.strategy-archive.v1",
+                records=(first,),
+                expected_archive_revision=1,
+                expected_journal_revision=opened.revision,
+            )
+        assert archive_path.read_bytes() == prior
+
+
+def test_repository_strategy_archive_rejects_symlink_and_nonregular_targets(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory
+) -> None:
+    with _repository(tmp_path / "knowledge", fixed_clock, fixed_uuid_factory) as repository:
+        repository.create(manifest, initial_drafts(manifest, lane))
+        engagement = _engagement_path(tmp_path / "knowledge", manifest.engagement_id)
+        target = engagement / "strategy-archive.jsonl"
+        os.symlink("engagement.json", target)
+        with pytest.raises(JournalUnavailableError, match="strategy archive"):
+            repository.load_strategy_archive(manifest.engagement_id)
+        target.unlink()
+        target.mkdir()
+        with pytest.raises(JournalUnavailableError, match="strategy archive"):
+            repository.load_strategy_archive(manifest.engagement_id)
+
+
+def test_strategy_archive_rejects_duplicate_and_unsorted_entry_ids(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory
+) -> None:
+    first = StrategyArchiveRecordDraft(
+        entry_id=UUID("00000000-0000-4000-8000-000000000810"), payload={"n": 1}
+    )
+    second = StrategyArchiveRecordDraft(
+        entry_id=UUID("00000000-0000-4000-8000-000000000811"), payload={"n": 2}
+    )
+    with _repository(tmp_path / "knowledge", fixed_clock, fixed_uuid_factory) as repository:
+        opened = repository.create(manifest, initial_drafts(manifest, lane))
+        for records in ((first, first), (second, first)):
+            with pytest.raises(ValueError, match="strictly ordered"):
+                repository.commit_strategy_archive(
+                    manifest.engagement_id,
+                    schema_id="sedna.strategy-archive.v1",
+                    records=records,
+                    expected_archive_revision=None,
+                    expected_journal_revision=opened.revision,
+                )
+
+
+def _too_deep_strategy_archive_payload() -> dict[str, object]:
+    value: object = True
+    for _ in range(17):
+        value = {"nested": value}
+    return value
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        _too_deep_strategy_archive_payload(),
+        {"bad": float("nan")},
+        {"oversized": "x" * 8193},
+    ),
+)
+def test_strategy_archive_rejects_deep_oversized_and_invalid_payload_values(payload) -> None:
+    with pytest.raises(ValueError, match="deeply|non-finite|string exceeds"):
+        StrategyArchiveRecordDraft(
+            entry_id=UUID("00000000-0000-4000-8000-000000000812"), payload=payload
+        )
+
+
+def test_strategy_archive_rejects_corrupt_header_count_digest_and_entry(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory
+) -> None:
+    root = tmp_path / "knowledge"
+    record = StrategyArchiveRecordDraft(
+        entry_id=UUID("00000000-0000-4000-8000-000000000813"), payload={"n": 1}
+    )
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        opened = repository.create(manifest, initial_drafts(manifest, lane))
+        repository.commit_strategy_archive(
+            manifest.engagement_id,
+            schema_id="sedna.strategy-archive.v1",
+            records=(record,),
+            expected_archive_revision=None,
+            expected_journal_revision=opened.revision,
+        )
+        path = _engagement_path(root, manifest.engagement_id) / "strategy-archive.jsonl"
+        original = path.read_bytes()
+        header, entry = original.splitlines(keepends=True)
+        corruptions = (
+            b"not-json\n" + entry,
+            header.replace(b'"entry_count":1', b'"entry_count":2') + entry,
+            header.replace(b'"entries_sha256":"', b'"entries_sha256":"f', 1) + entry,
+            header + b"not-json\n",
+        )
+        for corrupted in corruptions:
+            path.write_bytes(corrupted)
+            os.chmod(path, 0o600)
+            with pytest.raises(JournalUnavailableError, match="header|count|digest|entry|byte"):
+                repository.load_strategy_archive(manifest.engagement_id)
+        path.write_bytes(original)
+        os.chmod(path, 0o600)
+
+
+def test_strategy_archive_cursor_limits_omitted_digest_and_pre_stat_bound(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory, monkeypatch
+) -> None:
+    root = tmp_path / "knowledge"
+    records = tuple(
+        StrategyArchiveRecordDraft(
+            entry_id=UUID(f"00000000-0000-4000-8000-{820 + index:012d}"), payload={"n": index}
+        )
+        for index in range(3)
+    )
+    with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
+        opened = repository.create(manifest, initial_drafts(manifest, lane))
+        repository.commit_strategy_archive(
+            manifest.engagement_id,
+            schema_id="sedna.strategy-archive.v1",
+            records=records,
+            expected_archive_revision=None,
+            expected_journal_revision=opened.revision,
+        )
+        for limit in (0, 257):
+            with pytest.raises(ValueError, match="limit"):
+                repository.load_strategy_archive(manifest.engagement_id, limit=limit)
+        with pytest.raises(JournalUnavailableError, match="cursor"):
+            repository.load_strategy_archive(
+                manifest.engagement_id,
+                after_entry_id=UUID("00000000-0000-4000-8000-000000000899"),
+            )
+        first = repository.load_strategy_archive(manifest.engagement_id, limit=1)
+        repeated = repository.load_strategy_archive(manifest.engagement_id, limit=1)
+        assert first is not None and repeated is not None
+        assert first.omitted_entries_sha256 == repeated.omitted_entries_sha256
+        path = _engagement_path(root, manifest.engagement_id) / "strategy-archive.jsonl"
+        monkeypatch.setattr(
+            repository_module, "MAX_STRATEGY_ARCHIVE_BYTES", len(path.read_bytes()) - 1
+        )
+        with pytest.raises(JournalUnavailableError, match="byte bound"):
+            repository.load_strategy_archive(manifest.engagement_id)
+
+
+def test_strategy_archive_accepts_exact_byte_bound_and_rejects_one_over_pre_replace(
+    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory, monkeypatch
+) -> None:
+    record = StrategyArchiveRecordDraft(
+        entry_id=UUID("00000000-0000-4000-8000-000000000830"), payload={"n": 1}
+    )
+
+    def commit(root):
+        repository = _repository(root, fixed_clock, fixed_uuid_factory)
+        try:
+            opened = repository.create(manifest, initial_drafts(manifest, lane))
+            repository.commit_strategy_archive(
+                manifest.engagement_id,
+                schema_id="sedna.strategy-archive.v1",
+                records=(record,),
+                expected_archive_revision=None,
+                expected_journal_revision=opened.revision,
+            )
+        finally:
+            repository.close()
+
+    measured = tmp_path / "measured"
+    commit(measured)
+    exact_size = len(
+        (_engagement_path(measured, manifest.engagement_id) / "strategy-archive.jsonl").read_bytes()
+    )
+    monkeypatch.setattr(repository_module, "MAX_STRATEGY_ARCHIVE_BYTES", exact_size)
+    exact = tmp_path / "exact"
+    commit(exact)
+
+    monkeypatch.setattr(repository_module, "MAX_STRATEGY_ARCHIVE_BYTES", exact_size - 1)
+    rejected = _repository(tmp_path / "one-over", fixed_clock, fixed_uuid_factory)
+    try:
+        opened = rejected.create(manifest, initial_drafts(manifest, lane))
+        with pytest.raises(ValueError, match="byte bound"):
+            rejected.commit_strategy_archive(
+                manifest.engagement_id,
+                schema_id="sedna.strategy-archive.v1",
+                records=(record,),
+                expected_archive_revision=None,
+                expected_journal_revision=opened.revision,
+            )
+        assert not (
+            _engagement_path(tmp_path / "one-over", manifest.engagement_id)
+            / "strategy-archive.jsonl"
+        ).exists()
+    finally:
+        rejected.close()
+
+
 
 
 def test_create_retry_finishes_exact_pending_intent_once(

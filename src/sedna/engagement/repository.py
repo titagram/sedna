@@ -9,7 +9,7 @@ import json
 import os
 import re
 import stat
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -46,6 +46,9 @@ from sedna.engagement.models import (
     MAX_MANIFEST_BYTES,
     MAX_PENDING_APPEND_BYTES,
     MAX_RECOVERABLE_TAIL_BYTES,
+    MAX_STRATEGY_ARCHIVE_BYTES,
+    MAX_STRATEGY_ARCHIVE_RECORD_BYTES,
+    MAX_STRATEGY_ARCHIVE_RECORDS,
     MAX_TAIL_RECOVERY_INTENT_BYTES,
     EngagementManifest,
     EvidenceId,
@@ -54,6 +57,10 @@ from sedna.engagement.models import (
     ExecutionLaneKey,
     JournalRevision,
     OrphanEvidencePage,
+    StrategyArchiveCommitResult,
+    StrategyArchivePage,
+    StrategyArchiveProjectionEnvelope,
+    StrategyArchiveRecordDraft,
 )
 from sedna.engagement.reducer import reduce_engagement
 
@@ -65,6 +72,8 @@ PROJECTION_OWNERS = {
     "frontier": "planning",
     "strategy-ledger": "planning",
 }
+
+STRATEGY_ARCHIVE_NAME = "strategy-archive.jsonl"
 
 
 class RevisionConflictError(ValueError):
@@ -704,6 +713,66 @@ def _atomic_write(parent_fd: int, name: str, data: bytes) -> None:
         with suppress(FileNotFoundError):
             os.unlink(temporary, dir_fd=parent_fd)
         raise
+
+
+def _archive_header_bytes(envelope: StrategyArchiveProjectionEnvelope) -> bytes:
+    return _model_bytes(envelope) + b"\n"
+
+
+def _archive_record_bytes(record: StrategyArchiveRecordDraft, archive_revision: int) -> bytes:
+    return _canonical_json(
+        {
+            "archive_revision": archive_revision,
+            "entry_id": str(record.entry_id),
+            "payload": record.payload,
+        }
+    ) + b"\n"
+
+
+def _archive_envelope(
+    *,
+    schema_id: str,
+    archive_revision: int,
+    journal_revision: JournalRevision,
+    entry_count: int,
+    entries_sha256: str,
+    entry_bytes: int,
+) -> StrategyArchiveProjectionEnvelope:
+    """Resolve the small self-referential total-byte header deterministically."""
+    byte_size = entry_bytes + 1
+    for _ in range(8):
+        envelope = StrategyArchiveProjectionEnvelope(
+            schema_id=schema_id,
+            archive_revision=archive_revision,
+            authoritative_journal_revision=journal_revision,
+            entry_count=entry_count,
+            entries_sha256=entries_sha256,
+            byte_size=byte_size,
+        )
+        resolved = entry_bytes + len(_archive_header_bytes(envelope))
+        if resolved == byte_size:
+            return envelope
+        byte_size = resolved
+    raise JournalUnavailableError("strategy archive header byte size did not converge")
+
+
+def _archive_read_lines(fd: int) -> Iterator[bytes]:
+    """Yield newline-terminated archive lines without retaining the complete archive."""
+    buffered = b""
+    while True:
+        chunk = os.read(fd, 65_536)
+        if not chunk:
+            break
+        buffered += chunk
+        while b"\n" in buffered:
+            line, buffered = buffered.split(b"\n", 1)
+            if len(line) > MAX_STRATEGY_ARCHIVE_RECORD_BYTES + 1024:
+                raise JournalUnavailableError("strategy archive line exceeds its byte bound")
+            yield line
+        if len(buffered) > MAX_STRATEGY_ARCHIVE_RECORD_BYTES + 1024:
+            raise JournalUnavailableError("strategy archive line exceeds its byte bound")
+    if buffered:
+        raise JournalUnavailableError("strategy archive is missing its final newline")
 
 
 @contextmanager
@@ -1861,6 +1930,228 @@ class EngagementJournalRepository:
                 raise RevisionConflictError("projection revision is stale")
             return value
         finally:
+            os.close(engagement_fd)
+
+    def _load_strategy_archive_locked(
+        self,
+        engagement_fd: int,
+        *,
+        after_entry_id: UUID | None = None,
+        limit: int = 256,
+    ) -> StrategyArchivePage | None:
+        """Validate a complete archive while retaining at most one bounded page."""
+        try:
+            fd = _open_regular(
+                engagement_fd,
+                STRATEGY_ARCHIVE_NAME,
+                MAX_STRATEGY_ARCHIVE_BYTES,
+                "strategy archive",
+            )
+        except JournalUnavailableError as exc:
+            if _missing_file(exc):
+                return None
+            raise
+        try:
+            size = os.fstat(fd).st_size
+            lines = _archive_read_lines(fd)
+            try:
+                header_line = next(lines)
+            except StopIteration as exc:
+                raise JournalUnavailableError("strategy archive has no header") from exc
+            try:
+                envelope = StrategyArchiveProjectionEnvelope.model_validate_json(header_line)
+            except Exception as exc:
+                raise JournalUnavailableError("strategy archive header is invalid") from exc
+            if _archive_header_bytes(envelope) != header_line + b"\n":
+                raise JournalUnavailableError("strategy archive header is not canonical")
+            if envelope.byte_size != size:
+                raise JournalUnavailableError("strategy archive byte size is invalid")
+
+            count = 0
+            previous_id: UUID | None = None
+            entries_digest = sha256()
+            page: list[StrategyArchiveRecordDraft] = []
+            omitted_digest = sha256()
+            has_omitted = False
+            cursor_found = after_entry_id is None
+            for line in lines:
+                try:
+                    value = json.loads(line)
+                    if not isinstance(value, dict):
+                        raise ValueError("record must be an object")
+                    revision = value.pop("archive_revision")
+                    record = StrategyArchiveRecordDraft.model_validate(value)
+                except Exception as exc:
+                    raise JournalUnavailableError("strategy archive entry is invalid") from exc
+                if revision != envelope.archive_revision:
+                    raise JournalUnavailableError("strategy archive entry revision is invalid")
+                canonical = _archive_record_bytes(record, envelope.archive_revision)
+                if canonical != line + b"\n":
+                    raise JournalUnavailableError("strategy archive entry is not canonical")
+                if previous_id is not None and record.entry_id <= previous_id:
+                    raise JournalUnavailableError(
+                        "strategy archive entries are not strictly ordered"
+                    )
+                previous_id = record.entry_id
+                if record.entry_id == after_entry_id:
+                    cursor_found = True
+                count += 1
+                if count > MAX_STRATEGY_ARCHIVE_RECORDS:
+                    raise JournalUnavailableError("strategy archive record count exceeds its bound")
+                entries_digest.update(canonical)
+                if after_entry_id is None or record.entry_id > after_entry_id:
+                    if len(page) < limit:
+                        page.append(record)
+                    else:
+                        has_omitted = True
+                        omitted_digest.update(canonical)
+            if count != envelope.entry_count:
+                raise JournalUnavailableError("strategy archive record count is invalid")
+            if entries_digest.hexdigest() != envelope.entries_sha256:
+                raise JournalUnavailableError("strategy archive digest is invalid")
+            if not cursor_found:
+                raise JournalUnavailableError("strategy archive cursor is unknown")
+            return StrategyArchivePage(
+                envelope=envelope,
+                records=tuple(page),
+                next_after_entry_id=page[-1].entry_id if has_omitted else None,
+                complete=not has_omitted,
+                omitted_entries_sha256=omitted_digest.hexdigest() if has_omitted else None,
+            )
+        finally:
+            os.close(fd)
+
+    def load_strategy_archive(
+        self,
+        engagement_id: UUID,
+        *,
+        after_entry_id: UUID | None = None,
+        limit: int = 256,
+    ) -> StrategyArchivePage | None:
+        if not 1 <= limit <= 256:
+            raise ValueError("strategy archive page limit is out of bounds")
+        self._complete_tail_recovery(engagement_id)
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            with _locked_file(engagement_fd, ".strategy-archive.lock"):
+                return self._load_strategy_archive_locked(
+                    engagement_fd, after_entry_id=after_entry_id, limit=limit
+                )
+        finally:
+            os.close(engagement_fd)
+
+    def commit_strategy_archive(
+        self,
+        engagement_id: UUID,
+        *,
+        schema_id: str,
+        records: Iterable[StrategyArchiveRecordDraft],
+        expected_archive_revision: int | None,
+        expected_journal_revision: JournalRevision,
+    ) -> StrategyArchiveCommitResult:
+        """Stream a fixed-path cold projection with archive and journal CAS guards."""
+        if not isinstance(schema_id, str) or not schema_id:
+            raise ValueError("strategy archive schema ID is required")
+        self._complete_tail_recovery(engagement_id)
+        engagement_fd = self._engagement_fd(engagement_id)
+        stage_name: str | None = None
+        temporary_name: str | None = None
+        try:
+            with _locked_file(engagement_fd, ".journal.lock"):
+                self._recover_pending_append(engagement_fd, engagement_id)
+                _, _, head, _ = self._load_authoritative_locked(
+                    engagement_fd, engagement_id, allow_tail=False
+                )
+                if head.revision != expected_journal_revision:
+                    raise RevisionConflictError("strategy archive journal revision is stale")
+                with _locked_file(engagement_fd, ".strategy-archive.lock"):
+                    current = self._load_strategy_archive_locked(engagement_fd)
+                    current_revision = (
+                        None if current is None else current.envelope.archive_revision
+                    )
+                    if current_revision != expected_archive_revision:
+                        raise RevisionConflictError("strategy archive revision is stale")
+                    archive_revision = 1 if current_revision is None else current_revision + 1
+                    stage_name = f".{STRATEGY_ARCHIVE_NAME}.stage-{uuid4()}"
+                    stage_fd = os.open(stage_name, _create_flags(), 0o600, dir_fd=engagement_fd)
+                    try:
+                        os.fchmod(stage_fd, 0o600)
+                        digest = sha256()
+                        entry_bytes = 0
+                        entry_count = 0
+                        prior_id: UUID | None = None
+                        iterator = iter(records)
+                        while True:
+                            try:
+                                supplied = next(iterator)
+                            except StopIteration:
+                                break
+                            entry_count += 1
+                            if entry_count > MAX_STRATEGY_ARCHIVE_RECORDS:
+                                raise ValueError("strategy archive record count exceeds its bound")
+                            record = StrategyArchiveRecordDraft.model_validate(supplied)
+                            if prior_id is not None and record.entry_id <= prior_id:
+                                raise ValueError(
+                                    "strategy archive records must be strictly ordered"
+                                )
+                            prior_id = record.entry_id
+                            line = _archive_record_bytes(record, archive_revision)
+                            entry_bytes += len(line)
+                            if entry_bytes >= MAX_STRATEGY_ARCHIVE_BYTES:
+                                raise ValueError("strategy archive exceeds its byte bound")
+                            _write_all(stage_fd, line)
+                            digest.update(line)
+                        os.fsync(stage_fd)
+                    finally:
+                        os.close(stage_fd)
+                    envelope = _archive_envelope(
+                        schema_id=schema_id,
+                        archive_revision=archive_revision,
+                        journal_revision=head.revision,
+                        entry_count=entry_count,
+                        entries_sha256=digest.hexdigest(),
+                        entry_bytes=entry_bytes,
+                    )
+                    header = _archive_header_bytes(envelope)
+                    if len(header) + entry_bytes > MAX_STRATEGY_ARCHIVE_BYTES:
+                        raise ValueError("strategy archive exceeds its byte bound")
+                    temporary_name = f".{STRATEGY_ARCHIVE_NAME}.tmp-{uuid4()}"
+                    temporary_fd = os.open(
+                        temporary_name, _create_flags(), 0o600, dir_fd=engagement_fd
+                    )
+                    try:
+                        os.fchmod(temporary_fd, 0o600)
+                        _write_all(temporary_fd, header)
+                        stage_fd = _open_regular(
+                            engagement_fd,
+                            stage_name,
+                            MAX_STRATEGY_ARCHIVE_BYTES,
+                            "strategy archive staging file",
+                        )
+                        try:
+                            while chunk := os.read(stage_fd, 65_536):
+                                _write_all(temporary_fd, chunk)
+                        finally:
+                            os.close(stage_fd)
+                        os.fsync(temporary_fd)
+                    finally:
+                        os.close(temporary_fd)
+                    self._fault("strategy_archive_after_temp_fsync")
+                    os.replace(
+                        temporary_name,
+                        STRATEGY_ARCHIVE_NAME,
+                        src_dir_fd=engagement_fd,
+                        dst_dir_fd=engagement_fd,
+                    )
+                    temporary_name = None
+                    os.fsync(engagement_fd)
+                    self._fault("strategy_archive_after_replace")
+                    return StrategyArchiveCommitResult(envelope=envelope)
+        finally:
+            for name in (stage_name, temporary_name):
+                if name is not None:
+                    with suppress(FileNotFoundError):
+                        os.unlink(name, dir_fd=engagement_fd)
             os.close(engagement_fd)
 
     def write_evidence(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -37,6 +37,7 @@ from sedna.engagement.models import (
     MAX_JOURNAL_EVENTS,
     MAX_PUBLIC_INVENTORY_ITEMS,
     MAX_SETTLEMENT_PENDING_RANGES,
+    MAX_STRATEGY_ARCHIVE_PAGE,
     ActiveDecision,
     AuthorizationScope,
     EngagementManifest,
@@ -52,6 +53,9 @@ from sedna.engagement.models import (
     ProofRequirement,
     SettlementSafeCode,
     Sha256Hex,
+    StrategyArchiveCommitResult,
+    StrategyArchivePage,
+    StrategyArchiveRecordDraft,
     scope_references,
 )
 from sedna.engagement.normalization import (
@@ -1098,6 +1102,34 @@ class EngagementJournalService:
             / "engagements"
             / str(engagement_id)
             / f"{name}.json"
+        )
+
+    def load_strategy_archive(
+        self,
+        engagement_id: UUID,
+        *,
+        after_entry_id: UUID | None = None,
+        limit: int = MAX_STRATEGY_ARCHIVE_PAGE,
+    ) -> StrategyArchivePage | None:
+        return self._repository.load_strategy_archive(
+            engagement_id, after_entry_id=after_entry_id, limit=limit
+        )
+
+    def commit_strategy_archive(
+        self,
+        engagement_id: UUID,
+        *,
+        schema_id: str,
+        records: Iterable[StrategyArchiveRecordDraft],
+        expected_archive_revision: int | None,
+        expected_journal_revision: JournalRevision,
+    ) -> StrategyArchiveCommitResult:
+        return self._repository.commit_strategy_archive(
+            engagement_id,
+            schema_id=schema_id,
+            records=records,
+            expected_archive_revision=expected_archive_revision,
+            expected_journal_revision=expected_journal_revision,
         )
 
     def resolve_lane_binding_method(self, lane: ExecutionLaneKey) -> LaneBindingResolution:

@@ -19,6 +19,7 @@ from sedna.engagement import (
 from sedna.engagement.events import EvidenceSliceEventRef, PlanningCallMetadataEventRecord
 from sedna.engagement.service import PlanningEventCommitItem
 from sedna.planning.journal_events import payloads_from_observation_batch
+from sedna.planning.ledger import StrategyLedgerReducer
 from sedna.planning.llm import ObservationEvidenceSlice, ObservationRequest
 from sedna.planning.models import (
     EVIDENCE_SLICE_BYTES,
@@ -38,6 +39,7 @@ from sedna.planning.models import (
     SettledSettlementResult,
     SettlementResult,
     SituationProjection,
+    StrategyLedger,
 )
 from sedna.planning.ports import TerminalSettlementPort
 from sedna.planning.prompts import (
@@ -94,6 +96,28 @@ class PlanningService:
             expected_revision=snapshot.revision,
         )
         return situation
+
+    def load_ledger(self, engagement_id: UUID) -> StrategyLedger:
+        """Load or rebuild the bounded hot ledger; the journal remains authority."""
+        snapshot = self._journal.load_snapshot(engagement_id)
+        try:
+            cached = self._journal.load_projection(engagement_id, "strategy-ledger", StrategyLedger)
+        except Exception:
+            cached = None
+        if cached is not None:
+            # A projection cannot carry its own authority in the legacy data-only ledger model;
+            # rebuild to avoid accepting a stale hot view after journal advancement.
+            rebuilt = StrategyLedgerReducer.rebuild(snapshot)
+            if cached == rebuilt:
+                return cached
+        ledger = StrategyLedgerReducer.rebuild(snapshot)
+        self._journal.commit_projection(
+            engagement_id,
+            "strategy-ledger",
+            ledger,
+            expected_revision=snapshot.revision,
+        )
+        return ledger
 
     def settle_pending_evidence(
         self,
