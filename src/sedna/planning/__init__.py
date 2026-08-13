@@ -103,6 +103,12 @@ from sedna.planning.ledger import (
     validate_reconciliation,
 )
 from sedna.planning.ports import TerminalReconciliationResult, TerminalSettlementPort
+from sedna.planning.retrieval import (
+    CandidateResearchSource,
+    PlannerKnowledgeContext,
+    assemble_planner_knowledge,
+    build_retrieval_queries,
+)
 from sedna.planning.service import PlanningService
 from sedna.planning.situation import (
     SituationReducer,
@@ -116,6 +122,7 @@ __all__ = [
     "CommandOrigin",
     "CommandSuggestion",
     "CommandSuggestionDraft",
+    "CandidateResearchSource",
     "EVIDENCE_SLICE_BYTES",
     "MAX_EVIDENCE_BYTES_PER_SETTLEMENT",
     "MAX_ARCHIVE_SUMMARY_BYTES",
@@ -171,6 +178,7 @@ __all__ = [
     "PlannerCriticRequest",
     "PlannerCriticVerdict",
     "PlannerDraft",
+    "PlannerKnowledgeContext",
     "PlannerRepairAudit",
     "PlannerRejectionAudit",
     "PlannerRequest",
@@ -197,6 +205,8 @@ __all__ = [
     "StrategyLedgerReducer",
     "StrategyStatus",
     "archive_digest",
+    "assemble_planner_knowledge",
+    "build_retrieval_queries",
     "ledger_digest",
     "partition_ledger",
     "select_reactivation_candidates",

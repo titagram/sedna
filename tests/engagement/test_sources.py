@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 import sedna.engagement.sources as sources_module
@@ -92,6 +94,43 @@ def test_snapshot_and_list_entries_are_atomic_and_bounded(tmp_path) -> None:
     assert snapshot.entries == listed
     assert snapshot.content_sha256
     assert snapshot.byte_size <= 1024 * 1024
+
+
+def test_planner_snapshot_is_managed_only_bounded_and_preserves_full_api(tmp_path) -> None:
+    root = tmp_path / "knowledge"
+    root.mkdir(mode=0o700)
+    manual = b"# private manual prose\n"
+    (root / "sources.md").write_bytes(manual)
+    with EngagementJournalRepository(root) as repository:
+        registry = SharedSourceRegistry(repository)
+        registry.add_or_update(source_entry("https://example.test/linux", topics=("linux",)))
+        planner = registry.planner_snapshot()
+
+    assert tuple(inspect.signature(SharedSourceRegistry.snapshot).parameters) == ("self",)
+    assert tuple(inspect.signature(SharedSourceRegistry.list_entries).parameters) == ("self",)
+    assert len(planner.entries) == 1
+    assert planner.total_count == 1
+    assert planner.truncated is False
+    assert planner.omitted_entries_sha256 is None
+    assert planner.canonical_bytes <= 64 * 1024
+    assert b"private manual prose" not in planner.model_dump_json().encode()
+    assert (root / "sources.md").read_bytes().startswith(manual)
+
+
+def test_planner_hints_exclude_known_incompatible_platform(tmp_path) -> None:
+    root = tmp_path / "knowledge"
+    with EngagementJournalRepository(root) as repository:
+        registry = SharedSourceRegistry(repository)
+        registry.add_or_update(source_entry("https://example.test/linux", topics=("linux", "http")))
+        registry.add_or_update(
+            source_entry("https://example.test/windows", topics=("windows", "http"))
+        )
+
+        page = registry.list_planner_hints(topic_tokens=("linux", "http"))
+
+    assert [entry.locator for entry in page.entries] == ["https://example.test/linux"]
+    assert page.total_count == 2
+    assert page.truncated is True
 
 
 def test_oversized_registry_fails_before_unbounded_parse(tmp_path) -> None:

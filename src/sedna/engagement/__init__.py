@@ -161,6 +161,8 @@ from sedna.engagement.logbook import (
     render_session_logbook,
 )
 from sedna.engagement.sources import (
+    PlannerSourceHintPage,
+    PlannerSourceSnapshot,
     SharedSourceEntry,
     SharedSourceRegistry,
     SourceOrigin,
@@ -239,6 +241,8 @@ __all__ = [
     "InterpretationSucceededEventPayload",
     "ObjectiveProofObservedEventPayload",
     "PlanRequestedEventPayload",
+    "PlannerSourceHintPage",
+    "PlannerSourceSnapshot",
     "PlanningGapRecordedEventPayload",
     "ResearchQueryProposedEventPayload",
     "ResearchSourceAssessedEventPayload",

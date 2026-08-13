@@ -188,6 +188,28 @@ class SourceRegistrySnapshot(BaseModel):
     )
 
 
+class PlannerSourceSnapshot(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    registry_sha256: Sha256Hex
+    total_count: int = Field(ge=0, le=MAX_SOURCE_REGISTRY_ENTRIES)
+    entries: tuple[SharedSourceEntry, ...] = Field(max_length=128)
+    truncated: bool
+    omitted_entries_sha256: Sha256Hex | None = None
+    canonical_bytes: int = Field(ge=0, le=64 * 1024)
+
+
+class PlannerSourceHintPage(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    registry_sha256: Sha256Hex
+    total_count: int = Field(ge=0, le=MAX_SOURCE_REGISTRY_ENTRIES)
+    entries: tuple[SharedSourceEntry, ...] = Field(max_length=16)
+    truncated: bool
+    omitted_entries_sha256: Sha256Hex | None = None
+    canonical_bytes: int = Field(ge=0, le=16 * 1024)
+
+
 @dataclass(frozen=True)
 class SourceRegistryResult:
     entry: SharedSourceEntry
@@ -293,6 +315,54 @@ class SharedSourceRegistry:
     def list_entries(self) -> tuple[SharedSourceEntry, ...]:
         return self.snapshot().entries
 
+    def planner_snapshot(self) -> PlannerSourceSnapshot:
+        with _locked_file(self._root_fd, ".sources.lock"):
+            data = self._read_current()
+            entries, preserved = self._parse(data)
+        ordered = tuple(sorted(entries.values(), key=lambda item: item.source_id))
+        selected, canonical_bytes = _bounded_planner_entries(
+            ordered, count_limit=128, byte_limit=64 * 1024
+        )
+        omitted = ordered[len(selected) :]
+        return PlannerSourceSnapshot(
+            registry_sha256=_planner_registry_digest(ordered, preserved),
+            total_count=len(ordered),
+            entries=selected,
+            truncated=bool(omitted),
+            omitted_entries_sha256=_entries_digest(omitted) if omitted else None,
+            canonical_bytes=canonical_bytes,
+        )
+
+    def list_planner_hints(
+        self,
+        *,
+        topic_tokens: tuple[str, ...] = (),
+    ) -> PlannerSourceHintPage:
+        tokens = tuple(
+            sorted({" ".join(token.split()).casefold() for token in topic_tokens if token.split()})
+        )
+        if len(tokens) > 32 or sum(map(len, tokens)) > 4096:
+            raise ValueError("planner topic tokens exceed the cumulative bound")
+        with _locked_file(self._root_fd, ".sources.lock"):
+            data = self._read_current()
+            entries, preserved = self._parse(data)
+        complete = tuple(sorted(entries.values(), key=lambda item: item.source_id))
+        compatible = tuple(item for item in complete if _planner_topics_compatible(item, tokens))
+        ranked = tuple(sorted(compatible, key=lambda item: _planner_hint_key(item, tokens)))
+        selected, canonical_bytes = _bounded_planner_entries(
+            ranked, count_limit=16, byte_limit=16 * 1024
+        )
+        selected_ids = {item.source_id for item in selected}
+        omitted = tuple(item for item in complete if item.source_id not in selected_ids)
+        return PlannerSourceHintPage(
+            registry_sha256=_planner_registry_digest(complete, preserved),
+            total_count=len(complete),
+            entries=selected,
+            truncated=bool(omitted),
+            omitted_entries_sha256=_entries_digest(omitted) if omitted else None,
+            canonical_bytes=canonical_bytes,
+        )
+
     def add_or_update(self, entry: SharedSourceEntry) -> SourceRegistryResult:
         entry = SharedSourceEntry.model_validate(entry.model_dump(mode="python"))
         with _locked_file(self._root_fd, ".sources.lock"):
@@ -337,6 +407,55 @@ class SharedSourceRegistry:
         for source_id in sorted(entries):
             chunks.append(_render_block(entries[source_id]).encode("utf-8"))
         return b"".join(chunks)
+
+
+def _canonical_entry_bytes(entry: SharedSourceEntry) -> bytes:
+    return _canonical_json(entry.model_dump(mode="json"))
+
+
+def _entries_digest(entries: tuple[SharedSourceEntry, ...]) -> str:
+    return sha256(b"\n".join(_canonical_entry_bytes(entry) for entry in entries)).hexdigest()
+
+
+def _planner_registry_digest(entries: tuple[SharedSourceEntry, ...], preserved: list[bytes]) -> str:
+    payload = {
+        "entries_sha256": _entries_digest(entries),
+        "manual_sha256": sha256(b"".join(preserved)).hexdigest(),
+    }
+    return sha256(_canonical_json(payload)).hexdigest()
+
+
+def _bounded_planner_entries(
+    entries: tuple[SharedSourceEntry, ...], *, count_limit: int, byte_limit: int
+) -> tuple[tuple[SharedSourceEntry, ...], int]:
+    selected: list[SharedSourceEntry] = []
+    canonical_bytes = 2
+    for entry in entries[:count_limit]:
+        size = len(_canonical_entry_bytes(entry)) + (1 if selected else 0)
+        if canonical_bytes + size > byte_limit:
+            break
+        selected.append(entry)
+        canonical_bytes += size
+    return tuple(selected), canonical_bytes
+
+
+def _planner_hint_key(entry: SharedSourceEntry, tokens: tuple[str, ...]) -> tuple[int, int, str]:
+    topics = {topic.casefold() for topic in entry.topics}
+    matches = sum(token in topics for token in tokens)
+    user_priority = entry.origin is SourceOrigin.USER_SUGGESTED
+    return (-matches, -int(user_priority), entry.source_id)
+
+
+def _planner_topics_compatible(entry: SharedSourceEntry, tokens: tuple[str, ...]) -> bool:
+    topics = {topic.casefold() for topic in entry.topics}
+    token_set = set(tokens)
+    incompatible = {
+        "linux": {"windows", "macos", "darwin", "freebsd"},
+        "windows": {"linux", "macos", "darwin", "freebsd"},
+        "x86_64": {"aarch64", "arm64", "i386", "armv7"},
+        "aarch64": {"x86_64", "amd64", "i386", "armv7"},
+    }
+    return not any(topics & incompatible.get(token, set()) for token in token_set)
 
 
 def _decode_block(block: list[str], source_id: str) -> SharedSourceEntry:
