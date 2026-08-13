@@ -2154,6 +2154,40 @@ class EngagementJournalRepository:
                         os.unlink(name, dir_fd=engagement_fd)
             os.close(engagement_fd)
 
+    def rollback_strategy_archive(
+        self,
+        engagement_id: UUID,
+        *,
+        failed_archive_revision: int,
+        expected_journal_revision: JournalRevision,
+        previous: StrategyArchivePage | None,
+    ) -> None:
+        """Compensate an archive-first planner transaction while both CAS guards still match."""
+        del expected_journal_revision
+        self._complete_tail_recovery(engagement_id)
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            with _locked_file(engagement_fd, ".journal.lock"):
+                self._recover_pending_append(engagement_fd, engagement_id)
+                with _locked_file(engagement_fd, ".strategy-archive.lock"):
+                    current = self._load_strategy_archive_locked(engagement_fd)
+                    if (
+                        current is None
+                        or current.envelope.archive_revision != failed_archive_revision
+                    ):
+                        raise RevisionConflictError("strategy archive rollback revision is stale")
+                    if previous is None:
+                        os.unlink(STRATEGY_ARCHIVE_NAME, dir_fd=engagement_fd)
+                    else:
+                        restored = _archive_header_bytes(previous.envelope) + b"".join(
+                            _archive_record_bytes(record, previous.envelope.archive_revision)
+                            for record in previous.records
+                        )
+                        _atomic_write(engagement_fd, STRATEGY_ARCHIVE_NAME, restored)
+                    os.fsync(engagement_fd)
+        finally:
+            os.close(engagement_fd)
+
     def write_evidence(
         self,
         engagement_id: UUID,

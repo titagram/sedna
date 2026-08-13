@@ -198,6 +198,15 @@ def _apply_snapshot(
         families[snapshot.family_id] = _family_state(snapshot)
     elif isinstance(snapshot, ExecutionVariantEventRecord):
         variants[snapshot.variant_id] = _variant_state(snapshot)
+        family = families.get(snapshot.family_id)
+        if family is not None and snapshot.variant_id not in family.variant_ids:
+            families[snapshot.family_id] = family.model_copy(
+                update={
+                    "variant_ids": tuple(
+                        sorted((*family.variant_ids, snapshot.variant_id), key=str)
+                    )
+                }
+            )
     elif isinstance(snapshot, StrategyTombstoneEventRecord):
         if snapshot.entity_kind == "family":
             families.pop(snapshot.entity_id, None)
@@ -449,6 +458,17 @@ def select_reactivation_candidates(
     return tuple(sorted(selected, key=lambda item: str(item.archive_entry_id))[:MAX_REACTIVATION_CANDIDATES])
 
 
+def matching_retry_predicate_ids(
+    record: ArchivedStrategyEventRecord, situation: SituationProjection
+) -> tuple[str, ...]:
+    """Identify the typed retry predicates satisfied by this authoritative situation."""
+    return tuple(
+        predicate.predicate_id
+        for predicate in record.retry_predicates
+        if _predicate_matches(predicate, situation)
+    )
+
+
 def partition_ledger(ledger: StrategyLedger) -> tuple[StrategyLedger, tuple[UUID, ...]]:
     """Deterministically retain hot entries or reject a partition that would lose active state."""
     hot_statuses = {StrategyStatus.AVAILABLE, StrategyStatus.DEFERRED}
@@ -586,7 +606,10 @@ class StrategyLedgerReducer:
                     ]
                     if len(candidates) != 1 or candidates[0][0].archive_entry_digest != item.payload.prior_archive_entry_digest:
                         raise LedgerReplayError("strategy reactivation archive companion is invalid")
-                    if candidates[0][0].snapshot != restored:
+                    expected_restored = candidates[0][0].snapshot.model_copy(
+                        update={"status": StrategyStatus.AVAILABLE.value}
+                    )
+                    if expected_restored != restored:
                         raise LedgerReplayError("strategy reactivation snapshot is invalid")
                     predicate_ids = {
                         predicate.predicate_id for predicate in candidates[0][0].retry_predicates

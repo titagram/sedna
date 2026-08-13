@@ -251,6 +251,7 @@ def _payload_from_planning(
             ),
         )
     if isinstance(source, FrontierProposedSource):
+        assert isinstance(conversion, PlanningAttemptEventConversion)
         return FrontierProposedEventPayload(
             request_id=source.request_id,
             frontier_id=source.frontier_id,
@@ -260,7 +261,7 @@ def _payload_from_planning(
             situation_digest=source.situation_digest,
             input_ledger_digest=source.input_ledger_digest,
             knowledge_context_digest=source.knowledge_context_digest,
-            draft_digest=_digest(source.proposal),
+            draft_digest=_digest(conversion.planner_draft),
             call_metadata=metadata,
             planner_call_digest=_digest(metadata),
         )
@@ -277,6 +278,7 @@ def _payload_from_planning(
             call_output_digest=_source_digest(source),
         )
     if isinstance(source, FrontierRepairedSource):
+        assert isinstance(conversion, PlanningAttemptEventConversion)
         return FrontierRepairedEventPayload(
             request_id=source.request_id,
             frontier_id=source.frontier_id,
@@ -284,7 +286,7 @@ def _payload_from_planning(
             proposal_ordinal=source.proposal_ordinal,
             proposal_count=source.proposal_count,
             proposal=source.proposal,
-            repaired_draft_digest=_digest(source.proposal),
+            repaired_draft_digest=_digest(conversion.planner_draft),
             call_metadata=metadata,
             call_input_digest=metadata.input_digest,
             call_output_digest=_source_digest(source),
@@ -689,8 +691,7 @@ def _source_is_represented_by_authoritative_model(
             )
         if isinstance(source, FrontierRepairedSource):
             return _planner_draft_contains_proposal(conversion, source.proposal) and any(
-                audit.call_metadata == conversion.call_metadata
-                and audit.request_id == source.request_id
+                audit.request_id == source.request_id
                 and audit.frontier_id == source.frontier_id
                 and audit.critic_event_id == source.critic_event_id
                 and audit.proposal_ordinal == source.proposal_ordinal
@@ -721,20 +722,17 @@ def _source_is_represented_by_authoritative_model(
         return False
     if isinstance(conversion, StrategyReconciliationEventConversion):
         if isinstance(source, StrategyReconciledSource):
-            return (
-                source.operation.family_id in conversion.reconciliation.input_family_ids
-                and any(
-                    item.request_id == source.request_id
-                    and item.frontier_id == source.frontier_id
-                    and item.reconciliation_id == source.reconciliation_id
-                    and item.item_ordinal == source.item_ordinal
-                    and item.item_count == source.item_count
-                    and item.input_ledger_digest == source.input_ledger_digest
-                    and item.resulting_ledger_digest == source.resulting_ledger_digest
-                    and item.operation == source.operation
-                    and item.resulting_snapshot == source.resulting_snapshot
-                    for item in conversion.reconciliation.items
-                )
+            return source.operation.family_id in conversion.reconciliation.input_family_ids and any(
+                item.request_id == source.request_id
+                and item.frontier_id == source.frontier_id
+                and item.reconciliation_id == source.reconciliation_id
+                and item.item_ordinal == source.item_ordinal
+                and item.item_count == source.item_count
+                and item.input_ledger_digest == source.input_ledger_digest
+                and item.resulting_ledger_digest == source.resulting_ledger_digest
+                and item.operation == source.operation
+                and item.resulting_snapshot == source.resulting_snapshot
+                for item in conversion.reconciliation.items
             )
         if isinstance(source, StrategyArchivedSource):
             return (
@@ -803,36 +801,32 @@ def _source_is_represented_by_authoritative_model(
                 "irrelevant": "not_useful",
                 "ambiguous": "inconclusive",
             }[source.assessment]
-            return (
-                any(
-                    draft.source_id == source.source_id and draft.assessment == draft_assessment
-                    for draft in conversion.research_sources
-                )
-                and any(
-                    assessment.query_id == source.query_id
-                    and assessment.source_id == source.source_id
-                    and assessment.consulted_event_id == source.consulted_event_id
-                    and assessment.assessment == source.assessment
-                    and assessment.confidence == source.confidence
-                    and assessment.summary == source.summary
-                    and assessment.related_event_ids == source.related_event_ids
-                    and assessment.suggested_registry_status == source.suggested_registry_status
-                    for assessment in conversion.research_assessments
-                )
+            return any(
+                draft.source_id == source.source_id and draft.assessment == draft_assessment
+                for draft in conversion.research_sources
+            ) and any(
+                assessment.query_id == source.query_id
+                and assessment.source_id == source.source_id
+                and assessment.consulted_event_id == source.consulted_event_id
+                and assessment.assessment == source.assessment
+                and assessment.confidence == source.confidence
+                and assessment.summary == source.summary
+                and assessment.related_event_ids == source.related_event_ids
+                and assessment.suggested_registry_status == source.suggested_registry_status
+                for assessment in conversion.research_assessments
             )
         if isinstance(source, ResearchSourceConsultedSource):
-            return (
-                any(draft.source_id == source.source_id for draft in conversion.research_sources)
-                and any(
-                    consultation.query_id == source.query_id
-                    and consultation.source_id == source.source_id
-                    and consultation.normalized_locator == source.normalized_locator
-                    and consultation.content == source.content
-                    and consultation.media_type == source.media_type
-                    and consultation.evidence_ids == source.evidence_ids
-                    and consultation.tool_event_ids == source.tool_event_ids
-                    for consultation in conversion.research_consultations
-                )
+            return any(
+                draft.source_id == source.source_id for draft in conversion.research_sources
+            ) and any(
+                consultation.query_id == source.query_id
+                and consultation.source_id == source.source_id
+                and consultation.normalized_locator == source.normalized_locator
+                and consultation.content == source.content
+                and consultation.media_type == source.media_type
+                and consultation.evidence_ids == source.evidence_ids
+                and consultation.tool_event_ids == source.tool_event_ids
+                for consultation in conversion.research_consultations
             )
         return False
     return False

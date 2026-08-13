@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum
-from typing import Annotated, Literal, Self
+from typing import TYPE_CHECKING, Annotated, Literal, Self
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from sedna.engagement import ScopeReference
 from sedna.knowledge.schema.execution import ExecutionExample, PlaceholderKind
-from sedna.planning.models import SecretReference
+
+if TYPE_CHECKING:
+    from sedna.planning.models import SecretReference
 
 _PLACEHOLDER = re.compile(r"\{\{([a-z][a-z0-9_]{0,63})\}\}")
 _RUNTIME_NUMERIC_LITERAL = re.compile(r"(?<![\w./:-])\d{1,5}(?![\w./:-])")
@@ -52,6 +54,12 @@ class CommandSuggestionDraft(BaseModel):
     placeholder_kinds: tuple[PlaceholderKind, ...]
     bindings: tuple[CommandBinding, ...] = ()
     source_example_id: str | None = None
+    capability_hint: Annotated[str, Field(min_length=1, max_length=512)] = "manual-command"
+    purpose: Annotated[str, Field(min_length=1, max_length=2048)] = "Validate the proposal."
+    knowledge_refs: Annotated[tuple[str, ...], Field(max_length=16)] = ()
+    validation_note: Annotated[str, Field(min_length=1, max_length=2048)] = (
+        "Review and validate before execution."
+    )
 
     @model_validator(mode="after")
     def _template_binding_policy(self) -> Self:
@@ -90,6 +98,10 @@ class CommandSuggestion(BaseModel):
     rendered_preview: str
     requires_validation: Literal[True] = True
     source_example_id: str | None = None
+    capability_hint: str
+    purpose: str
+    knowledge_refs: tuple[str, ...] = ()
+    validation_note: str
 
 
 def validate_command_suggestion(
@@ -160,6 +172,10 @@ def validate_command_suggestion(
         bindings=draft.bindings,
         rendered_preview=render_command_preview(draft.command_template, replacements),
         source_example_id=draft.source_example_id,
+        capability_hint=draft.capability_hint,
+        purpose=draft.purpose,
+        knowledge_refs=draft.knowledge_refs,
+        validation_note=draft.validation_note,
     )
 
 

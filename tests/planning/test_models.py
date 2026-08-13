@@ -49,6 +49,7 @@ from sedna.planning.models import (
     OutcomeAssessmentDraft,
     PendingEvidenceRange,
     PlannerCriticVerdict,
+    PlannerDraft,
     PlannerFinding,
     PlannerRejectionAudit,
     PlannerRepairAudit,
@@ -142,9 +143,7 @@ def test_objective_progress_requires_exact_sorted_manifest_requirements() -> Non
     )
 
     with pytest.raises(ValidationError, match="requirements_not_sorted_unique"):
-        ObjectiveProgress(
-            requirements=(progress.requirements[1], progress.requirements[0])
-        )
+        ObjectiveProgress(requirements=(progress.requirements[1], progress.requirements[0]))
 
 
 def test_settlement_binds_projection_revision_proofs_and_pending_ranges() -> None:
@@ -444,9 +443,7 @@ def test_typed_observation_batch_requires_grounded_sorted_unique_drafts() -> Non
         event_ids=(event_id,),
     )
     batch = ObservationBatchDraft(
-        observations=(
-            ObservationDraft(kind="text", text="SSH is open.", event_ids=(event_id,)),
-        ),
+        observations=(ObservationDraft(kind="text", text="SSH is open.", event_ids=(event_id,)),),
         facets=(facet,),
         access_deltas=(access,),
         secret_references=(secret,),
@@ -574,14 +571,17 @@ def test_frontier_requires_stable_score_order_and_complete_proposal_identity() -
         constrained_rationale="Only two strategies are currently applicable.",
     )
     assert frontier.proposals == (first, second)
-    assert FrontierProposalDraft(
-        family_runtime_key="family-web",
-        variant_runtime_key="variant-ssh",
-        title="Enumerate SSH authentication.",
-        score=90,
-        confidence=75,
-        rationale="The service is reachable and supports authentication checks.",
-    ).proposal_id is None
+    assert (
+        FrontierProposalDraft(
+            family_runtime_key="family-web",
+            variant_runtime_key="variant-ssh",
+            title="Enumerate SSH authentication.",
+            score=90,
+            confidence=75,
+            rationale="The service is reachable and supports authentication checks.",
+        ).proposal_id
+        is None
+    )
 
     with pytest.raises(ValidationError, match="frontier_proposals_not_score_ordered"):
         FrontierProjection(
@@ -591,6 +591,72 @@ def test_frontier_requires_stable_score_order_and_complete_proposal_identity() -
             input_ledger_digest=_sha("input-ledger"),
             resulting_ledger_digest=_sha("result-ledger"),
             proposals=(second, first),
+        )
+
+
+def test_planner_draft_rejects_semantically_duplicate_proposals() -> None:
+    proposal = FrontierProposalDraft(
+        family_runtime_key="family-ssh",
+        variant_runtime_key="variant-password",
+        title="Try SSH authentication",
+        score=80,
+        confidence=70,
+        rationale="Test the currently supported authentication path.",
+    )
+
+    with pytest.raises(ValidationError, match="planner_proposals_not_unique"):
+        PlannerDraft(proposals=(proposal, proposal.model_copy(update={"score": 70})))
+
+
+def test_zero_score_requires_terminal_status_and_typed_retry_predicate() -> None:
+    from sedna.planning.models import RetryPredicate
+
+    common = {
+        "family_runtime_key": "family:ssh",
+        "variant_runtime_key": "variant:rockyou",
+        "title": "Password candidates",
+        "score": 0,
+        "confidence": 90,
+        "rationale": "The complete bounded candidate set was exhausted.",
+    }
+
+    with pytest.raises(ValidationError, match="zero_score_requires_impossibility"):
+        FrontierProposalDraft(**common)
+    accepted = FrontierProposalDraft(
+        **common,
+        status=planning.StrategyStatus.EXHAUSTED,
+        terminal_reason="impossibility",
+        retry_predicates=(
+            RetryPredicate(
+                kind=planning.RetryPredicateKind.CREDENTIAL_AVAILABLE,
+                value="ssh-password",
+            ),
+        ),
+        event_refs=(uuid4(),),
+    )
+
+    assert accepted.status == "exhausted"
+
+
+def test_zero_score_requires_explicit_impossibility_or_incompatibility() -> None:
+    from sedna.planning.models import RetryPredicate
+
+    with pytest.raises(ValidationError, match="zero_score_requires_explicit_terminal_reason"):
+        FrontierProposalDraft(
+            family_runtime_key="family:ssh",
+            variant_runtime_key="variant:password",
+            title="Password authentication",
+            score=0,
+            confidence=90,
+            rationale="The complete bounded credential set was rejected.",
+            status=planning.StrategyStatus.EXHAUSTED,
+            retry_predicates=(
+                RetryPredicate(
+                    kind=planning.RetryPredicateKind.CREDENTIAL_AVAILABLE,
+                    value="ssh-password",
+                ),
+            ),
+            event_refs=(uuid4(),),
         )
 
 

@@ -10,10 +10,12 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from sedna.engagement.models import ScopeReference
 from sedna.knowledge.semantic.llm import StructuredResult, StructuredUsage
 from sedna.planning.models import (
     EVIDENCE_SLICE_BYTES,
     MAX_PLANNER_REQUEST_BYTES,
+    MAX_RECENT_EVENT_TEXT_BYTES,
     EvidenceId,
     MediaType,
     ObservationBatchDraft,
@@ -22,6 +24,9 @@ from sedna.planning.models import (
     SituationProjection,
     StrategyLedger,
 )
+from sedna.planning.retrieval import PlannerKnowledgeContext
+
+MAX_PLANNER_RESPONSE_BYTES = 128 * 1024
 
 PlanningLlmPurpose = Literal[
     "sedna.planning.observe",
@@ -61,12 +66,16 @@ class HostStructuredLlm(Protocol):
 class PlanningLlmError(RuntimeError):
     """Closed response-free planning LLM boundary failure."""
 
-    def __init__(self, reason_code: Literal[
-        "transport_failure",
-        "missing_parsed_response",
-        "invalid_structured_response",
-        "planner_input_too_large",
-    ]) -> None:
+    def __init__(
+        self,
+        reason_code: Literal[
+            "transport_failure",
+            "missing_parsed_response",
+            "invalid_structured_response",
+            "planner_input_too_large",
+            "planner_output_too_large",
+        ],
+    ) -> None:
         self.reason_code = reason_code
         super().__init__(reason_code)
 
@@ -119,6 +128,19 @@ class PlannerRequest(_PlanningRequest):
 
     situation: SituationProjection
     ledger: StrategyLedger
+    knowledge_context: PlannerKnowledgeContext
+    scope_references: Annotated[tuple[ScopeReference, ...], Field(max_length=512)]
+    recent_event_ids: Annotated[tuple[UUID, ...], Field(max_length=64)]
+    recent_event_context: Annotated[tuple[str, ...], Field(max_length=64)] = ()
+    max_proposals: Annotated[int, Field(ge=3, le=8)]
+
+    @model_validator(mode="after")
+    def _recent_event_context_is_bounded(self) -> PlannerRequest:
+        if sum(len(item.encode("utf-8")) for item in self.recent_event_context) > (
+            MAX_RECENT_EVENT_TEXT_BYTES
+        ):
+            raise ValueError("recent_event_context_too_large")
+        return self
 
 
 class PlannerCriticRequest(_PlanningRequest):
@@ -168,9 +190,11 @@ class PlanningLlmAdapter:
         if contract is None or type(payload) is not contract[0] or model_type is not contract[1]:
             raise TypeError("purpose, payload, and response model must match planning contract")
         try:
-            payload_data = type(payload).model_validate(
-                payload.model_dump(mode="python", warnings="error")
-            ).model_dump(mode="json", warnings="error")
+            payload_data = (
+                type(payload)
+                .model_validate(payload.model_dump(mode="python", warnings="error"))
+                .model_dump(mode="json", warnings="error")
+            )
             serialized_payload = json.dumps(
                 payload_data, ensure_ascii=False, separators=(",", ":"), sort_keys=True
             )
@@ -213,6 +237,8 @@ class PlanningLlmAdapter:
                 else parsed_response
             )
             response_json = json.dumps(response_data, allow_nan=False)
+            if len(response_json.encode("utf-8")) > MAX_PLANNER_RESPONSE_BYTES:
+                raise PlanningLlmError("planner_output_too_large")
             parsed = model_type.model_validate(json.loads(response_json))
             usage = StructuredUsage.model_validate(host_result.usage)
             attribution = _HostAttribution(
@@ -220,6 +246,8 @@ class PlanningLlmAdapter:
                 model=host_result.model,
                 agent_id=host_result.agent_id,
             )
+        except PlanningLlmError:
+            raise
         except (AttributeError, TypeError, ValidationError, ValueError):
             raise PlanningLlmError("invalid_structured_response") from None
         return StructuredResult(

@@ -29,6 +29,7 @@ from sedna.engagement.events import (
     StrategyReconciliationEventOperation,
     StrategyResultSnapshot,
 )
+from sedna.planning.commands import CommandSuggestionDraft
 
 ProofRequirementId: TypeAlias = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")]
 Sha256Hex: TypeAlias = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
@@ -218,9 +219,7 @@ class SituationProjection(BaseModel):
     facts: Annotated[tuple[ObservedFact, ...], Field(max_length=64)] = ()
     facets: Annotated[tuple[ObservedFacet, ...], Field(max_length=64)] = ()
     hypotheses: Annotated[tuple[SituationHypothesis, ...], Field(max_length=64)] = ()
-    unresolved_information: Annotated[
-        tuple[UnresolvedInformation, ...], Field(max_length=64)
-    ] = ()
+    unresolved_information: Annotated[tuple[UnresolvedInformation, ...], Field(max_length=64)] = ()
     research_sources: Annotated[tuple[ResearchSourceAssessment, ...], Field(max_length=64)] = ()
     access_states: Annotated[tuple[AccessState, ...], Field(max_length=64)] = ()
     interpretations: Annotated[
@@ -237,6 +236,13 @@ class SituationProjection(BaseModel):
         return self
 
 
+class RetryPredicate(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    kind: RetryPredicateKind
+    value: Annotated[str, Field(min_length=1, max_length=512)]
+
+
 class FrontierProposalDraft(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
@@ -245,8 +251,49 @@ class FrontierProposalDraft(BaseModel):
     variant_runtime_key: Annotated[str, Field(min_length=1, max_length=128)]
     title: ShortText
     score: Annotated[int, Field(ge=0, le=100)]
+    previous_score: Annotated[int, Field(ge=0, le=100)] | None = None
+    score_explanation: ShortText | None = None
+    status: StrategyStatus = StrategyStatus.AVAILABLE
+    terminal_reason: Literal["impossibility", "incompatibility"] | None = None
+    retry_predicates: Annotated[tuple[RetryPredicate, ...], Field(max_length=16)] = ()
     confidence: Annotated[int, Field(ge=0, le=100)]
     rationale: ShortText
+    strategic_intent: ShortText | None = None
+    prerequisites: Annotated[tuple[ShortText, ...], Field(max_length=16)] = ()
+    expected_information_gain: ShortText = "Reduce current uncertainty."
+    expected_evidence: Annotated[tuple[ShortText, ...], Field(max_length=16)] = ()
+    stop_conditions: Annotated[tuple[ShortText, ...], Field(max_length=16)] = ()
+    event_refs: Annotated[tuple[UUID, ...], Field(max_length=32)] = ()
+    knowledge_refs: Annotated[tuple[str, ...], Field(max_length=16)] = ()
+    scope_reference_ids: Annotated[tuple[str, ...], Field(max_length=8)] = ()
+    commands: Annotated[tuple[CommandSuggestionDraft, ...], Field(max_length=1)] = ()
+
+    @model_validator(mode="after")
+    def _references_and_commands_are_unique(self) -> Self:
+        for values in (self.event_refs, self.knowledge_refs, self.scope_reference_ids):
+            if len(values) != len(set(values)):
+                raise ValueError("planner_proposal_references_not_unique")
+        command_keys = tuple(
+            (command.command_template, command.origin, command.source_example_id)
+            for command in self.commands
+        )
+        if len(command_keys) != len(set(command_keys)):
+            raise ValueError("planner_commands_not_unique")
+        if self.score == 0 and self.status not in {
+            StrategyStatus.BLOCKED,
+            StrategyStatus.EXHAUSTED,
+        }:
+            raise ValueError("zero_score_requires_impossibility_or_incompatibility")
+        terminal = self.status in {StrategyStatus.BLOCKED, StrategyStatus.EXHAUSTED}
+        if terminal != bool(self.retry_predicates):
+            raise ValueError("terminal_strategy_retry_predicate_policy")
+        if terminal and not self.event_refs:
+            raise ValueError("terminal_strategy_requires_cited_event")
+        if self.score == 0 and self.terminal_reason is None:
+            raise ValueError("zero_score_requires_explicit_terminal_reason")
+        if self.score != 0 and self.terminal_reason is not None:
+            raise ValueError("terminal_reason_requires_zero_score")
+        return self
 
 
 class PlannerDraft(BaseModel):
@@ -255,6 +302,22 @@ class PlannerDraft(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
     proposals: Annotated[tuple[FrontierProposalDraft, ...], Field(max_length=8)]
+    research_queries: Annotated[tuple[ShortText, ...], Field(max_length=16)] = ()
+
+    @model_validator(mode="after")
+    def _proposals_are_semantically_unique(self) -> Self:
+        identities = tuple(
+            (proposal.family_runtime_key, proposal.variant_runtime_key)
+            for proposal in self.proposals
+        )
+        if len(identities) != len(set(identities)):
+            raise ValueError("planner_proposals_not_unique")
+        normalized_queries = tuple(
+            " ".join(query.lower().split()) for query in self.research_queries
+        )
+        if len(normalized_queries) != len(set(normalized_queries)):
+            raise ValueError("planner_research_queries_not_unique")
+        return self
 
 
 class FrontierProposal(BaseModel):
@@ -279,6 +342,7 @@ class FrontierProjection(BaseModel):
     resulting_ledger_digest: Sha256Hex
     proposals: Annotated[tuple[FrontierProposal, ...], Field(max_length=8)] = ()
     constrained_rationale: ShortText | None = None
+    stale: bool = False
 
     @model_validator(mode="after")
     def _proposals_are_viable_and_score_ordered(self) -> Self:
@@ -453,8 +517,11 @@ class InterpretationFailedSource(_PlanningEventSource):
     evidence_id: EvidenceId
     attempted_slices: Annotated[tuple[EvidenceSliceEventRef, ...], Field(max_length=64)]
     failure_code: Literal[
-        "llm_unavailable", "invalid_structured_output", "reference_validation_failed",
-        "concurrent_state_change", "unsupported_media",
+        "llm_unavailable",
+        "invalid_structured_output",
+        "reference_validation_failed",
+        "concurrent_state_change",
+        "unsupported_media",
     ]
     retryable: bool
     safe_summary: ShortText
@@ -521,9 +588,15 @@ class PlanningGapRecordedSource(_PlanningEventSource):
     kind: Literal["planning_gap_recorded"] = "planning_gap_recorded"
     request_id: UUID | None = None
     code: Literal[
-        "planner_input_too_large", "journal_payload_too_large", "concurrent_state_change",
-        "invalid_planner_output", "llm_unavailable", "critic_rejected", "retrieval_unavailable",
-        "journal_unavailable", "engagement_terminal",
+        "planner_input_too_large",
+        "journal_payload_too_large",
+        "concurrent_state_change",
+        "invalid_planner_output",
+        "llm_unavailable",
+        "critic_rejected",
+        "retrieval_unavailable",
+        "journal_unavailable",
+        "engagement_terminal",
     ]
     summary: ShortText
     retryable: bool
@@ -607,12 +680,24 @@ class ResearchSourceAssessedSource(_PlanningEventSource):
 
 
 PlanningEventSource: TypeAlias = Annotated[
-    ObservationExtractedSource | HypothesisFormedSource | MissingInformationIdentifiedSource
-    | OutcomeAssessedSource | ObjectiveProofObservedSource | InterpretationSucceededSource
-    | InterpretationFailedSource | PlanRequestedSource | FrontierProposedSource
-    | FrontierCriticizedSource | FrontierRepairedSource | FrontierRejectedSource
-    | PlanningGapRecordedSource | StrategyReconciledSource | StrategyArchivedSource
-    | StrategyReactivatedSource | ResearchQueryProposedSource | ResearchSourceConsultedSource
+    ObservationExtractedSource
+    | HypothesisFormedSource
+    | MissingInformationIdentifiedSource
+    | OutcomeAssessedSource
+    | ObjectiveProofObservedSource
+    | InterpretationSucceededSource
+    | InterpretationFailedSource
+    | PlanRequestedSource
+    | FrontierProposedSource
+    | FrontierCriticizedSource
+    | FrontierRepairedSource
+    | FrontierRejectedSource
+    | PlanningGapRecordedSource
+    | StrategyReconciledSource
+    | StrategyArchivedSource
+    | StrategyReactivatedSource
+    | ResearchQueryProposedSource
+    | ResearchSourceConsultedSource
     | ResearchSourceAssessedSource,
     Field(discriminator="kind"),
 ]
@@ -910,10 +995,18 @@ class PlanningGap(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
     code: Literal[
-        "no_viable_strategy", "planning_constraints", "planner_input_too_large",
-        "journal_payload_too_large", "concurrent_state_change", "invalid_planner_output",
-        "llm_unavailable", "critic_rejected", "retrieval_unavailable", "journal_unavailable",
+        "no_viable_strategy",
+        "planning_constraints",
+        "planner_input_too_large",
+        "journal_payload_too_large",
+        "concurrent_state_change",
+        "invalid_planner_output",
+        "llm_unavailable",
+        "critic_rejected",
+        "retrieval_unavailable",
+        "journal_unavailable",
         "engagement_terminal",
+        "settlement_incomplete",
     ]
     summary: ShortText
     request_id: UUID | None = None
@@ -921,6 +1014,8 @@ class PlanningGap(BaseModel):
     situation_digest: Sha256Hex | None = None
     ledger_digest: Sha256Hex | None = None
     related_event_ids: Annotated[tuple[UUID, ...], Field(max_length=32)] = ()
+    pending_ranges: Annotated[tuple[PendingEvidenceRange, ...], Field(max_length=512)] = ()
+    stale_frontier: FrontierProjection | None = None
 
 
 class StrategyReconciliationItem(BaseModel):
@@ -1304,13 +1399,6 @@ class AttemptSummary(_DerivedSituationRecord):
 class Incompatibility(_DerivedSituationRecord):
     subject: ShortText
     explanation: ShortText
-
-
-class RetryPredicate(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
-
-    kind: RetryPredicateKind
-    value: Annotated[str, Field(min_length=1, max_length=512)]
 
 
 class StrategyFamilyDraft(BaseModel):

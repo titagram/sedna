@@ -82,6 +82,7 @@ from sedna.planning.prompts import (
     PLANNER_REPAIR_PROMPT_ID,
     PLANNER_REPAIR_PROMPT_VERSION,
 )
+from sedna.planning.frontier import FrontierReducer, FrontierReplayError
 from sedna.planning.journal_events import (
     payloads_from_observation_batch,
     payloads_from_planning_attempt,
@@ -139,6 +140,8 @@ __all__ = [
     "EvidenceSliceInput",
     "FrontierProjection",
     "FrontierProposal",
+    "FrontierReducer",
+    "FrontierReplayError",
     "FrontierProposalDraft",
     "HostStructuredLlm",
     "IncompleteSettlementResult",

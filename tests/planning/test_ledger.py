@@ -863,7 +863,7 @@ def test_archive_and_reactivation_batches_require_atomic_complete_companions() -
         matched_predicate_ids=("fact-ready",),
         prior_archive_entry_digest=archive_record.archive_entry_digest,
         resulting_archive_digest=archive_digest(()),
-        restored_snapshot=snapshot,
+        restored_snapshot=snapshot.model_copy(update={"status": "available"}),
     )
     events = (
         SimpleNamespace(

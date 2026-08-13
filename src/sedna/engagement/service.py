@@ -1135,6 +1135,22 @@ class EngagementJournalService:
     def resolve_lane_binding_method(self, lane: ExecutionLaneKey) -> LaneBindingResolution:
         return self.resolve_lane_binding(lane)
 
+    def rollback_strategy_archive(
+        self,
+        engagement_id: UUID,
+        *,
+        failed_archive_revision: int,
+        expected_journal_revision: JournalRevision,
+        previous: StrategyArchivePage | None,
+    ) -> None:
+        """Restore the exact prior cold projection after its journal transaction fails."""
+        self._repository.rollback_strategy_archive(
+            engagement_id,
+            failed_archive_revision=failed_archive_revision,
+            expected_journal_revision=expected_journal_revision,
+            previous=previous,
+        )
+
     def load_active_decision(
         self,
         engagement_id: UUID,

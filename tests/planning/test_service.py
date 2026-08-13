@@ -18,14 +18,30 @@ from sedna.engagement import (
     ProofRequirement,
     SessionCheckpointedPayload,
 )
-from sedna.engagement.events import EvidenceSliceEventRef, InterpretationFailedEventPayload
+from sedna.engagement.events import (
+    ArchivedStrategyEventRecord,
+    EvidenceSliceEventRef,
+    InterpretationFailedEventPayload,
+)
 from sedna.engagement.service import PlanningEventCommitItem
 from sedna.knowledge.retrieval import AuthorizationScope, AuthorizationState, ValidatedTarget
+from sedna.knowledge.schema.execution import PlaceholderKind
+from sedna.planning.commands import CommandBinding, CommandOrigin, CommandSuggestionDraft
+from sedna.planning.frontier import FrontierReducer
 from sedna.planning.models import (
+    FrontierProposalDraft,
+    IncompleteSettlementResult,
     InterpretationSubject,
     ObservationBatchDraft,
+    PendingEvidenceRange,
+    PlannerCriticVerdict,
+    PlannerDraft,
+    PlannerFinding,
+    RetryPredicate,
+    RetryPredicateKind,
     SettlementResultAdapter,
     SituationProjection,
+    StrategyStatus,
 )
 from sedna.planning.ports import TerminalReconciliationResult
 from sedna.planning.service import PlanningService
@@ -633,7 +649,9 @@ def test_settlement_failure_codes_leave_the_attachment_pending(
         _, attached = attach_text_evidence(journal, current_manifest, current_lane)
         service = PlanningService(
             journal=journal,
-            llm=InvalidSubjectLlm() if fault == "invalid_output" else EmptyObservationLlm(
+            llm=InvalidSubjectLlm()
+            if fault == "invalid_output"
+            else EmptyObservationLlm(
                 InterpretationSubject(
                     attachment_event_id=attached.created_event_ids[0],
                     evidence_id=journal.load_snapshot(current_manifest.engagement_id)
@@ -694,9 +712,9 @@ def test_stale_append_reloads_and_retries_once_without_duplicate_llm_output(tmp_
 
     assert result.status == "settled"
     assert len(llm.calls) == 2
-    assert len(
-        [event for event in snapshot.events if event.type == "interpretation_succeeded"]
-    ) == 1
+    assert (
+        len([event for event in snapshot.events if event.type == "interpretation_succeeded"]) == 1
+    )
 
 
 def test_pending_fairness_orders_never_attempted_before_retryable_attempt_after_restart(
@@ -1073,8 +1091,7 @@ def test_mixed_binary_and_text_settles_every_subject_before_reporting_settled(tm
     ]
     assert len([event for event in snapshot.events if event.type == "interpretation_failed"]) == 1
     assert (
-        len([event for event in snapshot.events if event.type == "interpretation_succeeded"])
-        == 1
+        len([event for event in snapshot.events if event.type == "interpretation_succeeded"]) == 1
     )
 
 
@@ -1299,3 +1316,1036 @@ def test_empty_manifest_never_invokes_terminal_port(tmp_path) -> None:
 
     assert result.status == "nothing_pending"
     assert terminal.calls == []
+
+
+def test_plan_next_returns_ephemeral_terminal_gap_before_planner_calls(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        created = journal.create_from_manifest(current_manifest, lane=current_lane)
+        closing = journal.request_close(
+            current_manifest.engagement_id,
+            lane=current_lane,
+            reason="manual close",
+            expected_revision=created.snapshot.revision,
+        )
+        service = PlanningService(journal=journal, llm=FailingLlm(), clock=lambda: FIXED_TIME)
+
+        result = service.plan_next(current_lane)
+        after = journal.load_snapshot(current_manifest.engagement_id)
+
+    assert result.status == "gap"
+    assert result.gap is not None and result.gap.code == "engagement_terminal"
+    assert result.current_authoritative_journal_revision == closing.snapshot.revision
+    assert after.revision == closing.snapshot.revision
+
+
+def test_plan_next_maps_incomplete_settlement_to_retryable_typed_gap(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        service = PlanningService(journal=journal, llm=FailingLlm(), clock=lambda: FIXED_TIME)
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+        situation = service.load_situation(current_manifest.engagement_id)
+        service.settle_pending_evidence = lambda engagement_id, reason: IncompleteSettlementResult(
+            engagement_id=engagement_id,
+            reason=reason,
+            authoritative_journal_revision=snapshot.revision,
+            situation=situation,
+            required_proof_ids=("root-flag", "user-flag"),
+            pending_ranges=(
+                PendingEvidenceRange(
+                    evidence_id="evidence-sha256-" + "a" * 64,
+                    attachment_event_id=UUID("00000000-0000-4000-8000-000000000042"),
+                    start=0,
+                    end=1,
+                    media_type="text/plain",
+                    reason="budget_exhausted",
+                ),
+            ),
+            pending_total_count=1,
+            pending_inventory_sha256="b" * 64,
+            incomplete_reason="budget_exhausted",
+            all_required_proofs_satisfied=False,
+            possible_terminal_evidence=False,
+        )
+
+        result = service.plan_next(current_lane)
+
+    assert result.status == "gap"
+    assert result.gap is not None
+    assert result.gap.code == "settlement_incomplete"
+    assert result.gap.retryable is True
+    assert len(result.gap.pending_ranges) == 1
+
+
+class AcceptedPlannerLlm:
+    def __init__(self) -> None:
+        self.purposes = []
+        self.payloads = []
+
+    def complete(self, model_type, **kwargs):
+        self.purposes.append(kwargs["purpose"])
+        self.payloads.append(kwargs["payload"])
+        if model_type is PlannerDraft:
+            parsed = PlannerDraft(
+                proposals=tuple(
+                    FrontierProposalDraft(
+                        family_runtime_key=f"family-{index}",
+                        variant_runtime_key=f"variant-{index}",
+                        title=f"Proposal {index}",
+                        score=100 - index,
+                        confidence=80,
+                        rationale="Collect discriminating evidence.",
+                    )
+                    for index in range(1, 4)
+                )
+            )
+        else:
+            parsed = PlannerCriticVerdict(accepted=True)
+        return SimpleNamespace(
+            parsed=parsed,
+            provider="test-provider",
+            model="test-model",
+            agent_id="test-agent",
+            usage=SimpleNamespace(input_tokens=7, output_tokens=3),
+        )
+
+
+class TerminalPlannerLlm(AcceptedPlannerLlm):
+    def complete(self, model_type, **kwargs):
+        if model_type is not PlannerDraft:
+            return super().complete(model_type, **kwargs)
+        self.purposes.append(kwargs["purpose"])
+        self.payloads.append(kwargs["payload"])
+        cited_event_id = kwargs["payload"].recent_event_ids[0]
+        parsed = PlannerDraft(
+            proposals=(
+                FrontierProposalDraft(
+                    family_runtime_key="family-alternate-2",
+                    variant_runtime_key="variant-alternate-2",
+                    title="Alternate proposal 2",
+                    score=80,
+                    confidence=75,
+                    rationale="Preserve an independent alternative.",
+                ),
+                FrontierProposalDraft(
+                    family_runtime_key="family-alternate-3",
+                    variant_runtime_key="variant-alternate-3",
+                    title="Alternate proposal 3",
+                    score=70,
+                    confidence=65,
+                    rationale="Preserve a second independent alternative.",
+                ),
+                FrontierProposalDraft(
+                    family_runtime_key="family-terminal",
+                    variant_runtime_key="variant-terminal",
+                    title="Terminal proposal",
+                    score=60,
+                    confidence=90,
+                    rationale="The bounded path is incompatible.",
+                    status=StrategyStatus.BLOCKED,
+                    retry_predicates=(
+                        RetryPredicate(
+                            kind=RetryPredicateKind.STATE_REVISION_AFTER,
+                            value="new-state",
+                        ),
+                    ),
+                    event_refs=(cited_event_id,),
+                ),
+            )
+        )
+        return SimpleNamespace(
+            parsed=parsed,
+            provider="test-provider",
+            model="test-model",
+            agent_id="test-agent",
+            usage=SimpleNamespace(input_tokens=7, output_tokens=3),
+        )
+
+
+class UngroundedZeroScorePlannerLlm(TerminalPlannerLlm):
+    def complete(self, model_type, **kwargs):
+        completion = super().complete(model_type, **kwargs)
+        if model_type is not PlannerDraft:
+            return completion
+        terminal = completion.parsed.proposals[-1].model_copy(
+            update={"score": 0, "terminal_reason": "incompatibility"}
+        )
+        return SimpleNamespace(
+            **{
+                **completion.__dict__,
+                "parsed": completion.parsed.model_copy(
+                    update={"proposals": (*completion.parsed.proposals[:-1], terminal)}
+                ),
+            }
+        )
+
+
+class GroundedCommandPlannerLlm(AcceptedPlannerLlm):
+    def complete(self, model_type, **kwargs):
+        if model_type is not PlannerDraft:
+            return super().complete(model_type, **kwargs)
+        self.purposes.append(kwargs["purpose"])
+        self.payloads.append(kwargs["payload"])
+        request = kwargs["payload"]
+        scope = request.scope_references[0]
+        parsed = PlannerDraft(
+            proposals=(
+                FrontierProposalDraft(
+                    family_runtime_key="family-grounded",
+                    variant_runtime_key="variant-grounded",
+                    title="Probe the authorized target",
+                    score=91,
+                    confidence=84,
+                    rationale="The observed service merits a bounded probe.",
+                    strategic_intent="Collect discriminating service evidence.",
+                    prerequisites=("The target remains in scope.",),
+                    expected_information_gain="Resolve the service implementation.",
+                    expected_evidence=("A service banner is captured.",),
+                    stop_conditions=("Stop after one bounded request.",),
+                    event_refs=(request.recent_event_ids[0],),
+                    scope_reference_ids=(scope.reference_id,),
+                    commands=(
+                        CommandSuggestionDraft(
+                            origin=CommandOrigin.MODEL_GENERATED,
+                            command_template="probe {{target}}",
+                            placeholder_kinds=(PlaceholderKind.TARGET,),
+                            bindings=(
+                                CommandBinding(
+                                    placeholder_name="target",
+                                    source="scope_reference",
+                                    reference_id=scope.reference_id,
+                                ),
+                            ),
+                            capability_hint="service-probe",
+                            purpose="Collect the service banner.",
+                            validation_note="Run once against the authorized target.",
+                        ),
+                    ),
+                ),
+                FrontierProposalDraft(
+                    family_runtime_key="family-alternate-2",
+                    variant_runtime_key="variant-alternate-2",
+                    title="Alternate proposal 2",
+                    score=80,
+                    confidence=75,
+                    rationale="Preserve an independent alternative.",
+                ),
+                FrontierProposalDraft(
+                    family_runtime_key="family-alternate-3",
+                    variant_runtime_key="variant-alternate-3",
+                    title="Alternate proposal 3",
+                    score=70,
+                    confidence=65,
+                    rationale="Preserve a second independent alternative.",
+                ),
+            ),
+            research_queries=(
+                "OpenSSH 9.2 protocol CVE details",
+                "HTB-Orion root.txt walkthrough",
+            ),
+        )
+        return SimpleNamespace(
+            parsed=parsed,
+            provider="test-provider",
+            model="test-model",
+            agent_id="test-agent",
+            usage=SimpleNamespace(input_tokens=7, output_tokens=3),
+        )
+
+
+def test_plan_next_persists_grounded_proposal_and_exact_command_record(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        result = PlanningService(
+            journal=journal,
+            llm=GroundedCommandPlannerLlm(),
+            clock=lambda: FIXED_TIME,
+            research_aliases=("HTB-Orion", "Orion"),
+        ).plan_next(current_lane, max_proposals=3)
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+
+    assert result.status == "success"
+    proposed = next(event.payload for event in snapshot.events if event.type == "frontier_proposed")
+    record = proposed.proposal
+    assert record.strategic_intent == "Collect discriminating service evidence."
+    assert record.prerequisites == ("The target remains in scope.",)
+    assert record.expected_evidence == ("A service banner is captured.",)
+    assert record.stop_conditions == ("Stop after one bounded request.",)
+    assert record.scope_reference_ids
+    assert len(record.commands) == 1
+    command = record.commands[0]
+    assert command.capability_hint == "service-probe"
+    assert command.command_template == "probe {{target}}"
+    assert command.placeholders[0].binding_policy == "authorized_scope"
+    assert command.bindings[0].reference_id == record.scope_reference_ids[0]
+    assert command.rendered_preview != command.command_template
+    research = [
+        event.payload for event in snapshot.events if event.type == "research_query_proposed"
+    ]
+    assert [item.policy_decision for item in research] == ["allowed", "rejected"]
+    assert research[1].reason_codes == ("current_machine_solution",)
+
+
+def test_plan_next_routes_accepted_attempt_through_event_converter(tmp_path, monkeypatch) -> None:
+    from sedna.planning import service as service_module
+
+    converted = []
+    original = service_module.payloads_from_planning_attempt
+
+    def recording_converter(conversion):
+        converted.append(conversion)
+        return original(conversion)
+
+    monkeypatch.setattr(service_module, "payloads_from_planning_attempt", recording_converter)
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        result = PlanningService(
+            journal=journal,
+            llm=AcceptedPlannerLlm(),
+            clock=lambda: FIXED_TIME,
+        ).plan_next(current_lane, max_proposals=3)
+
+    assert result.status == "success"
+    assert converted
+    assert any(conversion.plan_request_audit is not None for conversion in converted)
+    assert sum(len(conversion.planner_proposals) for conversion in converted) == 3
+    assert sum(len(conversion.critic_verdicts) for conversion in converted) == 1
+
+
+def test_archive_cas_conflict_does_not_publish_frontier_events(tmp_path, monkeypatch) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        created = journal.create_from_manifest(current_manifest, lane=current_lane)
+        service = PlanningService(
+            journal=journal,
+            llm=AcceptedPlannerLlm(),
+            clock=lambda: FIXED_TIME,
+        )
+        def reject_archive(*args, **kwargs):
+            from sedna.engagement.repository import RevisionConflictError
+
+            raise RevisionConflictError("strategy archive revision is stale")
+
+        monkeypatch.setattr(journal, "commit_strategy_archive", reject_archive)
+        result = service.plan_next(current_lane, max_proposals=3)
+        after = journal.load_snapshot(current_manifest.engagement_id)
+
+    assert result.status == "gap"
+    assert result.gap is not None and result.gap.code == "concurrent_state_change"
+    assert after.revision == created.snapshot.revision
+    assert not any(event.type.startswith("frontier_") for event in after.events)
+
+
+def test_planning_append_failure_does_not_advance_prepared_cold_archive(
+    tmp_path, monkeypatch
+) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        created = journal.create_from_manifest(current_manifest, lane=current_lane)
+        service = PlanningService(
+            journal=journal,
+            llm=TerminalPlannerLlm(),
+            clock=lambda: FIXED_TIME,
+        )
+        monkeypatch.setattr(
+            service,
+            "_commit_planning_events",
+            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("append failed")),
+        )
+
+        with pytest.raises(OSError, match="append failed"):
+            service.plan_next(current_lane, max_proposals=3)
+        after = journal.load_snapshot(current_manifest.engagement_id)
+        archive = journal.load_strategy_archive(current_manifest.engagement_id)
+
+    assert after.revision == created.snapshot.revision
+    assert archive is None
+
+
+def test_planning_append_commit_then_raise_preserves_authoritative_cold_archive(
+    tmp_path, monkeypatch
+) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        service = PlanningService(
+            journal=journal,
+            llm=TerminalPlannerLlm(),
+            clock=lambda: FIXED_TIME,
+        )
+        fired = False
+
+        def fail_after_authoritative_append(point: str) -> None:
+            nonlocal fired
+            if point == "append_before_response" and not fired:
+                fired = True
+                raise OSError("append response failed")
+
+        monkeypatch.setattr(journal._repository, "_fault", fail_after_authoritative_append)
+
+        with pytest.raises(Exception) as raised:
+            service.plan_next(current_lane, max_proposals=3)
+        after = journal.load_snapshot(current_manifest.engagement_id)
+        archive = journal.load_strategy_archive(current_manifest.engagement_id)
+
+    archived_events = [event for event in after.events if event.type == "strategy_archived"]
+    assert fired
+    assert isinstance(raised.value.__cause__, OSError)
+    assert str(raised.value.__cause__) == "append response failed"
+    assert len(archived_events) == 1
+    assert archive is not None and len(archive.records) == 1
+    assert archive.records[0].payload == archived_events[0].payload.archive_record.model_dump(
+        mode="json", warnings="error"
+    )
+
+
+def test_concurrent_journal_append_does_not_prevent_archive_compensation(
+    tmp_path, monkeypatch
+) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        created = journal.create_from_manifest(current_manifest, lane=current_lane)
+        service = PlanningService(
+            journal=journal,
+            llm=TerminalPlannerLlm(),
+            clock=lambda: FIXED_TIME,
+        )
+
+        def append_concurrently_then_fail(*args, **kwargs):
+            journal.append_hook_events(
+                current_manifest.engagement_id,
+                (
+                    JournalEventDraft(
+                        lane=current_lane,
+                        actor="host_agent",
+                        type="session_checkpointed",
+                        payload=SessionCheckpointedPayload(
+                            completed=False,
+                            interrupted=False,
+                            reason="concurrent checkpoint",
+                        ),
+                    ),
+                ),
+                expected_revision=created.snapshot.revision,
+            )
+            raise OSError("append failed")
+
+        monkeypatch.setattr(service, "_commit_planning_events", append_concurrently_then_fail)
+        with pytest.raises(OSError, match="append failed"):
+            service.plan_next(current_lane, max_proposals=3)
+        after = journal.load_snapshot(current_manifest.engagement_id)
+        archive = journal.load_strategy_archive(current_manifest.engagement_id)
+
+    assert after.revision.sequence == created.snapshot.revision.sequence + 1
+    assert archive is None
+    assert not any(event.type == "strategy_archived" for event in after.events)
+
+
+def test_plan_next_rejects_zero_score_terminal_without_authoritative_grounding(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        created = journal.create_from_manifest(current_manifest, lane=current_lane)
+        service = PlanningService(
+            journal=journal,
+            llm=UngroundedZeroScorePlannerLlm(),
+            clock=lambda: FIXED_TIME,
+        )
+
+        with pytest.raises(ValueError, match="zero_score_terminal_not_grounded"):
+            service.plan_next(current_lane, max_proposals=3)
+        after = journal.load_snapshot(current_manifest.engagement_id)
+
+    assert after.revision == created.snapshot.revision
+
+
+def test_plan_next_reactivates_typed_retry_and_removes_cold_record(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        first = PlanningService(
+            journal=journal,
+            llm=TerminalPlannerLlm(),
+            clock=lambda: FIXED_TIME,
+        ).plan_next(current_lane, max_proposals=3)
+        assert first.status == "success"
+        archived = journal.load_strategy_archive(current_manifest.engagement_id)
+        assert archived is not None and len(archived.records) == 1
+        archived_record = ArchivedStrategyEventRecord.model_validate(archived.records[0].payload)
+        minimum_revision = archived_record.retry_predicates[0].minimum_material_revision
+        assert minimum_revision is not None
+        settled = PlanningService(
+            journal=journal,
+            llm=FailingLlm(),
+            clock=lambda: FIXED_TIME,
+        ).settle_pending_evidence(current_manifest.engagement_id, reason="plan")
+        assert settled.situation is not None
+        situation = SituationProjection.model_validate(
+            {
+                **settled.situation.model_dump(mode="python"),
+                "material_event_revision": minimum_revision.sequence + 1,
+            }
+        )
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(
+            "sedna.planning.service.SituationReducer.rebuild", lambda snapshot: situation
+        )
+        advanced = journal.append_hook_events(
+            current_manifest.engagement_id,
+            (
+                JournalEventDraft(
+                    lane=current_lane,
+                    actor="host_agent",
+                    type="session_checkpointed",
+                    payload=SessionCheckpointedPayload(
+                        completed=False,
+                        interrupted=False,
+                        reason="material state advanced",
+                    ),
+                ),
+            ),
+            expected_revision=first.current_authoritative_journal_revision,
+        )
+
+        second = PlanningService(
+            journal=journal,
+            llm=AcceptedPlannerLlm(),
+            clock=lambda: FIXED_TIME,
+        ).plan_next(current_lane, max_proposals=3)
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+        from sedna.planning.ledger import StrategyLedgerReducer
+
+        replay = StrategyLedgerReducer.rebuild_state(snapshot)
+        cold = journal.load_strategy_archive(current_manifest.engagement_id)
+        monkeypatch.undo()
+
+    assert second.status == "success"
+    assert (
+        advanced.snapshot.revision.sequence
+        < second.current_authoritative_journal_revision.sequence
+    )
+    assert any(event.type == "strategy_reactivated" for event in snapshot.events)
+    reactivated = next(
+        event.payload for event in snapshot.events if event.type == "strategy_reactivated"
+    )
+    assert reactivated.restored_snapshot.status == "available"
+    assert replay.archive_records == ()
+    assert cold is not None and cold.records == ()
+
+
+def test_plan_next_rejects_unreturnable_result_before_any_planning_event(
+    tmp_path, monkeypatch
+) -> None:
+    from sedna.planning import service as service_module
+
+    monkeypatch.setattr(service_module, "MAX_PLANNING_RESULT_BYTES", 1)
+    current_manifest = manifest()
+    current_lane = lane()
+    llm = AcceptedPlannerLlm()
+    with journal_service(tmp_path) as journal:
+        created = journal.create_from_manifest(current_manifest, lane=current_lane)
+        result = PlanningService(
+            journal=journal,
+            llm=llm,
+            clock=lambda: FIXED_TIME,
+        ).plan_next(current_lane, max_proposals=3)
+        after = journal.load_snapshot(current_manifest.engagement_id)
+
+    assert result.status == "failed"
+    assert result.failure_code == "result_too_large"
+    assert after.revision == created.snapshot.revision
+    assert llm.purposes == [
+        "sedna.planning.plan",
+        "sedna.planning.critic",
+        "sedna.planning.repair",
+        "sedna.planning.critic",
+    ]
+
+
+def test_plan_next_accepts_planner_then_critic_and_reuses_composite_cache(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    llm = AcceptedPlannerLlm()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        service = PlanningService(journal=journal, llm=llm, clock=lambda: FIXED_TIME)
+        result = service.plan_next(current_lane, max_proposals=3)
+        cached = service.plan_next(current_lane, max_proposals=3)
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+        frontier_path = (
+            tmp_path
+            / "knowledge"
+            / "engagements"
+            / str(current_manifest.engagement_id)
+            / "frontier.json"
+        )
+        canonical = frontier_path.read_bytes()
+        frontier_path.unlink()
+        replayed = FrontierReducer.rebuild(snapshot)
+        journal.commit_projection(
+            current_manifest.engagement_id,
+            "frontier",
+            replayed,
+            expected_revision=snapshot.revision,
+        )
+
+    assert result.status == "success"
+    assert cached.frontier == result.frontier
+    assert llm.purposes == ["sedna.planning.plan", "sedna.planning.critic"]
+    planner_request = llm.payloads[0]
+    assert planner_request.max_proposals == 3
+    assert planner_request.scope_references
+    assert planner_request.recent_event_ids
+    assert (
+        planner_request.knowledge_context.situation_digest == planner_request.situation.state_digest
+    )
+    assert planner_request.knowledge_context.context_digest != "0" * 64
+    assert replayed == result.frontier
+    assert frontier_path.read_bytes() == canonical
+    assert [event.type for event in snapshot.events[-11:-6]] == [
+        "plan_requested",
+        "frontier_proposed",
+        "frontier_proposed",
+        "frontier_proposed",
+        "frontier_criticized",
+    ]
+    assert [event.type for event in snapshot.events[-6:]] == ["strategy_reconciled"] * 6
+    proposed = next(event.payload for event in snapshot.events if event.type == "frontier_proposed")
+    assert proposed.call_metadata.provider == "test-provider"
+    assert proposed.call_metadata.model == "test-model"
+    assert proposed.call_metadata.agent_id == "test-agent"
+    assert proposed.call_metadata.input_tokens == 7
+    assert proposed.call_metadata.output_tokens == 3
+
+
+def test_frontier_replay_rejects_accepted_batch_without_plan_request(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        PlanningService(
+            journal=journal,
+            llm=AcceptedPlannerLlm(),
+            clock=lambda: FIXED_TIME,
+        ).plan_next(current_lane, max_proposals=3)
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+
+    without_request = SimpleNamespace(
+        engagement_id=snapshot.engagement_id,
+        revision=snapshot.revision,
+        events=tuple(event for event in snapshot.events if event.type != "plan_requested"),
+    )
+    with pytest.raises(ValueError, match="plan request"):
+        FrontierReducer.rebuild(without_request)
+
+
+def test_frontier_replay_rejects_duplicate_plan_request(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        PlanningService(
+            journal=journal,
+            llm=AcceptedPlannerLlm(),
+            clock=lambda: FIXED_TIME,
+        ).plan_next(current_lane, max_proposals=3)
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+
+    request = next(event for event in snapshot.events if event.type == "plan_requested")
+    duplicated = SimpleNamespace(
+        engagement_id=snapshot.engagement_id,
+        revision=snapshot.revision,
+        events=(*snapshot.events, request),
+    )
+    with pytest.raises(ValueError, match="exactly one plan request"):
+        FrontierReducer.rebuild(duplicated)
+
+
+def test_frontier_replay_rejects_proposal_appended_after_accepted_critic(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        PlanningService(
+            journal=journal,
+            llm=AcceptedPlannerLlm(),
+            clock=lambda: FIXED_TIME,
+        ).plan_next(current_lane, max_proposals=3)
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+
+    proposed = next(event for event in snapshot.events if event.type == "frontier_proposed")
+    reordered = SimpleNamespace(
+        engagement_id=snapshot.engagement_id,
+        revision=snapshot.revision,
+        events=tuple(event for event in snapshot.events if event is not proposed) + (proposed,),
+    )
+    with pytest.raises(ValueError, match="sequence"):
+        FrontierReducer.rebuild(reordered)
+
+
+def test_frontier_replay_rejects_reconciliation_before_accepted_critic(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        PlanningService(
+            journal=journal,
+            llm=AcceptedPlannerLlm(),
+            clock=lambda: FIXED_TIME,
+        ).plan_next(current_lane, max_proposals=3)
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+
+    reconciliation = tuple(
+        event for event in snapshot.events if event.type == "strategy_reconciled"
+    )
+    accepted_critic = next(
+        event
+        for event in snapshot.events
+        if event.type == "frontier_criticized" and event.payload.accepted
+    )
+    without_reconciliation = tuple(
+        event for event in snapshot.events if event.type != "strategy_reconciled"
+    )
+    critic_index = without_reconciliation.index(accepted_critic)
+    reordered = SimpleNamespace(
+        engagement_id=snapshot.engagement_id,
+        revision=snapshot.revision,
+        events=(
+            *without_reconciliation[:critic_index],
+            *reconciliation,
+            *without_reconciliation[critic_index:],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="sequence"):
+        FrontierReducer.rebuild(reordered)
+
+
+def test_frontier_replay_rejects_attempt_without_atomic_operation_identity(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        PlanningService(
+            journal=journal,
+            llm=AcceptedPlannerLlm(),
+            clock=lambda: FIXED_TIME,
+        ).plan_next(current_lane, max_proposals=3)
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+
+    uncorrelated = SimpleNamespace(
+        engagement_id=snapshot.engagement_id,
+        revision=snapshot.revision,
+        events=tuple(
+            SimpleNamespace(
+                sequence=event.sequence,
+                event_id=event.event_id,
+                type=event.type,
+                payload=event.payload,
+                system_correlation=None,
+            )
+            if event.type.startswith("frontier_") or event.type == "strategy_reconciled"
+            else event
+            for event in snapshot.events
+        ),
+    )
+    with pytest.raises(ValueError, match="atomic operation identity"):
+        FrontierReducer.rebuild(uncorrelated)
+
+
+def test_plan_next_cache_varies_with_canonical_and_source_revisions(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    revisions = {"canonical": "1" * 64, "sources": "2" * 64}
+    llm = AcceptedPlannerLlm()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        service = PlanningService(
+            journal=journal,
+            llm=llm,
+            clock=lambda: FIXED_TIME,
+            canonical_revision=lambda: revisions["canonical"],
+            source_registry_digest=lambda: revisions["sources"],
+        )
+        service.plan_next(current_lane, max_proposals=3)
+        service.plan_next(current_lane, max_proposals=3)
+        revisions["canonical"] = "3" * 64
+        service.plan_next(current_lane, max_proposals=3)
+        revisions["sources"] = "4" * 64
+        service.plan_next(current_lane, max_proposals=3)
+
+    assert llm.purposes.count("sedna.planning.plan") == 3
+
+
+class RepairedPlannerLlm(AcceptedPlannerLlm):
+    def __init__(self) -> None:
+        super().__init__()
+        self.critic_pass = 0
+
+    def complete(self, model_type, **kwargs):
+        if model_type is PlannerCriticVerdict:
+            self.purposes.append(kwargs["purpose"])
+            self.critic_pass += 1
+            parsed = (
+                PlannerCriticVerdict(
+                    accepted=False,
+                    findings=(
+                        PlannerFinding(
+                            code="weak_grounding", summary="Grounding needs repair.", material=True
+                        ),
+                    ),
+                )
+                if self.critic_pass == 1
+                else PlannerCriticVerdict(accepted=True)
+            )
+            return SimpleNamespace(
+                parsed=parsed,
+                provider="test-provider",
+                model="test-model",
+                agent_id="test-agent",
+                usage=SimpleNamespace(input_tokens=7, output_tokens=3),
+            )
+        return super().complete(model_type, **kwargs)
+
+
+class TwiceRejectedPlannerLlm(RepairedPlannerLlm):
+    def complete(self, model_type, **kwargs):
+        if model_type is PlannerCriticVerdict:
+            self.purposes.append(kwargs["purpose"])
+            return SimpleNamespace(
+                parsed=PlannerCriticVerdict(
+                    accepted=False,
+                    findings=(
+                        PlannerFinding(
+                            code="unsafe_output", summary="Still unsafe.", material=True
+                        ),
+                    ),
+                ),
+                provider="test-provider",
+                model="test-model",
+                agent_id="test-agent",
+                usage=SimpleNamespace(input_tokens=7, output_tokens=3),
+            )
+        return super().complete(model_type, **kwargs)
+
+
+class ConcurrentPlannerLlm(AcceptedPlannerLlm):
+    def __init__(self, journal, engagement_id, current_lane, *, changes: int) -> None:
+        super().__init__()
+        self._journal = journal
+        self._engagement_id = engagement_id
+        self._lane = current_lane
+        self._remaining = changes
+
+    def complete(self, model_type, **kwargs):
+        if model_type is PlannerDraft and self._remaining:
+            snapshot = self._journal.load_snapshot(self._engagement_id)
+            self._journal.append_hook_events(
+                self._engagement_id,
+                (
+                    JournalEventDraft(
+                        lane=self._lane,
+                        actor="host_agent",
+                        type="session_checkpointed",
+                        payload=SessionCheckpointedPayload(
+                            completed=False,
+                            interrupted=False,
+                            reason="concurrent planner checkpoint",
+                        ),
+                    ),
+                ),
+                expected_revision=snapshot.revision,
+            )
+            self._remaining -= 1
+        return super().complete(model_type, **kwargs)
+
+
+def test_plan_next_performs_at_most_one_repair_then_final_critic(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    llm = RepairedPlannerLlm()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        result = PlanningService(journal=journal, llm=llm, clock=lambda: FIXED_TIME).plan_next(
+            current_lane, max_proposals=3
+        )
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+
+    assert result.status == "success"
+    assert FrontierReducer.rebuild(snapshot) == result.frontier
+    attempt_types = [event.type for event in snapshot.events if event.type != "strategy_reconciled"]
+    assert attempt_types[-9:] == [
+        "plan_requested",
+        "frontier_proposed",
+        "frontier_proposed",
+        "frontier_proposed",
+        "frontier_criticized",
+        "frontier_repaired",
+        "frontier_repaired",
+        "frontier_repaired",
+        "frontier_criticized",
+    ]
+    assert [event.type for event in snapshot.events[-6:]] == ["strategy_reconciled"] * 6
+    assert llm.purposes == [
+        "sedna.planning.plan",
+        "sedna.planning.critic",
+        "sedna.planning.repair",
+        "sedna.planning.critic",
+    ]
+
+
+def test_frontier_replay_rejects_repair_without_rejected_first_critic(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        PlanningService(
+            journal=journal,
+            llm=RepairedPlannerLlm(),
+            clock=lambda: FIXED_TIME,
+        ).plan_next(current_lane, max_proposals=3)
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+
+    without_first_critic = SimpleNamespace(
+        engagement_id=snapshot.engagement_id,
+        revision=snapshot.revision,
+        events=tuple(
+            event
+            for event in snapshot.events
+            if not (event.type == "frontier_criticized" and not event.payload.accepted)
+        ),
+    )
+    with pytest.raises(ValueError, match="rejected first critic"):
+        FrontierReducer.rebuild(without_first_critic)
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected_status", "planner_calls"),
+    ((1, "success", 2), (2, "gap", 2)),
+)
+def test_plan_next_restarts_once_after_concurrent_state_change(
+    tmp_path, changes, expected_status, planner_calls
+) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        llm = ConcurrentPlannerLlm(
+            journal,
+            current_manifest.engagement_id,
+            current_lane,
+            changes=changes,
+        )
+        result = PlanningService(journal=journal, llm=llm, clock=lambda: FIXED_TIME).plan_next(
+            current_lane, max_proposals=3
+        )
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+
+    assert result.status == expected_status
+    assert llm.purposes.count("sedna.planning.plan") == planner_calls
+    if expected_status == "gap":
+        assert result.gap is not None and result.gap.code == "concurrent_state_change"
+        assert not any(event.type.startswith("frontier_") for event in snapshot.events)
+
+
+@pytest.mark.parametrize("changing_revision", ("canonical", "sources"))
+def test_plan_next_rejects_revision_change_before_commit(tmp_path, changing_revision) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    calls = {"canonical": 0, "sources": 0}
+
+    def revision(name: str) -> str:
+        calls[name] += 1
+        generation = calls[name] if name == changing_revision else 1
+        return f"{generation:064x}"
+
+    llm = AcceptedPlannerLlm()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        result = PlanningService(
+            journal=journal,
+            llm=llm,
+            clock=lambda: FIXED_TIME,
+            canonical_revision=lambda: revision("canonical"),
+            source_registry_digest=lambda: revision("sources"),
+        ).plan_next(current_lane, max_proposals=3)
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+
+    assert result.status == "gap"
+    assert result.gap is not None and result.gap.code == "concurrent_state_change"
+    assert llm.purposes.count("sedna.planning.plan") == 2
+    assert not any(event.type.startswith("frontier_") for event in snapshot.events)
+
+
+def test_second_critic_rejection_returns_gap_without_frontier_publication(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    llm = TwiceRejectedPlannerLlm()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        result = PlanningService(journal=journal, llm=llm, clock=lambda: FIXED_TIME).plan_next(
+            current_lane, max_proposals=3
+        )
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+
+    assert result.status == "gap"
+    assert result.gap is not None and result.gap.code == "critic_rejected"
+    assert not any(
+        event.type in {"frontier_proposed", "frontier_repaired"} for event in snapshot.events
+    )
+
+
+def test_second_critic_rejection_persists_closed_audit_without_frontier(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        result = PlanningService(
+            journal=journal,
+            llm=TwiceRejectedPlannerLlm(),
+            clock=lambda: FIXED_TIME,
+        ).plan_next(current_lane, max_proposals=3)
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+
+    assert result.status == "gap"
+    assert [
+        event.type
+        for event in snapshot.events
+        if event.type in {"frontier_rejected", "planning_gap_recorded"}
+    ] == ["frontier_rejected", "planning_gap_recorded"]
+    assert FrontierReducer.rebuild(snapshot) is None
+
+
+def test_second_critic_rejection_returns_the_prior_frontier_marked_stale(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        service = PlanningService(
+            journal=journal,
+            llm=AcceptedPlannerLlm(),
+            clock=lambda: FIXED_TIME,
+        )
+        accepted = service.plan_next(current_lane, max_proposals=3)
+        service._llm = TwiceRejectedPlannerLlm()
+        service._canonical_revision = lambda: "3" * 64
+
+        rejected = service.plan_next(current_lane, max_proposals=3)
+
+    assert accepted.frontier is not None
+    assert rejected.status == "gap" and rejected.gap is not None
+    assert rejected.gap.stale_frontier is not None
+    assert rejected.gap.stale_frontier.stale is True
+    assert rejected.gap.stale_frontier.model_copy(update={"stale": False}) == accepted.frontier
