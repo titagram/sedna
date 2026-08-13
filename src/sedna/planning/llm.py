@@ -15,10 +15,10 @@ from sedna.planning.models import (
     EVIDENCE_SLICE_BYTES,
     MAX_PLANNER_REQUEST_BYTES,
     EvidenceId,
-    FrontierProposalDraft,
     MediaType,
     ObservationBatchDraft,
     PlannerCriticVerdict,
+    PlannerDraft,
     SituationProjection,
     StrategyLedger,
 )
@@ -119,12 +119,6 @@ class PlannerRequest(_PlanningRequest):
 
     situation: SituationProjection
     ledger: StrategyLedger
-
-
-class PlannerDraft(_PlanningRequest):
-    """Complete, untrusted frontier proposal draft returned by planner or repair."""
-
-    proposals: Annotated[tuple[FrontierProposalDraft, ...], Field(max_length=8)]
 
 
 class PlannerCriticRequest(_PlanningRequest):

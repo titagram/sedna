@@ -21,6 +21,7 @@ from sedna.engagement.events import (
     EngagementReopenedPayload,
     EngagementResumedPayload,
     EngagementSnapshot,
+    EventPayload,
     JournalEvent,
     JournalEventDraft,
     LaneBoundPayload,
@@ -32,6 +33,7 @@ from sedna.engagement.events import (
 )
 from sedna.engagement.models import (
     MAX_EVIDENCE_ITEM_BYTES,
+    MAX_JOURNAL_BATCH_EVENTS,
     MAX_JOURNAL_EVENTS,
     MAX_PUBLIC_INVENTORY_ITEMS,
     MAX_SETTLEMENT_PENDING_RANGES,
@@ -94,6 +96,25 @@ EVENT_APPEND_OWNER_BY_TYPE: dict[str, str] = {
     "source_suggested": "source_registry",
     "recovery_warning": "recovery_repository",
     "user_note": "caller_facade",
+    "observation_extracted": "planning_capability",
+    "hypothesis_formed": "planning_capability",
+    "missing_information_identified": "planning_capability",
+    "outcome_assessed": "planning_capability",
+    "objective_proof_observed": "planning_capability",
+    "interpretation_succeeded": "planning_capability",
+    "interpretation_failed": "planning_capability",
+    "plan_requested": "planning_capability",
+    "frontier_proposed": "planning_capability",
+    "frontier_criticized": "planning_capability",
+    "frontier_repaired": "planning_capability",
+    "frontier_rejected": "planning_capability",
+    "planning_gap_recorded": "planning_capability",
+    "strategy_reconciled": "planning_capability",
+    "strategy_archived": "planning_capability",
+    "strategy_reactivated": "planning_capability",
+    "research_query_proposed": "planning_capability",
+    "research_source_consulted": "planning_capability",
+    "research_source_assessed": "planning_capability",
 }
 
 SettlementReason = Literal[
@@ -287,6 +308,68 @@ def create_operational_start_draft(
     )
 
 
+PLANNING_EVENT_KINDS = frozenset(
+    kind for kind, owner in EVENT_APPEND_OWNER_BY_TYPE.items() if owner == "planning_capability"
+)
+MAX_PLANNING_EVENT_BATCH = MAX_JOURNAL_BATCH_EVENTS - 1
+
+
+class PlanningEventCommitItem(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    event_id: UUID
+    payload: EventPayload
+    idempotency_key: Annotated[str, Field(min_length=1, max_length=1024)]
+
+    @model_validator(mode="after")
+    def validate_planning_payload(self) -> PlanningEventCommitItem:
+        if self.payload.kind not in PLANNING_EVENT_KINDS:
+            raise ValueError("commit item requires a planning event payload")
+        return self
+
+
+class PlanningEventCommitCapability:
+    """Repository-issued append authority for sealed planner facts."""
+
+    def __init__(self, service: EngagementJournalService, token: object):
+        if token is not service._planning_capability_token:
+            raise ValueError("invalid planning capability token")
+        self._service = service
+
+    def commit_planning_events(
+        self,
+        engagement_id: UUID,
+        items: Sequence[PlanningEventCommitItem],
+        *,
+        operation_id: UUID,
+        expected_revision: JournalRevision,
+    ) -> EngagementMutationResult:
+        validated = tuple(
+            PlanningEventCommitItem.model_validate(item.model_dump(mode="python")) for item in items
+        )
+        if not 1 <= len(validated) <= MAX_PLANNING_EVENT_BATCH:
+            raise ValueError("planning event batch exceeds its bound")
+        event_ids = tuple(item.event_id for item in validated)
+        keys = tuple(item.idempotency_key for item in validated)
+        if len(event_ids) != len(set(event_ids)) or len(keys) != len(set(keys)):
+            raise ValueError("planning event IDs and idempotency keys must be unique")
+        drafts = tuple(
+            JournalEventDraft(
+                event_id=item.event_id,
+                actor="system",
+                type=item.payload.kind,
+                payload=item.payload,
+                system_correlation={"source": "planning", "operation_id": operation_id},
+                idempotency_key=item.idempotency_key,
+            )
+            for item in validated
+        )
+        result = self._service._repository.append_batch(
+            engagement_id, drafts, expected_revision=expected_revision
+        )
+        return _mutation_result(self._service._repository, engagement_id, result)
+
+
 class EngagementJournalService:
     """Context-managed facade over the engagement journal repository."""
 
@@ -300,6 +383,10 @@ class EngagementJournalService:
         self._repository = repository
         self._clock = clock
         self._uuid_factory = uuid_factory
+        self._planning_capability_token = object()
+
+    def _issue_planning_event_commit_capability(self) -> PlanningEventCommitCapability:
+        return PlanningEventCommitCapability(self, self._planning_capability_token)
 
     @classmethod
     @contextmanager

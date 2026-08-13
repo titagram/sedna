@@ -20,10 +20,17 @@ from sedna.engagement import (
     ProofRequirement,
     SettlementReason,
 )
+from sedna.engagement.events import (
+    ArchivedStrategyEventRecord,
+    EvidenceSliceEventRef,
+    ExtractedObservationEventRecord,
+    FrontierProposalEventRecord,
+    PrivateValueEventRecord,
+    StrategyReconciliationEventOperation,
+    StrategyResultSnapshot,
+)
 
-ProofRequirementId: TypeAlias = Annotated[
-    str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")
-]
+ProofRequirementId: TypeAlias = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")]
 Sha256Hex: TypeAlias = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 ShortText: TypeAlias = Annotated[str, Field(min_length=1, max_length=2048)]
 MediaType: TypeAlias = Annotated[str, Field(min_length=1, max_length=255)]
@@ -236,6 +243,14 @@ class FrontierProposalDraft(BaseModel):
     rationale: ShortText
 
 
+class PlannerDraft(BaseModel):
+    """Complete untrusted planner output before runtime allocation."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    proposals: Annotated[tuple[FrontierProposalDraft, ...], Field(max_length=8)]
+
+
 class FrontierProposal(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
@@ -287,6 +302,10 @@ class PlannerCriticVerdict(BaseModel):
 
     accepted: bool
     findings: Annotated[tuple[PlannerFinding, ...], Field(max_length=64)] = ()
+    request_id: UUID | None = None
+    frontier_id: UUID | None = None
+    critic_pass: Literal[1, 2] | None = None
+    cited_event_ids: Annotated[tuple[UUID, ...], Field(max_length=64)] = ()
 
     @model_validator(mode="after")
     def _acceptance_matches_material_findings(self) -> Self:
@@ -303,6 +322,7 @@ class StrategyReconciliation(BaseModel):
     input_variant_ids: Annotated[tuple[UUID, ...], Field(max_length=64)]
     retained_family_ids: Annotated[tuple[UUID, ...], Field(max_length=32)]
     retained_variant_ids: Annotated[tuple[UUID, ...], Field(max_length=64)]
+    items: Annotated[tuple[StrategyReconciliationItem, ...], Field(max_length=256)] = ()
 
     @model_validator(mode="after")
     def _reject_silent_loss(self) -> Self:
@@ -348,6 +368,250 @@ class ProofIndexRecord(BaseModel):
     rejection_inventory_digest: Sha256Hex
 
 
+class _PlanningEventSource(BaseModel):
+    """A typed, pre-allocation-bound source record; never a journal payload."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    local_id: Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
+
+
+class ObservationExtractedSource(_PlanningEventSource):
+    kind: Literal["observation_extracted"] = "observation_extracted"
+    summary: Annotated[str, Field(min_length=1, max_length=4096)]
+    observation: ExtractedObservationEventRecord
+    confidence: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+    evidence_slices: Annotated[
+        tuple[EvidenceSliceEventRef, ...], Field(min_length=1, max_length=64)
+    ]
+    scope_reference_ids: Annotated[tuple[str, ...], Field(max_length=16)] = ()
+
+
+class HypothesisFormedSource(_PlanningEventSource):
+    kind: Literal["hypothesis_formed"] = "hypothesis_formed"
+    statement: Annotated[str, Field(min_length=1, max_length=4096)]
+    confidence: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+    supporting_event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=32)]
+    contradicting_event_ids: Annotated[tuple[UUID, ...], Field(max_length=32)] = ()
+    scope_reference_ids: Annotated[tuple[str, ...], Field(max_length=16)] = ()
+
+
+class MissingInformationIdentifiedSource(_PlanningEventSource):
+    kind: Literal["missing_information_identified"] = "missing_information_identified"
+    question: ShortText
+    reason: Annotated[str, Field(min_length=1, max_length=4096)]
+    importance: Annotated[int, Field(ge=0, le=100)]
+    related_event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=32)]
+    scope_reference_ids: Annotated[tuple[str, ...], Field(max_length=16)] = ()
+
+
+class OutcomeAssessedSource(_PlanningEventSource):
+    kind: Literal["outcome_assessed"] = "outcome_assessed"
+    attachment_event_id: UUID
+    terminal_tool_event_id: UUID
+    decision_id: UUID | None = None
+    tool_call_ids: Annotated[tuple[str, ...], Field(min_length=1, max_length=32)]
+    category: OutcomeCategory
+    summary: Annotated[str, Field(min_length=1, max_length=4096)]
+    strategic_impact: Annotated[str, Field(min_length=1, max_length=4096)]
+    evidence_ids: Annotated[tuple[EvidenceId, ...], Field(max_length=64)] = ()
+    source_event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=64)]
+
+
+class ObjectiveProofObservedSource(_PlanningEventSource):
+    kind: Literal["objective_proof_observed"] = "objective_proof_observed"
+    proof_requirement_id: ProofRequirementId
+    assessment_generation: Annotated[int, Field(ge=1)]
+    assessment: Literal["supported", "contradicted"]
+    candidate_value: PrivateValueEventRecord
+    confidence: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+    evidence_ids: Annotated[tuple[EvidenceId, ...], Field(min_length=1, max_length=16)]
+    source_event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=32)]
+
+
+class InterpretationSucceededSource(_PlanningEventSource):
+    kind: Literal["interpretation_succeeded"] = "interpretation_succeeded"
+    interpretation_id: UUID
+    attachment_event_id: UUID
+    terminal_tool_event_id: UUID | None = None
+    evidence_id: EvidenceId
+    covered_slices: Annotated[tuple[EvidenceSliceEventRef, ...], Field(max_length=64)]
+    emitted_event_ids: Annotated[tuple[UUID, ...], Field(max_length=64)]
+
+
+class InterpretationFailedSource(_PlanningEventSource):
+    kind: Literal["interpretation_failed"] = "interpretation_failed"
+    interpretation_id: UUID
+    attachment_event_id: UUID
+    terminal_tool_event_id: UUID | None = None
+    evidence_id: EvidenceId
+    attempted_slices: Annotated[tuple[EvidenceSliceEventRef, ...], Field(max_length=64)]
+    failure_code: Literal[
+        "llm_unavailable", "invalid_structured_output", "reference_validation_failed",
+        "concurrent_state_change", "unsupported_media",
+    ]
+    retryable: bool
+    safe_summary: ShortText
+
+
+class PlanRequestedSource(_PlanningEventSource):
+    kind: Literal["plan_requested"] = "plan_requested"
+    request_id: UUID
+    lane_key: Annotated[str, Field(pattern=r"^lane-[0-9a-f]{32}$")]
+    situation_digest: Sha256Hex
+    material_event_revision: JournalRevision
+    input_ledger_digest: Sha256Hex
+    canonical_revision: Sha256Hex
+    source_registry_digest: Sha256Hex
+    max_proposals: Annotated[int, Field(ge=3, le=8)]
+
+
+class FrontierProposedSource(_PlanningEventSource):
+    kind: Literal["frontier_proposed"] = "frontier_proposed"
+    request_id: UUID
+    frontier_id: UUID
+    proposal_ordinal: Annotated[int, Field(ge=1, le=8)]
+    proposal_count: Annotated[int, Field(ge=1, le=8)]
+    proposal: FrontierProposalEventRecord
+    situation_digest: Sha256Hex
+    input_ledger_digest: Sha256Hex
+    knowledge_context_digest: Sha256Hex
+
+
+class FrontierCriticizedSource(_PlanningEventSource):
+    kind: Literal["frontier_criticized"] = "frontier_criticized"
+    request_id: UUID
+    frontier_id: UUID
+    critic_pass: Literal[1, 2]
+    accepted: bool
+    finding_codes: Annotated[
+        tuple[Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")], ...], Field(max_length=32)
+    ] = ()
+    cited_event_ids: Annotated[tuple[UUID, ...], Field(max_length=64)] = ()
+
+
+class FrontierRepairedSource(_PlanningEventSource):
+    kind: Literal["frontier_repaired"] = "frontier_repaired"
+    request_id: UUID
+    frontier_id: UUID
+    critic_event_id: UUID
+    proposal_ordinal: Annotated[int, Field(ge=1, le=8)]
+    proposal_count: Annotated[int, Field(ge=1, le=8)]
+    proposal: FrontierProposalEventRecord
+
+
+class FrontierRejectedSource(_PlanningEventSource):
+    kind: Literal["frontier_rejected"] = "frontier_rejected"
+    request_id: UUID
+    frontier_id: UUID
+    critic_event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=2)]
+    reason_codes: Annotated[
+        tuple[Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")], ...],
+        Field(min_length=1, max_length=32),
+    ]
+
+
+class PlanningGapRecordedSource(_PlanningEventSource):
+    kind: Literal["planning_gap_recorded"] = "planning_gap_recorded"
+    request_id: UUID | None = None
+    code: Literal[
+        "planner_input_too_large", "journal_payload_too_large", "concurrent_state_change",
+        "invalid_planner_output", "llm_unavailable", "critic_rejected", "retrieval_unavailable",
+        "journal_unavailable", "engagement_terminal",
+    ]
+    summary: ShortText
+    retryable: bool
+    situation_digest: Sha256Hex
+    ledger_digest: Sha256Hex
+    related_event_ids: Annotated[tuple[UUID, ...], Field(max_length=32)] = ()
+
+
+class StrategyReconciledSource(_PlanningEventSource):
+    kind: Literal["strategy_reconciled"] = "strategy_reconciled"
+    request_id: UUID
+    frontier_id: UUID
+    reconciliation_id: UUID
+    item_ordinal: Annotated[int, Field(ge=1, le=256)]
+    item_count: Annotated[int, Field(ge=1, le=256)]
+    input_ledger_digest: Sha256Hex
+    resulting_ledger_digest: Sha256Hex
+    operation: StrategyReconciliationEventOperation
+    resulting_snapshot: StrategyResultSnapshot
+
+
+class StrategyArchivedSource(_PlanningEventSource):
+    kind: Literal["strategy_archived"] = "strategy_archived"
+    request_id: UUID
+    archive_batch_id: UUID
+    entry_ordinal: Annotated[int, Field(ge=1, le=256)]
+    entry_count: Annotated[int, Field(ge=1, le=256)]
+    archive_record: ArchivedStrategyEventRecord
+    resulting_archive_digest: Sha256Hex
+
+
+class StrategyReactivatedSource(_PlanningEventSource):
+    kind: Literal["strategy_reactivated"] = "strategy_reactivated"
+    request_id: UUID
+    reactivation_batch_id: UUID
+    entry_ordinal: Annotated[int, Field(ge=1, le=256)]
+    entry_count: Annotated[int, Field(ge=1, le=256)]
+    source_archive_event_id: UUID
+    triggering_event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=32)]
+    matched_predicate_ids: Annotated[tuple[str, ...], Field(min_length=1, max_length=16)]
+    prior_archive_entry_digest: Sha256Hex
+    resulting_archive_digest: Sha256Hex
+    restored_snapshot: StrategyResultSnapshot
+
+
+class ResearchQueryProposedSource(_PlanningEventSource):
+    kind: Literal["research_query_proposed"] = "research_query_proposed"
+    query_id: UUID
+    normalized_query: ShortText
+    policy_decision: Literal["allowed", "rejected"]
+    policy_version: Annotated[str, Field(min_length=1, max_length=512)]
+    reason_codes: Annotated[
+        tuple[Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")], ...],
+        Field(min_length=1, max_length=16),
+    ]
+    related_event_ids: Annotated[tuple[UUID, ...], Field(max_length=32)] = ()
+    candidate_source_ids: Annotated[tuple[str, ...], Field(max_length=16)] = ()
+
+
+class ResearchSourceConsultedSource(_PlanningEventSource):
+    kind: Literal["research_source_consulted"] = "research_source_consulted"
+    query_id: UUID
+    source_id: Annotated[str, Field(min_length=1, max_length=512)]
+    normalized_locator: ShortText
+    content: bytes = Field(min_length=1, max_length=MAX_HOST_RESULT_BYTES)
+    media_type: MediaType
+    evidence_ids: Annotated[tuple[EvidenceId, ...], Field(min_length=1, max_length=16)]
+    tool_event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=16)]
+
+
+class ResearchSourceAssessedSource(_PlanningEventSource):
+    kind: Literal["research_source_assessed"] = "research_source_assessed"
+    query_id: UUID
+    source_id: Annotated[str, Field(min_length=1, max_length=512)]
+    consulted_event_id: UUID
+    assessment: Literal["useful", "contradicted", "stale", "irrelevant", "ambiguous"]
+    confidence: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+    summary: Annotated[str, Field(min_length=1, max_length=4096)]
+    related_event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=64)]
+    suggested_registry_status: Literal["consulted", "useful", "contradicted", "stale"] | None = None
+
+
+PlanningEventSource: TypeAlias = Annotated[
+    ObservationExtractedSource | HypothesisFormedSource | MissingInformationIdentifiedSource
+    | OutcomeAssessedSource | ObjectiveProofObservedSource | InterpretationSucceededSource
+    | InterpretationFailedSource | PlanRequestedSource | FrontierProposedSource
+    | FrontierCriticizedSource | FrontierRepairedSource | FrontierRejectedSource
+    | PlanningGapRecordedSource | StrategyReconciledSource | StrategyArchivedSource
+    | StrategyReactivatedSource | ResearchQueryProposedSource | ResearchSourceConsultedSource
+    | ResearchSourceAssessedSource,
+    Field(discriminator="kind"),
+]
+
+
 class _ConversionEnvelope(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
@@ -365,6 +629,10 @@ class _ConversionEnvelope(BaseModel):
     valid_variant_ids: Annotated[tuple[UUID, ...], Field(max_length=128)] = ()
     valid_knowledge_ids: Annotated[tuple[str, ...], Field(max_length=512)] = ()
     valid_source_ids: Annotated[tuple[str, ...], Field(max_length=512)] = ()
+    evidence_slices: Annotated[tuple[EvidenceSliceInput, ...], Field(max_length=64)] = ()
+    sources: Annotated[
+        tuple[PlanningEventSource, ...], Field(max_length=MAX_PLANNING_EVENT_BATCH)
+    ] = ()
 
     @model_validator(mode="after")
     def _bindings_and_indexes_are_deterministic(self) -> Self:
@@ -410,32 +678,104 @@ class _ConversionEnvelope(BaseModel):
             if admission_key not in indexed_proofs:
                 raise ValueError("proof_candidate_admission_not_in_index")
         has_unindexed_binding = any(
-            binding.event_id not in self.valid_event_ids
-            for binding in self.local_event_bindings
+            binding.event_id not in self.valid_event_ids for binding in self.local_event_bindings
         )
         if has_unindexed_binding:
             raise ValueError("local_event_binding_not_in_index")
+        source_ids = tuple(source.local_id for source in self.sources)
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("source_local_ids_not_unique")
+        if set(source_ids) - set(binding_keys):
+            raise ValueError("source_local_id_not_preallocated")
         return self
 
 
 class ObservationEventConversion(_ConversionEnvelope):
     batch: ObservationBatchDraft
     call_metadata: PlanningCallMetadata
+    interpretation_audits: Annotated[tuple[InterpretationAudit, ...], Field(max_length=64)] = ()
+
+    @model_validator(mode="after")
+    def _source_family(self) -> Self:
+        allowed = {
+            "observation_extracted",
+            "hypothesis_formed",
+            "missing_information_identified",
+            "outcome_assessed",
+            "objective_proof_observed",
+            "interpretation_succeeded",
+            "interpretation_failed",
+        }
+        if any(source.kind not in allowed for source in self.sources):
+            raise ValueError("observation conversion contains a non-observation source")
+        return self
 
 
 class PlanningAttemptEventConversion(_ConversionEnvelope):
     reconciliation: StrategyReconciliation
     call_metadata: PlanningCallMetadata
+    plan_request_audit: PlanRequestAudit | None = None
+    planner_draft: PlannerDraft | None = None
+    planner_proposals: Annotated[tuple[PlannerProposalAudit, ...], Field(max_length=8)] = ()
+    critic_verdicts: Annotated[tuple[PlannerCriticVerdict, ...], Field(max_length=2)] = ()
+    repair_audits: Annotated[tuple[PlannerRepairAudit, ...], Field(max_length=8)] = ()
+    rejection_audits: Annotated[tuple[PlannerRejectionAudit, ...], Field(max_length=8)] = ()
+    planning_gaps: Annotated[tuple[PlanningGap, ...], Field(max_length=8)] = ()
+
+    @model_validator(mode="after")
+    def _source_family(self) -> Self:
+        allowed = {
+            "plan_requested",
+            "frontier_proposed",
+            "frontier_criticized",
+            "frontier_repaired",
+            "frontier_rejected",
+            "planning_gap_recorded",
+        }
+        if any(source.kind not in allowed for source in self.sources):
+            raise ValueError("planning conversion contains a non-planning-attempt source")
+        return self
 
 
 class StrategyReconciliationEventConversion(_ConversionEnvelope):
     reconciliation: StrategyReconciliation
     call_metadata: PlanningCallMetadata
+    archive_transitions: Annotated[
+        tuple[StrategyArchiveTransition, ...], Field(max_length=256)
+    ] = ()
+    reactivation_transitions: Annotated[
+        tuple[StrategyReactivationTransition, ...], Field(max_length=256)
+    ] = ()
+
+    @model_validator(mode="after")
+    def _source_family(self) -> Self:
+        allowed = {"strategy_reconciled", "strategy_archived", "strategy_reactivated"}
+        if any(source.kind not in allowed for source in self.sources):
+            raise ValueError("reconciliation conversion contains a non-reconciliation source")
+        return self
 
 
 class ResearchEventConversion(_ConversionEnvelope):
     research_sources: Annotated[tuple[ResearchSourceObservationDraft, ...], Field(max_length=64)]
     call_metadata: PlanningCallMetadata
+    policy_decisions: Annotated[tuple[ResearchPolicyDecision, ...], Field(max_length=64)] = ()
+    research_consultations: Annotated[
+        tuple[ResearchSourceConsultation, ...], Field(max_length=64)
+    ] = ()
+    research_assessments: Annotated[
+        tuple[ResearchSourceAssessmentAudit, ...], Field(max_length=64)
+    ] = ()
+
+    @model_validator(mode="after")
+    def _source_family(self) -> Self:
+        allowed = {
+            "research_query_proposed",
+            "research_source_consulted",
+            "research_source_assessed",
+        }
+        if any(source.kind not in allowed for source in self.sources):
+            raise ValueError("research conversion contains a non-research source")
+        return self
 
 
 class InterpretationAudit(BaseModel):
@@ -444,9 +784,9 @@ class InterpretationAudit(BaseModel):
     subject: InterpretationSubject
     call_metadata: PlanningCallMetadata
     status: Literal["succeeded", "failed"]
-    safe_code: Literal[
-        "evidence_read_failed", "extractor_unavailable", "invalid_extractor_output"
-    ] | None = None
+    safe_code: (
+        Literal["evidence_read_failed", "extractor_unavailable", "invalid_extractor_output"] | None
+    ) = None
 
     @model_validator(mode="after")
     def _failure_code_matches_status(self) -> Self:
@@ -461,6 +801,27 @@ class PlanRequestAudit(BaseModel):
     call_metadata: PlanningCallMetadata
     state_digest: Sha256Hex
     ledger_digest: Sha256Hex
+    request_id: UUID | None = None
+    lane_key: Annotated[str, Field(pattern=r"^lane-[0-9a-f]{32}$")] | None = None
+    material_event_revision: JournalRevision | None = None
+    canonical_revision: Sha256Hex | None = None
+    source_registry_digest: Sha256Hex | None = None
+    max_proposals: Annotated[int, Field(ge=3, le=8)] | None = None
+
+
+class PlannerProposalAudit(BaseModel):
+    """The fully allocated proposal that may be journaled for one draft ordinal."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    request_id: UUID
+    frontier_id: UUID
+    proposal_ordinal: Annotated[int, Field(ge=1, le=8)]
+    proposal_count: Annotated[int, Field(ge=1, le=8)]
+    proposal: FrontierProposalEventRecord
+    situation_digest: Sha256Hex
+    input_ledger_digest: Sha256Hex
+    knowledge_context_digest: Sha256Hex
 
 
 class PlannerRepairAudit(BaseModel):
@@ -468,6 +829,12 @@ class PlannerRepairAudit(BaseModel):
 
     call_metadata: PlanningCallMetadata
     critic_finding_codes: Annotated[tuple[str, ...], Field(max_length=64)]
+    request_id: UUID | None = None
+    frontier_id: UUID | None = None
+    critic_event_id: UUID | None = None
+    proposal_ordinal: Annotated[int, Field(ge=1, le=8)] | None = None
+    proposal_count: Annotated[int, Field(ge=1, le=8)] | None = None
+    proposal: FrontierProposalEventRecord | None = None
 
 
 class PlannerRejectionAudit(BaseModel):
@@ -475,6 +842,13 @@ class PlannerRejectionAudit(BaseModel):
 
     call_metadata: PlanningCallMetadata
     safe_code: Literal["critic_rejected", "repair_exhausted", "result_too_large"]
+    request_id: UUID | None = None
+    frontier_id: UUID | None = None
+    critic_event_ids: Annotated[tuple[UUID, ...], Field(max_length=2)] = ()
+    reason_codes: Annotated[
+        tuple[Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")], ...],
+        Field(max_length=32),
+    ] = ()
 
 
 class ResearchPolicyDecision(BaseModel):
@@ -483,6 +857,15 @@ class ResearchPolicyDecision(BaseModel):
     decision_id: UUID
     allowed: bool
     rationale: ShortText
+    query_id: UUID | None = None
+    normalized_query: ShortText | None = None
+    policy_version: Annotated[str, Field(min_length=1, max_length=512)] | None = None
+    reason_codes: Annotated[
+        tuple[Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")], ...],
+        Field(max_length=16),
+    ] = ()
+    related_event_ids: Annotated[tuple[UUID, ...], Field(max_length=32)] = ()
+    candidate_source_ids: Annotated[tuple[str, ...], Field(max_length=16)] = ()
 
 
 class StrategyArchiveTransition(BaseModel):
@@ -491,6 +874,12 @@ class StrategyArchiveTransition(BaseModel):
     family_id: UUID
     event_id: UUID
     rationale: ShortText
+    request_id: UUID | None = None
+    archive_batch_id: UUID | None = None
+    entry_ordinal: Annotated[int, Field(ge=1, le=256)] | None = None
+    entry_count: Annotated[int, Field(ge=1, le=256)] | None = None
+    archive_record: ArchivedStrategyEventRecord | None = None
+    resulting_archive_digest: Sha256Hex | None = None
 
 
 class StrategyReactivationTransition(BaseModel):
@@ -499,13 +888,78 @@ class StrategyReactivationTransition(BaseModel):
     family_id: UUID
     event_id: UUID
     rationale: ShortText
+    request_id: UUID | None = None
+    reactivation_batch_id: UUID | None = None
+    entry_ordinal: Annotated[int, Field(ge=1, le=256)] | None = None
+    entry_count: Annotated[int, Field(ge=1, le=256)] | None = None
+    source_archive_event_id: UUID | None = None
+    triggering_event_ids: Annotated[tuple[UUID, ...], Field(max_length=32)] = ()
+    matched_predicate_ids: Annotated[tuple[str, ...], Field(max_length=16)] = ()
+    prior_archive_entry_digest: Sha256Hex | None = None
+    resulting_archive_digest: Sha256Hex | None = None
+    restored_snapshot: StrategyResultSnapshot | None = None
 
 
 class PlanningGap(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
-    code: Literal["no_viable_strategy", "planning_constraints"]
+    code: Literal[
+        "no_viable_strategy", "planning_constraints", "planner_input_too_large",
+        "journal_payload_too_large", "concurrent_state_change", "invalid_planner_output",
+        "llm_unavailable", "critic_rejected", "retrieval_unavailable", "journal_unavailable",
+        "engagement_terminal",
+    ]
     summary: ShortText
+    request_id: UUID | None = None
+    retryable: bool | None = None
+    situation_digest: Sha256Hex | None = None
+    ledger_digest: Sha256Hex | None = None
+    related_event_ids: Annotated[tuple[UUID, ...], Field(max_length=32)] = ()
+
+
+class StrategyReconciliationItem(BaseModel):
+    """One complete accepted reconciliation operation and its resulting snapshot."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    request_id: UUID
+    frontier_id: UUID
+    reconciliation_id: UUID
+    item_ordinal: Annotated[int, Field(ge=1, le=256)]
+    item_count: Annotated[int, Field(ge=1, le=256)]
+    input_ledger_digest: Sha256Hex
+    resulting_ledger_digest: Sha256Hex
+    operation: StrategyReconciliationEventOperation
+    resulting_snapshot: StrategyResultSnapshot
+
+
+class ResearchSourceConsultation(BaseModel):
+    """Host-evidence-backed source consultation before journal allocation."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    query_id: UUID
+    source_id: Annotated[str, Field(min_length=1, max_length=512)]
+    normalized_locator: ShortText
+    content: bytes = Field(min_length=1, max_length=MAX_HOST_RESULT_BYTES)
+    media_type: MediaType
+    evidence_ids: Annotated[tuple[EvidenceId, ...], Field(min_length=1, max_length=16)]
+    tool_event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=16)]
+
+
+class ResearchSourceAssessmentAudit(BaseModel):
+    """Authoritative assessed-source semantics, distinct from allocation IDs."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    query_id: UUID
+    source_id: Annotated[str, Field(min_length=1, max_length=512)]
+    consulted_event_id: UUID
+    assessment: Literal["useful", "contradicted", "stale", "irrelevant", "ambiguous"]
+    confidence: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+    summary: Annotated[str, Field(min_length=1, max_length=4096)]
+    related_event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=64)]
+    suggested_registry_status: Literal["consulted", "useful", "contradicted", "stale"] | None = None
 
 
 class PlanningResult(BaseModel):
@@ -516,9 +970,9 @@ class PlanningResult(BaseModel):
     current_authoritative_journal_revision: JournalRevision
     frontier: FrontierProjection | None = None
     gap: PlanningGap | None = None
-    failure_code: Literal[
-        "planning_failed", "settlement_unavailable", "result_too_large"
-    ] | None = None
+    failure_code: (
+        Literal["planning_failed", "settlement_unavailable", "result_too_large"] | None
+    ) = None
 
     @model_validator(mode="after")
     def _exclusive_status_payload(self) -> Self:
@@ -736,9 +1190,7 @@ class ObservationBatchDraft(BaseModel):
     incompatibilities: Annotated[
         tuple[IncompatibilityObservationDraft, ...], Field(max_length=64)
     ] = ()
-    missing_information: Annotated[
-        tuple[MissingInformationDraft, ...], Field(max_length=64)
-    ] = ()
+    missing_information: Annotated[tuple[MissingInformationDraft, ...], Field(max_length=64)] = ()
     research_sources: Annotated[
         tuple[ResearchSourceObservationDraft, ...], Field(max_length=64)
     ] = ()
@@ -902,8 +1354,7 @@ class _SettlementResultBase(BaseModel):
             raise ValueError("settlement_projection_revision_pair_required")
         if (
             self.situation is not None
-            and self.authoritative_journal_revision
-            != self.situation.authoritative_journal_revision
+            and self.authoritative_journal_revision != self.situation.authoritative_journal_revision
         ):
             raise ValueError("settlement_projection_revision_mismatch")
         range_keys = tuple(
@@ -1027,9 +1478,15 @@ SettlementResultAdapter = TypeAdapter(SettlementResult)
 
 
 __all__ = [
-    "EVIDENCE_SLICE_BYTES", "MAX_EVIDENCE_BYTES_PER_SETTLEMENT", "MAX_PLANNING_EVENT_BATCH",
-    "MAX_PLANNING_PAYLOAD_BYTES", "MAX_PLANNING_RESULT_BYTES", "MAX_PLANNER_REQUEST_BYTES",
-    "MAX_RECENT_EVENTS", "MAX_RECENT_EVENT_TEXT_BYTES", "IncompleteSettlementResult",
+    "EVIDENCE_SLICE_BYTES",
+    "MAX_EVIDENCE_BYTES_PER_SETTLEMENT",
+    "MAX_PLANNING_EVENT_BATCH",
+    "MAX_PLANNING_PAYLOAD_BYTES",
+    "MAX_PLANNING_RESULT_BYTES",
+    "MAX_PLANNER_REQUEST_BYTES",
+    "MAX_RECENT_EVENTS",
+    "MAX_RECENT_EVENT_TEXT_BYTES",
+    "IncompleteSettlementResult",
     "NothingPendingSettlementResult",
     "ObjectiveProgress",
     "OutcomeCategory",

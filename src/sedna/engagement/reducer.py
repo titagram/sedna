@@ -52,6 +52,8 @@ class LifecycleEffect(StrEnum):
     TOOL_START = "tool_start"
     TOOL_TERMINAL = "tool_terminal"
     BOOKKEEPING = "bookkeeping"
+    SETTLEMENT_BOOKKEEPING = "settlement_bookkeeping"
+    ACTIVE_PLANNING = "active_planning"
     CLOSURE_REQUEST = "closure_request"
     CLOSURE_CANCEL = "closure_cancel"
     REOPEN = "reopen"
@@ -88,8 +90,57 @@ EVENT_LIFECYCLE_EFFECTS: Mapping[EventType, LifecycleEffect] = MappingProxyType(
         EventType.RECOVERY_WARNING: LifecycleEffect.BOOKKEEPING,
         EventType.UNCERTAIN_CORRELATION: LifecycleEffect.BOOKKEEPING,
         EventType.USER_NOTE: LifecycleEffect.BOOKKEEPING,
+        EventType.OBSERVATION_EXTRACTED: LifecycleEffect.SETTLEMENT_BOOKKEEPING,
+        EventType.HYPOTHESIS_FORMED: LifecycleEffect.SETTLEMENT_BOOKKEEPING,
+        EventType.MISSING_INFORMATION_IDENTIFIED: LifecycleEffect.SETTLEMENT_BOOKKEEPING,
+        EventType.OUTCOME_ASSESSED: LifecycleEffect.SETTLEMENT_BOOKKEEPING,
+        EventType.OBJECTIVE_PROOF_OBSERVED: LifecycleEffect.SETTLEMENT_BOOKKEEPING,
+        EventType.INTERPRETATION_SUCCEEDED: LifecycleEffect.SETTLEMENT_BOOKKEEPING,
+        EventType.INTERPRETATION_FAILED: LifecycleEffect.SETTLEMENT_BOOKKEEPING,
+        EventType.PLAN_REQUESTED: LifecycleEffect.ACTIVE_PLANNING,
+        EventType.FRONTIER_PROPOSED: LifecycleEffect.ACTIVE_PLANNING,
+        EventType.FRONTIER_CRITICIZED: LifecycleEffect.ACTIVE_PLANNING,
+        EventType.FRONTIER_REPAIRED: LifecycleEffect.ACTIVE_PLANNING,
+        EventType.FRONTIER_REJECTED: LifecycleEffect.ACTIVE_PLANNING,
+        EventType.PLANNING_GAP_RECORDED: LifecycleEffect.ACTIVE_PLANNING,
+        EventType.STRATEGY_RECONCILED: LifecycleEffect.ACTIVE_PLANNING,
+        EventType.STRATEGY_ARCHIVED: LifecycleEffect.ACTIVE_PLANNING,
+        EventType.STRATEGY_REACTIVATED: LifecycleEffect.ACTIVE_PLANNING,
+        EventType.RESEARCH_QUERY_PROPOSED: LifecycleEffect.ACTIVE_PLANNING,
+        EventType.RESEARCH_SOURCE_CONSULTED: LifecycleEffect.ACTIVE_PLANNING,
+        EventType.RESEARCH_SOURCE_ASSESSED: LifecycleEffect.ACTIVE_PLANNING,
     }
 )
+
+SETTLEMENT_BOOKKEEPING_EVENT_TYPES = frozenset(
+    {
+        EventType.OBSERVATION_EXTRACTED,
+        EventType.HYPOTHESIS_FORMED,
+        EventType.MISSING_INFORMATION_IDENTIFIED,
+        EventType.OUTCOME_ASSESSED,
+        EventType.OBJECTIVE_PROOF_OBSERVED,
+        EventType.INTERPRETATION_SUCCEEDED,
+        EventType.INTERPRETATION_FAILED,
+    }
+)
+ACTIVE_PLANNING_EVENT_TYPES = frozenset(
+    {
+        EventType.PLAN_REQUESTED,
+        EventType.FRONTIER_PROPOSED,
+        EventType.FRONTIER_CRITICIZED,
+        EventType.FRONTIER_REPAIRED,
+        EventType.FRONTIER_REJECTED,
+        EventType.PLANNING_GAP_RECORDED,
+        EventType.STRATEGY_RECONCILED,
+        EventType.STRATEGY_ARCHIVED,
+        EventType.STRATEGY_REACTIVATED,
+        EventType.RESEARCH_QUERY_PROPOSED,
+        EventType.RESEARCH_SOURCE_CONSULTED,
+        EventType.RESEARCH_SOURCE_ASSESSED,
+    }
+)
+PLANNING_EVENT_TYPES = SETTLEMENT_BOOKKEEPING_EVENT_TYPES | ACTIVE_PLANNING_EVENT_TYPES
+
 
 RESUMABLE_STATUSES = frozenset(
     {
@@ -107,6 +158,8 @@ _ACTIVE_EFFECTS = frozenset(
         LifecycleEffect.TOOL_START,
         LifecycleEffect.TOOL_TERMINAL,
         LifecycleEffect.BOOKKEEPING,
+        LifecycleEffect.SETTLEMENT_BOOKKEEPING,
+        LifecycleEffect.ACTIVE_PLANNING,
         LifecycleEffect.CLOSURE_REQUEST,
         LifecycleEffect.ABANDON,
     }
@@ -117,6 +170,7 @@ _CLOSING_EFFECTS = frozenset(
         LifecycleEffect.CONTROL_PLANE,
         LifecycleEffect.TOOL_TERMINAL,
         LifecycleEffect.BOOKKEEPING,
+        LifecycleEffect.SETTLEMENT_BOOKKEEPING,
         LifecycleEffect.CLOSURE_CANCEL,
         LifecycleEffect.REOPEN,
         LifecycleEffect.ABANDON,
@@ -128,19 +182,19 @@ _ABANDONED_EFFECTS = frozenset(
         LifecycleEffect.CONTROL_PLANE,
         LifecycleEffect.TOOL_TERMINAL,
         LifecycleEffect.BOOKKEEPING,
+        LifecycleEffect.SETTLEMENT_BOOKKEEPING,
         LifecycleEffect.REOPEN,
     }
 )
 _CLOSED_EFFECTS = frozenset(
     {
         LifecycleEffect.CONTROL_PLANE,
+        LifecycleEffect.SETTLEMENT_BOOKKEEPING,
         LifecycleEffect.REOPEN,
     }
 )
 
-STATUS_LIFECYCLE_MATRIX: Mapping[
-    EngagementStatus, frozenset[LifecycleEffect]
-] = MappingProxyType(
+STATUS_LIFECYCLE_MATRIX: Mapping[EngagementStatus, frozenset[LifecycleEffect]] = MappingProxyType(
     {
         EngagementStatus.ACTIVE: _ACTIVE_EFFECTS,
         EngagementStatus.CLOSING: _CLOSING_EFFECTS,
@@ -162,9 +216,7 @@ _BOUND_LANE_TYPES = frozenset(
         EventType.CONTROL_TOOL_INVOKED,
     }
 )
-_ATOMIC_RESTART_ERROR = (
-    "closure_cancelled must be immediately followed by tool_call_started"
-)
+_ATOMIC_RESTART_ERROR = "closure_cancelled must be immediately followed by tool_call_started"
 
 
 def _canonical_event_hash(item: JournalEvent) -> str:
@@ -240,18 +292,12 @@ class _Accumulator:
                     "closure cancellation must cite the current closure barrier"
                 )
 
-        if (
-            self.operational_restart_required
-            and item.type is not EventType.TOOL_CALL_STARTED
-        ):
+        if self.operational_restart_required and item.type is not EventType.TOOL_CALL_STARTED:
             raise EngagementReplayError(_ATOMIC_RESTART_ERROR)
 
         effect = EVENT_LIFECYCLE_EFFECTS[item.type]
         if effect not in STATUS_LIFECYCLE_MATRIX[self.status]:
-            if (
-                self.status is EngagementStatus.CLOSING
-                and item.type is EventType.TOOL_CALL_STARTED
-            ):
+            if self.status is EngagementStatus.CLOSING and item.type is EventType.TOOL_CALL_STARTED:
                 raise EngagementReplayError(
                     "closure must be cancelled before a new operational call starts"
                 )
@@ -291,6 +337,8 @@ class _Accumulator:
             EventType.UNCERTAIN_CORRELATION: self._apply_inert,
             EventType.USER_NOTE: self._apply_inert,
         }.get(item.type)
+        if item.type in PLANNING_EVENT_TYPES:
+            handler = self._apply_inert
         if handler is None:
             raise EngagementReplayError(f"unsupported event type: {item.type.value}")
         handler(item)
@@ -398,9 +446,7 @@ class _Accumulator:
             raise EngagementReplayError("closure request payload is invalid")
         expected_calls = tuple(
             sorted(
-                call_id
-                for call_id, call in self.calls.items()
-                if call.terminal_sequence is None
+                call_id for call_id, call in self.calls.items() if call.terminal_sequence is None
             )
         )
         if (
@@ -448,14 +494,10 @@ class _Accumulator:
             LaneBinding(lane=lane, engagement_id=self.manifest.engagement_id)
             for _, lane in sorted(self.bound_lanes.items())
         )
-        decisions = tuple(
-            decision for _, decision in sorted(self.active_decisions.items())
-        )
+        decisions = tuple(decision for _, decision in sorted(self.active_decisions.items()))
         in_flight_call_ids = tuple(
             sorted(
-                call_id
-                for call_id, call in self.calls.items()
-                if call.terminal_sequence is None
+                call_id for call_id, call in self.calls.items() if call.terminal_sequence is None
             )
         )
         closure_ready = self.closure is not None and all(

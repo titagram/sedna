@@ -311,9 +311,7 @@ class SessionFinalizedPayload(_Payload):
         "not_configured", "complete", "incomplete", "failed", "unavailable"
     ] = "not_configured"
     pending_range_count: StrictInt = Field(default=0, ge=0, le=MAX_SETTLEMENT_PENDING_RANGES)
-    next_pending_offset: StrictInt | None = Field(
-        default=None, ge=0, le=MAX_EVIDENCE_ITEM_BYTES
-    )
+    next_pending_offset: StrictInt | None = Field(default=None, ge=0, le=MAX_EVIDENCE_ITEM_BYTES)
     next_pending_subject: PendingSubjectCursor | None = None
     pending_inventory_sha256: Sha256Hex | None = None
     safe_code: SettlementSafeCode | None = None
@@ -333,8 +331,7 @@ class SessionFinalizedPayload(_Payload):
             if (
                 self.pending_range_count <= 0
                 or self.pending_inventory_sha256 is None
-                or self.safe_code
-                not in {"evidence_budget_exhausted", "interpretation_incomplete"}
+                or self.safe_code not in {"evidence_budget_exhausted", "interpretation_incomplete"}
             ):
                 raise ValueError("incomplete settlement requires bounded pending inventory")
         elif self.settlement_status == "failed":
@@ -568,6 +565,962 @@ class UserNotePayload(_Payload):
     note: Annotated[str, Field(min_length=1, max_length=8192)]
 
 
+PrivateText: TypeAlias = Annotated[str, Field(min_length=1, max_length=4096)]
+ConditionText: TypeAlias = Annotated[str, Field(min_length=1, max_length=512)]
+MediaType: TypeAlias = Annotated[str, Field(min_length=1, max_length=255)]
+StableRef: TypeAlias = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=512,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,511}$",
+    ),
+]
+Confidence: TypeAlias = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
+
+
+class _EventRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    @model_validator(mode="after")
+    def normalize_bounded_tuples(self) -> _EventRecord:
+        for name in type(self).model_fields:
+            value = getattr(self, name)
+            if not isinstance(value, tuple):
+                continue
+            keyed = tuple(
+                (
+                    json.dumps(item.model_dump(mode="json"), sort_keys=True)
+                    if isinstance(item, BaseModel)
+                    else str(item),
+                    item,
+                )
+                for item in value
+            )
+            keys = tuple(key for key, _ in keyed)
+            if len(keys) != len(set(keys)):
+                raise ValueError(f"{name} must be unique")
+            object.__setattr__(self, name, tuple(item for _, item in sorted(keyed)))
+        return self
+
+
+class _PlanningEventPayload(_Payload):
+    @model_validator(mode="after")
+    def validate_planning_payload_size(self) -> _PlanningEventPayload:
+        encoded = json.dumps(
+            self.model_dump(mode="json", warnings="error"),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if len(encoded) > 64 * 1024:
+            raise ValueError("canonical planning payload exceeds 64 KiB")
+        return self
+
+
+class EvidenceSliceEventRef(_EventRecord):
+    evidence_id: EvidenceId
+    start: Annotated[int, Field(ge=0)]
+    end: Annotated[int, Field(gt=0)]
+    sha256: Sha256Hex
+    media_type: MediaType
+
+    @model_validator(mode="after")
+    def validate_range(self) -> EvidenceSliceEventRef:
+        if not 0 < self.end - self.start <= 32 * 1024:
+            raise ValueError("evidence slice range exceeds its bound")
+        return self
+
+
+class TextFactEventRecord(_EventRecord):
+    record_kind: Literal["text_fact"] = "text_fact"
+    subject: ConditionText
+    value: PrivateText
+    polarity: Literal["observed", "not_observed"] = "observed"
+
+
+class FacetObservationEventRecord(_EventRecord):
+    record_kind: Literal["facet"] = "facet"
+    dimension: Literal[
+        "os_family",
+        "os_version",
+        "cpu_architecture",
+        "execution_environment",
+        "service",
+        "port",
+        "protocol",
+        "technology",
+        "network_position",
+        "security_control",
+        "custom",
+    ]
+    key: ConditionText
+    value: Annotated[str, Field(min_length=1, max_length=2048)]
+    relation: Literal["observed", "compatible", "incompatible", "unknown"]
+
+
+class AccessStateDeltaEventRecord(_EventRecord):
+    record_kind: Literal["access_state_delta"] = "access_state_delta"
+    scope_reference_id: Annotated[str, Field(pattern=r"^scope-[0-9a-f]{32}$")]
+    access_kind: Literal[
+        "network_reachability",
+        "service_access",
+        "authenticated_session",
+        "shell",
+        "user",
+        "administrator",
+        "root",
+        "custom",
+    ]
+    transition: Literal["gained", "lost", "confirmed", "denied", "unknown"]
+    principal_label: ConditionText | None = None
+    service_ref: Annotated[str, Field(min_length=1, max_length=512)] | None = None
+    privilege_label: ConditionText | None = None
+
+
+class PrivateValueEventRecord(_EventRecord):
+    evidence_slice: EvidenceSliceEventRef
+    value_sha256: Sha256Hex
+
+    @model_validator(mode="after")
+    def validate_value_digest(self) -> PrivateValueEventRecord:
+        if self.value_sha256 != self.evidence_slice.sha256:
+            raise ValueError("private value digest must match its evidence slice")
+        return self
+
+
+class SecretReferenceEventRecord(_EventRecord):
+    record_kind: Literal["secret_reference"] = "secret_reference"
+    secret_ref_id: Annotated[str, Field(min_length=1, max_length=512)]
+    secret_kind: Literal[
+        "username",
+        "password",
+        "token",
+        "hash",
+        "private_key",
+        "cookie",
+        "flag_candidate",
+        "other",
+    ]
+    label: ConditionText
+    value: PrivateValueEventRecord
+    scope_reference_ids: Annotated[
+        tuple[Annotated[str, Field(pattern=r"^scope-[0-9a-f]{32}$")], ...],
+        Field(max_length=8),
+    ] = ()
+    service_ref: Annotated[str, Field(min_length=1, max_length=512)] | None = None
+    username_ref: Annotated[str, Field(min_length=1, max_length=512)] | None = None
+    origin: Literal["engagement_evidence"] = "engagement_evidence"
+
+    @field_validator("scope_reference_ids")
+    @classmethod
+    def normalize_scope_reference_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("scope_reference_ids must be unique")
+        return tuple(sorted(value))
+
+
+class IncompatibilityObservationEventRecord(_EventRecord):
+    record_kind: Literal["incompatibility"] = "incompatibility"
+    subject_ref: StableRef
+    reason: Annotated[str, Field(min_length=1, max_length=2048)]
+    scope_reference_ids: Annotated[
+        tuple[Annotated[str, Field(pattern=r"^scope-[0-9a-f]{32}$")], ...],
+        Field(max_length=8),
+    ] = ()
+    event_refs: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=32)]
+    knowledge_refs: Annotated[tuple[StableRef, ...], Field(max_length=16)] = ()
+
+    @field_validator("scope_reference_ids", "event_refs", "knowledge_refs")
+    @classmethod
+    def normalize_unique_tuple(cls, value: tuple[object, ...]) -> tuple[object, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("references must be unique")
+        return tuple(sorted(value, key=str))
+
+
+ExtractedObservationEventRecord: TypeAlias = Annotated[
+    TextFactEventRecord
+    | FacetObservationEventRecord
+    | AccessStateDeltaEventRecord
+    | SecretReferenceEventRecord
+    | IncompatibilityObservationEventRecord,
+    Field(discriminator="record_kind"),
+]
+
+
+class ObservationExtractedEventPayload(_PlanningEventPayload):
+    kind: Literal["observation_extracted"] = "observation_extracted"
+    summary: PrivateText
+    observation: ExtractedObservationEventRecord
+    confidence: Confidence
+    evidence_slices: Annotated[
+        tuple[EvidenceSliceEventRef, ...], Field(min_length=1, max_length=64)
+    ]
+    scope_reference_ids: Annotated[
+        tuple[Annotated[str, Field(pattern=r"^scope-[0-9a-f]{32}$")], ...],
+        Field(max_length=16),
+    ] = ()
+    interpretation_input_digest: Sha256Hex
+
+    @field_validator("scope_reference_ids")
+    @classmethod
+    def normalize_scope_reference_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("scope_reference_ids must be unique")
+        return tuple(sorted(value))
+
+    @model_validator(mode="after")
+    def validate_nested_references(self) -> ObservationExtractedEventPayload:
+        if (
+            isinstance(self.observation, AccessStateDeltaEventRecord)
+            and self.observation.scope_reference_id not in self.scope_reference_ids
+        ):
+            raise ValueError("nested scope must occur in scope_reference_ids")
+        if isinstance(self.observation, SecretReferenceEventRecord):
+            if not set(self.observation.scope_reference_ids).issubset(self.scope_reference_ids):
+                raise ValueError("nested scopes must occur in scope_reference_ids")
+            if self.observation.value.evidence_slice not in self.evidence_slices:
+                raise ValueError("private value slice must occur in evidence_slices")
+        if isinstance(self.observation, IncompatibilityObservationEventRecord) and not set(
+            self.observation.scope_reference_ids
+        ).issubset(self.scope_reference_ids):
+            raise ValueError("nested scopes must occur in scope_reference_ids")
+        return self
+
+
+class HypothesisFormedEventPayload(_PlanningEventPayload):
+    kind: Literal["hypothesis_formed"] = "hypothesis_formed"
+    statement: PrivateText
+    confidence: Confidence
+    supporting_event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=32)]
+    contradicting_event_ids: Annotated[tuple[UUID, ...], Field(max_length=32)] = ()
+    scope_reference_ids: Annotated[
+        tuple[Annotated[str, Field(pattern=r"^scope-[0-9a-f]{32}$")], ...],
+        Field(max_length=16),
+    ] = ()
+    interpretation_input_digest: Sha256Hex
+
+    @field_validator("supporting_event_ids", "contradicting_event_ids", "scope_reference_ids")
+    @classmethod
+    def normalize_unique_tuple(cls, value: tuple[object, ...]) -> tuple[object, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("references must be unique")
+        return tuple(sorted(value, key=str))
+
+    @model_validator(mode="after")
+    def validate_event_sets(self) -> HypothesisFormedEventPayload:
+        if set(self.supporting_event_ids) & set(self.contradicting_event_ids):
+            raise ValueError("supporting and contradicting event ids must be disjoint")
+        return self
+
+
+class MissingInformationIdentifiedEventPayload(_PlanningEventPayload):
+    kind: Literal["missing_information_identified"] = "missing_information_identified"
+    question: Annotated[str, Field(min_length=1, max_length=2048)]
+    reason: PrivateText
+    importance: Annotated[int, Field(ge=0, le=100)]
+    related_event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=32)]
+    scope_reference_ids: Annotated[
+        tuple[Annotated[str, Field(pattern=r"^scope-[0-9a-f]{32}$")], ...],
+        Field(max_length=16),
+    ] = ()
+    interpretation_input_digest: Sha256Hex
+
+    @field_validator("related_event_ids", "scope_reference_ids")
+    @classmethod
+    def normalize_unique_tuple(cls, value: tuple[object, ...]) -> tuple[object, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("references must be unique")
+        return tuple(sorted(value, key=str))
+
+
+class OutcomeAssessedEventPayload(_PlanningEventPayload):
+    kind: Literal["outcome_assessed"] = "outcome_assessed"
+    attachment_event_id: UUID
+    terminal_tool_event_id: UUID
+    decision_id: UUID | None = None
+    tool_call_ids: Annotated[tuple[StableRef, ...], Field(min_length=1, max_length=32)]
+    category: Literal[
+        "progress",
+        "partial_progress",
+        "no_effect",
+        "negative_evidence",
+        "incompatible",
+        "execution_error",
+        "ambiguous",
+    ]
+    summary: PrivateText
+    strategic_impact: PrivateText
+    evidence_ids: Annotated[tuple[EvidenceId, ...], Field(max_length=64)] = ()
+    source_event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=64)]
+    interpretation_input_digest: Sha256Hex
+
+    @field_validator("tool_call_ids", "evidence_ids", "source_event_ids")
+    @classmethod
+    def normalize_unique_tuple(cls, value: tuple[object, ...]) -> tuple[object, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("references must be unique")
+        return tuple(sorted(value, key=str))
+
+
+class PlanningCallMetadataEventRecord(_EventRecord):
+    purpose: Literal["observe", "plan", "critic", "repair"]
+    provider: Annotated[str, Field(min_length=1, max_length=256)]
+    model: Annotated[str, Field(min_length=1, max_length=256)]
+    agent_id: Annotated[str, Field(min_length=1, max_length=256)]
+    prompt_id: StableRef
+    prompt_version: StableRef
+    response_schema_version: StableRef
+    input_digest: Sha256Hex
+    input_tokens: Annotated[int, Field(ge=0)]
+    output_tokens: Annotated[int, Field(ge=0)]
+    elapsed_ms: Annotated[int, Field(ge=0)]
+
+
+class RetryPredicateEventRecord(_EventRecord):
+    predicate_id: StableRef
+    kind: Literal[
+        "fact_present",
+        "fact_changed",
+        "prerequisite_satisfied",
+        "evidence_category_present",
+        "credential_available",
+        "state_revision_after",
+    ]
+    subject_ref: StableRef
+    expected_symbolic_value: StableRef | None = None
+    expected_value_digest: Sha256Hex | None = None
+    minimum_material_revision: JournalRevision | None = None
+    description: ConditionText
+
+    @model_validator(mode="after")
+    def validate_kind_fields(self) -> RetryPredicateEventRecord:
+        required = {
+            "fact_changed": self.expected_value_digest is not None,
+            "evidence_category_present": self.expected_symbolic_value is not None,
+            "state_revision_after": self.minimum_material_revision is not None,
+        }
+        if self.kind in required and not required[self.kind]:
+            raise ValueError("retry predicate required field is missing")
+        if self.kind == "credential_available" and any(
+            value is not None
+            for value in (
+                self.expected_symbolic_value,
+                self.expected_value_digest,
+                self.minimum_material_revision,
+            )
+        ):
+            raise ValueError("credential predicate carries only a symbolic subject")
+        return self
+
+
+class StrategyApplicabilityEventRecord(_EventRecord):
+    dimension: Literal[
+        "os_family",
+        "os_version",
+        "cpu_architecture",
+        "execution_environment",
+        "service",
+        "access_state",
+        "network_position",
+        "custom",
+    ]
+    relation: Literal["required", "compatible", "incompatible", "unknown"]
+    value: ConditionText
+    event_refs: Annotated[tuple[UUID, ...], Field(max_length=32)] = ()
+    knowledge_refs: Annotated[tuple[StableRef, ...], Field(max_length=16)] = ()
+
+    @model_validator(mode="after")
+    def require_grounding(self) -> StrategyApplicabilityEventRecord:
+        if self.relation != "unknown" and not (self.event_refs or self.knowledge_refs):
+            raise ValueError("non-unknown applicability requires grounding")
+        return self
+
+
+OutcomeValue: TypeAlias = Literal[
+    "progress",
+    "partial_progress",
+    "no_effect",
+    "negative_evidence",
+    "incompatible",
+    "execution_error",
+    "ambiguous",
+]
+StrategyStatusValue: TypeAlias = Literal[
+    "available",
+    "deferred",
+    "blocked",
+    "exhausted",
+    "completed",
+    "archived",
+    "superseded",
+]
+ReconciliationOperationValue: TypeAlias = Literal[
+    "retain",
+    "update",
+    "merge",
+    "split",
+    "supersede",
+    "complete",
+    "block",
+    "archive",
+    "reactivate",
+]
+
+
+class AttemptOutcomeCountEventRecord(_EventRecord):
+    category: OutcomeValue
+    count: Annotated[int, Field(ge=0)]
+
+
+class AttemptAggregateEventRecord(_EventRecord):
+    total_count: Annotated[int, Field(ge=0)]
+    recent_attempt_ids: Annotated[tuple[UUID, ...], Field(max_length=8)] = ()
+    outcome_counts: Annotated[tuple[AttemptOutcomeCountEventRecord, ...], Field(max_length=7)] = ()
+    first_material_revision: JournalRevision | None = None
+    last_material_revision: JournalRevision | None = None
+    history_digest: Sha256Hex
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> AttemptAggregateEventRecord:
+        if sum(item.count for item in self.outcome_counts) != self.total_count:
+            raise ValueError("outcome counts must equal total_count")
+        has_revisions = (
+            self.first_material_revision is not None and self.last_material_revision is not None
+        )
+        if (self.total_count > 0) != has_revisions:
+            raise ValueError("attempt revisions must match total_count")
+        return self
+
+
+class CommandPlaceholderEventRecord(_EventRecord):
+    name: Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
+    kind: Literal[
+        "target",
+        "port",
+        "username",
+        "credential_ref",
+        "source_case_credential",
+        "wordlist",
+        "path",
+        "value",
+    ]
+    binding_policy: Literal["authorized_scope", "host_supplied", "never_auto_bind"]
+    role: ConditionText
+
+
+class CommandBindingEventRecord(_EventRecord):
+    placeholder_name: Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
+    source: Literal[
+        "scope_reference",
+        "secret_reference",
+        "host_supplied",
+        "unresolved_source_case",
+    ]
+    reference_id: StableRef | None = None
+
+    @model_validator(mode="after")
+    def validate_reference(self) -> CommandBindingEventRecord:
+        if self.source == "unresolved_source_case" and self.reference_id is not None:
+            raise ValueError("unresolved source-case binding cannot carry a reference")
+        if self.source != "unresolved_source_case" and self.reference_id is None:
+            raise ValueError("resolved command binding requires a reference")
+        if self.source == "scope_reference" and (
+            self.reference_id is None or not self.reference_id.startswith("scope-")
+        ):
+            raise ValueError("scope binding requires a scope reference")
+        return self
+
+
+class CommandSuggestionEventRecord(_EventRecord):
+    command_id: UUID
+    origin: Literal["source_example", "model_generated", "host_adapted"]
+    capability_hint: StableRef
+    purpose: ConditionText
+    command_template: Annotated[str, Field(min_length=1, max_length=8192)]
+    placeholders: Annotated[tuple[CommandPlaceholderEventRecord, ...], Field(max_length=32)] = ()
+    bindings: Annotated[tuple[CommandBindingEventRecord, ...], Field(max_length=32)] = ()
+    rendered_preview: Annotated[str, Field(min_length=1, max_length=8192)]
+    source_example_id: StableRef | None = None
+    knowledge_refs: Annotated[tuple[StableRef, ...], Field(max_length=16)] = ()
+    requires_validation: Literal[True] = True
+    validation_note: ConditionText
+
+    @model_validator(mode="after")
+    def validate_command_shape(self) -> CommandSuggestionEventRecord:
+        names = {item.name for item in self.placeholders}
+        binding_names = {item.placeholder_name for item in self.bindings}
+        if names != binding_names:
+            raise ValueError("command placeholders and bindings must have exact coverage")
+        if (self.origin == "source_example") != (self.source_example_id is not None):
+            raise ValueError("source example identity must match command origin")
+        if any(item.kind == "source_case_credential" for item in self.placeholders):
+            source_case_names = {
+                item.name for item in self.placeholders if item.kind == "source_case_credential"
+            }
+            for binding in self.bindings:
+                if (
+                    binding.placeholder_name in source_case_names
+                    and binding.source != "unresolved_source_case"
+                ):
+                    raise ValueError("source-case credentials cannot be bound")
+        return self
+
+
+class ExecutionVariantEventRecord(_EventRecord):
+    record_kind: Literal["execution_variant"] = "execution_variant"
+    variant_id: UUID
+    family_id: UUID
+    stable_key: StableRef
+    title: Annotated[str, Field(min_length=1, max_length=2048)]
+    strategic_intent: Annotated[str, Field(min_length=1, max_length=2048)]
+    rationale: Annotated[str, Field(min_length=1, max_length=2048)]
+    score: Annotated[int, Field(ge=0, le=100)]
+    confidence: Confidence
+    status: StrategyStatusValue
+    prerequisites: Annotated[tuple[ConditionText, ...], Field(max_length=16)] = ()
+    applicability: Annotated[
+        tuple[StrategyApplicabilityEventRecord, ...], Field(max_length=16)
+    ] = ()
+    retry_predicates: Annotated[tuple[RetryPredicateEventRecord, ...], Field(max_length=16)] = ()
+    attempts: AttemptAggregateEventRecord
+    evidence_event_ids: Annotated[tuple[UUID, ...], Field(max_length=64)] = ()
+    knowledge_refs: Annotated[tuple[StableRef, ...], Field(max_length=32)] = ()
+    supersedes_variant_ids: Annotated[tuple[UUID, ...], Field(max_length=16)] = ()
+    last_material_revision: JournalRevision
+
+
+class StrategyFamilyEventRecord(_EventRecord):
+    record_kind: Literal["strategy_family"] = "strategy_family"
+    family_id: UUID
+    stable_key: StableRef
+    title: Annotated[str, Field(min_length=1, max_length=2048)]
+    strategic_intent: Annotated[str, Field(min_length=1, max_length=2048)]
+    rationale: Annotated[str, Field(min_length=1, max_length=2048)]
+    score: Annotated[int, Field(ge=0, le=100)]
+    confidence: Confidence
+    status: StrategyStatusValue
+    prerequisites: Annotated[tuple[ConditionText, ...], Field(max_length=16)] = ()
+    applicability: Annotated[
+        tuple[StrategyApplicabilityEventRecord, ...], Field(max_length=16)
+    ] = ()
+    retry_predicates: Annotated[tuple[RetryPredicateEventRecord, ...], Field(max_length=16)] = ()
+    variant_ids: Annotated[tuple[UUID, ...], Field(max_length=64)] = ()
+    evidence_event_ids: Annotated[tuple[UUID, ...], Field(max_length=64)] = ()
+    knowledge_refs: Annotated[tuple[StableRef, ...], Field(max_length=32)] = ()
+    supersedes_family_ids: Annotated[tuple[UUID, ...], Field(max_length=8)] = ()
+    last_material_revision: JournalRevision
+
+
+class StrategyTombstoneEventRecord(_EventRecord):
+    record_kind: Literal["strategy_tombstone"] = "strategy_tombstone"
+    entity_kind: Literal["family", "variant"]
+    entity_id: UUID
+    replacement_ids: Annotated[tuple[UUID, ...], Field(max_length=16)] = ()
+    reason: Annotated[str, Field(min_length=1, max_length=2048)]
+
+
+StrategyResultSnapshot: TypeAlias = Annotated[
+    StrategyFamilyEventRecord | ExecutionVariantEventRecord | StrategyTombstoneEventRecord,
+    Field(discriminator="record_kind"),
+]
+
+
+class FrontierProposalEventRecord(_EventRecord):
+    proposal_id: UUID
+    rank: Annotated[int, Field(ge=1, le=8)]
+    family_id: UUID | None = None
+    variant_id: UUID | None = None
+    title: Annotated[str, Field(min_length=1, max_length=2048)]
+    strategic_intent: Annotated[str, Field(min_length=1, max_length=2048)]
+    rationale: Annotated[str, Field(min_length=1, max_length=2048)]
+    score: Annotated[int, Field(ge=0, le=100)]
+    confidence: Confidence
+    prerequisites: Annotated[tuple[ConditionText, ...], Field(max_length=16)] = ()
+    expected_information_gain: Annotated[str, Field(min_length=1, max_length=2048)]
+    expected_evidence: Annotated[tuple[ConditionText, ...], Field(max_length=16)] = ()
+    stop_conditions: Annotated[tuple[ConditionText, ...], Field(max_length=16)] = ()
+    event_refs: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=32)]
+    knowledge_refs: Annotated[tuple[StableRef, ...], Field(max_length=16)] = ()
+    scope_reference_ids: Annotated[
+        tuple[Annotated[str, Field(pattern=r"^scope-[0-9a-f]{32}$")], ...], Field(max_length=8)
+    ] = ()
+    commands: Annotated[tuple[CommandSuggestionEventRecord, ...], Field(max_length=1)] = ()
+
+    @model_validator(mode="after")
+    def validate_ancestry_and_commands(self) -> FrontierProposalEventRecord:
+        if self.variant_id is not None and self.family_id is None:
+            raise ValueError("variant proposal requires family ancestry")
+        if any(command.origin == "host_adapted" for command in self.commands):
+            raise ValueError("planner frontier cannot persist host-adapted commands")
+        return self
+
+
+class ArchivedStrategyEventRecord(_EventRecord):
+    archive_entry_id: UUID
+    snapshot: Annotated[
+        StrategyFamilyEventRecord | ExecutionVariantEventRecord, Field(discriminator="record_kind")
+    ]
+    archive_reason: Annotated[str, Field(min_length=1, max_length=2048)]
+    retry_predicates: Annotated[tuple[RetryPredicateEventRecord, ...], Field(max_length=16)] = ()
+    archive_summary: PrivateText
+    archived_at_material_revision: JournalRevision
+    source_reconciliation_event_id: UUID
+    archive_entry_digest: Sha256Hex
+
+
+class StrategyReconciliationEventOperation(_EventRecord):
+    operation_id: UUID
+    operation: ReconciliationOperationValue
+    family_id: UUID
+    variant_id: UUID | None = None
+    related_family_ids: Annotated[tuple[UUID, ...], Field(max_length=8)] = ()
+    related_variant_ids: Annotated[tuple[UUID, ...], Field(max_length=16)] = ()
+    reason: Annotated[str, Field(min_length=1, max_length=2048)]
+    evidence_event_ids: Annotated[tuple[UUID, ...], Field(max_length=64)] = ()
+    knowledge_refs: Annotated[tuple[StableRef, ...], Field(max_length=32)] = ()
+
+    @model_validator(mode="after")
+    def validate_grounding(self) -> StrategyReconciliationEventOperation:
+        if self.operation != "retain" and not (self.evidence_event_ids or self.knowledge_refs):
+            raise ValueError("semantic reconciliation change requires grounding")
+        return self
+
+
+class ObjectiveProofObservedEventPayload(_PlanningEventPayload):
+    kind: Literal["objective_proof_observed"] = "objective_proof_observed"
+    proof_requirement_id: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")]
+    assessment_generation: Annotated[int, Field(ge=1)]
+    assessment: Literal["supported", "contradicted"]
+    candidate_value: PrivateValueEventRecord
+    confidence: Confidence
+    evidence_ids: Annotated[tuple[EvidenceId, ...], Field(min_length=1, max_length=16)]
+    source_event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=32)]
+    interpretation_input_digest: Sha256Hex
+
+    @model_validator(mode="after")
+    def validate_candidate_evidence(self) -> ObjectiveProofObservedEventPayload:
+        if self.candidate_value.evidence_slice.evidence_id not in self.evidence_ids:
+            raise ValueError("candidate evidence slice must occur in evidence_ids")
+        return self
+
+
+class InterpretationSucceededEventPayload(_PlanningEventPayload):
+    kind: Literal["interpretation_succeeded"] = "interpretation_succeeded"
+    interpretation_id: UUID
+    attachment_event_id: UUID
+    terminal_tool_event_id: UUID | None = None
+    evidence_id: EvidenceId
+    covered_slices: Annotated[tuple[EvidenceSliceEventRef, ...], Field(max_length=64)]
+    emitted_event_ids: Annotated[tuple[UUID, ...], Field(max_length=64)]
+    call_metadata: PlanningCallMetadataEventRecord
+    call_input_digest: Sha256Hex
+    call_output_digest: Sha256Hex
+
+    @model_validator(mode="after")
+    def validate_slice_evidence(self) -> InterpretationSucceededEventPayload:
+        if any(item.evidence_id != self.evidence_id for item in self.covered_slices):
+            raise ValueError("covered slices must use evidence_id")
+        return self
+
+
+class InterpretationFailedEventPayload(_PlanningEventPayload):
+    kind: Literal["interpretation_failed"] = "interpretation_failed"
+    interpretation_id: UUID
+    attachment_event_id: UUID
+    terminal_tool_event_id: UUID | None = None
+    evidence_id: EvidenceId
+    attempted_slices: Annotated[tuple[EvidenceSliceEventRef, ...], Field(max_length=64)]
+    failure_code: Literal[
+        "llm_unavailable",
+        "invalid_structured_output",
+        "reference_validation_failed",
+        "concurrent_state_change",
+        "unsupported_media",
+    ]
+    retryable: bool
+    safe_summary: Annotated[str, Field(min_length=1, max_length=2048)]
+    call_metadata: PlanningCallMetadataEventRecord | None = None
+    call_input_digest: Sha256Hex
+
+    @model_validator(mode="after")
+    def validate_failure_policy(self) -> InterpretationFailedEventPayload:
+        unsupported = self.failure_code == "unsupported_media"
+        if unsupported:
+            if self.retryable or self.attempted_slices or self.call_metadata is not None:
+                raise ValueError("unsupported_media must be terminal without an LLM call")
+        elif not self.retryable or not self.attempted_slices:
+            raise ValueError("interpretation failures require retryable positive slices")
+        if any(item.evidence_id != self.evidence_id for item in self.attempted_slices):
+            raise ValueError("attempted slices must use evidence_id")
+        return self
+
+
+class PlanRequestedEventPayload(_PlanningEventPayload):
+    kind: Literal["plan_requested"] = "plan_requested"
+    request_id: UUID
+    lane_key: Annotated[str, Field(pattern=r"^lane-[0-9a-f]{32}$")]
+    situation_digest: Sha256Hex
+    material_event_revision: JournalRevision
+    input_ledger_digest: Sha256Hex
+    canonical_revision: Sha256Hex
+    source_registry_digest: Sha256Hex
+    max_proposals: Annotated[int, Field(ge=3, le=8)]
+    request_digest: Sha256Hex
+
+    @model_validator(mode="after")
+    def validate_request_digest(self) -> PlanRequestedEventPayload:
+        canonical = self.model_dump(
+            mode="json", exclude={"kind", "request_digest"}, warnings="error"
+        )
+        expected = sha256(
+            json.dumps(
+                canonical,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if self.request_digest != expected:
+            raise ValueError("request_digest does not match canonical request")
+        return self
+
+
+class FrontierProposedEventPayload(_PlanningEventPayload):
+    kind: Literal["frontier_proposed"] = "frontier_proposed"
+    request_id: UUID
+    frontier_id: UUID
+    proposal_ordinal: Annotated[int, Field(ge=1, le=8)]
+    proposal_count: Annotated[int, Field(ge=1, le=8)]
+    proposal: FrontierProposalEventRecord
+    situation_digest: Sha256Hex
+    input_ledger_digest: Sha256Hex
+    knowledge_context_digest: Sha256Hex
+    draft_digest: Sha256Hex
+    call_metadata: PlanningCallMetadataEventRecord
+    planner_call_digest: Sha256Hex
+
+    @model_validator(mode="after")
+    def validate_ordinal(self) -> FrontierProposedEventPayload:
+        if (
+            self.proposal_ordinal > self.proposal_count
+            or self.proposal.rank != self.proposal_ordinal
+        ):
+            raise ValueError("proposal ordinal must match rank and count")
+        return self
+
+
+class FrontierCriticizedEventPayload(_PlanningEventPayload):
+    kind: Literal["frontier_criticized"] = "frontier_criticized"
+    request_id: UUID
+    frontier_id: UUID
+    critic_pass: Literal[1, 2]
+    accepted: bool
+    finding_codes: Annotated[
+        tuple[Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")], ...], Field(max_length=32)
+    ] = ()
+    cited_event_ids: Annotated[tuple[UUID, ...], Field(max_length=64)] = ()
+    call_metadata: PlanningCallMetadataEventRecord
+    call_input_digest: Sha256Hex
+    call_output_digest: Sha256Hex
+
+    @model_validator(mode="after")
+    def validate_acceptance(self) -> FrontierCriticizedEventPayload:
+        if self.accepted != (not self.finding_codes):
+            raise ValueError("accepted iff finding_codes is empty")
+        return self
+
+
+class FrontierRepairedEventPayload(_PlanningEventPayload):
+    kind: Literal["frontier_repaired"] = "frontier_repaired"
+    request_id: UUID
+    frontier_id: UUID
+    repair_attempt: Literal[1] = 1
+    critic_event_id: UUID
+    proposal_ordinal: Annotated[int, Field(ge=1, le=8)]
+    proposal_count: Annotated[int, Field(ge=1, le=8)]
+    proposal: FrontierProposalEventRecord
+    repaired_draft_digest: Sha256Hex
+    call_metadata: PlanningCallMetadataEventRecord
+    call_input_digest: Sha256Hex
+    call_output_digest: Sha256Hex
+
+    @model_validator(mode="after")
+    def validate_ordinal(self) -> FrontierRepairedEventPayload:
+        if (
+            self.proposal_ordinal > self.proposal_count
+            or self.proposal.rank != self.proposal_ordinal
+        ):
+            raise ValueError("proposal ordinal must match rank and count")
+        return self
+
+
+class FrontierRejectedEventPayload(_PlanningEventPayload):
+    kind: Literal["frontier_rejected"] = "frontier_rejected"
+    request_id: UUID
+    frontier_id: UUID
+    critic_event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=2)]
+    reason_codes: Annotated[
+        tuple[Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")], ...],
+        Field(min_length=1, max_length=32),
+    ]
+    rejected_draft_digest: Sha256Hex
+
+
+class PlanningGapRecordedEventPayload(_PlanningEventPayload):
+    kind: Literal["planning_gap_recorded"] = "planning_gap_recorded"
+    request_id: UUID | None = None
+    code: Literal[
+        "planner_input_too_large",
+        "journal_payload_too_large",
+        "concurrent_state_change",
+        "invalid_planner_output",
+        "llm_unavailable",
+        "critic_rejected",
+        "retrieval_unavailable",
+        "journal_unavailable",
+        "engagement_terminal",
+    ]
+    summary: Annotated[str, Field(min_length=1, max_length=2048)]
+    retryable: bool
+    situation_digest: Sha256Hex
+    ledger_digest: Sha256Hex
+    related_event_ids: Annotated[tuple[UUID, ...], Field(max_length=32)] = ()
+
+
+class StrategyReconciledEventPayload(_PlanningEventPayload):
+    kind: Literal["strategy_reconciled"] = "strategy_reconciled"
+    request_id: UUID
+    frontier_id: UUID
+    reconciliation_id: UUID
+    item_ordinal: Annotated[int, Field(ge=1, le=256)]
+    item_count: Annotated[int, Field(ge=1, le=256)]
+    input_ledger_digest: Sha256Hex
+    resulting_ledger_digest: Sha256Hex
+    operation: StrategyReconciliationEventOperation
+    resulting_snapshot: StrategyResultSnapshot
+    reconciliation_digest: Sha256Hex
+
+    @model_validator(mode="after")
+    def validate_ordinal(self) -> StrategyReconciledEventPayload:
+        if self.item_ordinal > self.item_count:
+            raise ValueError("item ordinal exceeds count")
+        return self
+
+
+class StrategyArchivedEventPayload(_PlanningEventPayload):
+    kind: Literal["strategy_archived"] = "strategy_archived"
+    request_id: UUID
+    archive_batch_id: UUID
+    entry_ordinal: Annotated[int, Field(ge=1, le=256)]
+    entry_count: Annotated[int, Field(ge=1, le=256)]
+    archive_record: ArchivedStrategyEventRecord
+    resulting_archive_digest: Sha256Hex
+
+    @model_validator(mode="after")
+    def validate_ordinal(self) -> StrategyArchivedEventPayload:
+        if self.entry_ordinal > self.entry_count:
+            raise ValueError("entry ordinal exceeds count")
+        return self
+
+
+class StrategyReactivatedEventPayload(_PlanningEventPayload):
+    kind: Literal["strategy_reactivated"] = "strategy_reactivated"
+    request_id: UUID
+    reactivation_batch_id: UUID
+    entry_ordinal: Annotated[int, Field(ge=1, le=256)]
+    entry_count: Annotated[int, Field(ge=1, le=256)]
+    source_archive_event_id: UUID
+    triggering_event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=32)]
+    matched_predicate_ids: Annotated[tuple[StableRef, ...], Field(min_length=1, max_length=16)]
+    prior_archive_entry_digest: Sha256Hex
+    resulting_archive_digest: Sha256Hex
+    restored_snapshot: Annotated[
+        StrategyFamilyEventRecord | ExecutionVariantEventRecord, Field(discriminator="record_kind")
+    ]
+
+    @model_validator(mode="after")
+    def validate_ordinal(self) -> StrategyReactivatedEventPayload:
+        if self.entry_ordinal > self.entry_count:
+            raise ValueError("entry ordinal exceeds count")
+        return self
+
+
+class ResearchQueryProposedEventPayload(_PlanningEventPayload):
+    kind: Literal["research_query_proposed"] = "research_query_proposed"
+    query_id: UUID
+    normalized_query: Annotated[str, Field(min_length=1, max_length=2048)]
+    query_digest: Sha256Hex
+    policy_decision: Literal["allowed", "rejected"]
+    policy_version: StableRef
+    reason_codes: Annotated[
+        tuple[Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")], ...],
+        Field(min_length=1, max_length=16),
+    ]
+    related_event_ids: Annotated[tuple[UUID, ...], Field(max_length=32)] = ()
+    candidate_source_ids: Annotated[tuple[StableRef, ...], Field(max_length=16)] = ()
+
+    @model_validator(mode="after")
+    def validate_query_digest(self) -> ResearchQueryProposedEventPayload:
+        if self.query_digest != sha256(self.normalized_query.encode("utf-8")).hexdigest():
+            raise ValueError("query_digest does not match normalized_query")
+        return self
+
+
+class ResearchSourceConsultedEventPayload(_PlanningEventPayload):
+    kind: Literal["research_source_consulted"] = "research_source_consulted"
+    query_id: UUID
+    source_id: StableRef
+    normalized_locator: Annotated[str, Field(min_length=1, max_length=2048)]
+    locator_digest: Sha256Hex
+    content_digest: Sha256Hex
+    media_type: MediaType
+    evidence_ids: Annotated[tuple[EvidenceId, ...], Field(min_length=1, max_length=16)]
+    tool_event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=16)]
+
+    @model_validator(mode="after")
+    def validate_locator_digest(self) -> ResearchSourceConsultedEventPayload:
+        if self.locator_digest != sha256(self.normalized_locator.encode("utf-8")).hexdigest():
+            raise ValueError("locator_digest does not match normalized_locator")
+        return self
+
+
+class ResearchSourceAssessedEventPayload(_PlanningEventPayload):
+    kind: Literal["research_source_assessed"] = "research_source_assessed"
+    query_id: UUID
+    source_id: StableRef
+    consulted_event_id: UUID
+    assessment: Literal["useful", "contradicted", "stale", "irrelevant", "ambiguous"]
+    confidence: Confidence
+    summary: PrivateText
+    related_event_ids: Annotated[tuple[UUID, ...], Field(min_length=1, max_length=64)]
+    assessment_digest: Sha256Hex
+    suggested_registry_status: Literal["consulted", "useful", "contradicted", "stale"] | None = None
+
+    @model_validator(mode="after")
+    def validate_consulted_reference(self) -> ResearchSourceAssessedEventPayload:
+        if self.consulted_event_id not in self.related_event_ids:
+            raise ValueError("consulted_event_id must occur in related_event_ids")
+        canonical = self.model_dump(
+            mode="json", exclude={"kind", "assessment_digest"}, warnings="error"
+        )
+        expected = sha256(
+            json.dumps(
+                canonical,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if self.assessment_digest != expected:
+            raise ValueError("assessment_digest does not match canonical assessment")
+        return self
+
+
 EventPayload: TypeAlias = Annotated[
     EngagementOpenedPayload
     | EngagementResumedPayload
@@ -596,7 +1549,26 @@ EventPayload: TypeAlias = Annotated[
     | SourceSuggestedPayload
     | RecoveryWarningPayload
     | UncertainCorrelationPayload
-    | UserNotePayload,
+    | UserNotePayload
+    | ObservationExtractedEventPayload
+    | HypothesisFormedEventPayload
+    | MissingInformationIdentifiedEventPayload
+    | OutcomeAssessedEventPayload
+    | ObjectiveProofObservedEventPayload
+    | InterpretationSucceededEventPayload
+    | InterpretationFailedEventPayload
+    | PlanRequestedEventPayload
+    | FrontierProposedEventPayload
+    | FrontierCriticizedEventPayload
+    | FrontierRepairedEventPayload
+    | FrontierRejectedEventPayload
+    | PlanningGapRecordedEventPayload
+    | StrategyReconciledEventPayload
+    | StrategyArchivedEventPayload
+    | StrategyReactivatedEventPayload
+    | ResearchQueryProposedEventPayload
+    | ResearchSourceConsultedEventPayload
+    | ResearchSourceAssessedEventPayload,
     Field(discriminator="kind"),
 ]
 
@@ -630,6 +1602,25 @@ class EventType(StrEnum):
     RECOVERY_WARNING = "recovery_warning"
     UNCERTAIN_CORRELATION = "uncertain_correlation"
     USER_NOTE = "user_note"
+    OBSERVATION_EXTRACTED = "observation_extracted"
+    HYPOTHESIS_FORMED = "hypothesis_formed"
+    MISSING_INFORMATION_IDENTIFIED = "missing_information_identified"
+    OUTCOME_ASSESSED = "outcome_assessed"
+    OBJECTIVE_PROOF_OBSERVED = "objective_proof_observed"
+    INTERPRETATION_SUCCEEDED = "interpretation_succeeded"
+    INTERPRETATION_FAILED = "interpretation_failed"
+    PLAN_REQUESTED = "plan_requested"
+    FRONTIER_PROPOSED = "frontier_proposed"
+    FRONTIER_CRITICIZED = "frontier_criticized"
+    FRONTIER_REPAIRED = "frontier_repaired"
+    FRONTIER_REJECTED = "frontier_rejected"
+    PLANNING_GAP_RECORDED = "planning_gap_recorded"
+    STRATEGY_RECONCILED = "strategy_reconciled"
+    STRATEGY_ARCHIVED = "strategy_archived"
+    STRATEGY_REACTIVATED = "strategy_reactivated"
+    RESEARCH_QUERY_PROPOSED = "research_query_proposed"
+    RESEARCH_SOURCE_CONSULTED = "research_source_consulted"
+    RESEARCH_SOURCE_ASSESSED = "research_source_assessed"
 
 
 _LANE_REQUIRED_TYPES = frozenset(
@@ -664,6 +1655,25 @@ _SYSTEM_SOURCE_BY_TYPE: dict[EventType, str] = {
     EventType.ENGAGEMENT_ABANDONED: "lifecycle",
     EventType.SOURCE_SUGGESTED: "planning",
     EventType.RECOVERY_WARNING: "recovery",
+    EventType.OBSERVATION_EXTRACTED: "planning",
+    EventType.HYPOTHESIS_FORMED: "planning",
+    EventType.MISSING_INFORMATION_IDENTIFIED: "planning",
+    EventType.OUTCOME_ASSESSED: "planning",
+    EventType.OBJECTIVE_PROOF_OBSERVED: "planning",
+    EventType.INTERPRETATION_SUCCEEDED: "planning",
+    EventType.INTERPRETATION_FAILED: "planning",
+    EventType.PLAN_REQUESTED: "planning",
+    EventType.FRONTIER_PROPOSED: "planning",
+    EventType.FRONTIER_CRITICIZED: "planning",
+    EventType.FRONTIER_REPAIRED: "planning",
+    EventType.FRONTIER_REJECTED: "planning",
+    EventType.PLANNING_GAP_RECORDED: "planning",
+    EventType.STRATEGY_RECONCILED: "planning",
+    EventType.STRATEGY_ARCHIVED: "planning",
+    EventType.STRATEGY_REACTIVATED: "planning",
+    EventType.RESEARCH_QUERY_PROPOSED: "planning",
+    EventType.RESEARCH_SOURCE_CONSULTED: "planning",
+    EventType.RESEARCH_SOURCE_ASSESSED: "planning",
 }
 
 
@@ -827,9 +1837,7 @@ class EngagementSnapshot(BaseModel):
         return self
 
 
-__all__ = [
-    name for name in globals() if name.endswith("Payload") and not name.startswith("_")
-]
+__all__ = [name for name in globals() if name.endswith("Payload") and not name.startswith("_")]
 __all__ += [
     "CONTROL_TOOL_NAMES",
     "CONTROL_TOOL_POLICY_VERSION",
