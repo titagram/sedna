@@ -63,6 +63,7 @@ from sedna.engagement.normalization import (
     sanitize_host_arguments,
 )
 from sedna.engagement.repository import (
+    EngagementAppendAuthorityError,
     EngagementJournalRepository,
     ProjectionOwnershipError,
 )
@@ -119,6 +120,9 @@ EVENT_APPEND_OWNER_BY_TYPE: dict[str, str] = {
     "research_query_proposed": "planning_capability",
     "research_source_consulted": "planning_capability",
     "research_source_assessed": "planning_capability",
+    "report_generated": "report_commit_capability",
+    "engagement_closed": "report_commit_capability",
+    "report_commit_abandoned": "report_recovery_capability",
 }
 
 SettlementReason = Literal[
@@ -215,9 +219,7 @@ class EngagementListPage(BaseModel):
 class LaneBindingResolution(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
-    mode: Literal[
-        "exact", "session_unique", "linked_child_unique", "ambiguous", "unbound"
-    ]
+    mode: Literal["exact", "session_unique", "linked_child_unique", "ambiguous", "unbound"]
     engagement_id: UUID | None = None
     lane: ExecutionLaneKey | None = None
     candidates: tuple[EngagementListItem, ...] = ()
@@ -241,9 +243,7 @@ class EngagementSettlementOutcome(BaseModel):
 
     status: Literal["complete", "incomplete", "failed", "unavailable"]
     pending_range_count: int = Field(ge=0, le=MAX_SETTLEMENT_PENDING_RANGES)
-    next_pending_offset: int | None = Field(
-        default=None, ge=0, le=MAX_EVIDENCE_ITEM_BYTES
-    )
+    next_pending_offset: int | None = Field(default=None, ge=0, le=MAX_EVIDENCE_ITEM_BYTES)
     next_pending_subject: PendingSubjectCursor | None = None
     pending_inventory_sha256: Sha256Hex | None = None
     safe_code: SettlementSafeCode | None = None
@@ -255,9 +255,7 @@ class EngagementSettlementOutcome(BaseModel):
             or self.next_pending_subject is not None
             or self.pending_inventory_sha256 is not None
         )
-        if self.status == "complete" and (
-            has_pending or self.safe_code is not None
-        ):
+        if self.status == "complete" and (has_pending or self.safe_code is not None):
             raise ValueError("complete settlement carries no pending metadata")
         if self.status == "unavailable" and (
             has_pending
@@ -293,9 +291,7 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def create_operational_start_draft(
-    lane: ExecutionLaneKey, *, call_id: str
-) -> JournalEventDraft:
+def create_operational_start_draft(lane: ExecutionLaneKey, *, call_id: str) -> JournalEventDraft:
     sanitized = sanitize_host_arguments({"call_id": call_id})
     value = sanitized.value if isinstance(sanitized, BaseModel) else {}
     summary, _ = bounded_safe_argument_summary(value)
@@ -479,9 +475,7 @@ class EngagementJournalService:
 
     def _list_snapshots(self) -> tuple[EngagementSnapshot, ...]:
         identifiers = self._repository.list_snapshot_ids()
-        return tuple(
-            self._repository.load_snapshot(identifier) for identifier in identifiers
-        )
+        return tuple(self._repository.load_snapshot(identifier) for identifier in identifiers)
 
     def resume_engagement(
         self,
@@ -496,17 +490,11 @@ class EngagementJournalService:
             snapshot = self._repository.load_snapshot(engagement_id)
         else:
             snapshots = self._list_snapshots()
-            resumable = [
-                item
-                for item in snapshots
-                if item.state.status in {"active", "closing"}
-            ]
+            resumable = [item for item in snapshots if item.state.status in {"active", "closing"}]
             candidates: list[EngagementSnapshot] = []
             if display_name is not None:
                 candidates = [
-                    item
-                    for item in resumable
-                    if item.manifest.display_name == display_name
+                    item for item in resumable if item.manifest.display_name == display_name
                 ]
             elif scope is not None:
                 supplied = scope_references(scope)
@@ -514,17 +502,12 @@ class EngagementJournalService:
                 candidates = [
                     item
                     for item in resumable
-                    if any(
-                        ref.reference_id in supplied_ids
-                        for ref in item.state.scope_references
-                    )
+                    if any(ref.reference_id in supplied_ids for ref in item.state.scope_references)
                 ]
             else:
                 candidates = resumable
             if len(candidates) > 1:
-                raise EngagementAmbiguousError(
-                    _engagement_list_items(candidates)
-                )
+                raise EngagementAmbiguousError(_engagement_list_items(candidates))
             if not candidates:
                 raise EngagementNotFoundError()
             snapshot = candidates[0]
@@ -551,9 +534,7 @@ class EngagementJournalService:
                         lane=lane,
                         actor="host_agent",
                         type="lane_bound",
-                        payload=LaneBoundPayload(
-                            lane=lane, binding_reason="resume binding"
-                        ),
+                        payload=LaneBoundPayload(lane=lane, binding_reason="resume binding"),
                     ),
                 ),
                 expected_revision=expected_revision,
@@ -589,11 +570,7 @@ class EngagementJournalService:
         snapshots = self._list_snapshots()
         items = _engagement_list_items(snapshots)
         if after_engagement_id is not None:
-            items = tuple(
-                item
-                for item in items
-                if item.engagement_id > after_engagement_id
-            )
+            items = tuple(item for item in items if item.engagement_id > after_engagement_id)
         page = items[:limit]
         omitted = items[limit:]
         digest = (
@@ -688,10 +665,7 @@ class EngagementJournalService:
             for item in snapshots
             if any(
                 binding.lane.session_id == parent_session_id
-                and (
-                    parent_task_id is None
-                    or binding.lane.task_id == parent_task_id
-                )
+                and (parent_task_id is None or binding.lane.task_id == parent_task_id)
                 for binding in item.state.bound_lanes
             )
         ]
@@ -872,10 +846,7 @@ class EngagementJournalService:
             event
             for event in snapshot.events
             if event.sequence > after_sequence
-            and (
-                through_revision is None
-                or event.sequence <= through_revision.sequence
-            )
+            and (through_revision is None or event.sequence <= through_revision.sequence)
         ]
         page = tuple(selected[:limit])
         complete = len(selected) <= limit
@@ -933,13 +904,12 @@ class EngagementJournalService:
         expected_revision: JournalRevision | None = None,
     ) -> EngagementMutationResult:
         validated = tuple(
-            JournalEventDraft.model_validate(item.model_dump(mode="python"))
-            for item in drafts
+            JournalEventDraft.model_validate(item.model_dump(mode="python")) for item in drafts
         )
         for draft in validated:
             owner = EVENT_APPEND_OWNER_BY_TYPE.get(draft.type)
             if owner != "caller_facade":
-                raise ValueError(
+                raise EngagementAppendAuthorityError(
                     f"generic facade cannot append {draft.type}; owner is {owner}"
                 )
         result = self._repository.append_batch(
@@ -957,9 +927,7 @@ class EngagementJournalService:
         validated = JournalEventDraft.model_validate(draft.model_dump(mode="python"))
         owner = EVENT_APPEND_OWNER_BY_TYPE.get(validated.type)
         if owner not in {"hook_adapter", "tool_resolution_service"}:
-            raise ValueError(
-                f"operational start cannot append {validated.type}; owner is {owner}"
-            )
+            raise ValueError(f"operational start cannot append {validated.type}; owner is {owner}")
         result = self._repository.append_batch(
             engagement_id, (validated,), expected_revision=expected_revision
         )
@@ -974,8 +942,7 @@ class EngagementJournalService:
     ) -> EngagementMutationResult:
         """Append one sealed hook-adapter batch (hook, closure, resolution owners)."""
         validated = tuple(
-            JournalEventDraft.model_validate(item.model_dump(mode="python"))
-            for item in drafts
+            JournalEventDraft.model_validate(item.model_dump(mode="python")) for item in drafts
         )
         allowed_owners = {
             "hook_adapter",
@@ -986,9 +953,7 @@ class EngagementJournalService:
         for draft in validated:
             owner = EVENT_APPEND_OWNER_BY_TYPE.get(draft.type)
             if owner not in allowed_owners:
-                raise ValueError(
-                    f"hook batch cannot append {draft.type}; owner is {owner}"
-                )
+                raise ValueError(f"hook batch cannot append {draft.type}; owner is {owner}")
         result = self._repository.append_batch(
             engagement_id, validated, expected_revision=expected_revision
         )
@@ -1062,15 +1027,11 @@ class EngagementJournalService:
         if name not in LOADABLE_PROJECTION_NAMES:
             raise ProjectionOwnershipError("projection name is not owned by this reader")
         if name == "engagement-state":
-            value = self._repository.load_projection(
-                engagement_id, name=name, owner="engagement"
-            )
+            value = self._repository.load_projection(engagement_id, name=name, owner="engagement")
             if value is None:
                 return None
             return model_type.model_validate(value["state"])
-        value = self._repository.load_projection(
-            engagement_id, name=name, owner="planning"
-        )
+        value = self._repository.load_projection(engagement_id, name=name, owner="planning")
         if value is None:
             return None
         return model_type.model_validate(value["payload"])
@@ -1084,9 +1045,7 @@ class EngagementJournalService:
         expected_revision: JournalRevision,
     ) -> Path:
         if name not in PLANNING_PROJECTION_NAMES:
-            raise ProjectionOwnershipError(
-                "projection name is not owned by this writer"
-            )
+            raise ProjectionOwnershipError("projection name is not owned by this writer")
         self._repository.write_projection(
             engagement_id,
             name=name,
@@ -1098,10 +1057,7 @@ class EngagementJournalService:
             expected_revision=expected_revision,
         )
         return (
-            self._repository._knowledge_root
-            / "engagements"
-            / str(engagement_id)
-            / f"{name}.json"
+            self._repository._knowledge_root / "engagements" / str(engagement_id) / f"{name}.json"
         )
 
     def load_strategy_archive(
@@ -1292,9 +1248,7 @@ def _engagement_list_items(
         )
         for snapshot in snapshots
     ]
-    return tuple(
-        sorted(items, key=lambda item: (item.display_name, item.created_at))
-    )
+    return tuple(sorted(items, key=lambda item: (item.display_name, item.created_at)))
 
 
 __all__ = [

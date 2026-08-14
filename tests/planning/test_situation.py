@@ -11,6 +11,7 @@ import pytest
 from sedna.engagement import (
     EngagementJournalService,
     EngagementManifest,
+    EventType,
     EvidenceAttachedPayload,
     ExecutionLaneKey,
     HostKind,
@@ -41,10 +42,23 @@ from sedna.engagement.events import (
 from sedna.engagement.service import PlanningEventCommitItem
 from sedna.knowledge.retrieval import AuthorizationScope, AuthorizationState, ValidatedTarget
 from sedna.planning.situation import (
+    SITUATION_EFFECT_EVENT_TYPES,
+    SITUATION_NO_OP_EVENT_TYPES,
     SituationReducer,
     proof_value_was_rejected,
     transition_proof_generation,
 )
+
+
+def test_situation_event_effect_table_exhaustively_covers_report_events() -> None:
+    assert SITUATION_EFFECT_EVENT_TYPES.isdisjoint(SITUATION_NO_OP_EVENT_TYPES)
+    assert frozenset(EventType) == SITUATION_EFFECT_EVENT_TYPES | SITUATION_NO_OP_EVENT_TYPES
+    assert {
+        EventType.REPORT_GENERATED,
+        EventType.ENGAGEMENT_CLOSED,
+        EventType.REPORT_COMMIT_ABANDONED,
+    } <= SITUATION_NO_OP_EVENT_TYPES
+
 
 FIXED_TIME = datetime(2026, 8, 11, 12, 30, tzinfo=UTC)
 

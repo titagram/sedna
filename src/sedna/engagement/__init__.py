@@ -11,11 +11,13 @@ from sedna.engagement.events import (
     CorrelationKind,
     DecisionRecordedPayload,
     EngagementAbandonedPayload,
+    EngagementClosedPayload,
     EngagementOpenedPayload,
     EngagementReopenedPayload,
     EngagementResumedPayload,
     EngagementSnapshot,
     EventPayload,
+    EventPayloadAdapter,
     EventType,
     FrontierCriticizedEventPayload,
     FrontierProposedEventPayload,
@@ -43,6 +45,8 @@ from sedna.engagement.events import (
     ObjectiveChangedPayload,
     ObservationExtractedEventPayload,
     OutcomeAssessedEventPayload,
+    ReportCommitAbandonedPayload,
+    ReportGeneratedPayload,
     RecoveryWarningPayload,
     ScopeChangedPayload,
     SessionCheckpointedPayload,
@@ -90,6 +94,7 @@ from sedna.engagement.models import (
     MAX_PENDING_APPEND_BYTES,
     MAX_PUBLIC_INVENTORY_ITEMS,
     MAX_RECOVERABLE_TAIL_BYTES,
+    MAX_REPORT_REVISIONS,
     MAX_REQUIRED_PROOFS,
     MAX_SCOPE_EVENT_BYTES,
     MAX_SETTLEMENT_PENDING_RANGES,
@@ -190,6 +195,16 @@ from sedna.engagement.service import (
     SettlementReason,
 )
 from sedna.engagement.repository import RevisionConflictError
+from sedna.engagement.reporting.models import ReportCommitResult, ReportRef
+
+_report_namespace = {"ReportRef": ReportRef, "EngagementSnapshot": EngagementSnapshot}
+ReportGeneratedPayload.model_rebuild(_types_namespace=_report_namespace)
+EventPayloadAdapter.rebuild(_types_namespace=_report_namespace)
+JournalEventDraft.model_rebuild(_types_namespace=_report_namespace)
+JournalEvent.model_rebuild(_types_namespace=_report_namespace)
+EngagementState.model_rebuild(_types_namespace=_report_namespace)
+EngagementSnapshot.model_rebuild(_types_namespace=_report_namespace)
+ReportCommitResult.model_rebuild(_types_namespace=_report_namespace)
 
 __all__ = [
     "ALWAYS_REDACTED_HOST_KEYS",
@@ -216,6 +231,7 @@ __all__ = [
     "EVENT_ENVELOPE_SCHEMA_VERSION",
     "EngagementAbandonedPayload",
     "EngagementAmbiguousError",
+    "EngagementClosedPayload",
     "EngagementJournalService",
     "EngagementListItem",
     "EngagementListPage",
@@ -232,6 +248,7 @@ __all__ = [
     "EngagementState",
     "EngagementStatus",
     "EventPayload",
+    "EventPayloadAdapter",
     "EventType",
     "FrontierCriticizedEventPayload",
     "FrontierProposedEventPayload",
@@ -306,6 +323,7 @@ __all__ = [
     "MAX_PENDING_APPEND_BYTES",
     "MAX_PUBLIC_INVENTORY_ITEMS",
     "MAX_RECOVERABLE_TAIL_BYTES",
+    "MAX_REPORT_REVISIONS",
     "MAX_REQUIRED_PROOFS",
     "MAX_SAFE_ARGUMENT_BYTES",
     "MAX_SAFE_ARGUMENT_DEPTH",
@@ -325,6 +343,9 @@ __all__ = [
     "ObservationExtractedEventPayload",
     "OrphanEvidencePage",
     "OutcomeAssessedEventPayload",
+    "ReportCommitAbandonedPayload",
+    "ReportGeneratedPayload",
+    "ReportRef",
     "PendingSubjectCursor",
     "ProofRequirement",
     "REDACTED_HOST_SECRET",

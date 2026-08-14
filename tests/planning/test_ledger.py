@@ -16,6 +16,7 @@ import sedna.planning.ledger as ledger_module
 from sedna.engagement import (
     EngagementJournalService,
     EngagementManifest,
+    EventType,
     ExecutionLaneKey,
     HostKind,
     ProofRequirement,
@@ -36,6 +37,8 @@ from sedna.engagement.events import (
 from sedna.engagement.service import PlanningEventCommitItem
 from sedna.knowledge.retrieval import AuthorizationScope, AuthorizationState, ValidatedTarget
 from sedna.planning.ledger import (
+    LEDGER_EFFECT_EVENT_TYPES,
+    LEDGER_NO_OP_EVENT_TYPES,
     LedgerReplayError,
     StrategyLedgerReducer,
     archive_digest,
@@ -57,6 +60,17 @@ from sedna.planning.models import (
     StrategyStatus,
 )
 from tests.planning.test_journal_events import _conversion, _convert, planning_event_cases
+
+
+def test_ledger_event_effect_table_exhaustively_covers_report_events() -> None:
+    assert LEDGER_EFFECT_EVENT_TYPES.isdisjoint(LEDGER_NO_OP_EVENT_TYPES)
+    assert frozenset(EventType) == LEDGER_EFFECT_EVENT_TYPES | LEDGER_NO_OP_EVENT_TYPES
+    assert {
+        EventType.REPORT_GENERATED,
+        EventType.ENGAGEMENT_CLOSED,
+        EventType.REPORT_COMMIT_ABANDONED,
+    } <= LEDGER_NO_OP_EVENT_TYPES
+
 
 FIXED_TIME = datetime(2026, 8, 11, 12, 30, tzinfo=UTC)
 

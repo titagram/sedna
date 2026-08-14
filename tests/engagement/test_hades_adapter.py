@@ -215,8 +215,7 @@ def test_adapter_registers_compact_tools_and_required_hooks(tmp_path) -> None:
         "subagent_stop",
     }
     assert all(
-        item["schema"]["parameters"]["additionalProperties"] is False
-        for item in context.tools
+        item["schema"]["parameters"]["additionalProperties"] is False for item in context.tools
     )
 
 
@@ -304,9 +303,10 @@ def test_bound_operational_tool_is_recorded_with_original_result(tmp_path) -> No
         **identity,
     )
 
-    events, evidence = load_private_capture(
-        tmp_path, created["engagement"]["engagement_id"]
-    )
+    events, evidence = load_private_capture(tmp_path, created["engagement"]["engagement_id"])
+    decision = next(event for event in events if event.type == "decision_recorded")
+    started = next(event for event in events if event.type == "tool_call_started")
+    assert started.payload.decision_id == decision.payload.decision_id
     assert [event.type for event in events][-2:] == [
         "evidence_attached",
         "tool_call_completed",
@@ -326,22 +326,23 @@ def test_only_exact_control_tools_are_skipped_and_legacy_nmap_is_captured(
         **LANE,
     )
     assert CONTROL_TOOL_POLICY_VERSION == "sedna.control-tools.v1"
-    assert frozenset(
-        {
-            "sedna_manage_engagement",
-            "sedna_plan_next",
-            "sedna_record_decision",
-            "sedna_add_source",
-            "sedna_learn_local",
-            "sedna_retrieve_knowledge",
-            "sedna_get_knowledge_artifact",
-            "sedna_knowledge_maintenance",
-        }
-    ) == CONTROL_TOOL_NAMES
-    for control in sorted(CONTROL_TOOL_NAMES):
-        hooks["pre_tool_call"](
-            tool_name=control, args={}, **stable_hook_identity(control)
+    assert (
+        frozenset(
+            {
+                "sedna_manage_engagement",
+                "sedna_plan_next",
+                "sedna_record_decision",
+                "sedna_add_source",
+                "sedna_learn_local",
+                "sedna_retrieve_knowledge",
+                "sedna_get_knowledge_artifact",
+                "sedna_knowledge_maintenance",
+            }
         )
+        == CONTROL_TOOL_NAMES
+    )
+    for control in sorted(CONTROL_TOOL_NAMES):
+        hooks["pre_tool_call"](tool_name=control, args={}, **stable_hook_identity(control))
     hooks["pre_tool_call"](
         tool_name="sedna_nmap_tcp_discovery",
         args={"target": "192.0.2.44"},
@@ -427,9 +428,7 @@ def test_new_call_while_closing_appends_cancel_and_start_in_one_batch(
         {"action": "close", "reason": "proof"},
         **LANE,
     )
-    hooks["pre_tool_call"](
-        tool_name="terminal", args={"command": "whoami"}, **HOOK_ID
-    )
+    hooks["pre_tool_call"](tool_name="terminal", args={"command": "whoami"}, **HOOK_ID)
     snapshot = load_snapshot(tmp_path)
     assert snapshot.state.status == "active"
     assert [event.type for event in snapshot.events][-3:] == [
@@ -473,9 +472,7 @@ def test_redelivered_stable_pre_before_closing_is_noop_and_does_not_cancel(
     tmp_path,
 ) -> None:
     _, tools, hooks = registered_bound_adapter(tmp_path)
-    hooks["pre_tool_call"](
-        tool_name="terminal", args={"command": "id"}, **HOOK_ID
-    )
+    hooks["pre_tool_call"](tool_name="terminal", args={"command": "id"}, **HOOK_ID)
     call_tool(
         tools,
         "sedna_manage_engagement",
@@ -484,9 +481,7 @@ def test_redelivered_stable_pre_before_closing_is_noop_and_does_not_cancel(
     )
     before = load_snapshot(tmp_path)
     assert before.state.status == "closing"
-    hooks["pre_tool_call"](
-        tool_name="terminal", args={"command": "id"}, **HOOK_ID
-    )
+    hooks["pre_tool_call"](tool_name="terminal", args={"command": "id"}, **HOOK_ID)
     after = load_snapshot(tmp_path)
     assert after.revision == before.revision
     assert after.state.status == "closing"
@@ -494,12 +489,8 @@ def test_redelivered_stable_pre_before_closing_is_noop_and_does_not_cancel(
 
 def test_stable_duplicate_pre_post_pair_is_idempotent(tmp_path) -> None:
     _, tools, hooks = registered_bound_adapter(tmp_path)
-    hooks["pre_tool_call"](
-        tool_name="terminal", args={"command": "id"}, **HOOK_ID
-    )
-    hooks["pre_tool_call"](
-        tool_name="terminal", args={"command": "id"}, **HOOK_ID
-    )
+    hooks["pre_tool_call"](tool_name="terminal", args={"command": "id"}, **HOOK_ID)
+    hooks["pre_tool_call"](tool_name="terminal", args={"command": "id"}, **HOOK_ID)
     snapshot = load_snapshot(tmp_path)
     relevant = [
         event.type
@@ -587,9 +578,7 @@ def test_two_uncertain_candidates_emit_sealed_unmatched_audit(tmp_path) -> None:
         task_id="task-root",
     )
     snapshot = load_snapshot(tmp_path)
-    unmatched = [
-        event for event in snapshot.events if event.type == "unmatched_tool_completion"
-    ]
+    unmatched = [event for event in snapshot.events if event.type == "unmatched_tool_completion"]
     assert len(unmatched) == 1
     assert unmatched[0].payload.reason_code == "ambiguous_within_engagement"
 
@@ -608,9 +597,7 @@ def test_zero_or_cross_engagement_candidates_set_health_only(tmp_path) -> None:
         task_id="task-other",
     )
     snapshot = load_snapshot(tmp_path)
-    assert not [
-        event for event in snapshot.events if event.type == "unmatched_tool_completion"
-    ]
+    assert not [event for event in snapshot.events if event.type == "unmatched_tool_completion"]
     assert context.adapter._health.peek(digest, "session-other") == (
         "unmatched_completion",
         1,
@@ -661,16 +648,8 @@ def test_zero_or_cross_engagement_candidates_set_health_only(tmp_path) -> None:
     )
     snapshot_a = load_snapshot(tmp_path, engagement_a)
     snapshot_b = load_snapshot(tmp_path, engagement_b)
-    assert not [
-        event
-        for event in snapshot_a.events
-        if event.type == "unmatched_tool_completion"
-    ]
-    assert not [
-        event
-        for event in snapshot_b.events
-        if event.type == "unmatched_tool_completion"
-    ]
+    assert not [event for event in snapshot_a.events if event.type == "unmatched_tool_completion"]
+    assert not [event for event in snapshot_b.events if event.type == "unmatched_tool_completion"]
     assert context.adapter._health.peek(digest, "session-orion") == (
         "unmatched_completion",
         1,
@@ -681,9 +660,7 @@ def test_post_after_abandon_is_unmatched_call_already_terminated(
     tmp_path,
 ) -> None:
     _, tools, hooks = registered_bound_adapter(tmp_path)
-    hooks["pre_tool_call"](
-        tool_name="terminal", args={"command": "slow"}, **HOOK_ID
-    )
+    hooks["pre_tool_call"](tool_name="terminal", args={"command": "slow"}, **HOOK_ID)
     call_id = latest_event(tmp_path, "tool_call_started").payload.call_id
     call_tool(
         tools,
@@ -704,9 +681,7 @@ def test_post_after_abandon_is_unmatched_call_already_terminated(
         **HOOK_ID,
     )
     snapshot = load_snapshot(tmp_path)
-    unmatched = [
-        event for event in snapshot.events if event.type == "unmatched_tool_completion"
-    ]
+    unmatched = [event for event in snapshot.events if event.type == "unmatched_tool_completion"]
     assert len(unmatched) == 1
     assert unmatched[0].payload.reason_code == "call_already_terminated"
 
@@ -715,9 +690,7 @@ def test_minimum_post_signature_succeeds_without_status_fields(
     tmp_path,
 ) -> None:
     _, tools, hooks = registered_bound_adapter(tmp_path)
-    hooks["pre_tool_call"](
-        tool_name="terminal", args={"command": "id"}, **HOOK_ID
-    )
+    hooks["pre_tool_call"](tool_name="terminal", args={"command": "id"}, **HOOK_ID)
     hooks["post_tool_call"](
         tool_name="terminal",
         args={"command": "id"},
@@ -731,18 +704,14 @@ def test_minimum_post_signature_succeeds_without_status_fields(
         tool_call_id="tool-call-1",
     )
     snapshot = load_snapshot(tmp_path)
-    completed = [
-        event for event in snapshot.events if event.type == "tool_call_completed"
-    ]
+    completed = [event for event in snapshot.events if event.type == "tool_call_completed"]
     assert len(completed) == 1
     assert completed[0].payload.technical_status == "returned"
 
 
 def test_post_follows_pre_calls_engagement_after_lane_rebind(tmp_path) -> None:
     context, tools, hooks = registered_bound_adapter(tmp_path)
-    hooks["pre_tool_call"](
-        tool_name="terminal", args={"command": "id"}, **HOOK_ID
-    )
+    hooks["pre_tool_call"](tool_name="terminal", args={"command": "id"}, **HOOK_ID)
     engagement_a = _first_engagement_id(tmp_path)
     call_tool(
         tools,
@@ -751,9 +720,7 @@ def test_post_follows_pre_calls_engagement_after_lane_rebind(tmp_path) -> None:
         session_id="session-b",
         task_id="task-b",
     )
-    engagement_b = resolve_bound_engagement(
-        tmp_path, "session-b", "task-b"
-    )
+    engagement_b = resolve_bound_engagement(tmp_path, "session-b", "task-b")
     from sedna.engagement.models import ExecutionLaneKey, HostKind
 
     lane = ExecutionLaneKey.from_host(
@@ -774,35 +741,25 @@ def test_post_follows_pre_calls_engagement_after_lane_rebind(tmp_path) -> None:
     )
     snapshot_a = load_snapshot(tmp_path, engagement_a)
     snapshot_b = load_snapshot(tmp_path, engagement_b)
-    assert [event.type for event in snapshot_a.events].count(
-        "tool_call_completed"
-    ) == 1
-    assert not [
-        event for event in snapshot_b.events if event.type == "tool_call_completed"
-    ]
+    assert [event.type for event in snapshot_a.events].count("tool_call_completed") == 1
+    assert not [event for event in snapshot_b.events if event.type == "tool_call_completed"]
 
 
 def test_bound_lane_without_decision_emits_unplanned_action(tmp_path) -> None:
     _, tools, hooks = registered_adapter(tmp_path)
     create_bound_orion(tools)
-    hooks["pre_tool_call"](
-        tool_name="terminal", args={"command": "id"}, **HOOK_ID
-    )
+    hooks["pre_tool_call"](tool_name="terminal", args={"command": "id"}, **HOOK_ID)
     snapshot = load_snapshot(tmp_path)
-    unplanned = [
-        event for event in snapshot.events if event.type == "unplanned_action"
-    ]
+    unplanned = [event for event in snapshot.events if event.type == "unplanned_action"]
     assert len(unplanned) == 1
-    assert unplanned[0].payload.call_id == latest_event(
-        tmp_path, "tool_call_started"
-    ).payload.call_id
+    assert (
+        unplanned[0].payload.call_id == latest_event(tmp_path, "tool_call_started").payload.call_id
+    )
 
 
 def test_unbound_lane_attaches_nothing(tmp_path) -> None:
     _, tools, hooks = registered_adapter(tmp_path)
-    hooks["pre_tool_call"](
-        tool_name="terminal", args={"command": "id"}, **HOOK_ID
-    )
+    hooks["pre_tool_call"](tool_name="terminal", args={"command": "id"}, **HOOK_ID)
     hooks["post_tool_call"](
         tool_name="terminal",
         args={"command": "id"},
@@ -812,11 +769,7 @@ def test_unbound_lane_attaches_nothing(tmp_path) -> None:
     )
     root = tmp_path / "knowledge"
     engagements = root / "engagements"
-    published = [
-        entry
-        for entry in engagements.iterdir()
-        if _is_uuid_dir(entry)
-    ]
+    published = [entry for entry in engagements.iterdir() if _is_uuid_dir(entry)]
     assert not published
 
 
@@ -931,10 +884,7 @@ def logbook_authoritative_revision(tmp_path) -> Any:
         key=lambda path: path.stat().st_mtime,
     )
     assert logbooks, "no logbook published"
-    marker = (
-        f"- Revision: {snapshot.revision.sequence}/"
-        f"{snapshot.revision.event_hash[:12]}"
-    )
+    marker = f"- Revision: {snapshot.revision.sequence}/{snapshot.revision.event_hash[:12]}"
     assert any(marker in path.read_text(encoding="utf-8") for path in logbooks)
     return JournalRevision(
         sequence=snapshot.revision.sequence,
@@ -957,9 +907,7 @@ def latest_event_of_type(events, event_type: str):
 
 def test_result_prose_does_not_change_technical_status(tmp_path) -> None:
     _, tools, hooks = registered_bound_adapter(tmp_path)
-    hooks["pre_tool_call"](
-        tool_name="terminal", args={"command": "run"}, **HOOK_ID
-    )
+    hooks["pre_tool_call"](tool_name="terminal", args={"command": "run"}, **HOOK_ID)
     hooks["post_tool_call"](
         tool_name="terminal",
         args={"command": "run"},
@@ -978,13 +926,9 @@ def test_argument_normalization_failure_emits_capture_role_audit(
     _, tools, hooks = registered_bound_adapter(tmp_path)
     cyclic: dict[str, Any] = {}
     cyclic["self"] = cyclic
-    hooks["pre_tool_call"](
-        tool_name="terminal", args=cyclic, **HOOK_ID
-    )
+    hooks["pre_tool_call"](tool_name="terminal", args=cyclic, **HOOK_ID)
     snapshot = load_snapshot(tmp_path)
-    failed = [
-        event for event in snapshot.events if event.type == "evidence_capture_failed"
-    ]
+    failed = [event for event in snapshot.events if event.type == "evidence_capture_failed"]
     assert len(failed) == 1
     assert failed[0].payload.capture_role == "arguments"
     assert failed[0].payload.observed_size is None
@@ -994,9 +938,7 @@ def test_argument_normalization_failure_emits_capture_role_audit(
 
 def test_result_none_emits_unknown_terminal_without_evidence(tmp_path) -> None:
     _, tools, hooks = registered_bound_adapter(tmp_path)
-    hooks["pre_tool_call"](
-        tool_name="terminal", args={"command": "id"}, **HOOK_ID
-    )
+    hooks["pre_tool_call"](tool_name="terminal", args={"command": "id"}, **HOOK_ID)
     hooks["post_tool_call"](
         tool_name="terminal",
         args={"command": "id"},
@@ -1005,9 +947,7 @@ def test_result_none_emits_unknown_terminal_without_evidence(tmp_path) -> None:
         **HOOK_ID,
     )
     snapshot = load_snapshot(tmp_path)
-    completed = [
-        event for event in snapshot.events if event.type == "tool_call_completed"
-    ]
+    completed = [event for event in snapshot.events if event.type == "tool_call_completed"]
     assert len(completed) == 1
     assert completed[0].payload.technical_status == "unknown"
     # no result evidence between the start and the lone terminal completion
@@ -1047,19 +987,13 @@ def test_session_start_before_bind_is_deferred_to_first_bound_operation(
     tmp_path,
 ) -> None:
     _, tools, hooks = registered_adapter(tmp_path)
-    hooks["on_session_start"](
-        session_id="session-orion", task_id="task-root"
-    )
+    hooks["on_session_start"](session_id="session-orion", task_id="task-root")
     create_bound_orion(tools)
-    hooks["pre_tool_call"](
-        tool_name="terminal", args={"command": "id"}, **HOOK_ID
-    )
+    hooks["pre_tool_call"](tool_name="terminal", args={"command": "id"}, **HOOK_ID)
     snapshot = load_snapshot(tmp_path)
     starts = [event for event in snapshot.events if event.type == "session_started"]
     assert len(starts) == 1
-    assert starts[0].sequence < latest_event(
-        tmp_path, "tool_call_started"
-    ).sequence
+    assert starts[0].sequence < latest_event(tmp_path, "tool_call_started").sequence
 
 
 def test_session_end_preserves_host_booleans_and_rejects_both_true(
@@ -1075,11 +1009,7 @@ def test_session_end_preserves_host_booleans_and_rejects_both_true(
         turn_id="turn-9",
     )
     snapshot = load_snapshot(tmp_path)
-    checkpoints = [
-        event
-        for event in snapshot.events
-        if event.type == "session_checkpointed"
-    ]
+    checkpoints = [event for event in snapshot.events if event.type == "session_checkpointed"]
     assert len(checkpoints) == 1
     assert checkpoints[0].payload.completed is True
     assert checkpoints[0].payload.interrupted is False
@@ -1093,16 +1023,7 @@ def test_session_end_preserves_host_booleans_and_rejects_both_true(
         turn_id="turn-10",
     )
     snapshot = load_snapshot(tmp_path)
-    assert (
-        len(
-            [
-                event
-                for event in snapshot.events
-                if event.type == "session_checkpointed"
-            ]
-        )
-        == 1
-    )
+    assert len([event for event in snapshot.events if event.type == "session_checkpointed"]) == 1
     # a redelivered identical callback is a no-op (same turn identity)
     hooks["on_session_end"](
         session_id="session-orion",
@@ -1113,16 +1034,7 @@ def test_session_end_preserves_host_booleans_and_rejects_both_true(
         turn_id="turn-9",
     )
     snapshot = load_snapshot(tmp_path)
-    assert (
-        len(
-            [
-                event
-                for event in snapshot.events
-                if event.type == "session_checkpointed"
-            ]
-        )
-        == 1
-    )
+    assert len([event for event in snapshot.events if event.type == "session_checkpointed"]) == 1
 
 
 def test_session_finalize_without_task_id_finalizes_each_engagement_once(
@@ -1141,9 +1053,7 @@ def test_session_finalize_without_task_id_finalizes_each_engagement_once(
         service.bind_lane(engagement_id, lane2, reason="second task lane")
     hooks["on_session_finalize"](session_id="session-orion")
     snapshot = load_snapshot(tmp_path)
-    finalized = [
-        event for event in snapshot.events if event.type == "session_finalized"
-    ]
+    finalized = [event for event in snapshot.events if event.type == "session_finalized"]
     assert len(finalized) == 1
     expected_lane = min(
         binding.lane.stable_key
@@ -1155,16 +1065,7 @@ def test_session_finalize_without_task_id_finalizes_each_engagement_once(
     # duplicate finalize delivery is a no-op
     hooks["on_session_finalize"](session_id="session-orion")
     snapshot = load_snapshot(tmp_path)
-    assert (
-        len(
-            [
-                event
-                for event in snapshot.events
-                if event.type == "session_finalized"
-            ]
-        )
-        == 1
-    )
+    assert len([event for event in snapshot.events if event.type == "session_finalized"]) == 1
 
 
 def test_session_reset_clears_health_without_mutation(tmp_path) -> None:
@@ -1212,12 +1113,7 @@ def test_child_session_inherits_only_from_unique_parent_binding(
         api_request_id="child-request-1",
         api_call_count=1,
     )
-    assert (
-        resolve_bound_engagement(
-            tmp_path, "session-child", "child-task-observed"
-        )
-        is not None
-    )
+    assert resolve_bound_engagement(tmp_path, "session-child", "child-task-observed") is not None
 
 
 @pytest.mark.parametrize(
@@ -1246,9 +1142,7 @@ def test_subagent_stop_maps_child_status(
         "api_request_id": "r-1",
         "api_call_count": 1,
     }
-    hooks["pre_tool_call"](
-        tool_name="terminal", args={"command": "work"}, **child_identity
-    )
+    hooks["pre_tool_call"](tool_name="terminal", args={"command": "work"}, **child_identity)
     hooks["post_tool_call"](
         tool_name="terminal",
         args={"command": "work"},
@@ -1265,18 +1159,11 @@ def test_subagent_stop_maps_child_status(
         duration_ms=1234,
     )
     snapshot = load_snapshot(tmp_path)
-    checkpoints = [
-        event
-        for event in snapshot.events
-        if event.type == "session_checkpointed"
-    ]
+    checkpoints = [event for event in snapshot.events if event.type == "session_checkpointed"]
     assert checkpoints[-1].payload.completed is completed
     assert checkpoints[-1].payload.interrupted is interrupted
     # no in-flight calls remain, so the child lane is unbound
-    assert (
-        resolve_bound_engagement(tmp_path, "session-child", "task-child")
-        is None
-    )
+    assert resolve_bound_engagement(tmp_path, "session-child", "task-child") is None
 
 
 def test_subagent_stop_retains_binding_with_in_flight_call(tmp_path) -> None:
@@ -1302,10 +1189,7 @@ def test_subagent_stop_retains_binding_with_in_flight_call(tmp_path) -> None:
     )
     snapshot = load_snapshot(tmp_path)
     assert [event.type for event in snapshot.events].count("lane_unbound") == 0
-    assert (
-        resolve_bound_engagement(tmp_path, "session-child", "task-child")
-        is not None
-    )
+    assert resolve_bound_engagement(tmp_path, "session-child", "task-child") is not None
 
 
 def test_subagent_stop_unknown_or_unbound_is_noop_with_health(
@@ -1320,11 +1204,7 @@ def test_subagent_stop_unknown_or_unbound_is_noop_with_health(
         child_status="ok",
     )
     snapshot = load_snapshot(tmp_path)
-    assert not [
-        event
-        for event in snapshot.events
-        if event.type == "session_checkpointed"
-    ]
+    assert not [event for event in snapshot.events if event.type == "session_checkpointed"]
     assert context.adapter._health.peek(digest, "session-ghost") is not None
     # unknown child status: mapped checkpoint plus bounded health
     hooks["subagent_start"](
@@ -1348,27 +1228,18 @@ def test_subagent_stop_unknown_or_unbound_is_noop_with_health(
 def test_resume_and_finalize_call_optional_settlement_port_outside_journal_context(
     tmp_path,
 ) -> None:
-    port = MutatingRecordingSettlementPort(
-        tmp_path / "knowledge", assert_no_journal_lock=True
-    )
+    port = MutatingRecordingSettlementPort(tmp_path / "knowledge", assert_no_journal_lock=True)
     _, tools, hooks = registered_bound_adapter(
         tmp_path,
         settlement_port_factory=StaticSettlementPortFactory(port),
     )
-    resumed = call_tool(
-        tools, "sedna_manage_engagement", {"action": "resume"}, **LANE
-    )
+    resumed = call_tool(tools, "sedna_manage_engagement", {"action": "resume"}, **LANE)
     after_resume = load_snapshot(tmp_path)
 
-    assert (
-        resumed["engagement"]["revision"]
-        == after_resume.revision.model_dump(mode="json")
-    )
+    assert resumed["engagement"]["revision"] == after_resume.revision.model_dump(mode="json")
     assert after_resume.events[-1].payload.note == "settled:resume"
 
-    hooks["on_session_finalize"](
-        session_id=LANE["session_id"], task_id=LANE["task_id"]
-    )
+    hooks["on_session_finalize"](session_id=LANE["session_id"], task_id=LANE["task_id"])
     finalized = load_snapshot(tmp_path)
     settlement_event = event_with_note(finalized.events, "settled:session_finalize")
     final_checkpoint = latest_event_of_type(finalized.events, "session_finalized")
@@ -1382,27 +1253,24 @@ def test_resume_and_finalize_call_optional_settlement_port_outside_journal_conte
 def test_settlement_failure_is_typed_without_returning_stale_state(
     tmp_path,
 ) -> None:
-    port = RaisingSettlementPort(
-        code="settlement_unavailable", assert_no_journal_lock=True
-    )
+    port = RaisingSettlementPort(code="settlement_unavailable", assert_no_journal_lock=True)
     _, tools, hooks = registered_bound_adapter(
         tmp_path,
         settlement_port_factory=StaticSettlementPortFactory(port),
     )
 
-    resumed = call_tool(
-        tools, "sedna_manage_engagement", {"action": "resume"}, **LANE
-    )
+    resumed = call_tool(tools, "sedna_manage_engagement", {"action": "resume"}, **LANE)
     assert resumed["ok"] is False
     assert resumed["error"]["code"] == "settlement_unavailable"
     assert "engagement" not in resumed
-    assert hooks["on_session_finalize"](
-        session_id=LANE["session_id"],
-        task_id=LANE["task_id"],
-    ) is None
-    assert latest_event(tmp_path, "session_finalized").payload.reason == (
-        "settlement_unavailable"
+    assert (
+        hooks["on_session_finalize"](
+            session_id=LANE["session_id"],
+            task_id=LANE["task_id"],
+        )
+        is None
     )
+    assert latest_event(tmp_path, "session_finalized").payload.reason == ("settlement_unavailable")
 
     reminder = hooks["pre_llm_call"](
         session_id=LANE["session_id"],
@@ -1426,9 +1294,7 @@ def test_resume_with_incomplete_settlement_exposes_no_stale_snapshot(
         tmp_path,
         settlement_port_factory=StaticSettlementPortFactory(port),
     )
-    resumed = call_tool(
-        tools, "sedna_manage_engagement", {"action": "resume"}, **LANE
-    )
+    resumed = call_tool(tools, "sedna_manage_engagement", {"action": "resume"}, **LANE)
     assert resumed["ok"] is False
     assert resumed["error"]["code"] == "evidence_budget_exhausted"
     assert resumed["error"]["retryable"] is True
@@ -1444,9 +1310,7 @@ def test_finalize_with_incomplete_settlement_records_exact_non_complete(
         tmp_path,
         settlement_port_factory=StaticSettlementPortFactory(port),
     )
-    hooks["on_session_finalize"](
-        session_id=LANE["session_id"], task_id=LANE["task_id"]
-    )
+    hooks["on_session_finalize"](session_id=LANE["session_id"], task_id=LANE["task_id"])
     snapshot = load_snapshot(tmp_path)
     finalized = latest_event_of_type(snapshot.events, "session_finalized")
     assert finalized.payload.reason == "settlement_incomplete"
@@ -1460,9 +1324,7 @@ def test_finalize_with_incomplete_settlement_records_exact_non_complete(
 def test_close_with_settlement_port_settles_once_and_cas_after_reload(
     tmp_path,
 ) -> None:
-    port = MutatingRecordingSettlementPort(
-        tmp_path / "knowledge", assert_no_journal_lock=True
-    )
+    port = MutatingRecordingSettlementPort(tmp_path / "knowledge", assert_no_journal_lock=True)
     _, tools, hooks = registered_bound_adapter(
         tmp_path,
         settlement_port_factory=StaticSettlementPortFactory(port),
@@ -1501,11 +1363,7 @@ def test_close_with_incomplete_settlement_returns_typed_envelope_without_mutatio
     assert "engagement" not in closed
     snapshot = load_snapshot(tmp_path)
     assert snapshot.state.status == "active"
-    assert not [
-        event
-        for event in snapshot.events
-        if event.type == "closure_requested"
-    ]
+    assert not [event for event in snapshot.events if event.type == "closure_requested"]
 
 
 def test_profile_switch_pins_initial_store_for_whole_invocation(
@@ -1544,9 +1402,7 @@ def test_profile_switch_pins_initial_store_for_whole_invocation(
 # -- health map saturation --------------------------------------------------
 
 
-def test_health_map_rejects_unknown_codes_and_enforces_bounds(
-    tmp_path, monkeypatch
-) -> None:
+def test_health_map_rejects_unknown_codes_and_enforces_bounds(tmp_path, monkeypatch) -> None:
     from sedna.engagement.hades_adapter import _HealthMap
     from sedna.engagement.models import (
         MAX_HEALTH_ENTRIES_PER_STORE,
@@ -1557,9 +1413,7 @@ def test_health_map_rejects_unknown_codes_and_enforces_bounds(
     with pytest.raises(ValueError):
         health.record("store", "session", "bogus_code")
 
-    monkeypatch.setattr(
-        "sedna.engagement.hades_adapter.MAX_HEALTH_OCCURRENCES", 5
-    )
+    monkeypatch.setattr("sedna.engagement.hades_adapter.MAX_HEALTH_OCCURRENCES", 5)
     for _ in range(20):
         health.record("store-sat", "session-sat", "journal_unavailable")
     assert health.peek("store-sat", "session-sat") == (
@@ -1569,15 +1423,10 @@ def test_health_map_rejects_unknown_codes_and_enforces_bounds(
 
     for index in range(MAX_HEALTH_ENTRIES_PER_STORE + 1):
         health.record("store-a", f"session-{index}", "unbound_lane")
-    assert (
-        sum(1 for key in health._entries if key[0] == "store-a")
-        == MAX_HEALTH_ENTRIES_PER_STORE
-    )
+    assert sum(1 for key in health._entries if key[0] == "store-a") == MAX_HEALTH_ENTRIES_PER_STORE
 
     for index in range(MAX_HEALTH_ENTRIES_TOTAL + 17):
-        health.record(
-            f"store-{index % 9}", f"session-{index}", "unmatched_completion"
-        )
+        health.record(f"store-{index % 9}", f"session-{index}", "unmatched_completion")
     assert len(health._entries) == MAX_HEALTH_ENTRIES_TOTAL
 
 
@@ -1600,9 +1449,7 @@ def test_health_map_concurrent_insert_purge(tmp_path) -> None:
         except Exception as exc:  # pragma: no cover - failure reporting only
             errors.append(exc)
 
-    threads = [
-        threading.Thread(target=worker, args=(f"t{n}",)) for n in range(4)
-    ]
+    threads = [threading.Thread(target=worker, args=(f"t{n}",)) for n in range(4)]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -1627,19 +1474,11 @@ def test_cyclic_control_argument_produces_uncertain_correlation(
         api_call_count=1,
     )
     snapshot = load_snapshot(tmp_path)
-    invoked = [
-        event
-        for event in snapshot.events
-        if event.type == "control_tool_invoked"
-    ]
+    invoked = [event for event in snapshot.events if event.type == "control_tool_invoked"]
     assert len(invoked) == 1
     assert invoked[0].payload.correlation.kind.value == "uncertain"
     # no ordinary argument sidecar for the cyclic value
-    assert not [
-        event
-        for event in snapshot.events
-        if event.type == "evidence_attached"
-    ]
+    assert not [event for event in snapshot.events if event.type == "evidence_attached"]
 
 
 def test_control_call_with_provider_token_leaks_nothing(tmp_path) -> None:
@@ -1660,11 +1499,7 @@ def test_control_call_with_provider_token_leaks_nothing(tmp_path) -> None:
         api_call_count=1,
     )
     snapshot = load_snapshot(tmp_path)
-    invoked = [
-        event
-        for event in snapshot.events
-        if event.type == "control_tool_invoked"
-    ]
+    invoked = [event for event in snapshot.events if event.type == "control_tool_invoked"]
     assert len(invoked) == 1
     raw = json.dumps(snapshot.model_dump(mode="json"), ensure_ascii=False)
     assert secret not in raw

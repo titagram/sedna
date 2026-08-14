@@ -16,7 +16,7 @@ from hashlib import sha256
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from sedna.engagement import EngagementSnapshot
+from sedna.engagement import EngagementSnapshot, EventType
 from sedna.engagement.events import (
     ArchivedStrategyEventRecord,
     ExecutionVariantEventRecord,
@@ -46,6 +46,65 @@ MAX_HOT_FAMILIES = 32
 MAX_HOT_VARIANTS = 64
 MAX_REACTIVATION_CANDIDATES = 16
 MAX_ARCHIVE_SUMMARY_BYTES = 16 * 1024
+
+LEDGER_EFFECT_EVENT_TYPES = frozenset(
+    {
+        EventType.STRATEGY_RECONCILED,
+        EventType.STRATEGY_ARCHIVED,
+        EventType.STRATEGY_REACTIVATED,
+        EventType.OUTCOME_ASSESSED,
+    }
+)
+LEDGER_NO_OP_EVENT_TYPES = frozenset(
+    {
+        EventType.ENGAGEMENT_OPENED,
+        EventType.ENGAGEMENT_RESUMED,
+        EventType.LANE_BOUND,
+        EventType.LANE_UNBOUND,
+        EventType.CHILD_LANE_LINKED,
+        EventType.SESSION_STARTED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.SESSION_FINALIZED,
+        EventType.OBJECTIVE_CHANGED,
+        EventType.SCOPE_CHANGED,
+        EventType.DECISION_RECORDED,
+        EventType.AGENT_DEVIATION_RECORDED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_TERMINATED,
+        EventType.EVIDENCE_ATTACHED,
+        EventType.EVIDENCE_CAPTURE_FAILED,
+        EventType.UNMATCHED_TOOL_COMPLETION,
+        EventType.UNPLANNED_ACTION,
+        EventType.CONTROL_TOOL_INVOKED,
+        EventType.CLOSURE_REQUESTED,
+        EventType.CLOSURE_CANCELLED,
+        EventType.ENGAGEMENT_REOPENED,
+        EventType.ENGAGEMENT_ABANDONED,
+        EventType.SOURCE_SUGGESTED,
+        EventType.RECOVERY_WARNING,
+        EventType.UNCERTAIN_CORRELATION,
+        EventType.USER_NOTE,
+        EventType.OBSERVATION_EXTRACTED,
+        EventType.HYPOTHESIS_FORMED,
+        EventType.MISSING_INFORMATION_IDENTIFIED,
+        EventType.OBJECTIVE_PROOF_OBSERVED,
+        EventType.INTERPRETATION_SUCCEEDED,
+        EventType.INTERPRETATION_FAILED,
+        EventType.PLAN_REQUESTED,
+        EventType.FRONTIER_PROPOSED,
+        EventType.FRONTIER_CRITICIZED,
+        EventType.FRONTIER_REPAIRED,
+        EventType.FRONTIER_REJECTED,
+        EventType.PLANNING_GAP_RECORDED,
+        EventType.RESEARCH_QUERY_PROPOSED,
+        EventType.RESEARCH_SOURCE_CONSULTED,
+        EventType.RESEARCH_SOURCE_ASSESSED,
+        EventType.REPORT_GENERATED,
+        EventType.ENGAGEMENT_CLOSED,
+        EventType.REPORT_COMMIT_ABANDONED,
+    }
+)
 
 
 class LedgerReplayError(ValueError):
@@ -78,7 +137,9 @@ class LedgerReplay:
 
 def _attempt_id(payload: OutcomeAssessedEventPayload) -> UUID:
     decision = "" if payload.decision_id is None else str(payload.decision_id)
-    return uuid5(NAMESPACE_URL, f"sedna-strategy-attempt:{decision}:{','.join(payload.tool_call_ids)}")
+    return uuid5(
+        NAMESPACE_URL, f"sedna-strategy-attempt:{decision}:{','.join(payload.tool_call_ids)}"
+    )
 
 
 def _family_state(record: StrategyFamilyEventRecord) -> StrategyFamilyState:
@@ -106,7 +167,9 @@ def _variant_state(record: ExecutionVariantEventRecord) -> ExecutionVariantState
         status=record.status,
         recent_attempts=recent,
         historical_attempt_count=max(0, record.attempts.total_count - len(recent)),
-        outcome_category_totals={item.category: item.count for item in record.attempts.outcome_counts},
+        outcome_category_totals={
+            item.category: item.count for item in record.attempts.outcome_counts
+        },
         historical_oldest_revision=(
             record.attempts.first_material_revision
             if record.attempts.total_count > len(recent)
@@ -147,8 +210,12 @@ def _ledger(
     variants: dict[UUID, ExecutionVariantState],
     archives: Sequence[tuple[ArchivedStrategyEventRecord, UUID]],
 ) -> StrategyLedger:
-    ordered_families = tuple(sorted(families.values(), key=lambda item: (item.runtime_key, str(item.family_id))))
-    ordered_variants = tuple(sorted(variants.values(), key=lambda item: (item.runtime_key, str(item.variant_id))))
+    ordered_families = tuple(
+        sorted(families.values(), key=lambda item: (item.runtime_key, str(item.family_id)))
+    )
+    ordered_variants = tuple(
+        sorted(variants.values(), key=lambda item: (item.runtime_key, str(item.variant_id)))
+    )
     # The hot ledger keeps summaries for planner candidate selection only; full cold state remains
     # in ``archive_records`` and the M6A paginated archive projection.
     selected: list[ArchivedStrategyState] = []
@@ -271,9 +338,9 @@ def _complete_batch(
         batch.append(event)
         index += 1
     expected_count = getattr(first, count)
-    if len(batch) != expected_count or tuple(getattr(item.payload, ordinal) for item in batch) != tuple(
-        range(1, expected_count + 1)
-    ):
+    if len(batch) != expected_count or tuple(
+        getattr(item.payload, ordinal) for item in batch
+    ) != tuple(range(1, expected_count + 1)):
         raise LedgerReplayError("strategy batch is incomplete or has invalid ordinals")
     return tuple(batch), index
 
@@ -314,7 +381,9 @@ def _reconciliation_snapshot_matches_operation(
         related = operation.related_variant_ids
         supersedes = snapshot.supersedes_variant_ids
     else:
-        expected_id = operation.family_id if snapshot.entity_kind == "family" else operation.variant_id
+        expected_id = (
+            operation.family_id if snapshot.entity_kind == "family" else operation.variant_id
+        )
         if snapshot.entity_id != expected_id:
             raise LedgerReplayError("strategy reconciliation tombstone mismatches operation")
         related = (
@@ -328,15 +397,21 @@ def _reconciliation_snapshot_matches_operation(
         raise LedgerReplayError("strategy reconciliation has duplicate related identities")
     if operation.operation in {"merge", "split", "supersede"}:
         if not related:
-            raise LedgerReplayError("strategy reconciliation relationship operation lacks companions")
+            raise LedgerReplayError(
+                "strategy reconciliation relationship operation lacks companions"
+            )
         if not set(related).issubset(set(supersedes) | {operation.family_id, operation.variant_id}):
-            raise LedgerReplayError("strategy reconciliation relationship is not represented by snapshot")
+            raise LedgerReplayError(
+                "strategy reconciliation relationship is not represented by snapshot"
+            )
     elif related or supersedes:
         raise LedgerReplayError("strategy reconciliation unrelated operation carries relationships")
 
     if isinstance(snapshot, StrategyTombstoneEventRecord):
         if operation.operation not in {"merge", "split", "supersede", "archive"}:
-            raise LedgerReplayError("strategy reconciliation operation requires a full state snapshot")
+            raise LedgerReplayError(
+                "strategy reconciliation operation requires a full state snapshot"
+            )
         return
     expected_statuses = {
         "complete": {StrategyStatus.COMPLETED},
@@ -344,7 +419,10 @@ def _reconciliation_snapshot_matches_operation(
         "archive": {StrategyStatus.ARCHIVED},
         "reactivate": {StrategyStatus.AVAILABLE, StrategyStatus.DEFERRED},
     }
-    if operation.operation in expected_statuses and snapshot.status not in expected_statuses[operation.operation]:
+    if (
+        operation.operation in expected_statuses
+        and snapshot.status not in expected_statuses[operation.operation]
+    ):
         raise LedgerReplayError("strategy reconciliation operation does not match snapshot status")
 
 
@@ -418,7 +496,9 @@ def validate_reconciliation(
         raise LedgerReplayError("strategy reconciliation resulting digest is invalid")
 
 
-def _predicate_matches(predicate: RetryPredicateEventRecord, situation: SituationProjection) -> bool:
+def _predicate_matches(
+    predicate: RetryPredicateEventRecord, situation: SituationProjection
+) -> bool:
     facts = tuple(item.text for item in situation.facts)
     facets = {item.key: item.value for item in situation.facets}
     if predicate.kind == "fact_present":
@@ -455,7 +535,9 @@ def select_reactivation_candidates(
         for record in archive
         if any(_predicate_matches(predicate, situation) for predicate in record.retry_predicates)
     ]
-    return tuple(sorted(selected, key=lambda item: str(item.archive_entry_id))[:MAX_REACTIVATION_CANDIDATES])
+    return tuple(
+        sorted(selected, key=lambda item: str(item.archive_entry_id))[:MAX_REACTIVATION_CANDIDATES]
+    )
 
 
 def matching_retry_predicate_ids(
@@ -475,11 +557,17 @@ def partition_ledger(ledger: StrategyLedger) -> tuple[StrategyLedger, tuple[UUID
     protected_families = [item for item in ledger.families if item.status in hot_statuses]
     protected_variants = [item for item in ledger.variants if item.status in hot_statuses]
     if len(protected_families) > MAX_HOT_FAMILIES or len(protected_variants) > MAX_HOT_VARIANTS:
-        raise LedgerReplayError("hot strategy partition cannot retain all available or deferred entries")
+        raise LedgerReplayError(
+            "hot strategy partition cannot retain all available or deferred entries"
+        )
     families = tuple(
         sorted(
             ledger.families,
-            key=lambda item: (item.status not in hot_statuses, item.runtime_key, str(item.family_id)),
+            key=lambda item: (
+                item.status not in hot_statuses,
+                item.runtime_key,
+                str(item.family_id),
+            ),
         )[:MAX_HOT_FAMILIES]
     )
     selected_family_ids = {item.family_id for item in families}
@@ -487,25 +575,37 @@ def partition_ledger(ledger: StrategyLedger) -> tuple[StrategyLedger, tuple[UUID
         item
         for item in sorted(
             ledger.variants,
-            key=lambda item: (item.status not in hot_statuses, item.runtime_key, str(item.variant_id)),
+            key=lambda item: (
+                item.status not in hot_statuses,
+                item.runtime_key,
+                str(item.variant_id),
+            ),
         )
         if item.family_id in selected_family_ids
     )[:MAX_HOT_VARIANTS]
     retained_variant_ids = {item.variant_id for item in variants}
     missing = tuple(
         item.variant_id
-        for item in sorted(ledger.variants, key=lambda item: (item.runtime_key, str(item.variant_id)))
+        for item in sorted(
+            ledger.variants, key=lambda item: (item.runtime_key, str(item.variant_id))
+        )
         if item.variant_id not in retained_variant_ids
     )
     if any(item.status in hot_statuses for item in ledger.variants if item.variant_id in missing):
         raise LedgerReplayError("hot strategy partition would silently lose an active variant")
     revised_families = tuple(
         family.model_copy(
-            update={"variant_ids": tuple(item for item in family.variant_ids if item in retained_variant_ids)}
+            update={
+                "variant_ids": tuple(
+                    item for item in family.variant_ids if item in retained_variant_ids
+                )
+            }
         )
         for family in families
     )
-    return StrategyLedger(families=revised_families, variants=variants, archive=ledger.archive), missing
+    return StrategyLedger(
+        families=revised_families, variants=variants, archive=ledger.archive
+    ), missing
 
 
 class StrategyLedgerReducer:
@@ -530,7 +630,12 @@ class StrategyLedgerReducer:
             payload = event.payload
             if isinstance(payload, StrategyReconciledEventPayload):
                 batch, index = _complete_batch(
-                    events, index, StrategyReconciledEventPayload, "reconciliation_id", "item_ordinal", "item_count"
+                    events,
+                    index,
+                    StrategyReconciledEventPayload,
+                    "reconciliation_id",
+                    "item_ordinal",
+                    "item_count",
                 )
                 payloads = tuple(item.payload for item in batch)
                 if payloads[0].reconciliation_id in seen_reconciliations:
@@ -541,7 +646,9 @@ class StrategyLedgerReducer:
                     _apply_snapshot(item.payload.resulting_snapshot, families, variants)
                     reconciled_snapshots[item.event_id] = item.payload.resulting_snapshot
                     if isinstance(item.payload.resulting_snapshot, ExecutionVariantEventRecord):
-                        snapshot_variants_by_event[item.event_id] = item.payload.resulting_snapshot.variant_id
+                        snapshot_variants_by_event[item.event_id] = (
+                            item.payload.resulting_snapshot.variant_id
+                        )
                 _validate_hot_identity(families, variants)
                 resulting = _ledger(families, variants, archives)
                 if ledger_digest(resulting) != payloads[0].resulting_ledger_digest:
@@ -549,7 +656,12 @@ class StrategyLedgerReducer:
                 continue
             if isinstance(payload, StrategyArchivedEventPayload):
                 batch, index = _complete_batch(
-                    events, index, StrategyArchivedEventPayload, "archive_batch_id", "entry_ordinal", "entry_count"
+                    events,
+                    index,
+                    StrategyArchivedEventPayload,
+                    "archive_batch_id",
+                    "entry_ordinal",
+                    "entry_count",
                 )
                 first = batch[0].payload
                 if first.archive_batch_id in seen_archive_batches:
@@ -566,16 +678,24 @@ class StrategyLedgerReducer:
                     archived = item.payload.archive_record
                     if archived.snapshot.status in {"available", "deferred"}:
                         raise LedgerReplayError("strategy archive cannot hide an active strategy")
-                    if reconciled_snapshots.get(archived.source_reconciliation_event_id) != archived.snapshot:
+                    if (
+                        reconciled_snapshots.get(archived.source_reconciliation_event_id)
+                        != archived.snapshot
+                    ):
                         raise LedgerReplayError("strategy archive companion snapshot is invalid")
                     if any(
                         existing.archive_entry_id == archived.archive_entry_id
                         for existing, _ in archives
                     ):
                         raise LedgerReplayError("strategy archive entry is duplicated")
-                    if archived.archive_entry_digest != sha256(
-                        _canonical(archived.model_dump(mode="json", exclude={"archive_entry_digest"}))
-                    ).hexdigest():
+                    if (
+                        archived.archive_entry_digest
+                        != sha256(
+                            _canonical(
+                                archived.model_dump(mode="json", exclude={"archive_entry_digest"})
+                            )
+                        ).hexdigest()
+                    ):
                         raise LedgerReplayError("strategy archive entry digest is invalid")
                     archives.append((archived, item.event_id))
                     _remove_archived_snapshot(archived.snapshot, families, variants)
@@ -586,7 +706,12 @@ class StrategyLedgerReducer:
                 continue
             if isinstance(payload, StrategyReactivatedEventPayload):
                 batch, index = _complete_batch(
-                    events, index, StrategyReactivatedEventPayload, "reactivation_batch_id", "entry_ordinal", "entry_count"
+                    events,
+                    index,
+                    StrategyReactivatedEventPayload,
+                    "reactivation_batch_id",
+                    "entry_ordinal",
+                    "entry_count",
                 )
                 first = batch[0].payload
                 if first.reactivation_batch_id in seen_reactivation_batches:
@@ -604,8 +729,14 @@ class StrategyLedgerReducer:
                     candidates = [
                         pair for pair in archives if pair[1] == item.payload.source_archive_event_id
                     ]
-                    if len(candidates) != 1 or candidates[0][0].archive_entry_digest != item.payload.prior_archive_entry_digest:
-                        raise LedgerReplayError("strategy reactivation archive companion is invalid")
+                    if (
+                        len(candidates) != 1
+                        or candidates[0][0].archive_entry_digest
+                        != item.payload.prior_archive_entry_digest
+                    ):
+                        raise LedgerReplayError(
+                            "strategy reactivation archive companion is invalid"
+                        )
                     expected_restored = candidates[0][0].snapshot.model_copy(
                         update={"status": StrategyStatus.AVAILABLE.value}
                     )
@@ -615,7 +746,9 @@ class StrategyLedgerReducer:
                         predicate.predicate_id for predicate in candidates[0][0].retry_predicates
                     }
                     if not set(item.payload.matched_predicate_ids).issubset(predicate_ids):
-                        raise LedgerReplayError("strategy reactivation predicate companion is invalid")
+                        raise LedgerReplayError(
+                            "strategy reactivation predicate companion is invalid"
+                        )
                     archives.remove(candidates[0])
                     _apply_snapshot(restored, families, variants)
                     if isinstance(restored, ExecutionVariantEventRecord):
@@ -623,7 +756,9 @@ class StrategyLedgerReducer:
                 _validate_hot_identity(families, variants)
                 actual_archive = archive_digest(tuple(item[0] for item in archives))
                 if actual_archive != first.resulting_archive_digest:
-                    raise LedgerReplayError("strategy reactivation resulting archive digest is invalid")
+                    raise LedgerReplayError(
+                        "strategy reactivation resulting archive digest is invalid"
+                    )
                 continue
             if isinstance(payload, OutcomeAssessedEventPayload):
                 targets = {
@@ -678,9 +813,10 @@ class StrategyLedgerReducer:
                             }
                         )
                         hot_attempt_order.append((variant_id, attempt.attempt_event_id))
-                        while sum(
-                            len(item.recent_attempts) for item in variants.values()
-                        ) > MAX_HOT_ATTEMPTS:
+                        while (
+                            sum(len(item.recent_attempts) for item in variants.values())
+                            > MAX_HOT_ATTEMPTS
+                        ):
                             while hot_attempt_order:
                                 oldest_variant_id, oldest_attempt_id = hot_attempt_order.pop(0)
                                 oldest_variant = variants.get(oldest_variant_id)

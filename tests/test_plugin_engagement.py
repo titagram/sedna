@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +15,134 @@ import pytest
 
 import sedna.plugin as plugin_module
 from sedna.plugin import register
+
+
+def test_plugin_imports_in_a_cold_interpreter() -> None:
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, "-c", "import sedna.plugin; print('cold-start-ok')"],
+        cwd=Path(__file__).resolve().parents[1] / "src",
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "cold-start-ok"
+
+
+@pytest.mark.parametrize("import_order", ("engagement-first", "reporting-first"))
+def test_report_contracts_round_trip_in_both_cold_start_import_orders(import_order: str) -> None:
+    imports = (
+        "import sedna.engagement as engagement\nimport sedna.engagement.reporting as reporting"
+        if import_order == "engagement-first"
+        else "import sedna.engagement.reporting as reporting\nimport sedna.engagement as engagement"
+    )
+    script = (
+        imports
+        + "\n"
+        + textwrap.dedent(
+            """
+        import tempfile
+        from pathlib import Path
+
+        import sedna
+        from sedna.engagement.events import EventPayloadAdapter
+        from sedna.engagement.reporting.markdown import render_operational_report
+        from sedna.engagement.reporting.projector import OperationalReportProjector
+        from sedna.knowledge.retrieval import (
+            AuthorizationScope,
+            AuthorizationState,
+            ValidatedTarget,
+        )
+
+        scope = AuthorizationScope(
+            state=AuthorizationState.AUTHORIZED,
+            exact_targets=(ValidatedTarget.parse("192.0.2.44"),),
+        )
+        lane = engagement.ExecutionLaneKey(
+            host_kind=engagement.HostKind.HADES,
+            session_id="cold-start",
+            task_id="report-round-trip",
+        )
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            with engagement.EngagementJournalService.open(Path(directory) / "knowledge") as service:
+                opened = service.create_engagement(
+                    display_name="Orion",
+                    objective="Obtain proof",
+                    scope=scope,
+                    lane=lane,
+                )
+                closing = service.request_close(
+                    opened.snapshot.engagement_id,
+                    lane=lane,
+                    reason="complete",
+                    expected_revision=opened.snapshot.revision,
+                ).snapshot
+                report = OperationalReportProjector().project(
+                    snapshot=closing,
+                    events=closing.events,
+                    evidence=(),
+                    evidence_reader=service.read_evidence_slice,
+                    report_revision=1,
+                    generated_at=closing.events[-1].occurred_at,
+                )
+                capability = service._repository._issue_report_commit_capability()
+                committed = capability.commit_report_snapshot(
+                    closing.engagement_id,
+                    report,
+                    render_operational_report(report),
+                    expected_revision=closing.revision,
+                )
+
+        generated = committed.snapshot.events[-2]
+        payload = generated.payload.model_dump(mode="json")
+        assert EventPayloadAdapter.validate_python(payload) == generated.payload
+        draft = engagement.JournalEventDraft.model_validate(
+            {
+                "actor": generated.actor,
+                "type": generated.type,
+                "payload": generated.payload.model_dump(mode="json"),
+                "system_correlation": generated.system_correlation.model_dump(mode="json"),
+            }
+        )
+        assert draft.payload == generated.payload
+        assert engagement.JournalEvent.model_validate_json(generated.model_dump_json()) == generated
+        assert engagement.EngagementSnapshot.model_validate_json(
+            committed.snapshot.model_dump_json()
+        ) == committed.snapshot
+        validated_commit = reporting.ReportCommitResult.model_validate_json(
+            committed.model_dump_json()
+        )
+        assert validated_commit == committed
+        for contract in (
+            engagement.JournalEventDraft,
+            engagement.JournalEvent,
+            engagement.EngagementSnapshot,
+            reporting.OperationalReport,
+            reporting.ReportCommitResult,
+        ):
+            assert contract.model_json_schema()["type"] == "object"
+        assert sedna.__version__ == "0.2.0"
+        print("report-round-trip-ok")
+        """
+        )
+    )
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1] / "src",
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "report-round-trip-ok"
 
 
 class HookContext:
@@ -199,21 +331,20 @@ def test_engagement_hook_binding_uses_pinned_store(tmp_path: Path) -> None:
     )
 
     hook = context.hooks["pre_tool_call"]
-    assert hook(
-        tool_name="terminal",
-        args={"command": "id"},
-        session_id="session-a",
-        task_id="root-a",
-        turn_id="turn-1",
-        api_request_id="request-1",
-        api_call_count=1,
-        tool_call_id="tool-call-1",
-    ) is None
-    journals = list(
-        (tmp_path / "knowledge" / "engagements").glob("*/events.jsonl")
+    assert (
+        hook(
+            tool_name="terminal",
+            args={"command": "id"},
+            session_id="session-a",
+            task_id="root-a",
+            turn_id="turn-1",
+            api_request_id="request-1",
+            api_call_count=1,
+            tool_call_id="tool-call-1",
+        )
+        is None
     )
+    journals = list((tmp_path / "knowledge" / "engagements").glob("*/events.jsonl"))
     assert len(journals) == 1
     lines = journals[0].read_text(encoding="utf-8").splitlines()
-    assert any(
-        json.loads(line)["type"] == "tool_call_started" for line in lines
-    )
+    assert any(json.loads(line)["type"] == "tool_call_started" for line in lines)

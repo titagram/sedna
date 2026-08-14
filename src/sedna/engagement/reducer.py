@@ -14,11 +14,13 @@ from sedna.engagement.events import (
     ClosureCancelledPayload,
     ClosureRequestedPayload,
     DecisionRecordedPayload,
+    EngagementClosedPayload,
     EngagementOpenedPayload,
     EventType,
     JournalEvent,
     LaneBoundPayload,
     LaneUnboundPayload,
+    ReportGeneratedPayload,
     ScopeChangedPayload,
     ToolCallCompletedPayload,
     ToolCallStartedPayload,
@@ -58,6 +60,8 @@ class LifecycleEffect(StrEnum):
     CLOSURE_CANCEL = "closure_cancel"
     REOPEN = "reopen"
     ABANDON = "abandon"
+    REPORT = "report"
+    CLOSE = "close"
 
 
 EVENT_LIFECYCLE_EFFECTS: Mapping[EventType, LifecycleEffect] = MappingProxyType(
@@ -109,6 +113,9 @@ EVENT_LIFECYCLE_EFFECTS: Mapping[EventType, LifecycleEffect] = MappingProxyType(
         EventType.RESEARCH_QUERY_PROPOSED: LifecycleEffect.ACTIVE_PLANNING,
         EventType.RESEARCH_SOURCE_CONSULTED: LifecycleEffect.ACTIVE_PLANNING,
         EventType.RESEARCH_SOURCE_ASSESSED: LifecycleEffect.ACTIVE_PLANNING,
+        EventType.REPORT_GENERATED: LifecycleEffect.REPORT,
+        EventType.ENGAGEMENT_CLOSED: LifecycleEffect.CLOSE,
+        EventType.REPORT_COMMIT_ABANDONED: LifecycleEffect.BOOKKEEPING,
     }
 )
 
@@ -174,6 +181,8 @@ _CLOSING_EFFECTS = frozenset(
         LifecycleEffect.CLOSURE_CANCEL,
         LifecycleEffect.REOPEN,
         LifecycleEffect.ABANDON,
+        LifecycleEffect.REPORT,
+        LifecycleEffect.CLOSE,
     }
 )
 _ABANDONED_EFFECTS = frozenset(
@@ -191,6 +200,7 @@ _CLOSED_EFFECTS = frozenset(
         LifecycleEffect.CONTROL_PLANE,
         LifecycleEffect.SETTLEMENT_BOOKKEEPING,
         LifecycleEffect.REOPEN,
+        LifecycleEffect.REPORT,
     }
 )
 
@@ -264,6 +274,9 @@ class _Accumulator:
     calls: dict[str, _CallState] = field(default_factory=dict)
     closure: ClosureBarrier | None = None
     operational_restart_required: bool = False
+    reports: list[object] = field(default_factory=list)
+    active_report: object | None = None
+    pending_report: object | None = None
     revision: JournalRevision = field(
         default_factory=lambda: JournalRevision(sequence=0, event_hash="0" * 64)
     )
@@ -336,6 +349,9 @@ class _Accumulator:
             EventType.RECOVERY_WARNING: self._apply_inert,
             EventType.UNCERTAIN_CORRELATION: self._apply_inert,
             EventType.USER_NOTE: self._apply_inert,
+            EventType.REPORT_GENERATED: self._apply_report_generated,
+            EventType.ENGAGEMENT_CLOSED: self._apply_engagement_closed,
+            EventType.REPORT_COMMIT_ABANDONED: self._apply_inert,
         }.get(item.type)
         if item.type in PLANNING_EVENT_TYPES:
             handler = self._apply_inert
@@ -487,6 +503,59 @@ class _Accumulator:
         del item
         self.status = EngagementStatus.ABANDONED
 
+    def _apply_report_generated(self, item: JournalEvent) -> None:
+        payload = item.payload
+        if not isinstance(payload, ReportGeneratedPayload):
+            raise EngagementReplayError("report payload is invalid")
+        report = payload.report
+        if payload.generation_reason == "closure":
+            if self.status is not EngagementStatus.CLOSING or self.closure is None:
+                raise EngagementReplayError("report closure barrier is not ready")
+            if not self.closure_ready or report.journal_revision != self.revision:
+                raise EngagementReplayError("report does not match a ready closure barrier")
+            if self.pending_report is not None or self.reports:
+                raise EngagementReplayError("closure report revision has already been used")
+            self.pending_report = report
+            return
+        if self.status not in {
+            EngagementStatus.CLOSED_UNVERIFIED,
+            EngagementStatus.CLOSED_VERIFIED,
+        }:
+            raise EngagementReplayError("later report revision requires a closed engagement")
+        if self.pending_report is not None or report.report_revision != len(self.reports) + 1:
+            raise EngagementReplayError("report revisions must increase exactly")
+        self.reports.append(report)
+        self.active_report = report
+
+    def _apply_engagement_closed(self, item: JournalEvent) -> None:
+        payload = item.payload
+        report = self.pending_report
+        if not isinstance(payload, EngagementClosedPayload) or report is None:
+            raise EngagementReplayError(
+                "engagement close requires the immediately committed report"
+            )
+        if self.closure is None or (
+            payload.report_id != report.report_id
+            or payload.report_revision != report.report_revision
+            or payload.closure_request_event_id != self.closure.event_id
+            or payload.terminal_watermark != self.closure.terminal_watermark
+        ):
+            raise EngagementReplayError(
+                "engagement close does not match report and closure barrier"
+            )
+        self.reports.append(report)
+        self.active_report = report
+        self.pending_report = None
+        self.closure = None
+        self.status = EngagementStatus.CLOSED_UNVERIFIED
+
+    @property
+    def closure_ready(self) -> bool:
+        return self.closure is not None and all(
+            self.calls[call_id].terminal_sequence is not None
+            for call_id in self.closure.in_flight_call_ids
+        )
+
     def freeze(self) -> EngagementState:
         if self.operational_restart_required:
             raise EngagementReplayError(_ATOMIC_RESTART_ERROR)
@@ -500,10 +569,7 @@ class _Accumulator:
                 call_id for call_id, call in self.calls.items() if call.terminal_sequence is None
             )
         )
-        closure_ready = self.closure is not None and all(
-            self.calls[call_id].terminal_sequence is not None
-            for call_id in self.closure.in_flight_call_ids
-        )
+        closure_ready = self.closure_ready
         return EngagementState(
             revision=self.revision,
             status=self.status,
@@ -513,6 +579,8 @@ class _Accumulator:
             in_flight_call_ids=in_flight_call_ids,
             closure=self.closure,
             closure_ready=closure_ready,
+            reports=tuple(self.reports),
+            active_report=self.active_report,
         )
 
 

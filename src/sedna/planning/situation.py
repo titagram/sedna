@@ -8,7 +8,7 @@ from hashlib import sha256
 from typing import Any, Literal
 from uuid import UUID
 
-from sedna.engagement import EngagementSnapshot, scope_references
+from sedna.engagement import EngagementSnapshot, EventType, scope_references
 from sedna.engagement.events import (
     AccessStateDeltaEventRecord,
     EngagementReopenedPayload,
@@ -48,6 +48,65 @@ from sedna.planning.models import (
 )
 
 _EMPTY_DIGEST = sha256(b"[]").hexdigest()
+
+SITUATION_EFFECT_EVENT_TYPES = frozenset(
+    {
+        EventType.EVIDENCE_ATTACHED,
+        EventType.INTERPRETATION_SUCCEEDED,
+        EventType.INTERPRETATION_FAILED,
+        EventType.ENGAGEMENT_REOPENED,
+        EventType.RESEARCH_SOURCE_ASSESSED,
+        EventType.OUTCOME_ASSESSED,
+        EventType.HYPOTHESIS_FORMED,
+        EventType.MISSING_INFORMATION_IDENTIFIED,
+        EventType.OBJECTIVE_PROOF_OBSERVED,
+        EventType.OBSERVATION_EXTRACTED,
+    }
+)
+SITUATION_NO_OP_EVENT_TYPES = frozenset(
+    {
+        EventType.ENGAGEMENT_OPENED,
+        EventType.ENGAGEMENT_RESUMED,
+        EventType.LANE_BOUND,
+        EventType.LANE_UNBOUND,
+        EventType.CHILD_LANE_LINKED,
+        EventType.SESSION_STARTED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.SESSION_FINALIZED,
+        EventType.OBJECTIVE_CHANGED,
+        EventType.SCOPE_CHANGED,
+        EventType.DECISION_RECORDED,
+        EventType.AGENT_DEVIATION_RECORDED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_TERMINATED,
+        EventType.EVIDENCE_CAPTURE_FAILED,
+        EventType.UNMATCHED_TOOL_COMPLETION,
+        EventType.UNPLANNED_ACTION,
+        EventType.CONTROL_TOOL_INVOKED,
+        EventType.CLOSURE_REQUESTED,
+        EventType.CLOSURE_CANCELLED,
+        EventType.ENGAGEMENT_ABANDONED,
+        EventType.SOURCE_SUGGESTED,
+        EventType.RECOVERY_WARNING,
+        EventType.UNCERTAIN_CORRELATION,
+        EventType.USER_NOTE,
+        EventType.PLAN_REQUESTED,
+        EventType.FRONTIER_PROPOSED,
+        EventType.FRONTIER_CRITICIZED,
+        EventType.FRONTIER_REPAIRED,
+        EventType.FRONTIER_REJECTED,
+        EventType.PLANNING_GAP_RECORDED,
+        EventType.STRATEGY_RECONCILED,
+        EventType.STRATEGY_ARCHIVED,
+        EventType.STRATEGY_REACTIVATED,
+        EventType.RESEARCH_QUERY_PROPOSED,
+        EventType.RESEARCH_SOURCE_CONSULTED,
+        EventType.REPORT_GENERATED,
+        EventType.ENGAGEMENT_CLOSED,
+        EventType.REPORT_COMMIT_ABANDONED,
+    }
+)
 
 
 def _canonical_bytes(value: Any) -> bytes:

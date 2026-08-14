@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import PurePosixPath
-from typing import Annotated, Any, Literal, Self, TypeAlias
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Self, TypeAlias
 from uuid import UUID
 
 from pydantic import (
@@ -25,6 +25,9 @@ from pydantic import (
 
 from sedna.knowledge.retrieval import AuthorizationScope, AuthorizationState, TargetKind
 
+if TYPE_CHECKING:
+    from sedna.engagement.reporting.models import ReportRef
+
 ENGAGEMENT_MANIFEST_SCHEMA_VERSION = "sedna.engagement-manifest.v1"
 EVENT_ENVELOPE_SCHEMA_VERSION = "sedna.journal-event.v1"
 ENGAGEMENT_STATE_PROJECTION_SCHEMA_VERSION = "sedna.engagement-state.v1"
@@ -35,6 +38,7 @@ MAX_JOURNAL_BATCH_EVENTS = 512
 MAX_MANIFEST_BYTES = 1 * 1024 * 1024
 MAX_JOURNAL_BYTES = 256 * 1024 * 1024
 MAX_JOURNAL_EVENTS = 100_000
+MAX_REPORT_REVISIONS = 1_024
 MAX_ENGAGEMENTS = 10_000
 MAX_ENGAGEMENT_DIRECTORY_ENTRIES = 11_000
 MAX_EVIDENCE_OBJECTS = 110_000
@@ -43,8 +47,7 @@ MAX_EVIDENCE_ITEM_BYTES = 64 * 1024 * 1024
 MAX_EVIDENCE_ENGAGEMENT_BYTES = 4 * 1024 * 1024 * 1024
 MAX_JOURNAL_HEAD_BYTES = 16 * 1024
 MAX_CREATE_INTENT_BYTES = (
-    4 * ((MAX_MANIFEST_BYTES + 2 * (MAX_JOURNAL_EVENT_BYTES + 1) + 2) // 3)
-    + 128 * 1024
+    4 * ((MAX_MANIFEST_BYTES + 2 * (MAX_JOURNAL_EVENT_BYTES + 1) + 2) // 3) + 128 * 1024
 )
 MAX_PENDING_APPEND_BYTES = (
     4 * ((MAX_JOURNAL_BATCH_EVENTS * (MAX_JOURNAL_EVENT_BYTES + 1) + 2) // 3) + 128 * 1024
@@ -137,7 +140,12 @@ PendingSubjectCursor: TypeAlias = Annotated[str, Field(pattern=r"^pending-[0-9a-
 def validate_confined_relative_path(value: object) -> str:
     if not isinstance(value, str):
         raise TypeError("confined relative path must be a string")
-    if not value or len(value) > 4096 or "\0" in value or "\\" in value:
+    if (
+        not value
+        or len(value) > 4096
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or "\\" in value
+    ):
         raise ValueError("invalid confined relative path")
     if value.startswith("/") or value != unicodedata.normalize("NFC", value):
         raise ValueError("invalid confined relative path")
@@ -470,6 +478,8 @@ class EngagementState(BaseModel):
     scope_references: tuple[ScopeReference, ...]
     bound_lanes: tuple[LaneBinding, ...] = ()
     active_decisions: tuple[ActiveDecision, ...] = ()
+    reports: tuple[ReportRef, ...] = Field(default=(), max_length=MAX_REPORT_REVISIONS)
+    active_report: ReportRef | None = None
     in_flight_call_ids: tuple[Annotated[str, Field(min_length=1, max_length=512)], ...] = Field(
         default=(), max_length=MAX_IN_FLIGHT_CALLS
     )

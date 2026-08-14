@@ -84,6 +84,10 @@ class ProjectionOwnershipError(ValueError):
     """A projection writer attempted to cross a sealed ownership boundary."""
 
 
+class EngagementAppendAuthorityError(ValueError):
+    """A generic append attempted to emit a repository-owned event."""
+
+
 class JournalUnavailableError(ValueError):
     """The journal cannot be served without weakening its durability contract."""
 
@@ -117,9 +121,7 @@ class BatchAppendResult(BaseModel):
 
 
 class _RecoverableTailError(Exception):
-    def __init__(
-        self, tail: bytes, head: JournalHead, recovery_lane: ExecutionLaneKey
-    ) -> None:
+    def __init__(self, tail: bytes, head: JournalHead, recovery_lane: ExecutionLaneKey) -> None:
         self.tail = tail
         self.head = head
         self.recovery_lane = recovery_lane
@@ -253,27 +255,19 @@ def _draft_material(event: JournalEvent) -> dict[str, Any]:
     )
 
 
-def _complete_staged_create_value(
-    name: str, data: bytes, engagement_id: UUID
-) -> bool:
+def _complete_staged_create_value(name: str, data: bytes, engagement_id: UUID) -> bool:
     try:
         if name == "engagement.json":
-            return (
-                EngagementManifest.model_validate_json(data).engagement_id
-                == engagement_id
-            )
+            return EngagementManifest.model_validate_json(data).engagement_id == engagement_id
         if name == "journal-head.json":
             return JournalHead.model_validate_json(data).engagement_id == engagement_id
         if name == "events.jsonl":
             if not data or not data.endswith(b"\n"):
                 return False
             events = tuple(
-                JournalEvent.model_validate_json(line)
-                for line in _iter_journal_lines(data)
+                JournalEvent.model_validate_json(line) for line in _iter_journal_lines(data)
             )
-            return bool(events) and all(
-                event.engagement_id == engagement_id for event in events
-            )
+            return bool(events) and all(event.engagement_id == engagement_id for event in events)
     except Exception:
         return False
     return False
@@ -293,14 +287,10 @@ class _EvidenceObjectStore:
     ) -> None:
         self._engagement_fd = engagement_fd
         self._fault = fault or (lambda _point: None)
-        self._max_item_bytes = (
-            MAX_EVIDENCE_ITEM_BYTES if max_item_bytes is None else max_item_bytes
-        )
+        self._max_item_bytes = MAX_EVIDENCE_ITEM_BYTES if max_item_bytes is None else max_item_bytes
         self._max_objects = MAX_EVIDENCE_OBJECTS if max_objects is None else max_objects
         self._max_engagement_bytes = (
-            MAX_EVIDENCE_ENGAGEMENT_BYTES
-            if max_engagement_bytes is None
-            else max_engagement_bytes
+            MAX_EVIDENCE_ENGAGEMENT_BYTES if max_engagement_bytes is None else max_engagement_bytes
         )
 
     def capture(self, data: bytes) -> EvidenceReference:
@@ -324,9 +314,7 @@ class _EvidenceObjectStore:
                     if entry.startswith("blob-") and entry.endswith(".bin"):
                         expected_digest = entry[len("blob-") : -len(".bin")]
                     elif entry.startswith(".pending-blob-") and entry.endswith(".bin"):
-                        expected_digest = entry[
-                            len(".pending-blob-") : -len(".bin")
-                        ]
+                        expected_digest = entry[len(".pending-blob-") : -len(".bin")]
                     elif _is_quarantine_payload_name(entry):
                         fd = _open_regular(
                             evidence_fd,
@@ -383,10 +371,7 @@ class _EvidenceObjectStore:
                             if not chunk:
                                 break
                             content_digest.update(chunk)
-                        if (
-                            content_digest.hexdigest() != expected_digest
-                            and entry != pending_name
-                        ):
+                        if content_digest.hexdigest() != expected_digest and entry != pending_name:
                             raise JournalUnavailableError(
                                 "evidence object filename digest mismatch"
                             )
@@ -399,20 +384,12 @@ class _EvidenceObjectStore:
                         )
                     finally:
                         os.close(fd)
-                canonical_count = sum(
-                    item.startswith("blob-") for item, _, _ in objects
-                )
-                quarantine_count = sum(
-                    item.startswith(".quarantine-") for item, _, _ in objects
-                )
+                canonical_count = sum(item.startswith("blob-") for item, _, _ in objects)
+                quarantine_count = sum(item.startswith(".quarantine-") for item, _, _ in objects)
                 object_count = canonical_count + quarantine_count
-                payload_by_identity = {
-                    identity: size for _, size, identity in objects
-                }
+                payload_by_identity = {identity: size for _, size, identity in objects}
                 payload_bytes = sum(payload_by_identity.values())
-                existing = next(
-                    (size for item, size, _ in objects if item == name), None
-                )
+                existing = next((size for item, size, _ in objects if item == name), None)
                 if object_count > self._max_objects:
                     raise ValueError("evidence object quota exceeded")
                 if payload_bytes > self._max_engagement_bytes:
@@ -443,11 +420,7 @@ class _EvidenceObjectStore:
                     if object_count + 1 > self._max_objects:
                         raise ValueError("evidence object quota exceeded")
                     pending = next(
-                        (
-                            size
-                            for item, size, _ in objects
-                            if item == pending_name
-                        ),
+                        (size for item, size, _ in objects if item == pending_name),
                         None,
                     )
                     if pending is not None:
@@ -460,15 +433,10 @@ class _EvidenceObjectStore:
                         if pending_data != data:
                             os.unlink(pending_name, dir_fd=evidence_fd)
                             os.fsync(evidence_fd)
-                            objects = [
-                                item for item in objects if item[0] != pending_name
-                            ]
+                            objects = [item for item in objects if item[0] != pending_name]
                             pending = None
                             payload_bytes = sum(
-                                {
-                                    identity: size
-                                    for _, size, identity in objects
-                                }.values()
+                                {identity: size for _, size, identity in objects}.values()
                             )
                     additional = 0 if pending is not None else len(data)
                     if payload_bytes + additional > self._max_engagement_bytes:
@@ -508,9 +476,7 @@ class _EvidenceObjectStore:
                             "evidence object",
                         )
                         if found != data:
-                            raise JournalUnavailableError(
-                                "evidence digest collision"
-                            ) from None
+                            raise JournalUnavailableError("evidence digest collision") from None
                     self._fault("evidence_after_publication")
                     os.fsync(evidence_fd)
                     self._fault("evidence_after_directory_fsync")
@@ -565,15 +531,11 @@ def _tail_recovery_drafts(
     )
     correlation = SystemCorrelation(
         source="recovery",
-        operation_id=uuid5(
-            NAMESPACE_URL, f"sedna-tail-operation:{engagement_id}:{digest}"
-        ),
+        operation_id=uuid5(NAMESPACE_URL, f"sedna-tail-operation:{engagement_id}:{digest}"),
     )
     return (
         JournalEventDraft(
-            event_id=uuid5(
-                NAMESPACE_URL, f"sedna-tail-evidence:{engagement_id}:{digest}"
-            ),
+            event_id=uuid5(NAMESPACE_URL, f"sedna-tail-evidence:{engagement_id}:{digest}"),
             lane=lane,
             actor="host_agent",
             type="evidence_attached",
@@ -581,9 +543,7 @@ def _tail_recovery_drafts(
             idempotency_key=f"tail-evidence:{digest}",
         ),
         JournalEventDraft(
-            event_id=uuid5(
-                NAMESPACE_URL, f"sedna-tail-warning:{engagement_id}:{digest}"
-            ),
+            event_id=uuid5(NAMESPACE_URL, f"sedna-tail-warning:{engagement_id}:{digest}"),
             actor="system",
             type="recovery_warning",
             payload=RecoveryWarningPayload(
@@ -686,9 +646,7 @@ def _atomic_write(parent_fd: int, name: str, data: bytes) -> None:
         raise JournalUnavailableError(f"unsafe atomic target: {name}") from exc
     else:
         try:
-            _validate_regular(
-                existing_fd, label=name, expected_mode=0o600
-            )
+            _validate_regular(existing_fd, label=name, expected_mode=0o600)
         finally:
             os.close(existing_fd)
     temporary = f".{name}.tmp-{uuid4()}"
@@ -720,13 +678,16 @@ def _archive_header_bytes(envelope: StrategyArchiveProjectionEnvelope) -> bytes:
 
 
 def _archive_record_bytes(record: StrategyArchiveRecordDraft, archive_revision: int) -> bytes:
-    return _canonical_json(
-        {
-            "archive_revision": archive_revision,
-            "entry_id": str(record.entry_id),
-            "payload": record.payload,
-        }
-    ) + b"\n"
+    return (
+        _canonical_json(
+            {
+                "archive_revision": archive_revision,
+                "entry_id": str(record.entry_id),
+                "payload": record.payload,
+            }
+        )
+        + b"\n"
+    )
 
 
 def _archive_envelope(
@@ -802,6 +763,55 @@ def _locked_file(parent_fd: int, name: str):
             os.close(fd)
 
 
+class _ReportCommitCapability:
+    """Repository-issued authority for immutable report transactions only."""
+
+    def __init__(self, repository: Any, token: object) -> None:
+        if token is not repository._report_capability_token:
+            raise ValueError("invalid report capability token")
+        self._repository = repository
+        self._token = token
+
+    def _require_holder(self) -> None:
+        if self._token is not self._repository._report_capability_token:
+            raise ValueError("invalid report capability holder")
+
+    def commit_report_snapshot(self, engagement_id, report, markdown, *, expected_revision):
+        self._require_holder()
+        return self._repository._commit_report_snapshot(
+            engagement_id,
+            report,
+            markdown,
+            expected_revision=expected_revision,
+        )
+
+    def commit_report_revision(
+        self,
+        engagement_id,
+        report,
+        markdown,
+        *,
+        generation_reason,
+        expected_revision,
+    ):
+        self._require_holder()
+        return self._repository._commit_report_revision(
+            engagement_id,
+            report,
+            markdown,
+            generation_reason=generation_reason,
+            expected_revision=expected_revision,
+        )
+
+    def repair_markdown(self, engagement_id, report_revision, *, expected_revision):
+        self._require_holder()
+        return self._repository._repair_markdown(
+            engagement_id,
+            report_revision,
+            expected_revision=expected_revision,
+        )
+
+
 class EngagementJournalRepository:
     """Append-only engagement repository rooted in retained POSIX descriptors."""
 
@@ -826,11 +836,10 @@ class EngagementJournalRepository:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._uuid_factory = uuid_factory or uuid4
         self._closed = False
+        self._report_capability_token = object()
         self._root_fd = self._open_absolute_root(raw)
         try:
-            _validate_directory(
-                self._root_fd, label="knowledge root", expected_mode=0o700
-            )
+            _validate_directory(self._root_fd, label="knowledge root", expected_mode=0o700)
             pathname = os.stat(raw, follow_symlinks=False)
             retained = os.fstat(self._root_fd)
             if not stat.S_ISDIR(pathname.st_mode) or (
@@ -838,17 +847,10 @@ class EngagementJournalRepository:
                 pathname.st_ino,
             ) != (retained.st_dev, retained.st_ino):
                 raise JournalUnavailableError("knowledge root descriptor identity mismatch")
-            self._engagements_fd = _open_or_create_directory(
-                self._root_fd, "engagements", 0o700
-            )
+            self._engagements_fd = _open_or_create_directory(self._root_fd, "engagements", 0o700)
             entries = self._bounded_engagement_entries()
-            if (
-                ".registry.lock" not in entries
-                and len(entries) >= MAX_ENGAGEMENT_DIRECTORY_ENTRIES
-            ):
-                raise JournalUnavailableError(
-                    "engagement directory entry bound exceeded"
-                )
+            if ".registry.lock" not in entries and len(entries) >= MAX_ENGAGEMENT_DIRECTORY_ENTRIES:
+                raise JournalUnavailableError("engagement directory entry bound exceeded")
             self._retry_registry_tail_recovery(self._recover_registry_once)
         except Exception:
             with suppress(AttributeError):
@@ -940,9 +942,7 @@ class EngagementJournalRepository:
         self._require_open()
         with _locked_file(self._engagements_fd, ".registry.lock"):
             entries = self._bounded_engagement_entries()
-            return tuple(
-                UUID(name) for name in entries if _is_uuid_name(name)
-            )
+            return tuple(UUID(name) for name in entries if _is_uuid_name(name))
 
     def _recover_pending_creates(self, entries: Sequence[str]) -> None:
         pending: list[tuple[str, UUID]] = []
@@ -959,9 +959,7 @@ class EngagementJournalRepository:
         for name, engagement_id in pending:
             self._recover_pending_create(name, engagement_id)
 
-    def _decode_create_intent(
-        self, raw: bytes, expected_engagement_id: UUID
-    ) -> _CreateRecovery:
+    def _decode_create_intent(self, raw: bytes, expected_engagement_id: UUID) -> _CreateRecovery:
         try:
             value = json.loads(raw)
             if _canonical_json(value) != raw:
@@ -1017,9 +1015,7 @@ class EngagementJournalRepository:
             state = reduce_engagement(manifest, events)
             projection = self._projection_bytes(head.revision, state)
         except Exception as exc:
-            raise JournalUnavailableError(
-                "conflicting pending create transaction"
-            ) from exc
+            raise JournalUnavailableError("conflicting pending create transaction") from exc
         return _CreateRecovery(
             engagement_id=expected_engagement_id,
             manifest=manifest,
@@ -1052,22 +1048,14 @@ class EngagementJournalRepository:
                 if allow_missing and _missing_file(exc):
                     missing.append(name)
                     continue
-                raise JournalUnavailableError(
-                    "conflicting pending create transaction"
-                ) from exc
+                raise JournalUnavailableError("conflicting pending create transaction") from exc
             if actual != expected:
-                raise JournalUnavailableError(
-                    "conflicting pending create transaction"
-                )
+                raise JournalUnavailableError("conflicting pending create transaction")
         return tuple(missing)
 
-    def _finalize_published_create(
-        self, engagement_fd: int, recovery: _CreateRecovery
-    ) -> None:
+    def _finalize_published_create(self, engagement_fd: int, recovery: _CreateRecovery) -> None:
         self._verify_create_files(engagement_fd, recovery, allow_missing=False)
-        _atomic_write(
-            engagement_fd, "engagement-state.json", recovery.projection_bytes
-        )
+        _atomic_write(engagement_fd, "engagement-state.json", recovery.projection_bytes)
         with suppress(FileNotFoundError):
             os.unlink(".create-intent.json", dir_fd=engagement_fd)
         os.fsync(engagement_fd)
@@ -1078,23 +1066,15 @@ class EngagementJournalRepository:
         except OSError as exc:
             raise JournalUnavailableError("unsafe pending create directory") from exc
         try:
-            _validate_directory(
-                pending_fd, label="pending create directory", expected_mode=0o700
-            )
-            entries = _scan_directory_bounded(
-                pending_fd, 8, "pending create directory"
-            )
+            _validate_directory(pending_fd, label="pending create directory", expected_mode=0o700)
+            entries = _scan_directory_bounded(pending_fd, 8, "pending create directory")
             intent_temp_prefix = "..create-intent.json.tmp-"
-            intent_temps = [
-                entry for entry in entries if entry.startswith(intent_temp_prefix)
-            ]
-            if any(
-                not _is_uuid_name(entry[len(intent_temp_prefix) :])
-                for entry in intent_temps
-            ) or len(intent_temps) > 1:
-                raise JournalUnavailableError(
-                    "conflicting pending create transaction"
-                )
+            intent_temps = [entry for entry in entries if entry.startswith(intent_temp_prefix)]
+            if (
+                any(not _is_uuid_name(entry[len(intent_temp_prefix) :]) for entry in intent_temps)
+                or len(intent_temps) > 1
+            ):
+                raise JournalUnavailableError("conflicting pending create transaction")
             if intent_temps:
                 temp_name = intent_temps[0]
                 try:
@@ -1128,14 +1108,10 @@ class EngagementJournalRepository:
                         os.fsync(pending_fd)
                     else:
                         if canonical_intent != temp_bytes:
-                            raise JournalUnavailableError(
-                                "conflicting pending create transaction"
-                            )
+                            raise JournalUnavailableError("conflicting pending create transaction")
                         os.unlink(temp_name, dir_fd=pending_fd)
                         os.fsync(pending_fd)
-                entries = _scan_directory_bounded(
-                    pending_fd, 8, "pending create directory"
-                )
+                entries = _scan_directory_bounded(pending_fd, 8, "pending create directory")
             if not entries:
                 os.close(pending_fd)
                 pending_fd = -1
@@ -1157,15 +1133,11 @@ class EngagementJournalRepository:
                 for staged_name, prefix in staged_temp_prefixes.items():
                     if entry.startswith(prefix):
                         if not _is_uuid_name(entry[len(prefix) :]):
-                            raise JournalUnavailableError(
-                                "conflicting pending create transaction"
-                            )
+                            raise JournalUnavailableError("conflicting pending create transaction")
                         staged_temps[staged_name].append(entry)
                         break
             if sum(len(temps) for temps in staged_temps.values()) > 1:
-                raise JournalUnavailableError(
-                    "conflicting pending create transaction"
-                )
+                raise JournalUnavailableError("conflicting pending create transaction")
             allowed = {
                 ".create-intent.json",
                 "engagement.json",
@@ -1174,9 +1146,7 @@ class EngagementJournalRepository:
                 *(temp for temps in staged_temps.values() for temp in temps),
             }
             if any(entry not in allowed for entry in entries):
-                raise JournalUnavailableError(
-                    "conflicting pending create transaction"
-                )
+                raise JournalUnavailableError("conflicting pending create transaction")
             raw = _read_bounded(
                 pending_fd,
                 ".create-intent.json",
@@ -1211,12 +1181,8 @@ class EngagementJournalRepository:
                         raise
                     temp_bytes = b""
                 if temp_bytes != expected:
-                    if _complete_staged_create_value(
-                        staged_name, temp_bytes, engagement_id
-                    ):
-                        raise JournalUnavailableError(
-                            "conflicting pending create transaction"
-                        )
+                    if _complete_staged_create_value(staged_name, temp_bytes, engagement_id):
+                        raise JournalUnavailableError("conflicting pending create transaction")
                     os.unlink(temp_name, dir_fd=pending_fd)
                     os.fsync(pending_fd)
                     continue
@@ -1239,17 +1205,11 @@ class EngagementJournalRepository:
                     os.fsync(pending_fd)
                 else:
                     if canonical != expected:
-                        raise JournalUnavailableError(
-                            "conflicting pending create transaction"
-                        )
+                        raise JournalUnavailableError("conflicting pending create transaction")
                     os.unlink(temp_name, dir_fd=pending_fd)
                     os.fsync(pending_fd)
-            missing = self._verify_create_files(
-                pending_fd, recovery, allow_missing=True
-            )
-            self._assert_lane_available(
-                recovery.events[1].lane, exclude=engagement_id
-            )
+            missing = self._verify_create_files(pending_fd, recovery, allow_missing=True)
+            self._assert_lane_available(recovery.events[1].lane, exclude=engagement_id)
             for missing_name in missing:
                 _atomic_write(pending_fd, missing_name, expected_by_name[missing_name])
             os.fsync(pending_fd)
@@ -1269,12 +1229,8 @@ class EngagementJournalRepository:
                 os.fsync(self._engagements_fd)
                 published_fd = self._engagement_fd(engagement_id)
             else:
-                self._verify_create_files(
-                    published_fd, recovery, allow_missing=False
-                )
-                for entry in _scan_directory_bounded(
-                    pending_fd, 8, "pending create directory"
-                ):
+                self._verify_create_files(published_fd, recovery, allow_missing=False)
+                for entry in _scan_directory_bounded(pending_fd, 8, "pending create directory"):
                     os.unlink(entry, dir_fd=pending_fd)
                 os.close(pending_fd)
                 pending_fd = -1
@@ -1287,9 +1243,7 @@ class EngagementJournalRepository:
         except JournalUnavailableError:
             raise
         except Exception as exc:
-            raise JournalUnavailableError(
-                "conflicting pending create transaction"
-            ) from exc
+            raise JournalUnavailableError("conflicting pending create transaction") from exc
         finally:
             if pending_fd >= 0:
                 os.close(pending_fd)
@@ -1324,9 +1278,7 @@ class EngagementJournalRepository:
                 raise ValueError("unsafe engagement directory") from exc
             raise JournalUnavailableError("engagement does not exist") from exc
         try:
-            _validate_directory(
-                fd, label="engagement directory", expected_mode=0o700
-            )
+            _validate_directory(fd, label="engagement directory", expected_mode=0o700)
         except Exception:
             os.close(fd)
             raise
@@ -1377,10 +1329,7 @@ class EngagementJournalRepository:
                     return snapshot
                 raise ValueError("engagement UUID already exists with different content")
             pending_reservation = 0 if pending_name in entries else 1
-            if (
-                len(entries) + pending_reservation
-                > MAX_ENGAGEMENT_DIRECTORY_ENTRIES
-            ):
+            if len(entries) + pending_reservation > MAX_ENGAGEMENT_DIRECTORY_ENTRIES:
                 raise ValueError("engagement directory entry bound exceeded")
             if len(published) + 1 > MAX_ENGAGEMENTS:
                 raise ValueError("engagement count exceeds its bound")
@@ -1408,18 +1357,14 @@ class EngagementJournalRepository:
             try:
                 os.mkdir(pending_name, 0o700, dir_fd=self._engagements_fd)
             except FileExistsError:
-                pending_fd = os.open(
-                    pending_name, _directory_flags(), dir_fd=self._engagements_fd
-                )
+                pending_fd = os.open(pending_name, _directory_flags(), dir_fd=self._engagements_fd)
                 try:
                     _validate_directory(
                         pending_fd,
                         label="pending create directory",
                         expected_mode=0o700,
                     )
-                    entries = _scan_directory_bounded(
-                        pending_fd, 8, "pending create directory"
-                    )
+                    entries = _scan_directory_bounded(pending_fd, 8, "pending create directory")
                     if any(
                         entry
                         not in {
@@ -1430,9 +1375,7 @@ class EngagementJournalRepository:
                         }
                         for entry in entries
                     ):
-                        raise JournalUnavailableError(
-                            "conflicting pending create transaction"
-                        )
+                        raise JournalUnavailableError("conflicting pending create transaction")
                     try:
                         existing_intent = _read_bounded(
                             pending_fd,
@@ -1471,17 +1414,14 @@ class EngagementJournalRepository:
                             stored_journal_bytes = base64.b64decode(
                                 stored["journal"], validate=True
                             )
-                            stored_head_bytes = base64.b64decode(
-                                stored["head"], validate=True
-                            )
+                            stored_head_bytes = base64.b64decode(stored["head"], validate=True)
                             if (
                                 stored["engagement_id"] != str(manifest.engagement_id)
                                 or sha256(stored_manifest_bytes).hexdigest()
                                 != stored["manifest_sha256"]
                                 or sha256(stored_journal_bytes).hexdigest()
                                 != stored["journal_sha256"]
-                                or sha256(stored_head_bytes).hexdigest()
-                                != stored["head_sha256"]
+                                or sha256(stored_head_bytes).hexdigest() != stored["head_sha256"]
                             ):
                                 raise ValueError("intent digest mismatch")
                             stored_manifest = EngagementManifest.model_validate_json(
@@ -1503,9 +1443,7 @@ class EngagementJournalRepository:
                                 )
                             ):
                                 raise ValueError("intent content mismatch")
-                            stored_state = reduce_engagement(
-                                stored_manifest, stored_events
-                            )
+                            stored_state = reduce_engagement(stored_manifest, stored_events)
                         except Exception as exc:
                             raise JournalUnavailableError(
                                 "conflicting pending create transaction"
@@ -1550,9 +1488,7 @@ class EngagementJournalRepository:
                         os.fsync(self._engagements_fd)
                         engagement_fd = self._engagement_fd(manifest.engagement_id)
                         try:
-                            _atomic_write(
-                                engagement_fd, "engagement-state.json", projection
-                            )
+                            _atomic_write(engagement_fd, "engagement-state.json", projection)
                             os.unlink(".create-intent.json", dir_fd=engagement_fd)
                             os.fsync(engagement_fd)
                         finally:
@@ -1628,12 +1564,369 @@ class EngagementJournalRepository:
         *,
         expected_revision: JournalRevision | None = None,
     ) -> BatchAppendResult:
+        repository_owned = {
+            "report_generated",
+            "engagement_closed",
+            "report_commit_abandoned",
+        }
+        if any(draft.type in repository_owned for draft in drafts):
+            raise EngagementAppendAuthorityError(
+                "generic append cannot emit repository-owned report events"
+            )
         return self._append_batch(
             engagement_id,
             drafts,
             expected_revision=expected_revision,
             defer_tail_recovery=False,
         )
+
+    def _issue_report_commit_capability(self) -> _ReportCommitCapability:
+        return _ReportCommitCapability(self, self._report_capability_token)
+
+    def _commit_report_snapshot(
+        self,
+        engagement_id: UUID,
+        report,
+        markdown: str,
+        *,
+        expected_revision: JournalRevision,
+    ):
+        return self._commit_report(
+            engagement_id,
+            report,
+            markdown,
+            generation_reason="closure",
+            expected_revision=expected_revision,
+        )
+
+    def _commit_report_revision(
+        self,
+        engagement_id: UUID,
+        report,
+        markdown: str,
+        *,
+        generation_reason: str,
+        expected_revision: JournalRevision,
+    ):
+        return self._commit_report(
+            engagement_id,
+            report,
+            markdown,
+            generation_reason=generation_reason,
+            expected_revision=expected_revision,
+        )
+
+    def _repair_markdown(
+        self, engagement_id: UUID, report_revision: int, *, expected_revision: JournalRevision
+    ):
+        from sedna.engagement.reporting.markdown import render_operational_report
+        from sedna.engagement.reporting.models import (
+            MAX_REPORT_JSON_BYTES,
+            OperationalReport,
+        )
+
+        self._complete_tail_recovery(engagement_id)
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            with _locked_file(engagement_fd, ".journal.lock"):
+                self._recover_pending_append(engagement_fd, engagement_id)
+                manifest, events, _head, _journal_bytes = self._load_authoritative_locked(
+                    engagement_fd, engagement_id, allow_tail=False
+                )
+                snapshot = self._snapshot(manifest, events, reduce_engagement(manifest, events))
+                if snapshot.revision != expected_revision:
+                    raise RevisionConflictError("expected revision is stale")
+                ref = next(
+                    (
+                        item
+                        for item in snapshot.state.reports
+                        if item.report_revision == report_revision
+                    ),
+                    None,
+                )
+                if ref is None:
+                    raise ValueError("report revision does not exist")
+                reports_fd = os.open("reports", _directory_flags(), dir_fd=engagement_fd)
+                try:
+                    json_name = f"report-v{report_revision}.json"
+                    raw = _read_bounded(
+                        reports_fd,
+                        json_name,
+                        MAX_REPORT_JSON_BYTES,
+                        label="committed report JSON",
+                    )
+                    if sha256(raw).hexdigest() != ref.json_sha256:
+                        raise JournalUnavailableError("committed report JSON digest mismatch")
+                    report = OperationalReport.model_validate_json(raw)
+                    markdown = render_operational_report(report).encode("utf-8")
+                    if sha256(markdown).hexdigest() != ref.markdown_sha256:
+                        raise JournalUnavailableError(
+                            "renderer output does not match committed digest"
+                        )
+                    _atomic_write(reports_fd, f"report-v{report_revision}.md", markdown)
+                    os.fsync(reports_fd)
+                finally:
+                    os.close(reports_fd)
+                return ref
+        finally:
+            os.close(engagement_fd)
+
+    def _commit_report(
+        self,
+        engagement_id: UUID,
+        report,
+        markdown: str,
+        *,
+        generation_reason: Literal["closure", "repair_json", "manual_report"],
+        expected_revision: JournalRevision,
+    ):
+        from sedna.engagement.events import (
+            EngagementClosedPayload,
+            ReportGeneratedPayload,
+            SystemCorrelation,
+        )
+        from sedna.engagement.reporting.markdown import render_operational_report
+        from sedna.engagement.reporting.models import (
+            MAX_REPORT_JSON_BYTES,
+            MAX_REPORT_MARKDOWN_BYTES,
+            MAX_REPORT_TRANSACTION_BYTES,
+            REPORT_RENDERER_VERSION,
+            OperationalReport,
+            ReportCommitResult,
+            ReportRef,
+        )
+
+        report = OperationalReport.model_validate(report.model_dump(mode="json", warnings="error"))
+        expected_markdown = render_operational_report(report)
+        if markdown != expected_markdown:
+            raise ValueError("report Markdown does not match its immutable JSON snapshot")
+        json_bytes = _canonical_json(report.model_dump(mode="json", warnings="error"))
+        markdown_bytes = markdown.encode("utf-8")
+        if (
+            len(json_bytes) > MAX_REPORT_JSON_BYTES
+            or len(markdown_bytes) > MAX_REPORT_MARKDOWN_BYTES
+        ):
+            raise ValueError("report exceeds immutable report budget")
+        json_digest = sha256(json_bytes).hexdigest()
+        markdown_digest = sha256(markdown_bytes).hexdigest()
+        json_name = f"report-v{report.report_revision}.json"
+        markdown_name = f"report-v{report.report_revision}.md"
+        intent_id = uuid5(
+            engagement_id,
+            f"report-intent:{report.report_revision}:{generation_reason}:{json_digest}:{markdown_digest}",
+        )
+        intent = _canonical_json(
+            {
+                "intent_id": str(intent_id),
+                "engagement_id": str(engagement_id),
+                "report_id": str(report.report_id),
+                "report_revision": report.report_revision,
+                "generation_reason": generation_reason,
+                "expected_revision": expected_revision.model_dump(mode="json"),
+                "json_name": json_name,
+                "json_sha256": json_digest,
+                "markdown_name": markdown_name,
+                "markdown_sha256": markdown_digest,
+                "renderer_version": REPORT_RENDERER_VERSION,
+            }
+        )
+        self._complete_tail_recovery(engagement_id)
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            with _locked_file(engagement_fd, ".journal.lock"):
+                self._recover_pending_append(engagement_fd, engagement_id)
+                manifest, existing, head, journal_bytes = self._load_authoritative_locked(
+                    engagement_fd, engagement_id, allow_tail=False
+                )
+                snapshot = self._snapshot(manifest, existing, reduce_engagement(manifest, existing))
+                already_payload = next(
+                    (
+                        event.payload
+                        for event in existing
+                        if isinstance(event.payload, ReportGeneratedPayload)
+                        and event.payload.report.report_id == report.report_id
+                    ),
+                    None,
+                )
+                if already_payload is not None:
+                    already = already_payload.report
+                    prefix = f"engagements/{engagement_id}/reports"
+                    if (
+                        already_payload.generation_reason != generation_reason
+                        or already.report_revision != report.report_revision
+                        or already.json_relative_path
+                        != f"{prefix}/report-v{report.report_revision}.json"
+                        or already.markdown_relative_path
+                        != f"{prefix}/report-v{report.report_revision}.md"
+                        or already.renderer_version != REPORT_RENDERER_VERSION
+                        or (already.json_sha256, already.markdown_sha256, already.journal_revision)
+                        != (
+                            json_digest,
+                            markdown_digest,
+                            expected_revision,
+                        )
+                    ):
+                        raise JournalUnavailableError("conflicting committed report")
+                    try:
+                        reports_fd = os.open("reports", _directory_flags(), dir_fd=engagement_fd)
+                    except OSError as exc:
+                        raise JournalUnavailableError(
+                            "committed reports directory is unavailable"
+                        ) from exc
+                    try:
+                        _validate_directory(
+                            reports_fd, label="reports directory", expected_mode=0o700
+                        )
+                        for name, expected, limit, label in (
+                            (
+                                f"report-v{report.report_revision}.json",
+                                json_bytes,
+                                MAX_REPORT_JSON_BYTES,
+                                "committed report JSON",
+                            ),
+                            (
+                                f"report-v{report.report_revision}.md",
+                                markdown_bytes,
+                                MAX_REPORT_MARKDOWN_BYTES,
+                                "committed report Markdown",
+                            ),
+                        ):
+                            actual = _read_bounded(reports_fd, name, limit, label=label)
+                            if actual != expected:
+                                raise JournalUnavailableError(f"{label} digest mismatch")
+                        try:
+                            retained_intent = _read_bounded(
+                                reports_fd,
+                                ".report-transaction.json",
+                                MAX_REPORT_TRANSACTION_BYTES,
+                                "report transaction intent",
+                            )
+                        except JournalUnavailableError as exc:
+                            if not _missing_file(exc):
+                                raise
+                        else:
+                            if retained_intent != intent:
+                                raise JournalUnavailableError(
+                                    "conflicting report transaction intent"
+                                )
+                            os.unlink(".report-transaction.json", dir_fd=reports_fd)
+                            os.fsync(reports_fd)
+                    finally:
+                        os.close(reports_fd)
+                    return ReportCommitResult(report=already, snapshot=snapshot)
+                if head.revision != expected_revision:
+                    raise RevisionConflictError("expected revision is stale")
+                if (
+                    report.engagement_id != engagement_id
+                    or report.journal_revision != expected_revision
+                ):
+                    raise ValueError("report does not match engagement journal revision")
+                if generation_reason == "closure":
+                    if snapshot.state.status.value != "closing" or not snapshot.state.closure_ready:
+                        raise ValueError("closure barrier is not ready")
+                elif snapshot.state.status.value not in {"closed_unverified", "closed_verified"}:
+                    raise ValueError("report revision requires a closed engagement")
+                with suppress(FileExistsError):
+                    os.mkdir("reports", 0o700, dir_fd=engagement_fd)
+                try:
+                    reports_fd = os.open("reports", _directory_flags(), dir_fd=engagement_fd)
+                except OSError as exc:
+                    raise JournalUnavailableError("reports directory is unavailable") from exc
+                try:
+                    _validate_directory(reports_fd, label="reports directory", expected_mode=0o700)
+                    try:
+                        current_intent = _read_bounded(
+                            reports_fd,
+                            ".report-transaction.json",
+                            MAX_REPORT_TRANSACTION_BYTES,
+                            "report transaction intent",
+                        )
+                    except JournalUnavailableError as exc:
+                        if not _missing_file(exc):
+                            raise
+                        _atomic_write(reports_fd, ".report-transaction.json", intent)
+                    else:
+                        if current_intent != intent:
+                            raise JournalUnavailableError("conflicting report transaction intent")
+                    self._fault("report_after_intent")
+                    for index, (name, data, limit) in enumerate(
+                        (
+                            (json_name, json_bytes, MAX_REPORT_JSON_BYTES),
+                            (markdown_name, markdown_bytes, MAX_REPORT_MARKDOWN_BYTES),
+                        )
+                    ):
+                        try:
+                            current = _read_bounded(reports_fd, name, limit, name)
+                        except JournalUnavailableError as exc:
+                            if not _missing_file(exc):
+                                raise
+                            _atomic_write(reports_fd, name, data)
+                        else:
+                            if current != data:
+                                raise JournalUnavailableError("immutable report file conflicts")
+                        self._fault("report_after_json" if index == 0 else "report_after_markdown")
+                    os.fsync(reports_fd)
+                    self._fault("report_after_directory_fsync")
+                finally:
+                    os.close(reports_fd)
+                prefix = f"engagements/{engagement_id}/reports"
+                ref = ReportRef(
+                    report_id=report.report_id,
+                    report_revision=report.report_revision,
+                    json_relative_path=f"{prefix}/{json_name}",
+                    json_sha256=json_digest,
+                    markdown_relative_path=f"{prefix}/{markdown_name}",
+                    markdown_sha256=markdown_digest,
+                    renderer_version=REPORT_RENDERER_VERSION,
+                    journal_revision=expected_revision,
+                )
+                operation_id = uuid5(
+                    engagement_id, f"report-commit:{report.report_revision}:{generation_reason}"
+                )
+                correlation = SystemCorrelation(source="reporting", operation_id=operation_id)
+                drafts = [
+                    JournalEventDraft(
+                        actor="system",
+                        type="report_generated",
+                        payload=ReportGeneratedPayload(
+                            report=ref, generation_reason=generation_reason
+                        ),
+                        system_correlation=correlation,
+                    )
+                ]
+                if generation_reason == "closure":
+                    closure = snapshot.state.closure
+                    assert closure is not None
+                    drafts.append(
+                        JournalEventDraft(
+                            actor="system",
+                            type="engagement_closed",
+                            payload=EngagementClosedPayload(
+                                report_id=ref.report_id,
+                                report_revision=ref.report_revision,
+                                closure_request_event_id=closure.event_id,
+                                terminal_watermark=closure.terminal_watermark,
+                            ),
+                            system_correlation=correlation,
+                        )
+                    )
+                self._fault("report_before_event_append")
+                appended = self._append_locked(
+                    engagement_fd, manifest, existing, head, journal_bytes, tuple(drafts)
+                )
+                self._fault("report_after_event_append")
+                reports_fd = os.open("reports", _directory_flags(), dir_fd=engagement_fd)
+                try:
+                    os.unlink(".report-transaction.json", dir_fd=reports_fd)
+                    os.fsync(reports_fd)
+                finally:
+                    os.close(reports_fd)
+                self._fault("report_after_intent_clear")
+                events = (*existing, *appended.events)
+                closed = self._snapshot(manifest, events, reduce_engagement(manifest, events))
+                return ReportCommitResult(report=ref, snapshot=closed)
+        finally:
+            os.close(engagement_fd)
 
     def _append_batch(
         self,
@@ -1663,9 +1956,7 @@ class EngagementJournalRepository:
                         existing,
                         current_head,
                         journal_bytes,
-                    ) = self._load_authoritative_registry_locked(
-                        engagement_fd, engagement_id
-                    )
+                    ) = self._load_authoritative_registry_locked(engagement_fd, engagement_id)
                 else:
                     (
                         manifest,
@@ -1675,13 +1966,22 @@ class EngagementJournalRepository:
                     ) = self._load_authoritative_locked(
                         engagement_fd, engagement_id, allow_tail=False
                     )
+                abandoned = self._abandon_report_transaction_locked(
+                    engagement_fd,
+                    manifest,
+                    existing,
+                    current_head,
+                    journal_bytes,
+                    validated,
+                    expected_revision,
+                )
+                if abandoned is not None:
+                    return abandoned
                 prior = self._resolve_existing_batch(existing, validated)
                 if prior is not None:
                     self._validate_journal_limits(existing, journal_bytes)
                     state = reduce_engagement(manifest, existing)
-                    expected_projection = self._projection_bytes(
-                        current_head.revision, state
-                    )
+                    expected_projection = self._projection_bytes(current_head.revision, state)
                     try:
                         actual_projection = _read_bounded(
                             engagement_fd,
@@ -1716,6 +2016,325 @@ class EngagementJournalRepository:
                 )
         finally:
             os.close(engagement_fd)
+
+    def _abandon_report_transaction_locked(
+        self,
+        engagement_fd: int,
+        manifest: EngagementManifest,
+        existing: tuple[JournalEvent, ...],
+        current_head: JournalHead,
+        journal_bytes: bytes,
+        drafts: tuple[JournalEventDraft, ...],
+        caller_expected_revision: JournalRevision | None,
+    ) -> BatchAppendResult | None:
+        from sedna.engagement.events import (
+            EventType,
+            ReportCommitAbandonedPayload,
+            ReportGeneratedPayload,
+        )
+        from sedna.engagement.reporting.models import (
+            MAX_REPORT_JSON_BYTES,
+            MAX_REPORT_MARKDOWN_BYTES,
+            MAX_REPORT_TRANSACTION_BYTES,
+            REPORT_RENDERER_VERSION,
+        )
+
+        try:
+            reports_fd = os.open("reports", _directory_flags(), dir_fd=engagement_fd)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise JournalUnavailableError("committed reports directory is unavailable") from exc
+        try:
+            _validate_directory(reports_fd, label="reports directory", expected_mode=0o700)
+            try:
+                raw = _read_bounded(
+                    reports_fd,
+                    ".report-transaction.json",
+                    MAX_REPORT_TRANSACTION_BYTES,
+                    "report transaction intent",
+                )
+            except JournalUnavailableError as exc:
+                if _missing_file(exc):
+                    return None
+                raise
+            try:
+                value = json.loads(raw)
+                if _canonical_json(value) != raw:
+                    raise ValueError("non-canonical intent")
+                if set(value) != {
+                    "intent_id",
+                    "engagement_id",
+                    "report_id",
+                    "report_revision",
+                    "generation_reason",
+                    "expected_revision",
+                    "json_name",
+                    "json_sha256",
+                    "markdown_name",
+                    "markdown_sha256",
+                    "renderer_version",
+                }:
+                    raise ValueError("unexpected intent fields")
+                intent_id = UUID(value["intent_id"])
+                report_id = UUID(value["report_id"])
+                expected = JournalRevision.model_validate(value["expected_revision"])
+                report_revision = value["report_revision"]
+                if type(report_revision) is not int or report_revision < 1:
+                    raise ValueError("invalid report revision")
+                generation_reason = value["generation_reason"]
+                json_digest = value["json_sha256"]
+                markdown_digest = value["markdown_sha256"]
+                json_name = f"report-v{report_revision}.json"
+                markdown_name = f"report-v{report_revision}.md"
+                expected_report_id = uuid5(manifest.engagement_id, f"report:{report_revision}")
+                expected_intent_id = uuid5(
+                    manifest.engagement_id,
+                    f"report-intent:{report_revision}:{generation_reason}:"
+                    f"{json_digest}:{markdown_digest}",
+                )
+                if (
+                    value["engagement_id"] != str(manifest.engagement_id)
+                    or value["json_name"] != json_name
+                    or value["markdown_name"] != markdown_name
+                    or not re.fullmatch(r"[0-9a-f]{64}", json_digest)
+                    or not re.fullmatch(r"[0-9a-f]{64}", markdown_digest)
+                    or generation_reason not in {"closure", "repair_json", "manual_report"}
+                    or value["renderer_version"] != REPORT_RENDERER_VERSION
+                    or report_id != expected_report_id
+                    or intent_id != expected_intent_id
+                ):
+                    raise ValueError("intent identity mismatch")
+            except Exception as exc:
+                raise JournalUnavailableError("invalid report transaction intent") from exc
+
+            bound = next(
+                (
+                    item.payload
+                    for item in existing
+                    if isinstance(item.payload, ReportGeneratedPayload)
+                    and item.payload.report.report_id == report_id
+                ),
+                None,
+            )
+            if bound is not None:
+                ref = bound.report
+                prefix = f"engagements/{manifest.engagement_id}/reports"
+                if (
+                    bound.generation_reason != value["generation_reason"]
+                    or ref.report_revision != report_revision
+                    or ref.journal_revision != expected
+                    or ref.json_relative_path != f"{prefix}/{json_name}"
+                    or ref.markdown_relative_path != f"{prefix}/{markdown_name}"
+                    or ref.json_sha256 != json_digest
+                    or ref.markdown_sha256 != markdown_digest
+                    or ref.renderer_version != value["renderer_version"]
+                ):
+                    raise JournalUnavailableError("conflicting event-bound report transaction")
+                for name, digest, limit, label in (
+                    (
+                        json_name,
+                        json_digest,
+                        MAX_REPORT_JSON_BYTES,
+                        "event-bound report JSON",
+                    ),
+                    (
+                        markdown_name,
+                        markdown_digest,
+                        MAX_REPORT_MARKDOWN_BYTES,
+                        "event-bound report Markdown",
+                    ),
+                ):
+                    data = _read_bounded(reports_fd, name, limit, label)
+                    if sha256(data).hexdigest() != digest:
+                        raise JournalUnavailableError(f"{label} digest mismatch")
+                os.unlink(".report-transaction.json", dir_fd=reports_fd)
+                os.fsync(reports_fd)
+                return None
+
+            state = reduce_engagement(manifest, existing)
+            closing_reason_is_valid = (
+                report_revision == 1
+                and generation_reason == "closure"
+                and state.status.value == "closing"
+                and state.closure_ready
+                and not state.reports
+            )
+            later_reason_is_valid = (
+                report_revision == len(state.reports) + 1
+                and report_revision > 1
+                and generation_reason in {"repair_json", "manual_report"}
+                and state.status.value in {"closed_unverified", "closed_verified"}
+            )
+            if not (closing_reason_is_valid or later_reason_is_valid):
+                raise JournalUnavailableError("invalid report transaction intent")
+
+            draft_digest = sha256(
+                _canonical_json([item.model_dump(mode="json", warnings="error") for item in drafts])
+            ).hexdigest()
+            orphan_name = f"{intent_id}-{json_digest}"
+            orphan_directory = f"engagements/{manifest.engagement_id}/reports/orphans/{orphan_name}"
+
+            def complete_abandonment() -> None:
+                with suppress(FileExistsError):
+                    os.mkdir("orphans", 0o700, dir_fd=reports_fd)
+                orphans_fd = os.open("orphans", _directory_flags(), dir_fd=reports_fd)
+                try:
+                    _validate_directory(orphans_fd, label="report orphans", expected_mode=0o700)
+                    with suppress(FileExistsError):
+                        os.mkdir(orphan_name, 0o700, dir_fd=orphans_fd)
+                    orphan_fd = os.open(orphan_name, _directory_flags(), dir_fd=orphans_fd)
+                    try:
+                        _validate_directory(
+                            orphan_fd,
+                            label="report orphan directory",
+                            expected_mode=0o700,
+                        )
+                        for name, digest, limit, label, fault_point in (
+                            (
+                                json_name,
+                                json_digest,
+                                MAX_REPORT_JSON_BYTES,
+                                "orphaned report JSON",
+                                "report_abandon_after_json_move",
+                            ),
+                            (
+                                markdown_name,
+                                markdown_digest,
+                                MAX_REPORT_MARKDOWN_BYTES,
+                                "orphaned report Markdown",
+                                "report_abandon_after_markdown_move",
+                            ),
+                        ):
+                            try:
+                                source = _read_bounded(reports_fd, name, limit, label)
+                            except JournalUnavailableError as exc:
+                                if not _missing_file(exc):
+                                    raise
+                                source = None
+                            try:
+                                destination = _read_bounded(orphan_fd, name, limit, label)
+                            except JournalUnavailableError as exc:
+                                if not _missing_file(exc):
+                                    raise
+                                destination = None
+                            if source is not None and destination is not None:
+                                raise JournalUnavailableError(
+                                    "report transaction file exists in both canonical "
+                                    "and orphan locations"
+                                )
+                            data = source if source is not None else destination
+                            if data is None or sha256(data).hexdigest() != digest:
+                                raise JournalUnavailableError(f"{label} digest mismatch")
+                            if source is not None:
+                                os.rename(
+                                    name,
+                                    name,
+                                    src_dir_fd=reports_fd,
+                                    dst_dir_fd=orphan_fd,
+                                )
+                                self._fault(fault_point)
+                        os.fsync(orphan_fd)
+                    finally:
+                        os.close(orphan_fd)
+                    os.fsync(orphans_fd)
+                finally:
+                    os.close(orphans_fd)
+                os.fsync(reports_fd)
+                os.unlink(".report-transaction.json", dir_fd=reports_fd)
+                os.fsync(reports_fd)
+
+            prior = next(
+                (
+                    (index, item.payload)
+                    for index, item in enumerate(existing)
+                    if isinstance(item.payload, ReportCommitAbandonedPayload)
+                    and item.payload.intent_id == intent_id
+                ),
+                None,
+            )
+            if prior is not None:
+                index, payload = prior
+                replay = existing[index + 1 : index + 1 + payload.displaced_batch_count]
+                if (
+                    payload.displaced_batch_count != len(drafts)
+                    or payload.displaced_batch_digest != draft_digest
+                    or payload.report_id != report_id
+                    or payload.report_revision != report_revision
+                    or payload.expected_revision != expected
+                    or payload.json_sha256 != json_digest
+                    or payload.markdown_sha256 != markdown_digest
+                    or payload.orphan_directory != orphan_directory
+                    or len(replay) != len(drafts)
+                    or not self._drafts_match(replay, drafts)
+                ):
+                    raise JournalUnavailableError("conflicting abandoned report retry")
+                complete_abandonment()
+                return BatchAppendResult(
+                    events=replay,
+                    revision=current_head.revision,
+                    existing_event_ids=tuple(item.event_id for item in replay),
+                )
+
+            if len(drafts) > MAX_JOURNAL_BATCH_EVENTS - 1:
+                raise ValueError("report abandonment leaves no room for caller batch")
+            if (
+                caller_expected_revision is not None
+                and caller_expected_revision != current_head.revision
+            ):
+                raise RevisionConflictError("expected revision is stale")
+            for name, digest, limit, label in (
+                (json_name, json_digest, MAX_REPORT_JSON_BYTES, "report transaction JSON"),
+                (
+                    markdown_name,
+                    markdown_digest,
+                    MAX_REPORT_MARKDOWN_BYTES,
+                    "report transaction Markdown",
+                ),
+            ):
+                data = _read_bounded(reports_fd, name, limit, label)
+                if sha256(data).hexdigest() != digest:
+                    raise JournalUnavailableError(f"{label} digest mismatch")
+
+            recovery = JournalEventDraft(
+                actor="system",
+                type=EventType.REPORT_COMMIT_ABANDONED,
+                payload=ReportCommitAbandonedPayload(
+                    intent_id=intent_id,
+                    report_id=report_id,
+                    report_revision=report_revision,
+                    expected_revision=expected,
+                    json_sha256=json_digest,
+                    markdown_sha256=markdown_digest,
+                    orphan_directory=orphan_directory,
+                    displaced_batch_count=len(drafts),
+                    displaced_batch_digest=draft_digest,
+                ),
+                system_correlation=SystemCorrelation(
+                    source="recovery",
+                    operation_id=uuid5(manifest.engagement_id, f"report-abandoned:{intent_id}"),
+                ),
+            )
+            self._fault("report_abandon_before_event_append")
+            appended = self._append_locked(
+                engagement_fd,
+                manifest,
+                existing,
+                current_head,
+                journal_bytes,
+                (recovery, *drafts),
+            )
+            self._fault("report_abandon_after_event_append")
+            complete_abandonment()
+            self._fault("report_abandon_after_intent_clear")
+            caller_events = appended.events[1:]
+            return BatchAppendResult(
+                events=caller_events,
+                revision=appended.revision,
+                created_event_ids=tuple(item.event_id for item in caller_events),
+            )
+        finally:
+            os.close(reports_fd)
 
     def _append_locked(
         self,
@@ -1756,9 +2375,7 @@ class EngagementJournalRepository:
             dir_fd=engagement_fd,
         )
         try:
-            result = _validate_regular(
-                journal_fd, label="events.jsonl", expected_mode=0o600
-            )
+            result = _validate_regular(journal_fd, label="events.jsonl", expected_mode=0o600)
             if result.st_size != base_head.journal_bytes:
                 raise JournalUnavailableError("journal_corrupt: append base size changed")
             for index, line in enumerate(lines):
@@ -1921,9 +2538,7 @@ class EngagementJournalRepository:
             ):
                 raise JournalUnavailableError("projection digest is invalid")
             try:
-                revision = JournalRevision.model_validate(
-                    value["authoritative_revision"]
-                )
+                revision = JournalRevision.model_validate(value["authoritative_revision"])
             except Exception as exc:
                 raise JournalUnavailableError("projection revision is invalid") from exc
             if revision != snapshot.revision:
@@ -2292,6 +2907,7 @@ class EngagementJournalRepository:
             payload=LaneBoundPayload(lane=lane, binding_reason=reason),
             idempotency_key=f"lane-bind:{lane.stable_key}:{engagement_id}",
         )
+
         def attempt() -> BatchAppendResult:
             with _locked_file(self._engagements_fd, ".registry.lock"):
                 self._assert_lane_available(lane, exclude=engagement_id)
@@ -2319,6 +2935,7 @@ class EngagementJournalRepository:
             payload=LaneUnboundPayload(lane=lane, reason=reason),
             idempotency_key=f"lane-unbind:{lane.stable_key}:{engagement_id}",
         )
+
         def attempt() -> BatchAppendResult:
             with _locked_file(self._engagements_fd, ".registry.lock"):
                 return self._append_batch(
@@ -2365,9 +2982,7 @@ class EngagementJournalRepository:
         else:
             raise _RegistryTailRecoveryRequiredError(engagement_id)
         try:
-            return self._load_authoritative_locked(
-                engagement_fd, engagement_id, allow_tail=True
-            )
+            return self._load_authoritative_locked(engagement_fd, engagement_id, allow_tail=True)
         except _RecoverableTailError as recovery:
             raise _RegistryTailRecoveryRequiredError(engagement_id) from recovery
 
@@ -2399,9 +3014,7 @@ class EngagementJournalRepository:
             os.close(engagement_fd)
 
     @staticmethod
-    def _drafts_match(
-        events: Sequence[JournalEvent], drafts: Sequence[JournalEventDraft]
-    ) -> bool:
+    def _drafts_match(events: Sequence[JournalEvent], drafts: Sequence[JournalEventDraft]) -> bool:
         if len(events) != len(drafts):
             return False
         for event, draft in zip(events, drafts, strict=True):
@@ -2533,10 +3146,7 @@ class EngagementJournalRepository:
         if head.engagement_id != engagement_id or manifest.engagement_id != engagement_id:
             raise JournalUnavailableError("journal_corrupt: engagement identity mismatch")
         prefix = journal_bytes[: head.journal_bytes]
-        if (
-            len(prefix) != head.journal_bytes
-            or sha256(prefix).hexdigest() != head.journal_sha256
-        ):
+        if len(prefix) != head.journal_bytes or sha256(prefix).hexdigest() != head.journal_sha256:
             raise JournalUnavailableError("journal_corrupt: journal disagrees with head")
         lines = tuple(_iter_journal_lines(prefix))
         try:
@@ -2583,9 +3193,7 @@ class EngagementJournalRepository:
             raise JournalUnavailableError("journal_corrupt: invalid pending append") from exc
         if base.engagement_id != engagement_id or target.engagement_id != engagement_id:
             raise JournalUnavailableError("journal_corrupt: pending append identity mismatch")
-        journal = _read_bounded(
-            engagement_fd, "events.jsonl", MAX_JOURNAL_BYTES, "events.jsonl"
-        )
+        journal = _read_bounded(engagement_fd, "events.jsonl", MAX_JOURNAL_BYTES, "events.jsonl")
         suffix = b"".join(lines)
         prefix = journal[: base.journal_bytes]
         if len(prefix) != base.journal_bytes or not prefix:
@@ -2608,12 +3216,10 @@ class EngagementJournalRepository:
                 )
             )
             base_events = tuple(
-                JournalEvent.model_validate_json(line)
-                for line in _iter_journal_lines(prefix)
+                JournalEvent.model_validate_json(line) for line in _iter_journal_lines(prefix)
             )
             target_events = tuple(
-                JournalEvent.model_validate_json(line)
-                for line in _iter_journal_lines(completed)
+                JournalEvent.model_validate_json(line) for line in _iter_journal_lines(completed)
             )
             if base != _head(engagement_id, base_events, prefix):
                 raise ValueError("pending base head mismatch")
@@ -2710,13 +3316,11 @@ class EngagementJournalRepository:
                         if (
                             JournalRevision.model_validate(stored["valid_prefix_revision"])
                             != recorded_head.revision
-                            or stored["valid_prefix_hash"]
-                            != recorded_head.revision.event_hash
+                            or stored["valid_prefix_hash"] != recorded_head.revision.event_hash
                         ):
                             raise ValueError("valid prefix mismatch")
                         parsed_drafts = tuple(
-                            JournalEventDraft.model_validate(item)
-                            for item in stored["drafts"]
+                            JournalEventDraft.model_validate(item) for item in stored["drafts"]
                         )
                         if len(parsed_drafts) != 2:
                             raise ValueError("recovery pair mismatch")
@@ -2768,15 +3372,12 @@ class EngagementJournalRepository:
                                 "journal_identity": list(journal_identity),
                                 "full_file_size": full_file_size,
                                 "last_valid_offset": head.journal_bytes,
-                                "valid_prefix_revision": head.revision.model_dump(
-                                    mode="json"
-                                ),
+                                "valid_prefix_revision": head.revision.model_dump(mode="json"),
                                 "valid_prefix_hash": head.revision.event_hash,
                                 "tail_sha256": digest,
                                 "tail_size": len(tail),
                                 "drafts": [
-                                    draft.model_dump(mode="json")
-                                    for draft in sealed_drafts
+                                    draft.model_dump(mode="json") for draft in sealed_drafts
                                 ],
                             }
                         )
@@ -2802,9 +3403,7 @@ class EngagementJournalRepository:
                     and tail_digest is not None
                     and tail_size is not None
                     and sealed_drafts
-                    != _tail_recovery_drafts(
-                        engagement_id, recovery_lane, tail_digest, tail_size
-                    )
+                    != _tail_recovery_drafts(engagement_id, recovery_lane, tail_digest, tail_size)
                 ):
                     raise JournalUnavailableError(
                         "journal_corrupt: tail recovery drafts are not deterministic"
@@ -2851,9 +3450,7 @@ class EngagementJournalRepository:
                         ) from exc
                     return
                 if raw_intent is None or current_intent != raw_intent:
-                    raise JournalUnavailableError(
-                        "journal_corrupt: tail recovery intent changed"
-                    )
+                    raise JournalUnavailableError("journal_corrupt: tail recovery intent changed")
                 journal_fd = _open_regular(
                     engagement_fd,
                     "events.jsonl",
@@ -2948,8 +3545,7 @@ class EngagementJournalRepository:
             )
         )
         events = tuple(
-            JournalEvent.model_validate_json(line)
-            for line in _iter_journal_lines(prefix)
+            JournalEvent.model_validate_json(line) for line in _iter_journal_lines(prefix)
         )
         reduce_engagement(manifest, events)
         if head != _head(engagement_id, events, prefix):

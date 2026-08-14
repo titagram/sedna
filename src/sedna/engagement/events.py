@@ -6,7 +6,7 @@ import json
 from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
-from typing import Annotated, Any, Literal, TypeAlias
+from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeAlias
 from uuid import UUID
 
 from pydantic import (
@@ -14,6 +14,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictInt,
+    TypeAdapter,
     field_validator,
     model_validator,
 )
@@ -26,12 +27,14 @@ from sedna.engagement.models import (
     MAX_EVIDENCE_ITEM_BYTES,
     MAX_HOST_CORRELATION_ID_CHARS,
     MAX_IN_FLIGHT_CALLS,
+    MAX_JOURNAL_BATCH_EVENTS,
     MAX_JOURNAL_EVENT_BYTES,
     MAX_JOURNAL_EVENTS,
     MAX_SETTLEMENT_PENDING_RANGES,
     MAX_TOOL_CALL_ORDINAL,
     MAX_TOOL_DURATION_MS,
     MAX_TOOL_NAME_CHARS,
+    ConfinedRelativePath,
     EngagementManifest,
     EngagementState,
     EvidenceId,
@@ -47,6 +50,9 @@ from sedna.engagement.models import (
 )
 from sedna.engagement.normalization import NormalizationFailure, SanitizedHostValue
 from sedna.knowledge.retrieval import AuthorizationScope, AuthorizationState
+
+if TYPE_CHECKING:
+    from sedna.engagement.reporting.models import ReportRef
 
 CONTROL_TOOL_POLICY_VERSION = "sedna.control-tools.v1"
 CONTROL_TOOL_NAMES = frozenset(
@@ -1521,6 +1527,33 @@ class ResearchSourceAssessedEventPayload(_PlanningEventPayload):
         return self
 
 
+class ReportGeneratedPayload(_Payload):
+    kind: Literal["report_generated"] = "report_generated"
+    report: ReportRef
+    generation_reason: Literal["closure", "repair_json", "manual_report"]
+
+
+class EngagementClosedPayload(_Payload):
+    kind: Literal["engagement_closed"] = "engagement_closed"
+    report_id: UUID
+    report_revision: int = Field(ge=1)
+    closure_request_event_id: UUID
+    terminal_watermark: int = Field(ge=0)
+
+
+class ReportCommitAbandonedPayload(_Payload):
+    kind: Literal["report_commit_abandoned"] = "report_commit_abandoned"
+    intent_id: UUID
+    report_id: UUID
+    report_revision: int = Field(ge=1)
+    expected_revision: JournalRevision
+    json_sha256: Sha256Hex
+    markdown_sha256: Sha256Hex
+    orphan_directory: ConfinedRelativePath
+    displaced_batch_count: int = Field(ge=1, le=MAX_JOURNAL_BATCH_EVENTS - 1)
+    displaced_batch_digest: Sha256Hex
+
+
 EventPayload: TypeAlias = Annotated[
     EngagementOpenedPayload
     | EngagementResumedPayload
@@ -1568,9 +1601,14 @@ EventPayload: TypeAlias = Annotated[
     | StrategyReactivatedEventPayload
     | ResearchQueryProposedEventPayload
     | ResearchSourceConsultedEventPayload
-    | ResearchSourceAssessedEventPayload,
+    | ResearchSourceAssessedEventPayload
+    | ReportGeneratedPayload
+    | EngagementClosedPayload
+    | ReportCommitAbandonedPayload,
     Field(discriminator="kind"),
 ]
+
+EventPayloadAdapter = TypeAdapter(EventPayload)
 
 
 class EventType(StrEnum):
@@ -1621,6 +1659,9 @@ class EventType(StrEnum):
     RESEARCH_QUERY_PROPOSED = "research_query_proposed"
     RESEARCH_SOURCE_CONSULTED = "research_source_consulted"
     RESEARCH_SOURCE_ASSESSED = "research_source_assessed"
+    REPORT_GENERATED = "report_generated"
+    ENGAGEMENT_CLOSED = "engagement_closed"
+    REPORT_COMMIT_ABANDONED = "report_commit_abandoned"
 
 
 _LANE_REQUIRED_TYPES = frozenset(
@@ -1674,6 +1715,9 @@ _SYSTEM_SOURCE_BY_TYPE: dict[EventType, str] = {
     EventType.RESEARCH_QUERY_PROPOSED: "planning",
     EventType.RESEARCH_SOURCE_CONSULTED: "planning",
     EventType.RESEARCH_SOURCE_ASSESSED: "planning",
+    EventType.REPORT_GENERATED: "reporting",
+    EventType.ENGAGEMENT_CLOSED: "reporting",
+    EventType.REPORT_COMMIT_ABANDONED: "recovery",
 }
 
 
