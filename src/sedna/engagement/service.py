@@ -1208,8 +1208,37 @@ class EngagementJournalService:
             raise ValueError("proposal_id and strategy are mutually exclusive")
         if strategy is not None and rationale is None:
             raise ValueError("custom decisions require a rationale")
-        resolved_strategy = strategy or "planner proposal"
-        resolved_rationale = rationale or ""
+        resolved_strategy = strategy
+        resolved_rationale = rationale
+        if proposal_id is not None:
+            stored_frontier = self._repository.load_projection(
+                engagement_id, name="frontier", owner="planning"
+            )
+            frontier = stored_frontier.get("payload") if stored_frontier is not None else None
+            proposals = frontier.get("proposals", ()) if isinstance(frontier, dict) else ()
+            proposal = next(
+                (
+                    item
+                    for item in proposals
+                    if isinstance(item, dict) and item.get("proposal_id") == str(proposal_id)
+                ),
+                None,
+            )
+            snapshot = self.load_snapshot(engagement_id)
+            owned_by_lane = any(
+                event.type.value in {"frontier_proposed", "frontier_repaired"}
+                and event.lane is not None
+                and event.lane.stable_key == lane.stable_key
+                and getattr(getattr(event.payload, "proposal", None), "proposal_id", None)
+                == proposal_id
+                for event in snapshot.events
+            )
+            if proposal is None or not owned_by_lane:
+                raise ValueError("proposal_not_found")
+            resolved_strategy = proposal.get("title")
+            resolved_rationale = proposal.get("rationale")
+        assert resolved_strategy is not None
+        assert resolved_rationale is not None
         result = self._repository.append_batch(
             engagement_id,
             (

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
 from sedna.engagement import EngagementJournalService
+from sedna.planning.models import InterpretationSubject, ObservationBatchDraft
 from sedna.plugin import register
 
 
@@ -24,12 +27,29 @@ class _SimulatedContext:
         self.sedna_knowledge_root = knowledge_root
         self.tools: list[dict[str, Any]] = []
         self.hooks: dict[str, Any] = {}
+        self.llm = self
 
     def register_tool(self, **kwargs: Any) -> None:
         self.tools.append(kwargs)
 
     def register_hook(self, name: str, callback) -> None:
         self.hooks[name] = callback
+
+    def complete_structured(self, **kwargs: Any) -> object:
+        payload = json.loads(kwargs["input"][0]["text"])
+        evidence = payload["evidence_slices"][0]
+        return SimpleNamespace(
+            parsed=ObservationBatchDraft(
+                subject=InterpretationSubject(
+                    attachment_event_id=evidence["event_id"],
+                    evidence_id=evidence["evidence_id"],
+                )
+            ),
+            provider="simulated",
+            model="simulated",
+            agent_id="simulated-hades",
+            usage={"input_tokens": 1, "output_tokens": 1},
+        )
 
 
 class SimulatedHades:

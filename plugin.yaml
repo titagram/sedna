@@ -11,6 +11,7 @@ provides_tools:
   - sedna_retrieve_knowledge
   - sedna_get_knowledge_artifact
   - sedna_knowledge_maintenance
+  - sedna_plan_next
   - sedna_manage_engagement
   - sedna_record_decision
   - sedna_add_source

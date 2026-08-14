@@ -103,7 +103,16 @@ from sedna.planning.ledger import (
     select_reactivation_candidates,
     validate_reconciliation,
 )
-from sedna.planning.ports import TerminalReconciliationResult, TerminalSettlementPort
+from sedna.planning.ports import (
+    KnowledgeRootResolver,
+    OwnedPlanningRuntime,
+    PlanningOperations,
+    PlanningRuntimeFactory,
+    PlanningSettlementAdapter,
+    PlanningSettlementPortFactory,
+    TerminalReconciliationResult,
+    TerminalSettlementPort,
+)
 from sedna.planning.retrieval import (
     CandidateResearchSource,
     PlannerKnowledgeContext,
@@ -178,6 +187,12 @@ __all__ = [
     "PlanningLlmAdapter",
     "PlanningLlmError",
     "PlanningResult",
+    "PlanningOperations",
+    "PlanningRuntimeFactory",
+    "PlanningSettlementAdapter",
+    "PlanningSettlementPortFactory",
+    "KnowledgeRootResolver",
+    "OwnedPlanningRuntime",
     "PlannerCriticRequest",
     "PlannerCriticVerdict",
     "PlannerDraft",

@@ -178,12 +178,19 @@ than installed as agent instructions. See the
 [Claude-Red integration assessment](docs/architecture/2026-08-06-claude-red-integration-assessment.md)
 for the proposed source adapter, Hades boundary, quality gates, and pilot rollout.
 
-## M6A Engagement Journal
+## M6 Engagement Journal and Adaptive Planner
 
 Since `0.2.0`, the plugin registers persistent engagement control tools
-(`sedna_manage_engagement`, `sedna_record_decision`, `sedna_add_source`) and nine
+(`sedna_manage_engagement`, `sedna_record_decision`, `sedna_add_source`), the adaptive
+`sedna_plan_next` tool, and nine
 observer hooks that retain host tool calls, results, decisions, and session checkpoints
 inside a crash-safe local journal per engagement.
+
+Planning is invocation-scoped: each plan or lifecycle settlement resolves the active knowledge
+root, opens one complete host-backed runtime, and closes it before returning. `sedna_plan_next`
+uses the exact host-bound session/task lane and accepts no caller-selected root. Proposals and
+source-derived command examples are non-coercive suggestions that require host validation;
+unplanned actions remain allowed and are assessed on the next planning pass.
 
 - **Root layout.** Engagements live under the selected knowledge root in
   `engagements/<engagement-uuid>/`: `events.jsonl` (append-only, hash-chained events),
@@ -205,10 +212,10 @@ inside a crash-safe local journal per engagement.
 - **Recovery.** A partial trailing JSON record (host crash mid-write) is recovered
   atomically into a typed `recovery_warning` with quarantined tail evidence; orphaned
   in-flight calls are terminated explicitly via `resolve_call`.
-- **Boundaries.** All paths are absolute; relative roots fail closed. The M6A adapter
-  performs one settlement per operation through an optional host port (M6B), and `closing`
-  state awaits the M6C finalizer; M6A itself has no planner and no final proof
-  verification.
+- **Boundaries.** All paths are absolute; relative roots fail closed. The engagement adapter
+  performs one settlement per mandatory plan/resume/finalize/close/reopen path through the
+  planning port. Incomplete or unavailable settlement exposes only bounded safe status and never
+  claims a clean lifecycle transition.
 
 The LLM-facing operating contract with complete JSON examples is in the
 [Sedna engagement tools guide](docs/llm/sedna-engagement-tools.md).

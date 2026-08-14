@@ -10,6 +10,7 @@ import pytest
 
 import sedna.knowledge.semantic.compiler as compiler_module
 import sedna.knowledge.semantic.service as semantic_service_module
+from sedna.engagement.repository import JournalUnavailableError
 from sedna.knowledge.hades_runtime import HadesKnowledgeRuntime
 from sedna.knowledge.inventory import discover_sources
 from sedna.knowledge.pipeline import IngestionPipeline
@@ -93,6 +94,22 @@ def test_runtime_close_releases_owned_resources_idempotently(tmp_path: Path) -> 
         runtime._repository.load_manifest("missing")
     with pytest.raises(RuntimeError):
         runtime._index.snapshot_state()
+
+
+def test_runtime_composes_planning_with_the_same_owned_journal(tmp_path: Path) -> None:
+    runtime = HadesKnowledgeRuntime.create(_ScriptedHost([]), tmp_path / "knowledge")
+
+    try:
+        assert runtime.planning._journal is runtime._journal
+        assert runtime.planning._retrieval is runtime.retrieval
+        assert (
+            runtime.planning._canonical_revision() == runtime._repository.retrieval_read_revision()
+        )
+    finally:
+        runtime.close()
+
+    with pytest.raises(JournalUnavailableError, match="repository is closed"):
+        runtime._journal.list_snapshot_ids()
 
 
 class _RawCompletionHost:
@@ -982,12 +999,16 @@ def test_runtime_close_serializes_threads_and_retries_only_failed_resource() -> 
     """Marking the runtime closed before a failed close blocks recovery and races callers."""
     index = _CloseProbe(fail_first=True)
     repository = _CloseProbe()
+    journal_repository = _CloseProbe()
     runtime = HadesKnowledgeRuntime(  # type: ignore[arg-type]
         learning=object(),
         retrieval=object(),
         maintenance=object(),
+        planning=object(),
         _repository=repository,
         _index=index,
+        _journal=object(),
+        _journal_repository=journal_repository,
     )
     start = Barrier(3)
     failures: list[BaseException] = []
@@ -1013,9 +1034,11 @@ def test_runtime_close_serializes_threads_and_retries_only_failed_resource() -> 
     assert len(failures) == 1 and isinstance(failures[0], OSError)
     assert index.calls == 2
     assert repository.calls == 1
+    assert journal_repository.calls == 1
     runtime.close()
     assert index.calls == 2
     assert repository.calls == 1
+    assert journal_repository.calls == 1
 
 
 class _FlippingStructuredHost:

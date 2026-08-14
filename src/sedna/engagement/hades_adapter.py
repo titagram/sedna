@@ -284,6 +284,7 @@ class HadesEngagementAdapter:
         self._settlement_port_factory = settlement_port_factory
         self._clock = clock or (lambda: datetime.now(UTC))
         self._health = _HealthMap()
+        self._invocation_state = threading.local()
 
     # -- registration -----------------------------------------------------
 
@@ -396,12 +397,12 @@ class HadesEngagementAdapter:
         if not isinstance(root, Path):
             raise ValueError("root resolver must return a Path")
         root = root.resolve()
-        self._pinned_root = root
+        self._invocation_state.pinned_root = root
         return root
 
     def _open_service(self) -> Any:
         return EngagementJournalService.open(
-            self._pinned_root, clock=self._clock, uuid_factory=uuid4
+            self._invocation_state.pinned_root, clock=self._clock, uuid_factory=uuid4
         )
 
     def _invoke(self) -> tuple[Path, str, Any]:
@@ -712,7 +713,7 @@ class HadesEngagementAdapter:
                 self._rebuild_logbook(
                     service,
                     engagement_id,
-                    sha256(str(self._pinned_root).encode("utf-8")).hexdigest(),
+                    sha256(str(self._invocation_state.pinned_root).encode("utf-8")).hexdigest(),
                     session_id,
                 )
                 return self._result(

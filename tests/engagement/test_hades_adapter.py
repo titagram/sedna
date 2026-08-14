@@ -4,6 +4,7 @@ import contextlib
 import fcntl
 import json
 import os
+import threading
 from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
@@ -217,6 +218,40 @@ def test_adapter_registers_compact_tools_and_required_hooks(tmp_path) -> None:
         item["schema"]["parameters"]["additionalProperties"] is False
         for item in context.tools
     )
+
+
+def test_pinned_invocation_roots_do_not_cross_concurrent_adapter_calls(tmp_path) -> None:
+    roots = iter((tmp_path / "one", tmp_path / "two"))
+    adapter = HadesEngagementAdapter(
+        FakeHadesContext(tmp_path / "unused"),
+        root_resolver=lambda: next(roots),
+    )
+    first_pinned = threading.Event()
+    second_finished = threading.Event()
+    observed: list[Path] = []
+
+    def first() -> None:
+        adapter._pin_root()
+        first_pinned.set()
+        assert second_finished.wait(timeout=2)
+        with adapter._open_service() as service:
+            observed.append(service._repository._knowledge_root)
+
+    def second() -> None:
+        assert first_pinned.wait(timeout=2)
+        adapter._pin_root()
+        with adapter._open_service() as service:
+            observed.append(service._repository._knowledge_root)
+        second_finished.set()
+
+    threads = (threading.Thread(target=first), threading.Thread(target=second))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert observed == [tmp_path / "two", tmp_path / "one"]
 
 
 def test_manage_create_requires_host_lane_and_has_no_per_call_root(tmp_path) -> None:

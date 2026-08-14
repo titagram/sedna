@@ -7,12 +7,14 @@ import json
 import os
 import sys
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from sedna.engagement.hades_adapter import HadesEngagementAdapter
+from sedna.engagement.models import ExecutionLaneKey, HostKind
 from sedna.knowledge.hades_runtime import HadesKnowledgeRuntime
 from sedna.knowledge.retrieval import (
     AuthorizationScope,
@@ -22,6 +24,12 @@ from sedna.knowledge.retrieval import (
     RetrievalQuery,
     SituationFacet,
     ValidatedTarget,
+)
+from sedna.planning import (
+    MAX_PLANNING_RESULT_BYTES,
+    PlanningResult,
+    PlanningRuntimeFactory,
+    PlanningSettlementPortFactory,
 )
 from sedna.runners import ToolRunner, nmap_service_scan, nmap_tcp_discovery
 
@@ -56,6 +64,14 @@ ToolErrorCode = Literal[
     "maintenance_failed",
     "retrieval_failed",
     "structured_llm_unavailable",
+    "engagement_binding_required",
+    "evidence_budget_exhausted",
+    "interpretation_incomplete",
+    "interpretation_failed",
+    "settlement_unavailable",
+    "journal_unavailable",
+    "planning_failed",
+    "result_too_large",
 ]
 
 
@@ -121,6 +137,10 @@ class _ArtifactInput(_RuntimeInput):
 
 class _MaintenanceInput(_RuntimeInput):
     operation: Literal["audit", "rebuild"]
+
+
+class _PlanNextInput(_ToolInput):
+    max_proposals: int = Field(default=5, ge=3, le=8)
 
 
 class _ToolErrorResult(BaseModel):
@@ -240,9 +260,28 @@ def register(ctx: Any) -> None:
         input_model=_MaintenanceInput,
         handler=_maintenance_handler,
     )
+
+    def root_resolver() -> Path:
+        return _knowledge_root(ctx, None)
+
+    planning_runtime_factory = _planning_runtime_factory(ctx)
+    ctx.register_tool(
+        name="sedna_plan_next",
+        toolset="plugin_sedna",
+        schema={
+            "name": "sedna_plan_next",
+            "description": "Settle pending evidence and return the validated planning frontier.",
+            "parameters": _PlanNextInput.model_json_schema(),
+        },
+        handler=_bind_plan_context(
+            root_resolver=root_resolver,
+            planning_runtime_factory=planning_runtime_factory,
+        ),
+    )
     HadesEngagementAdapter(
         ctx,
-        root_resolver=lambda: _knowledge_root(ctx, None),
+        root_resolver=root_resolver,
+        settlement_port_factory=PlanningSettlementPortFactory(planning_runtime_factory),
     ).register()
 
 
@@ -271,6 +310,71 @@ def _bind_context(handler: Callable[..., str], ctx: Any) -> Callable[..., str]:
         return handler(args, ctx=ctx)
 
     return bound
+
+
+def _bind_plan_context(
+    *,
+    root_resolver: Callable[[], Path],
+    planning_runtime_factory: PlanningRuntimeFactory,
+) -> Callable[..., str]:
+    def bound(args: object, **kwargs: Any) -> str:
+        return _plan_next_handler(
+            args,
+            root_resolver=root_resolver,
+            planning_runtime_factory=planning_runtime_factory,
+            **kwargs,
+        )
+
+    return bound
+
+
+def _planning_runtime_factory(ctx: Any) -> PlanningRuntimeFactory:
+    @contextmanager
+    def open_runtime(resolved_root: Path) -> Any:
+        host = _structured_host(ctx)
+        try:
+            runtime = HadesKnowledgeRuntime.create(host, resolved_root)
+        except Exception as error:
+            raise _ToolBoundaryError("knowledge_runtime_unavailable") from error
+        try:
+            yield runtime
+        finally:
+            runtime.close()
+
+    return open_runtime
+
+
+def _plan_next_handler(
+    args: object,
+    *,
+    root_resolver: Callable[[], Path],
+    planning_runtime_factory: PlanningRuntimeFactory,
+    session_id: str | None = None,
+    task_id: str | None = None,
+    **_: Any,
+) -> str:
+    if not session_id or not task_id:
+        return _json_error("engagement_binding_required")
+    try:
+        request = _validate_input(_PlanNextInput, args)
+        lane = ExecutionLaneKey.from_host(
+            host_kind=HostKind.HADES,
+            session_id=session_id,
+            task_id=task_id,
+        )
+        root = root_resolver()
+        with planning_runtime_factory(root) as runtime:
+            result = runtime.planning.plan_next(
+                lane,
+                max_proposals=request.max_proposals,
+            )
+        return _serialize_planning_result(result)
+    except _ToolBoundaryError as error:
+        return _json_error(error.code)
+    except ValidationError:
+        return _json_error("invalid_input")
+    except Exception:
+        return _json_error("planning_failed")
 
 
 def _learn_local_handler(args: object, *, ctx: Any) -> str:
@@ -509,6 +613,21 @@ def _require_external_knowledge_root(source_path: Path, knowledge_root: Path) ->
 def _json_model(model: BaseModel) -> str:
     canonical = type(model).model_validate(model.model_dump(mode="json"))
     return _json_payload(canonical.model_dump(mode="json"))
+
+
+def _serialize_planning_result(result: object) -> str:
+    try:
+        payload = result.model_dump(mode="json")  # type: ignore[attr-defined]
+        canonical = PlanningResult.model_validate(payload)
+    except Exception as error:
+        raise _ToolBoundaryError("planning_failed") from error
+    safe_payload = canonical.model_dump(mode="json")
+    if canonical.status == "gap" and canonical.gap is not None:
+        safe_payload["gap"].pop("pending_ranges", None)
+    encoded = _json_payload(safe_payload)
+    if len(encoded.encode("utf-8")) > MAX_PLANNING_RESULT_BYTES:
+        raise _ToolBoundaryError("result_too_large")
+    return encoded
 
 
 def _json_error(code: ToolErrorCode) -> str:

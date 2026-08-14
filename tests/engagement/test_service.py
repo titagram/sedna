@@ -21,6 +21,7 @@ from sedna.engagement.service import (
     EngagementNotFoundError,
     create_operational_start_draft,
 )
+from sedna.planning import FrontierProjection, FrontierProposal
 
 
 class PlannerState(BaseModel):
@@ -303,6 +304,47 @@ def test_decision_is_bound_only_to_calling_lane(
         )
         assert service.load_active_decision(created.engagement_id, child) is None
         assert service.load_active_decision(created.engagement_id, lane) is not None
+
+
+def test_proposal_decision_requires_current_authoritative_frontier(
+    tmp_path, authorized_scope, lane, fixed_clock, fixed_uuid_factory
+) -> None:
+    current_proposal_id = UUID("00000000-0000-0000-0000-000000000101")
+    stale_proposal_id = UUID("00000000-0000-0000-0000-000000000102")
+    with engagement_service(tmp_path, fixed_clock, fixed_uuid_factory) as service:
+        created = create_orion(service, authorized_scope, lane)
+        snapshot = service.load_snapshot(created.engagement_id)
+        service.commit_projection(
+            created.engagement_id,
+            "frontier",
+            FrontierProjection(
+                frontier_id=UUID("00000000-0000-0000-0000-000000000103"),
+                engagement_id=created.engagement_id,
+                state_digest="1" * 64,
+                input_ledger_digest="2" * 64,
+                resulting_ledger_digest="3" * 64,
+                proposals=(
+                    FrontierProposal(
+                        proposal_id=current_proposal_id,
+                        family_id=UUID("00000000-0000-0000-0000-000000000104"),
+                        variant_id=UUID("00000000-0000-0000-0000-000000000105"),
+                        title="Current proposal",
+                        score=90,
+                        confidence=80,
+                        rationale="Current authoritative frontier.",
+                    ),
+                ),
+                constrained_rationale="Only one proposal is currently applicable.",
+            ),
+            expected_revision=snapshot.revision,
+        )
+
+        with pytest.raises(ValueError, match="proposal_not_found"):
+            service.record_decision(
+                created.engagement_id,
+                lane=lane,
+                proposal_id=stale_proposal_id,
+            )
 
 
 def test_m6a_close_stops_at_closing_even_when_barrier_is_ready(

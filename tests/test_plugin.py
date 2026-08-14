@@ -44,6 +44,7 @@ def test_plugin_registers_all_implemented_tools_and_hooks():
         "sedna_retrieve_knowledge",
         "sedna_get_knowledge_artifact",
         "sedna_knowledge_maintenance",
+        "sedna_plan_next",
         "sedna_manage_engagement",
         "sedna_record_decision",
         "sedna_add_source",

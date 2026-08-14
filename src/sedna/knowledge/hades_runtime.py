@@ -10,7 +10,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from sedna.knowledge.learning import DocumentLearningService
 from sedna.knowledge.repository import CanonicalKnowledgeRepository
@@ -21,6 +21,11 @@ from sedna.knowledge.semantic.compiler import SemanticCompiler
 from sedna.knowledge.semantic.llm import HadesLlmAdapter, HostStructuredLlm
 from sedna.knowledge.semantic.service import SemanticIngestionService
 
+if TYPE_CHECKING:
+    from sedna.engagement.repository import EngagementJournalRepository
+    from sedna.engagement.service import EngagementJournalService
+    from sedna.planning.service import PlanningService
+
 
 @dataclass(slots=True)
 class HadesKnowledgeRuntime:
@@ -29,11 +34,15 @@ class HadesKnowledgeRuntime:
     learning: DocumentLearningService
     retrieval: KnowledgeRetrievalService
     maintenance: RetrievalMaintenanceService
+    planning: PlanningService
     _repository: CanonicalKnowledgeRepository
     _index: SQLiteRetrievalIndex
+    _journal: EngagementJournalService
+    _journal_repository: EngagementJournalRepository
     _closed: bool = field(default=False, init=False, repr=False)
     _index_closed: bool = field(default=False, init=False, repr=False)
     _repository_closed: bool = field(default=False, init=False, repr=False)
+    _journal_closed: bool = field(default=False, init=False, repr=False)
     _close_lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     @classmethod
@@ -45,18 +54,34 @@ class HadesKnowledgeRuntime:
         external_source_path: Path | None = None,
     ) -> HadesKnowledgeRuntime:
         """Create an owned local runtime using only the host structured-completion facade."""
+        from uuid import uuid4
+
+        from sedna.engagement.repository import EngagementJournalRepository
+        from sedna.engagement.service import EngagementJournalService
+        from sedna.engagement.sources import SharedSourceRegistry
+        from sedna.planning.llm import PlanningLlmAdapter
+        from sedna.planning.service import PlanningService
+
         host = _require_structured_host(host_llm)
         repository: CanonicalKnowledgeRepository | None = None
         index: SQLiteRetrievalIndex | None = None
+        journal_repository: EngagementJournalRepository | None = None
         index_parent_fd = -1
         guarded_root_fd = -1
         source_root_fd = -1
         guarded_source_root: Path | None = None
         try:
             if external_source_path is None:
+                journal_repository = EngagementJournalRepository(knowledge_root)
                 repository = CanonicalKnowledgeRepository(Path(knowledge_root))
             else:
                 guarded_source_root, source_root_fd = _open_source_root_guard(external_source_path)
+                requested_root = Path(knowledge_root).resolve(strict=False)
+                _require_external_paths(guarded_source_root, requested_root)
+                _assert_directory_identity(
+                    guarded_source_root, source_root_fd, "learning source root"
+                )
+                journal_repository = EngagementJournalRepository(requested_root)
                 guarded_knowledge_root, guarded_root_fd = _open_external_knowledge_root(
                     knowledge_root,
                     guarded_source_root,
@@ -101,12 +126,30 @@ class HadesKnowledgeRuntime:
                 revision_guard=repository.retrieval_read_revision,
                 execution_example_loader=repository.load_execution_examples,
             )
+            journal = EngagementJournalService(
+                journal_repository,
+                clock=lambda: datetime.now(UTC),
+                uuid_factory=uuid4,
+            )
+            source_registry = SharedSourceRegistry(journal_repository)
+            planning = PlanningService(
+                journal=journal,
+                llm=PlanningLlmAdapter(host),
+                clock=lambda: datetime.now(UTC),
+                canonical_revision=repository.retrieval_read_revision,
+                source_registry_digest=lambda: source_registry.planner_snapshot().registry_sha256,
+                retrieval=retrieval,
+                source_registry=source_registry,
+            )
             return cls(
                 learning=learning,
                 retrieval=retrieval,
                 maintenance=maintenance,
+                planning=planning,
                 _repository=repository,
                 _index=index,
+                _journal=journal,
+                _journal_repository=journal_repository,
             )
         except BaseException:
             if index_parent_fd >= 0:
@@ -115,7 +158,7 @@ class HadesKnowledgeRuntime:
                 os.close(guarded_root_fd)
             if source_root_fd >= 0:
                 os.close(source_root_fd)
-            _close_owned(index, repository)
+            _close_owned(journal_repository, index, repository)
             raise
 
     def __enter__(self) -> HadesKnowledgeRuntime:
@@ -134,12 +177,19 @@ class HadesKnowledgeRuntime:
             if self._closed:
                 return
             failure: BaseException | None = None
+            if not self._journal_closed:
+                try:
+                    self._journal_repository.close()
+                    self._journal_closed = True
+                except BaseException as error:
+                    failure = error
             if not self._index_closed:
                 try:
                     self._index.close()
                     self._index_closed = True
                 except BaseException as error:
-                    failure = error
+                    if failure is None:
+                        failure = error
             if not self._repository_closed:
                 try:
                     self._repository.close()
@@ -147,7 +197,7 @@ class HadesKnowledgeRuntime:
                 except BaseException as error:
                     if failure is None:
                         failure = error
-            if self._index_closed and self._repository_closed:
+            if self._journal_closed and self._index_closed and self._repository_closed:
                 self._closed = True
             if failure is not None:
                 raise failure
@@ -294,12 +344,13 @@ def _require_structured_host(host_llm: object) -> HostStructuredLlm:
 
 
 def _close_owned(
+    journal_repository: EngagementJournalRepository | None,
     index: SQLiteRetrievalIndex | None,
     repository: CanonicalKnowledgeRepository | None,
 ) -> None:
     """Attempt both owned closes once, preserving the first close failure."""
     failure: BaseException | None = None
-    for resource in (index, repository):
+    for resource in (journal_repository, index, repository):
         if resource is None:
             continue
         try:

@@ -2,13 +2,104 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
+from pathlib import Path
 from typing import Literal, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from sedna.engagement import EngagementStatus, JournalRevision, SettlementReason
-from sedna.planning.models import ProofRequirementId, SituationProjection
+from sedna.engagement import (
+    EngagementSettlementOutcome,
+    EngagementSettlementPort,
+    EngagementStatus,
+    ExecutionLaneKey,
+    JournalRevision,
+    SettlementReason,
+)
+from sedna.planning.models import (
+    FailedSettlementResult,
+    IncompleteSettlementResult,
+    PlanningResult,
+    ProofRequirementId,
+    SettlementResult,
+    SituationProjection,
+)
+
+KnowledgeRootResolver = Callable[[], Path]
+
+
+class PlanningOperations(Protocol):
+    def settle_pending_evidence(
+        self, engagement_id: UUID, *, reason: SettlementReason
+    ) -> SettlementResult: ...
+
+    def plan_next(self, lane: ExecutionLaneKey, *, max_proposals: int = 5) -> PlanningResult: ...
+
+
+class OwnedPlanningRuntime(Protocol):
+    planning: PlanningOperations
+
+
+PlanningRuntimeFactory = Callable[[Path], AbstractContextManager[OwnedPlanningRuntime]]
+
+
+class PlanningSettlementAdapter:
+    def __init__(self, *, planning: PlanningOperations) -> None:
+        self._planning = planning
+
+    def settle(
+        self, engagement_id: UUID, *, reason: SettlementReason
+    ) -> EngagementSettlementOutcome:
+        result = self._planning.settle_pending_evidence(engagement_id, reason=reason)
+        if result.status in {"settled", "nothing_pending"}:
+            return EngagementSettlementOutcome(status="complete", pending_range_count=0)
+        if isinstance(result, IncompleteSettlementResult):
+            return EngagementSettlementOutcome(
+                status="incomplete",
+                pending_range_count=result.pending_total_count,
+                next_pending_offset=min(item.start for item in result.pending_ranges),
+                next_pending_subject=result.next_pending_subject,
+                pending_inventory_sha256=result.pending_inventory_sha256,
+                safe_code=(
+                    "evidence_budget_exhausted"
+                    if result.incomplete_reason == "budget_exhausted"
+                    else "interpretation_incomplete"
+                ),
+            )
+        if not isinstance(result, FailedSettlementResult):
+            raise TypeError("unknown settlement result")
+        if result.failure_code in {"journal_unavailable", "journal_corrupt"}:
+            return EngagementSettlementOutcome(
+                status="unavailable", pending_range_count=0, safe_code=result.failure_code
+            )
+        if result.failure_code == "terminal_reconciliation_failed":
+            return EngagementSettlementOutcome(
+                status="unavailable",
+                pending_range_count=0,
+                safe_code="settlement_unavailable",
+            )
+        return EngagementSettlementOutcome(
+            status="failed",
+            pending_range_count=result.pending_total_count,
+            next_pending_offset=(
+                min(item.start for item in result.pending_ranges) if result.pending_ranges else None
+            ),
+            next_pending_subject=result.next_pending_subject,
+            pending_inventory_sha256=result.pending_inventory_sha256,
+            safe_code="interpretation_failed",
+        )
+
+
+class PlanningSettlementPortFactory:
+    def __init__(self, planning_runtime_factory: PlanningRuntimeFactory) -> None:
+        self._planning_runtime_factory = planning_runtime_factory
+
+    @contextmanager
+    def open(self, resolved_root: Path) -> Iterator[EngagementSettlementPort]:
+        with self._planning_runtime_factory(resolved_root) as runtime:
+            yield PlanningSettlementAdapter(planning=runtime.planning)
 
 
 class TerminalReconciliationResult(BaseModel):
