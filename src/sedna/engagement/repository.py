@@ -1616,6 +1616,60 @@ class EngagementJournalRepository:
             expected_revision=expected_revision,
         )
 
+    def report_artifact_status(self, engagement_id: UUID, ref) -> tuple[bool, bool]:
+        """Validate current immutable report artifacts under the journal lock."""
+        from sedna.engagement.reporting.markdown import render_operational_report
+        from sedna.engagement.reporting.models import (
+            MAX_REPORT_JSON_BYTES,
+            MAX_REPORT_MARKDOWN_BYTES,
+            OperationalReport,
+        )
+
+        self._complete_tail_recovery(engagement_id)
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            with _locked_file(engagement_fd, ".journal.lock"):
+                self._recover_pending_append(engagement_fd, engagement_id)
+                manifest, events, _head, _journal_bytes = self._load_authoritative_locked(
+                    engagement_fd, engagement_id, allow_tail=False
+                )
+                snapshot = self._snapshot(manifest, events, reduce_engagement(manifest, events))
+                if ref not in snapshot.state.reports or snapshot.state.active_report != ref:
+                    raise ValueError("report reference is not the active journal-bound report")
+                reports_fd = os.open("reports", _directory_flags(), dir_fd=engagement_fd)
+                try:
+                    try:
+                        raw = _read_bounded(
+                            reports_fd,
+                            f"report-v{ref.report_revision}.json",
+                            MAX_REPORT_JSON_BYTES,
+                            label="committed report JSON",
+                        )
+                        if sha256(raw).hexdigest() != ref.json_sha256:
+                            return False, False
+                        report = OperationalReport.model_validate_json(raw)
+                    except (JournalUnavailableError, ValueError):
+                        return False, False
+                    expected_markdown = render_operational_report(report).encode("utf-8")
+                    if sha256(expected_markdown).hexdigest() != ref.markdown_sha256:
+                        raise JournalUnavailableError(
+                            "journal-bound report renderer digest mismatch"
+                        )
+                    try:
+                        markdown = _read_bounded(
+                            reports_fd,
+                            f"report-v{ref.report_revision}.md",
+                            MAX_REPORT_MARKDOWN_BYTES,
+                            label="committed report Markdown",
+                        )
+                    except JournalUnavailableError:
+                        return True, False
+                    return True, markdown == expected_markdown
+                finally:
+                    os.close(reports_fd)
+        finally:
+            os.close(engagement_fd)
+
     def _repair_markdown(
         self, engagement_id: UUID, report_revision: int, *, expected_revision: JournalRevision
     ):
@@ -2914,6 +2968,42 @@ class EngagementJournalRepository:
                 return self._append_batch(
                     engagement_id,
                     (draft,),
+                    expected_revision=expected_revision,
+                    defer_tail_recovery=True,
+                )
+
+        return self._retry_registry_tail_recovery(attempt)
+
+    def append_lifecycle_batch(
+        self,
+        engagement_id: UUID,
+        lane: ExecutionLaneKey,
+        drafts: Sequence[JournalEventDraft],
+        *,
+        binding_reason: str,
+        expected_revision: JournalRevision,
+    ) -> BatchAppendResult:
+        """Atomically derive an optional lane binding and append a lifecycle batch."""
+
+        def attempt() -> BatchAppendResult:
+            with _locked_file(self._engagements_fd, ".registry.lock"):
+                self._assert_lane_available(lane, exclude=engagement_id)
+                snapshot = self._load_snapshot_registry_locked(engagement_id)
+                batch = tuple(drafts)
+                if not any(binding.lane == lane for binding in snapshot.state.bound_lanes):
+                    batch = (
+                        JournalEventDraft(
+                            lane=lane,
+                            actor="host_agent",
+                            type="lane_bound",
+                            payload=LaneBoundPayload(lane=lane, binding_reason=binding_reason),
+                            idempotency_key=f"lane-bind:{lane.stable_key}:{engagement_id}",
+                        ),
+                        *batch,
+                    )
+                return self._append_batch(
+                    engagement_id,
+                    batch,
                     expected_revision=expected_revision,
                     defer_tail_recovery=True,
                 )

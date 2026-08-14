@@ -106,10 +106,12 @@ from sedna.planning.ledger import (
 from sedna.planning.ports import (
     KnowledgeRootResolver,
     OwnedPlanningRuntime,
+    OwnedSednaRuntime,
     PlanningOperations,
     PlanningRuntimeFactory,
     PlanningSettlementAdapter,
     PlanningSettlementPortFactory,
+    SednaRuntimeFactory,
     TerminalReconciliationResult,
     TerminalSettlementPort,
 )
@@ -191,8 +193,10 @@ __all__ = [
     "PlanningRuntimeFactory",
     "PlanningSettlementAdapter",
     "PlanningSettlementPortFactory",
+    "SednaRuntimeFactory",
     "KnowledgeRootResolver",
     "OwnedPlanningRuntime",
+    "OwnedSednaRuntime",
     "PlannerCriticRequest",
     "PlannerCriticVerdict",
     "PlannerDraft",

@@ -18,6 +18,9 @@ from sedna.engagement import (
     JournalRevision,
     SettlementReason,
 )
+from sedna.engagement.lifecycle import EngagementLifecycleService
+from sedna.engagement.reporting.service import ReportClosureFinalizer, ReportManagementService
+from sedna.engagement.service import EngagementJournalService
 from sedna.planning.models import (
     FailedSettlementResult,
     IncompleteSettlementResult,
@@ -42,6 +45,16 @@ class OwnedPlanningRuntime(Protocol):
     planning: PlanningOperations
 
 
+class OwnedSednaRuntime(OwnedPlanningRuntime, Protocol):
+    """One invocation-owned runtime exposing all cross-domain service surfaces."""
+
+    journal: EngagementJournalService
+    engagements: EngagementLifecycleService
+    reporting: ReportManagementService
+    report_finalizer: ReportClosureFinalizer
+
+
+SednaRuntimeFactory = Callable[[Path], AbstractContextManager[OwnedSednaRuntime]]
 PlanningRuntimeFactory = Callable[[Path], AbstractContextManager[OwnedPlanningRuntime]]
 
 
@@ -53,43 +66,54 @@ class PlanningSettlementAdapter:
         self, engagement_id: UUID, *, reason: SettlementReason
     ) -> EngagementSettlementOutcome:
         result = self._planning.settle_pending_evidence(engagement_id, reason=reason)
-        if result.status in {"settled", "nothing_pending"}:
-            return EngagementSettlementOutcome(status="complete", pending_range_count=0)
-        if isinstance(result, IncompleteSettlementResult):
-            return EngagementSettlementOutcome(
-                status="incomplete",
-                pending_range_count=result.pending_total_count,
-                next_pending_offset=min(item.start for item in result.pending_ranges),
-                next_pending_subject=result.next_pending_subject,
-                pending_inventory_sha256=result.pending_inventory_sha256,
-                safe_code=(
-                    "evidence_budget_exhausted"
-                    if result.incomplete_reason == "budget_exhausted"
-                    else "interpretation_incomplete"
-                ),
-            )
-        if not isinstance(result, FailedSettlementResult):
-            raise TypeError("unknown settlement result")
-        if result.failure_code in {"journal_unavailable", "journal_corrupt"}:
-            return EngagementSettlementOutcome(
-                status="unavailable", pending_range_count=0, safe_code=result.failure_code
-            )
-        if result.failure_code == "terminal_reconciliation_failed":
-            return EngagementSettlementOutcome(
-                status="unavailable",
-                pending_range_count=0,
-                safe_code="settlement_unavailable",
-            )
+        return settlement_outcome(result)
+
+
+def settlement_outcome(result: SettlementResult) -> EngagementSettlementOutcome:
+    """Map one direct planning result to the stable host settlement envelope."""
+    if result.status in {"settled", "nothing_pending"}:
+        return EngagementSettlementOutcome(status="complete", pending_range_count=0)
+    if isinstance(result, IncompleteSettlementResult):
         return EngagementSettlementOutcome(
-            status="failed",
+            status="incomplete",
             pending_range_count=result.pending_total_count,
-            next_pending_offset=(
-                min(item.start for item in result.pending_ranges) if result.pending_ranges else None
-            ),
+            next_pending_offset=min(item.start for item in result.pending_ranges),
             next_pending_subject=result.next_pending_subject,
             pending_inventory_sha256=result.pending_inventory_sha256,
-            safe_code="interpretation_failed",
+            safe_code=(
+                "evidence_budget_exhausted"
+                if result.incomplete_reason == "budget_exhausted"
+                else "interpretation_incomplete"
+            ),
         )
+    if not isinstance(result, FailedSettlementResult):
+        raise TypeError("unknown settlement result")
+    if result.failure_code in {"journal_unavailable", "journal_corrupt"}:
+        return EngagementSettlementOutcome(
+            status="unavailable",
+            pending_range_count=0,
+            safe_code=(
+                "journal_unavailable"
+                if result.failure_code == "journal_unavailable"
+                else "journal_corrupt"
+            ),
+        )
+    if result.failure_code == "terminal_reconciliation_failed":
+        return EngagementSettlementOutcome(
+            status="unavailable",
+            pending_range_count=0,
+            safe_code="settlement_unavailable",
+        )
+    return EngagementSettlementOutcome(
+        status="failed",
+        pending_range_count=result.pending_total_count,
+        next_pending_offset=(
+            min(item.start for item in result.pending_ranges) if result.pending_ranges else None
+        ),
+        next_pending_subject=result.next_pending_subject,
+        pending_inventory_sha256=result.pending_inventory_sha256,
+        safe_code="interpretation_failed",
+    )
 
 
 class PlanningSettlementPortFactory:

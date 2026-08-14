@@ -541,6 +541,31 @@ class ClosureCancelledPayload(_Payload):
 class EngagementReopenedPayload(_Payload):
     kind: Literal["engagement_reopened"] = "engagement_reopened"
     reason: Annotated[str, Field(min_length=1, max_length=2048)]
+    prior_status: Literal["closing", "closed_unverified", "closed_verified", "abandoned"] | None = (
+        None
+    )
+    proof_revalidation: Literal["retain_rejections", "invalidate_all"] | None = None
+
+    @model_validator(mode="after")
+    def validate_versioned_fields(self) -> EngagementReopenedPayload:
+        if (self.prior_status is None) != (self.proof_revalidation is None):
+            raise ValueError("reopen lifecycle fields must be both present or both absent")
+        return self
+
+
+class EngagementVerifiedPayload(_Payload):
+    kind: Literal["engagement_verified"] = "engagement_verified"
+    report_id: UUID
+    report_revision: int = Field(ge=1)
+    verification_kind: Literal["platform", "user"]
+    verification_reference: Annotated[str, Field(min_length=1, max_length=2048)]
+
+
+class FlagRejectedPayload(_Payload):
+    kind: Literal["flag_rejected"] = "flag_rejected"
+    flag_event_id: UUID
+    rejected_value_sha256: Sha256Hex
+    reason: Annotated[str, Field(min_length=1, max_length=2048)]
 
 
 class EngagementAbandonedPayload(_Payload):
@@ -1577,6 +1602,8 @@ EventPayload: TypeAlias = Annotated[
     | ControlToolInvokedPayload
     | ClosureRequestedPayload
     | ClosureCancelledPayload
+    | EngagementVerifiedPayload
+    | FlagRejectedPayload
     | EngagementReopenedPayload
     | EngagementAbandonedPayload
     | SourceSuggestedPayload
@@ -1634,6 +1661,8 @@ class EventType(StrEnum):
     CONTROL_TOOL_INVOKED = "control_tool_invoked"
     CLOSURE_REQUESTED = "closure_requested"
     CLOSURE_CANCELLED = "closure_cancelled"
+    ENGAGEMENT_VERIFIED = "engagement_verified"
+    FLAG_REJECTED = "flag_rejected"
     ENGAGEMENT_REOPENED = "engagement_reopened"
     ENGAGEMENT_ABANDONED = "engagement_abandoned"
     SOURCE_SUGGESTED = "source_suggested"
@@ -1692,6 +1721,8 @@ _SYSTEM_SOURCE_BY_TYPE: dict[EventType, str] = {
     EventType.OBJECTIVE_CHANGED: "lifecycle",
     EventType.SCOPE_CHANGED: "lifecycle",
     EventType.CLOSURE_CANCELLED: "lifecycle",
+    EventType.ENGAGEMENT_VERIFIED: "lifecycle",
+    EventType.FLAG_REJECTED: "lifecycle",
     EventType.ENGAGEMENT_REOPENED: "lifecycle",
     EventType.ENGAGEMENT_ABANDONED: "lifecycle",
     EventType.SOURCE_SUGGESTED: "planning",

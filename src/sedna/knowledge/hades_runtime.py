@@ -22,6 +22,8 @@ from sedna.knowledge.semantic.llm import HadesLlmAdapter, HostStructuredLlm
 from sedna.knowledge.semantic.service import SemanticIngestionService
 
 if TYPE_CHECKING:
+    from sedna.engagement.lifecycle import EngagementLifecycleService
+    from sedna.engagement.reporting.service import ReportClosureFinalizer, ReportManagementService
     from sedna.engagement.repository import EngagementJournalRepository
     from sedna.engagement.service import EngagementJournalService
     from sedna.planning.service import PlanningService
@@ -39,6 +41,10 @@ class HadesKnowledgeRuntime:
     _index: SQLiteRetrievalIndex
     _journal: EngagementJournalService
     _journal_repository: EngagementJournalRepository
+    journal: EngagementJournalService | None = None
+    reporting: ReportManagementService | None = None
+    report_finalizer: ReportClosureFinalizer | None = None
+    engagements: EngagementLifecycleService | None = None
     _closed: bool = field(default=False, init=False, repr=False)
     _index_closed: bool = field(default=False, init=False, repr=False)
     _repository_closed: bool = field(default=False, init=False, repr=False)
@@ -56,6 +62,14 @@ class HadesKnowledgeRuntime:
         """Create an owned local runtime using only the host structured-completion facade."""
         from uuid import uuid4
 
+        from sedna.engagement.lifecycle import (
+            EngagementLifecycleService,
+            TerminalSettlementCoordinator,
+        )
+        from sedna.engagement.reporting.service import (
+            ReportClosureFinalizer,
+            ReportManagementService,
+        )
         from sedna.engagement.repository import EngagementJournalRepository
         from sedna.engagement.service import EngagementJournalService
         from sedna.engagement.sources import SharedSourceRegistry
@@ -131,6 +145,15 @@ class HadesKnowledgeRuntime:
                 clock=lambda: datetime.now(UTC),
                 uuid_factory=uuid4,
             )
+            report_finalizer = ReportClosureFinalizer(
+                journal,
+                journal_repository._issue_report_commit_capability(),
+            )
+            terminal_settlement = TerminalSettlementCoordinator(
+                journal=journal,
+                proof_closure=journal._issue_proof_closure_capability(),
+                finalizer=report_finalizer,
+            )
             source_registry = SharedSourceRegistry(journal_repository)
             planning = PlanningService(
                 journal=journal,
@@ -140,12 +163,28 @@ class HadesKnowledgeRuntime:
                 source_registry_digest=lambda: source_registry.planner_snapshot().registry_sha256,
                 retrieval=retrieval,
                 source_registry=source_registry,
+                terminal_settlement_port=terminal_settlement,
+            )
+            reporting = ReportManagementService(
+                journal=journal,
+                planning=planning,
+                finalizer=report_finalizer,
+            )
+            engagements = EngagementLifecycleService(
+                journal=journal,
+                planning=planning,
+                closure_finalizer=report_finalizer,
+                lifecycle_commits=journal._issue_lifecycle_commit_capability(),
             )
             return cls(
                 learning=learning,
                 retrieval=retrieval,
                 maintenance=maintenance,
                 planning=planning,
+                journal=journal,
+                reporting=reporting,
+                report_finalizer=report_finalizer,
+                engagements=engagements,
                 _repository=repository,
                 _index=index,
                 _journal=journal,

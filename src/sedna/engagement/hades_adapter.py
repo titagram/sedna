@@ -9,10 +9,13 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+if TYPE_CHECKING:
+    from sedna.planning.ports import SednaRuntimeFactory
 
 from sedna.engagement.events import (
     CONTROL_TOOL_NAMES,
@@ -101,6 +104,9 @@ class _ManageEngagementInput(BaseModel):
         "change_objective",
         "unbind",
         "resolve_call",
+        "verify",
+        "reject",
+        "report",
     ]
     engagement_id: UUID | None = None
     display_name: Annotated[str | None, Field(min_length=1, max_length=256)] = None
@@ -112,10 +118,13 @@ class _ManageEngagementInput(BaseModel):
     required_proofs: Annotated[
         tuple[ProofRequirement, ...], Field(max_length=MAX_REQUIRED_PROOFS)
     ] = ()
-    reason: Annotated[str | None, Field(min_length=1, max_length=1024)] = None
+    reason: Annotated[str | None, Field(min_length=1, max_length=2048)] = None
     authorization_basis: Annotated[str | None, Field(min_length=1, max_length=2048)] = None
     call_id: Annotated[str | None, Field(pattern=r"^call-[0-9a-f]{64}$")] = None
     resolution: Literal["timed_out", "abandoned"] | None = None
+    flag_event_id: UUID | None = None
+    verification_kind: Literal["platform", "user"] | None = None
+    verification_reference: Annotated[str | None, Field(min_length=1, max_length=2048)] = None
     after_engagement_id: UUID | None = None
     after_call_id: Annotated[str | None, Field(pattern=r"^call-[0-9a-f]{64}$")] = None
     limit: int = Field(default=64, ge=1, le=64)
@@ -128,6 +137,10 @@ class _ManageEngagementInput(BaseModel):
             raise ValueError("create requires display_name, objective, authorization")
         if self.action == "resolve_call" and not (self.call_id and self.resolution and self.reason):
             raise ValueError("resolve_call requires call_id, resolution, reason")
+        if self.action == "verify" and not (self.verification_kind and self.verification_reference):
+            raise ValueError("verify requires verification_kind and verification_reference")
+        if self.action == "reject" and not (self.flag_event_id and self.reason):
+            raise ValueError("reject requires flag_event_id and reason")
         if self.action == "inspect" and (
             self.after_call_id is not None and self.after_engagement_id is not None
         ):
@@ -273,11 +286,13 @@ class HadesEngagementAdapter:
         *,
         root_resolver: Callable[[], Path],
         settlement_port_factory: EngagementSettlementPortFactory | None = None,
+        runtime_factory: SednaRuntimeFactory | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._context = context
         self._root_resolver = root_resolver
         self._settlement_port_factory = settlement_port_factory
+        self._runtime_factory = runtime_factory
         self._clock = clock or (lambda: datetime.now(UTC))
         self._health = _HealthMap()
         self._invocation_state = threading.local()
@@ -309,6 +324,9 @@ class HadesEngagementAdapter:
                                 "change_objective",
                                 "unbind",
                                 "resolve_call",
+                                "verify",
+                                "reject",
+                                "report",
                             ],
                         },
                         "engagement_id": {"type": "string", "format": "uuid"},
@@ -324,6 +342,12 @@ class HadesEngagementAdapter:
                         "authorization_basis": {"type": "string", "maxLength": 2048},
                         "call_id": {"type": "string", "pattern": "^call-[0-9a-f]{64}$"},
                         "resolution": {"type": "string", "enum": ["timed_out", "abandoned"]},
+                        "flag_event_id": {"type": "string", "format": "uuid"},
+                        "verification_kind": {
+                            "type": "string",
+                            "enum": ["platform", "user"],
+                        },
+                        "verification_reference": {"type": "string", "maxLength": 2048},
                         "after_engagement_id": {"type": "string", "format": "uuid"},
                         "after_call_id": {"type": "string", "pattern": "^call-[0-9a-f]{64}$"},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 64},
@@ -495,7 +519,11 @@ class HadesEngagementAdapter:
             scope: AuthorizationScope | None = None
             if payload.action == "create":
                 scope = self._scope(payload.authorization)
-            if payload.action in {"resume", "close", "reopen"}:
+            if self._runtime_factory is not None:
+                return self._handle_owned_runtime_action(payload, lane, scope)
+            if payload.action == "resume" or (
+                payload.action in {"close", "reopen"} and self._runtime_factory is None
+            ):
                 return self._handle_settlement_action(payload, lane)
             with self._invoke()[2] as service:
                 if payload.action == "create":
@@ -593,6 +621,271 @@ class HadesEngagementAdapter:
                             ),
                         }
                     )
+                return self._error("invalid_transition", retryable=False)
+        except Exception as exc:
+            return _mapped_error(exc)
+
+    def _handle_owned_runtime_action(
+        self,
+        payload: _ManageEngagementInput,
+        lane: Any,
+        scope: AuthorizationScope | None,
+    ) -> dict[str, Any]:
+        if self._runtime_factory is None:
+            return self._error("knowledge_runtime_unavailable", retryable=True)
+        root = self._pin_root()
+        try:
+            with self._runtime_factory(root) as runtime:
+                journal = runtime.journal
+                if journal is None:
+                    return self._error("knowledge_runtime_unavailable", retryable=True)
+                if payload.action == "create":
+                    created = journal.create_engagement(
+                        display_name=payload.display_name or "",
+                        objective=payload.objective or "",
+                        scope=scope,
+                        lane=lane,
+                        required_proofs=payload.required_proofs,
+                    )
+                    return self._result(
+                        {
+                            "ok": True,
+                            "engagement": self._summary(journal, created.engagement_id).model_dump(
+                                mode="json"
+                            ),
+                        }
+                    )
+                if payload.action == "inspect":
+                    if payload.engagement_id is None:
+                        return self._error("engagement_not_found")
+                    return self._result(
+                        {
+                            "ok": True,
+                            "engagement": self._summary(journal, payload.engagement_id).model_dump(
+                                mode="json"
+                            ),
+                        }
+                    )
+                if payload.action == "list":
+                    page = journal.list_engagements(
+                        after_engagement_id=payload.after_engagement_id,
+                        limit=payload.limit,
+                    )
+                    return self._result(
+                        {
+                            "ok": True,
+                            "engagements": [
+                                {
+                                    "engagement_id": str(item.engagement_id),
+                                    "display_name": item.display_name,
+                                    "status": item.status,
+                                }
+                                for item in page.items
+                            ],
+                            "total_count": page.total_count,
+                            "next_after_engagement_id": (
+                                str(page.next_after_engagement_id)
+                                if page.next_after_engagement_id
+                                else None
+                            ),
+                        }
+                    )
+                if payload.action == "resume":
+                    from sedna.planning.ports import settlement_outcome
+
+                    resumed = journal.resume_engagement(
+                        lane=lane,
+                        engagement_id=payload.engagement_id,
+                        display_name=payload.display_name,
+                        scope=(
+                            self._scope(payload.authorization) if payload.authorization else None
+                        ),
+                    )
+                    settlement = settlement_outcome(
+                        runtime.planning.settle_pending_evidence(
+                            resumed.engagement_id,
+                            reason="resume",
+                        )
+                    )
+                    if settlement.status != "complete":
+                        return self._settlement_error(settlement)
+                    store_digest = sha256(str(root).encode("utf-8")).hexdigest()
+                    self._rebuild_logbook(
+                        journal,
+                        resumed.engagement_id,
+                        store_digest,
+                        lane.session_id,
+                    )
+                    return self._result(
+                        {
+                            "ok": True,
+                            "engagement": self._summary(journal, resumed.engagement_id).model_dump(
+                                mode="json"
+                            ),
+                        }
+                    )
+                engagement_id, explicit = self._lane_engagement_id(
+                    journal, payload.engagement_id, lane
+                )
+                if engagement_id is None:
+                    return self._error(
+                        "engagement_conflict" if explicit else "engagement_not_found",
+                        retryable=False,
+                    )
+                if payload.action == "abandon":
+                    result = journal.abandon_engagement(
+                        engagement_id,
+                        lane=lane,
+                        reason=payload.reason or "manual abandon",
+                    )
+                    return self._result(
+                        {
+                            "ok": True,
+                            "engagement": self._summary(journal, result.engagement_id).model_dump(
+                                mode="json"
+                            ),
+                        }
+                    )
+                if payload.action == "resolve_call":
+                    if not (payload.call_id and payload.resolution and payload.reason):
+                        return self._error("call_not_found")
+                    result = journal.terminate_tool_call(
+                        engagement_id,
+                        payload.call_id,
+                        resolution=payload.resolution,
+                        reason=payload.reason,
+                        lane=lane,
+                    )
+                    return self._result(
+                        {
+                            "ok": True,
+                            "engagement": self._summary(journal, result.engagement_id).model_dump(
+                                mode="json"
+                            ),
+                        }
+                    )
+                if payload.action == "change_objective":
+                    if payload.objective is None or payload.authorization_basis is None:
+                        return self._error("invalid_input", retryable=False)
+                    result = journal.change_objective(
+                        engagement_id,
+                        lane=lane,
+                        objective=payload.objective,
+                        authorization_basis=payload.authorization_basis,
+                    )
+                    return self._result(
+                        {
+                            "ok": True,
+                            "engagement": self._summary(journal, result.engagement_id).model_dump(
+                                mode="json"
+                            ),
+                        }
+                    )
+                if payload.action == "change_scope":
+                    if not payload.authorization or payload.authorization_basis is None:
+                        return self._error("invalid_input", retryable=False)
+                    result = journal.change_scope(
+                        engagement_id,
+                        lane=lane,
+                        scope=self._scope(payload.authorization),
+                        authorization_basis=payload.authorization_basis,
+                    )
+                    return self._result(
+                        {
+                            "ok": True,
+                            "engagement": self._summary(journal, result.engagement_id).model_dump(
+                                mode="json"
+                            ),
+                        }
+                    )
+                if payload.action == "unbind":
+                    result = journal.unbind_lane(
+                        engagement_id,
+                        lane,
+                        reason=payload.reason or "manual unbind",
+                    )
+                    return self._result(
+                        {
+                            "ok": True,
+                            "engagement": self._summary(journal, result.engagement_id).model_dump(
+                                mode="json"
+                            ),
+                        }
+                    )
+                if payload.action == "verify":
+                    if (
+                        runtime.engagements is None
+                        or payload.verification_kind is None
+                        or payload.verification_reference is None
+                    ):
+                        return self._error("knowledge_runtime_unavailable", retryable=True)
+                    result = runtime.engagements.verify(
+                        engagement_id,
+                        verification_kind=payload.verification_kind,
+                        verification_reference=payload.verification_reference,
+                    )
+                    return self._result(
+                        {
+                            "ok": True,
+                            "engagement": self._summary(journal, result.engagement_id).model_dump(
+                                mode="json"
+                            ),
+                        }
+                    )
+                if payload.action == "reject":
+                    if (
+                        runtime.engagements is None
+                        or payload.flag_event_id is None
+                        or payload.reason is None
+                    ):
+                        return self._error("invalid_input", retryable=False)
+                    result = runtime.engagements.reject_flag(
+                        engagement_id,
+                        lane=lane,
+                        flag_event_id=payload.flag_event_id,
+                        reason=payload.reason,
+                    )
+                    return self._result(
+                        {
+                            "ok": True,
+                            "engagement": self._summary(journal, result.engagement_id).model_dump(
+                                mode="json"
+                            ),
+                        }
+                    )
+                if payload.action == "close":
+                    if runtime.engagements is None:
+                        return self._error("knowledge_runtime_unavailable", retryable=True)
+                    result = runtime.engagements.close(
+                        engagement_id, lane=lane, reason=payload.reason or "manual close"
+                    )
+                    return self._result(
+                        {
+                            "ok": True,
+                            "engagement": self._summary(journal, result.engagement_id).model_dump(
+                                mode="json"
+                            ),
+                        }
+                    )
+                if payload.action == "reopen":
+                    if runtime.engagements is None:
+                        return self._error("knowledge_runtime_unavailable", retryable=True)
+                    result = runtime.engagements.reopen(
+                        engagement_id, lane=lane, reason=payload.reason or "manual reopen"
+                    )
+                    return self._result(
+                        {
+                            "ok": True,
+                            "engagement": self._summary(journal, result.engagement_id).model_dump(
+                                mode="json"
+                            ),
+                        }
+                    )
+                if payload.action == "report":
+                    if runtime.reporting is None:
+                        return self._error("knowledge_runtime_unavailable", retryable=True)
+                    report = runtime.reporting.report(engagement_id)
+                    return self._result({"ok": True, "report": report.model_dump(mode="json")})
                 return self._error("invalid_transition", retryable=False)
         except Exception as exc:
             return _mapped_error(exc)

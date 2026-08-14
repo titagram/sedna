@@ -14,6 +14,7 @@ from sedna.engagement.events import (
     EngagementReopenedPayload,
     EvidenceAttachedPayload,
     FacetObservationEventRecord,
+    FlagRejectedPayload,
     HypothesisFormedEventPayload,
     IncompatibilityObservationEventRecord,
     InterpretationFailedEventPayload,
@@ -54,6 +55,7 @@ SITUATION_EFFECT_EVENT_TYPES = frozenset(
         EventType.EVIDENCE_ATTACHED,
         EventType.INTERPRETATION_SUCCEEDED,
         EventType.INTERPRETATION_FAILED,
+        EventType.FLAG_REJECTED,
         EventType.ENGAGEMENT_REOPENED,
         EventType.RESEARCH_SOURCE_ASSESSED,
         EventType.OUTCOME_ASSESSED,
@@ -86,6 +88,7 @@ SITUATION_NO_OP_EVENT_TYPES = frozenset(
         EventType.CONTROL_TOOL_INVOKED,
         EventType.CLOSURE_REQUESTED,
         EventType.CLOSURE_CANCELLED,
+        EventType.ENGAGEMENT_VERIFIED,
         EventType.ENGAGEMENT_ABANDONED,
         EventType.SOURCE_SUGGESTED,
         EventType.RECOVERY_WARNING,
@@ -261,6 +264,10 @@ class SituationReducer:
             )
         )
         proof_by_id = {item.proof_requirement_id: item for item in requirements}
+        rejection_records: dict[str, list[ProofRejectionRecord]] = {
+            item.proof_requirement_id: [] for item in requirements
+        }
+        pending_rejection: tuple[UUID, FlagRejectedPayload, str] | None = None
         attached_evidence: dict[str, EvidenceAttachedPayload] = {}
         attachments_by_event_id: dict[object, EvidenceAttachedPayload] = {}
         interpretation_events: dict[tuple[UUID, UUID | None, str], list[UUID]] = {}
@@ -337,14 +344,95 @@ class SituationReducer:
                 interpretation_failure[subject_key] = True
                 material_event_revision = event.sequence
                 continue
-            if isinstance(event.payload, EngagementReopenedPayload):
-                objective = transition_proof_generation(
-                    ObjectiveProgress(
-                        requirements=tuple(proof_by_id[key] for key in sorted(proof_by_id))
-                    ),
-                    policy="invalidate_all",
-                    transition_event_id=event.event_id,
+            if isinstance(event.payload, FlagRejectedPayload):
+                if pending_rejection is not None:
+                    raise ValueError("proof_rejection_pair_incomplete")
+                matches = [
+                    proof
+                    for proof in proof_by_id.values()
+                    if any(
+                        reference.proof_event_id == event.payload.flag_event_id
+                        and reference.value_sha256 == event.payload.rejected_value_sha256
+                        and reference.assessment == "supported"
+                        for reference in proof.value_references
+                    )
+                ]
+                if len(matches) != 1:
+                    raise ValueError("rejected_value_not_grounded_in_current_proof")
+                pending_rejection = (
+                    event.event_id,
+                    event.payload,
+                    matches[0].proof_requirement_id,
                 )
+                continue
+            if isinstance(event.payload, EngagementReopenedPayload):
+                current = ObjectiveProgress(
+                    requirements=tuple(proof_by_id[key] for key in sorted(proof_by_id))
+                )
+                if event.payload.proof_revalidation == "retain_rejections":
+                    if pending_rejection is None:
+                        raise ValueError("proof_rejection_pair_incomplete")
+                    rejection_event_id, rejection, requirement_id = pending_rejection
+                    progress = proof_by_id[requirement_id]
+                    record = ProofRejectionRecord(
+                        proof_requirement_id=requirement_id,
+                        assessment_generation=progress.assessment_generation,
+                        rejection_event_id=rejection_event_id,
+                        rejected_proof_event_id=rejection.flag_event_id,
+                        rejected_value_sha256=rejection.rejected_value_sha256,
+                    )
+                    rejection_records[requirement_id].append(record)
+                    objective = transition_proof_generation(
+                        current,
+                        policy="retain_rejections",
+                        transition_event_id=event.event_id,
+                        rejected_requirement_id=requirement_id,
+                        rejection_event_id=rejection_event_id,
+                        rejected_value_sha256=rejection.rejected_value_sha256,
+                    )
+                    records = rejection_records[requirement_id]
+                    ordered_digests = tuple(
+                        dict.fromkeys(item.rejected_value_sha256 for item in records)
+                    )
+                    overflow_count = max(0, len(ordered_digests) - 32)
+                    overflow_digest = (
+                        sha256(
+                            _canonical_bytes(
+                                [item.model_dump(mode="json") for item in records[:overflow_count]]
+                            )
+                        ).hexdigest()
+                        if overflow_count
+                        else _EMPTY_DIGEST
+                    )
+                    selected = next(
+                        item
+                        for item in objective.requirements
+                        if item.proof_requirement_id == requirement_id
+                    )
+                    selected = ProofProgress.model_validate(
+                        selected.model_copy(
+                            update={
+                                "rejected_value_sha256s": ordered_digests[-32:],
+                                "rejected_value_overflow_count": overflow_count,
+                                "rejected_value_overflow_digest": overflow_digest,
+                            }
+                        ).model_dump(mode="python")
+                    )
+                    objective = ObjectiveProgress(
+                        requirements=tuple(
+                            selected if item.proof_requirement_id == requirement_id else item
+                            for item in objective.requirements
+                        )
+                    )
+                    pending_rejection = None
+                else:
+                    if pending_rejection is not None:
+                        raise ValueError("proof_rejection_pair_incomplete")
+                    objective = transition_proof_generation(
+                        current,
+                        policy="invalidate_all",
+                        transition_event_id=event.event_id,
+                    )
                 proof_by_id = {item.proof_requirement_id: item for item in objective.requirements}
                 material_event_revision = event.sequence
                 continue
@@ -425,6 +513,12 @@ class SituationReducer:
                 if not set(event.payload.source_event_ids).issubset(prior_event_ids):
                     raise ValueError("proof_grounding_not_authoritative")
                 candidate = event.payload.candidate_value
+                if proof_value_was_rejected(
+                    proof,
+                    candidate_value_sha256=candidate.value_sha256,
+                    authoritative_rejections=rejection_records[event.payload.proof_requirement_id],
+                ):
+                    raise ValueError("proof_value_previously_rejected")
                 attachment = attached_evidence.get(candidate.evidence_slice.evidence_id)
                 if attachment is None:
                     raise ValueError("proof_evidence_not_attached")
@@ -537,6 +631,8 @@ class SituationReducer:
             else:
                 continue
             material_event_revision = event.sequence
+        if pending_rejection is not None:
+            raise ValueError("proof_rejection_pair_incomplete")
         interpretations: list[EvidenceInterpretationState] = []
         for subject_key in sorted(
             interpretation_events, key=lambda item: (str(item[0]), str(item[1]), item[2])

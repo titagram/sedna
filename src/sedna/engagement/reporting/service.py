@@ -121,6 +121,19 @@ class ReportManagementService:
         self._finalizer = finalizer
         self._planning = planning
 
+    def request_close(self, engagement_id: UUID, *, lane, reason: str):
+        self._settle(engagement_id)
+        snapshot = self._journal.load_snapshot(engagement_id)
+        closing = self._journal.request_close(
+            engagement_id,
+            lane=lane,
+            reason=reason,
+            expected_revision=snapshot.revision,
+        ).snapshot
+        if closing.state.closure_ready:
+            return self._finalizer.finalize(snapshot=closing)
+        return closing
+
     def generate_report_revision(
         self, engagement_id: UUID, *, reason: Literal["repair_json", "manual_report"]
     ) -> ReportRef:
@@ -136,6 +149,24 @@ class ReportManagementService:
         if snapshot.state.status.value not in {"closed_unverified", "closed_verified"}:
             raise ValueError("report_revision_requires_closed_engagement")
         return self._finalizer.repair_markdown(snapshot=snapshot, report_revision=report_revision)
+
+    def report(self, engagement_id: UUID) -> ReportRef:
+        """Settle once, then triage the current immutable report artifacts."""
+        self._settle(engagement_id)
+        snapshot = self._journal.load_snapshot(engagement_id)
+        if snapshot.state.status.value not in {"closed_unverified", "closed_verified"}:
+            raise ValueError("report_revision_requires_closed_engagement")
+        current = snapshot.state.active_report
+        if current is None:
+            raise ValueError("report_revision_requires_active_report")
+        json_valid, markdown_valid = self._journal.report_artifact_status(engagement_id, current)
+        if not json_valid:
+            return self._finalizer.commit_later_revision(snapshot=snapshot, reason="repair_json")
+        if not markdown_valid:
+            return self._finalizer.repair_markdown(
+                snapshot=snapshot, report_revision=current.report_revision
+            )
+        return self._finalizer.commit_later_revision(snapshot=snapshot, reason="manual_report")
 
     def _settle(self, engagement_id: UUID) -> None:
         result = self._planning.settle_pending_evidence(engagement_id, reason="report")

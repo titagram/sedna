@@ -16,6 +16,7 @@ from sedna.engagement.events import (
     DecisionRecordedPayload,
     EngagementClosedPayload,
     EngagementOpenedPayload,
+    EngagementVerifiedPayload,
     EventType,
     JournalEvent,
     LaneBoundPayload,
@@ -62,6 +63,8 @@ class LifecycleEffect(StrEnum):
     ABANDON = "abandon"
     REPORT = "report"
     CLOSE = "close"
+    VERIFY = "verify"
+    REJECT = "reject"
 
 
 EVENT_LIFECYCLE_EFFECTS: Mapping[EventType, LifecycleEffect] = MappingProxyType(
@@ -88,6 +91,8 @@ EVENT_LIFECYCLE_EFFECTS: Mapping[EventType, LifecycleEffect] = MappingProxyType(
         EventType.CONTROL_TOOL_INVOKED: LifecycleEffect.CONTROL_PLANE,
         EventType.CLOSURE_REQUESTED: LifecycleEffect.CLOSURE_REQUEST,
         EventType.CLOSURE_CANCELLED: LifecycleEffect.CLOSURE_CANCEL,
+        EventType.ENGAGEMENT_VERIFIED: LifecycleEffect.VERIFY,
+        EventType.FLAG_REJECTED: LifecycleEffect.REJECT,
         EventType.ENGAGEMENT_REOPENED: LifecycleEffect.REOPEN,
         EventType.ENGAGEMENT_ABANDONED: LifecycleEffect.ABANDON,
         EventType.SOURCE_SUGGESTED: LifecycleEffect.NEW_WORK,
@@ -201,6 +206,8 @@ _CLOSED_EFFECTS = frozenset(
         LifecycleEffect.SETTLEMENT_BOOKKEEPING,
         LifecycleEffect.REOPEN,
         LifecycleEffect.REPORT,
+        LifecycleEffect.VERIFY,
+        LifecycleEffect.REJECT,
     }
 )
 
@@ -343,6 +350,8 @@ class _Accumulator:
             EventType.CONTROL_TOOL_INVOKED: self._apply_inert,
             EventType.CLOSURE_REQUESTED: self._apply_closure_requested,
             EventType.CLOSURE_CANCELLED: self._apply_closure_cancelled,
+            EventType.ENGAGEMENT_VERIFIED: self._apply_verified,
+            EventType.FLAG_REJECTED: self._apply_inert,
             EventType.ENGAGEMENT_REOPENED: self._apply_reopened,
             EventType.ENGAGEMENT_ABANDONED: self._apply_abandoned,
             EventType.SOURCE_SUGGESTED: self._apply_inert,
@@ -498,6 +507,19 @@ class _Accumulator:
         del item
         self.closure = None
         self.status = EngagementStatus.ACTIVE
+        self.active_report = None
+
+    def _apply_verified(self, item: JournalEvent) -> None:
+        payload = item.payload
+        if (
+            not isinstance(payload, EngagementVerifiedPayload)
+            or self.status is not EngagementStatus.CLOSED_UNVERIFIED
+            or self.active_report is None
+            or payload.report_id != self.active_report.report_id
+            or payload.report_revision != self.active_report.report_revision
+        ):
+            raise EngagementReplayError("verification requires the active closed report")
+        self.status = EngagementStatus.CLOSED_VERIFIED
 
     def _apply_abandoned(self, item: JournalEvent) -> None:
         del item

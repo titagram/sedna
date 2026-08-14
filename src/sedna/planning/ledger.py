@@ -79,6 +79,8 @@ LEDGER_NO_OP_EVENT_TYPES = frozenset(
         EventType.CONTROL_TOOL_INVOKED,
         EventType.CLOSURE_REQUESTED,
         EventType.CLOSURE_CANCELLED,
+        EventType.ENGAGEMENT_VERIFIED,
+        EventType.FLAG_REJECTED,
         EventType.ENGAGEMENT_REOPENED,
         EventType.ENGAGEMENT_ABANDONED,
         EventType.SOURCE_SUGGESTED,

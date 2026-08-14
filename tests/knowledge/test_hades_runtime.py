@@ -112,6 +112,22 @@ def test_runtime_composes_planning_with_the_same_owned_journal(tmp_path: Path) -
         runtime._journal.list_snapshot_ids()
 
 
+def test_runtime_owns_reporting_and_terminal_lifecycle_on_the_same_journal(tmp_path: Path) -> None:
+    runtime = HadesKnowledgeRuntime.create(_ScriptedHost([]), tmp_path / "knowledge")
+
+    try:
+        assert runtime.journal is runtime._journal
+        assert runtime.planning._journal is runtime.journal
+        assert runtime.report_finalizer._journal is runtime.journal
+        assert runtime.reporting._journal is runtime.journal
+        assert runtime.reporting._planning is runtime.planning
+        assert runtime.engagements._journal is runtime.journal
+        assert runtime.engagements._planning is runtime.planning
+        assert runtime.planning._terminal_settlement_port._journal is runtime.journal
+    finally:
+        runtime.close()
+
+
 class _RawCompletionHost:
     def complete(self, **_: Any) -> object:
         return object()

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from hashlib import sha256
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -22,8 +24,10 @@ from sedna.engagement import (
 )
 from sedna.engagement.events import (
     AccessStateDeltaEventRecord,
+    EngagementReopenedPayload,
     EvidenceSliceEventRef,
     FacetObservationEventRecord,
+    FlagRejectedPayload,
     HypothesisFormedEventPayload,
     IncompatibilityObservationEventRecord,
     InterpretationFailedEventPayload,
@@ -37,8 +41,10 @@ from sedna.engagement.events import (
     ResearchSourceAssessedEventPayload,
     ResearchSourceConsultedEventPayload,
     SecretReferenceEventRecord,
+    SystemCorrelation,
     TextFactEventRecord,
 )
+from sedna.engagement.reporting.service import ReportClosureFinalizer
 from sedna.engagement.service import PlanningEventCommitItem
 from sedna.knowledge.retrieval import AuthorizationScope, AuthorizationState, ValidatedTarget
 from sedna.planning.situation import (
@@ -820,6 +826,221 @@ def test_legacy_engagement_reopened_invalidates_all_proof_generations_and_reject
     ) == (("root-flag", 2, "pending"), ("user-flag", 2, "pending"))
     with pytest.raises(ValueError, match="proof_assessment_generation_mismatch"):
         SituationReducer.rebuild(stale.snapshot)
+
+
+def test_rejection_reopen_pair_advances_only_cited_proof_and_blocks_reuse(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    proof_event_id = UUID("00000000-0000-4000-8000-000000000821")
+    rejection_event_id = UUID("00000000-0000-4000-8000-000000000822")
+    reopen_event_id = UUID("00000000-0000-4000-8000-000000000823")
+    with engagement_service(tmp_path, lambda: FIXED_TIME, fixed_uuid_factory()) as journal:
+        created = journal.create_from_manifest(current_manifest, lane=current_lane)
+        evidence = journal.write_evidence(
+            current_manifest.engagement_id,
+            b"0123456789abcdef0123456789abcdef",
+            media_type="text/plain",
+            representation="utf-8",
+        )
+        attached = journal.append_hook_events(
+            current_manifest.engagement_id,
+            (
+                JournalEventDraft(
+                    lane=current_lane,
+                    actor="host_agent",
+                    type="evidence_attached",
+                    payload=EvidenceAttachedPayload(evidence=evidence),
+                ),
+            ),
+            expected_revision=created.snapshot.revision,
+        )
+        proof_payload = ObjectiveProofObservedEventPayload(
+            proof_requirement_id="user-flag",
+            assessment_generation=1,
+            assessment="supported",
+            candidate_value=PrivateValueEventRecord(
+                evidence_slice=EvidenceSliceEventRef(
+                    evidence_id=evidence.evidence_id,
+                    start=0,
+                    end=evidence.size,
+                    sha256=evidence.sha256,
+                    media_type="text/plain",
+                ),
+                value_sha256=evidence.sha256,
+            ),
+            confidence=1.0,
+            evidence_ids=(evidence.evidence_id,),
+            source_event_ids=(attached.created_event_ids[0],),
+            interpretation_input_digest="f" * 64,
+        )
+        observed = journal._issue_planning_event_commit_capability().commit_planning_events(
+            current_manifest.engagement_id,
+            (
+                PlanningEventCommitItem(
+                    event_id=proof_event_id,
+                    idempotency_key="retained-proof",
+                    payload=proof_payload,
+                ),
+            ),
+            operation_id=UUID("00000000-0000-4000-8000-000000000824"),
+            expected_revision=attached.snapshot.revision,
+        )
+        closing = journal.request_close(
+            current_manifest.engagement_id,
+            lane=current_lane,
+            reason="test close",
+            expected_revision=observed.snapshot.revision,
+        )
+        closed = ReportClosureFinalizer(
+            journal,
+            journal._repository._issue_report_commit_capability(),
+        ).finalize(snapshot=closing.snapshot)
+        operation_id = UUID("00000000-0000-4000-8000-000000000825")
+        lifecycle = journal._issue_lifecycle_commit_capability()
+        settled_situation = SituationReducer.rebuild(closed)
+        receipt = lifecycle.rejection_receipt(
+            SimpleNamespace(
+                authoritative_journal_revision=closed.revision,
+                situation=settled_situation,
+            ),
+            proof_event_id,
+        )
+        with pytest.raises(ValueError, match="rejection_requires_current_supported_proof"):
+            lifecycle.rejection_receipt(
+                SimpleNamespace(
+                    authoritative_journal_revision=closed.revision,
+                    situation=settled_situation,
+                ),
+                UUID("00000000-0000-4000-8000-000000000888"),
+            )
+        rejection_draft = JournalEventDraft(
+            event_id=rejection_event_id,
+            actor="system",
+            type=EventType.FLAG_REJECTED,
+            payload=FlagRejectedPayload(
+                flag_event_id=proof_event_id,
+                rejected_value_sha256=evidence.sha256,
+                reason="collect replacement",
+            ),
+            system_correlation=SystemCorrelation(source="lifecycle", operation_id=operation_id),
+        )
+        reopen_draft = JournalEventDraft(
+            event_id=reopen_event_id,
+            actor="system",
+            type=EventType.ENGAGEMENT_REOPENED,
+            payload=EngagementReopenedPayload(
+                reason="collect replacement",
+                prior_status="closed_unverified",
+                proof_revalidation="retain_rejections",
+            ),
+            system_correlation=SystemCorrelation(source="lifecycle", operation_id=operation_id),
+        )
+        assert evidence.sha256 not in repr(receipt)
+        forged_pairs = (
+            (
+                rejection_draft,
+                reopen_draft.model_copy(
+                    update={
+                        "payload": reopen_draft.payload.model_copy(
+                            update={"prior_status": "closed_verified"}
+                        )
+                    }
+                ),
+            ),
+            (
+                rejection_draft,
+                reopen_draft.model_copy(
+                    update={
+                        "payload": reopen_draft.payload.model_copy(
+                            update={"proof_revalidation": "invalidate_all"}
+                        )
+                    }
+                ),
+            ),
+            (
+                rejection_draft,
+                reopen_draft.model_copy(
+                    update={
+                        "system_correlation": SystemCorrelation(
+                            source="lifecycle",
+                            operation_id=UUID("00000000-0000-4000-8000-000000000899"),
+                        )
+                    }
+                ),
+            ),
+            (
+                rejection_draft.model_copy(
+                    update={
+                        "payload": rejection_draft.payload.model_copy(
+                            update={"reason": "different rejection reason"}
+                        )
+                    }
+                ),
+                reopen_draft,
+            ),
+        )
+        for forged_rejection, forged_reopen in forged_pairs:
+            with pytest.raises(ValueError, match="invalid sealed lifecycle batch"):
+                lifecycle.commit_rejection_and_reopen(
+                    current_manifest.engagement_id,
+                    current_lane,
+                    forged_rejection,
+                    forged_reopen,
+                    proof_rejection=receipt,
+                    expected_revision=closed.revision,
+                )
+            assert journal.load_snapshot(current_manifest.engagement_id).revision == closed.revision
+        with pytest.raises(ValueError, match="invalid sealed lifecycle batch"):
+            lifecycle.commit_rejection_and_reopen(
+                current_manifest.engagement_id,
+                current_lane,
+                rejection_draft,
+                reopen_draft,
+                proof_rejection=replace(receipt, rejected_value_sha256="a" * 64),
+                expected_revision=closed.revision,
+            )
+        assert journal.load_snapshot(current_manifest.engagement_id).revision == closed.revision
+        reopened = lifecycle.commit_rejection_and_reopen(
+            current_manifest.engagement_id,
+            current_lane,
+            rejection_draft,
+            reopen_draft,
+            proof_rejection=receipt,
+            expected_revision=closed.revision,
+        )
+        with pytest.raises(ValueError, match="invalid sealed lifecycle batch"):
+            lifecycle.commit_rejection_and_reopen(
+                current_manifest.engagement_id,
+                current_lane,
+                rejection_draft,
+                reopen_draft,
+                proof_rejection=receipt,
+                expected_revision=reopened.snapshot.revision,
+            )
+        assert (
+            journal.load_snapshot(current_manifest.engagement_id).revision
+            == reopened.snapshot.revision
+        )
+        situation = SituationReducer.rebuild(reopened.snapshot)
+        reused = journal._issue_planning_event_commit_capability().commit_planning_events(
+            current_manifest.engagement_id,
+            (
+                PlanningEventCommitItem(
+                    event_id=UUID("00000000-0000-4000-8000-000000000826"),
+                    idempotency_key="reused-proof",
+                    payload=proof_payload.model_copy(update={"assessment_generation": 2}),
+                ),
+            ),
+            operation_id=UUID("00000000-0000-4000-8000-000000000827"),
+            expected_revision=reopened.snapshot.revision,
+        )
+
+    assert tuple(
+        (item.proof_requirement_id, item.assessment_generation, item.status)
+        for item in situation.objective_progress.requirements
+    ) == (("root-flag", 1, "pending"), ("user-flag", 2, "contradicted"))
+    with pytest.raises(ValueError, match="proof_value_previously_rejected"):
+        SituationReducer.rebuild(reused.snapshot)
 
 
 def test_interpretation_success_closes_the_exact_attachment_subject(tmp_path) -> None:

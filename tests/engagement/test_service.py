@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import inspect
 from contextlib import contextmanager
+from types import SimpleNamespace
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
@@ -11,8 +13,10 @@ from sedna.engagement import (
     EngagementClosedPayload,
     EngagementJournalService,
     EngagementMutationResult,
+    EngagementReopenedPayload,
     EventType,
     ExecutionLaneKey,
+    HostKind,
     JournalEventDraft,
     JournalRevision,
     ProofRequirement,
@@ -23,11 +27,14 @@ from sedna.engagement import (
     StrategyArchiveRecordDraft,
     SystemCorrelation,
 )
+from sedna.engagement.events import FlagRejectedPayload
 from sedna.engagement.service import (
     EVENT_APPEND_OWNER_BY_TYPE,
     EngagementAmbiguousError,
     EngagementNotFoundError,
+    LifecycleCommitCapability,
     PlanningEventCommitItem,
+    SettledProofRejectionReceipt,
     create_operational_start_draft,
 )
 from sedna.planning import FrontierProjection, FrontierProposal
@@ -166,7 +173,9 @@ def test_event_append_owner_map_is_complete_and_authoritative() -> None:
         "scope_changed": "lifecycle_service",
         "decision_recorded": "lifecycle_service",
         "agent_deviation_recorded": "lifecycle_service",
-        "engagement_reopened": "lifecycle_service",
+        "engagement_verified": "lifecycle_commit_capability",
+        "flag_rejected": "lifecycle_commit_capability",
+        "engagement_reopened": "lifecycle_commit_capability",
         "engagement_abandoned": "lifecycle_service",
         "session_started": "hook_adapter",
         "session_checkpointed": "hook_adapter",
@@ -265,6 +274,220 @@ def test_resume_by_scope_is_automatic_only_when_one_open_engagement_is_compatibl
             lane=new_lane(session_id="session-2"), scope=authorized_scope
         )
     assert resumed.snapshot.manifest.engagement_id == first.snapshot.manifest.engagement_id
+
+
+def test_lifecycle_reopen_lane_conflict_is_atomic(
+    tmp_path, authorized_scope, new_lane, fixed_clock, fixed_uuid_factory
+) -> None:
+    first_lane = new_lane(session_id="session-a")
+    occupied_lane = new_lane(session_id="session-b")
+    with engagement_service(tmp_path, fixed_clock, fixed_uuid_factory) as service:
+        first = service.create_engagement(
+            display_name="Orion-A",
+            objective="Obtain flags",
+            scope=authorized_scope,
+            lane=first_lane,
+        )
+        abandoned = service.abandon_engagement(first.engagement_id, lane=first_lane, reason="pause")
+        service.create_engagement(
+            display_name="Orion-B",
+            objective="Validate foothold",
+            scope=authorized_scope,
+            lane=occupied_lane,
+        )
+        before = service.load_snapshot(first.engagement_id)
+        lifecycle = service._issue_lifecycle_commit_capability()
+        with pytest.raises(ValueError, match="lane is already bound"):
+            lifecycle.commit_reopen(
+                first.engagement_id,
+                occupied_lane,
+                JournalEventDraft(
+                    actor="system",
+                    type=EventType.ENGAGEMENT_REOPENED,
+                    payload=EngagementReopenedPayload(
+                        reason="resume",
+                        prior_status="abandoned",
+                        proof_revalidation="invalidate_all",
+                    ),
+                    system_correlation=SystemCorrelation(
+                        source="lifecycle",
+                        operation_id=UUID("00000000-0000-4000-8000-000000000999"),
+                    ),
+                ),
+                expected_revision=abandoned.snapshot.revision,
+            )
+        after = service.load_snapshot(first.engagement_id)
+
+    assert before == after
+
+
+@pytest.mark.parametrize(
+    ("prior_status", "proof_revalidation"),
+    (
+        ("closed_verified", "invalidate_all"),
+        ("abandoned", "retain_rejections"),
+    ),
+)
+def test_lifecycle_reopen_rejects_forged_sealed_semantics_before_mutation(
+    tmp_path,
+    authorized_scope,
+    lane,
+    fixed_clock,
+    fixed_uuid_factory,
+    prior_status,
+    proof_revalidation,
+) -> None:
+    with engagement_service(tmp_path, fixed_clock, fixed_uuid_factory) as service:
+        created = create_orion(service, authorized_scope, lane)
+        abandoned = service.abandon_engagement(
+            created.engagement_id,
+            lane=lane,
+            reason="pause",
+        )
+        before = service.load_snapshot(created.engagement_id)
+
+        with pytest.raises(ValueError, match="invalid sealed lifecycle batch"):
+            service._issue_lifecycle_commit_capability().commit_reopen(
+                created.engagement_id,
+                lane,
+                JournalEventDraft(
+                    actor="system",
+                    type=EventType.ENGAGEMENT_REOPENED,
+                    payload=EngagementReopenedPayload(
+                        reason="resume",
+                        prior_status=prior_status,
+                        proof_revalidation=proof_revalidation,
+                    ),
+                    system_correlation=SystemCorrelation(
+                        source="lifecycle",
+                        operation_id=UUID("00000000-0000-4000-8000-000000000998"),
+                    ),
+                ),
+                expected_revision=abandoned.snapshot.revision,
+            )
+
+        assert service.load_snapshot(created.engagement_id).revision == before.revision
+
+
+class _LifecycleMutationTripwireRepository:
+    def __init__(self, snapshot) -> None:
+        self.snapshot = snapshot
+        self.append_calls = 0
+
+    def load_snapshot(self, engagement_id):
+        del engagement_id
+        return self.snapshot
+
+    def append_lifecycle_batch(self, *args, **kwargs):
+        del args, kwargs
+        self.append_calls += 1
+        raise AssertionError("closed_verified lifecycle mutation attempted")
+
+
+def _closed_verified_capability(*, events=()):
+    token = object()
+    revision = JournalRevision(sequence=7, event_hash="a" * 64)
+    snapshot = SimpleNamespace(
+        revision=revision,
+        events=events,
+        state=SimpleNamespace(status=SimpleNamespace(value="closed_verified")),
+    )
+    repository = _LifecycleMutationTripwireRepository(snapshot)
+    service = object.__new__(EngagementJournalService)
+    service._lifecycle_capability_token = token
+    service._repository = cast(Any, repository)
+    return LifecycleCommitCapability(service, token), repository, revision
+
+
+def test_sealed_reopen_rejects_closed_verified_before_repository_mutation() -> None:
+    capability, repository, revision = _closed_verified_capability()
+
+    with pytest.raises(ValueError, match="canonical_revocation_required"):
+        capability.commit_reopen(
+            UUID("11111111-1111-4111-8111-111111111111"),
+            ExecutionLaneKey(host_kind=HostKind.HADES, session_id="session", task_id="task"),
+            JournalEventDraft(
+                actor="system",
+                type=EventType.ENGAGEMENT_REOPENED,
+                payload=EngagementReopenedPayload(
+                    reason="continue",
+                    prior_status="closed_verified",
+                    proof_revalidation="invalidate_all",
+                ),
+                system_correlation=SystemCorrelation(
+                    source="lifecycle",
+                    operation_id=UUID("22222222-2222-4222-8222-222222222222"),
+                ),
+            ),
+            expected_revision=revision,
+        )
+
+    assert repository.append_calls == 0
+
+
+def test_sealed_rejection_reopen_rejects_closed_verified_before_repository_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engagement_id = UUID("11111111-1111-4111-8111-111111111111")
+    proof_event_id = UUID("22222222-2222-4222-8222-222222222222")
+    operation_id = UUID("33333333-3333-4333-8333-333333333333")
+    rejected_digest = "b" * 64
+    proof_event = SimpleNamespace(
+        event_id=proof_event_id,
+        type=SimpleNamespace(value="objective_proof_observed"),
+        payload=SimpleNamespace(
+            proof_requirement_id="user-flag",
+            assessment_generation=1,
+            assessment="supported",
+            candidate_value=SimpleNamespace(value_sha256=rejected_digest),
+        ),
+    )
+    capability, repository, revision = _closed_verified_capability(events=(proof_event,))
+    monkeypatch.setattr(
+        "sedna.planning.situation.SituationReducer.rebuild",
+        lambda snapshot: SimpleNamespace(state_digest="c" * 64),
+    )
+    receipt = SettledProofRejectionReceipt(
+        engagement_id=engagement_id,
+        authoritative_revision=revision,
+        situation_sha256="c" * 64,
+        proof_requirement_id="user-flag",
+        assessment_generation=1,
+        proof_event_id=proof_event_id,
+        rejected_value_sha256=rejected_digest,
+        _issuer_token=capability._service._lifecycle_capability_token,
+    )
+    correlation = SystemCorrelation(source="lifecycle", operation_id=operation_id)
+
+    with pytest.raises(ValueError, match="canonical_revocation_required"):
+        capability.commit_rejection_and_reopen(
+            engagement_id,
+            ExecutionLaneKey(host_kind=HostKind.HADES, session_id="session", task_id="task"),
+            JournalEventDraft(
+                actor="system",
+                type=EventType.FLAG_REJECTED,
+                payload=FlagRejectedPayload(
+                    flag_event_id=proof_event_id,
+                    rejected_value_sha256=rejected_digest,
+                    reason="replace proof",
+                ),
+                system_correlation=correlation,
+            ),
+            JournalEventDraft(
+                actor="system",
+                type=EventType.ENGAGEMENT_REOPENED,
+                payload=EngagementReopenedPayload(
+                    reason="replace proof",
+                    prior_status="closed_verified",
+                    proof_revalidation="retain_rejections",
+                ),
+                system_correlation=correlation,
+            ),
+            proof_rejection=receipt,
+            expected_revision=revision,
+        )
+
+    assert repository.append_calls == 0
 
 
 def test_same_target_in_two_open_engagements_returns_readable_candidates(

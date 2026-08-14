@@ -36,19 +36,13 @@ def test_named_engagement_survives_sessions_crash_tail_closing_and_reopen(
         session_id="session-2",
         tool_call_id="call-2",
     )
-    closing = host.close(
-        reason="all expected proof observed", session_id="session-2"
-    )
-    reopened = host.reopen(
-        reason="platform rejected the proof", session_id="session-3"
-    )
+    closing = host.close(reason="all expected proof observed", session_id="session-2")
+    reopened = host.reopen(reason="platform rejected the proof", session_id="session-3")
 
-    assert closing.status == "closing"
-    assert closing.closure_ready is True
+    assert closing.status == "closed_unverified"
+    assert closing.closure_ready is False
     assert reopened.status == "active"
-    assert "HTB{private-root-proof}" in host.logbook_text(
-        engagement_id, "session-2"
-    )
+    assert "HTB{private-root-proof}" in host.logbook_text(engagement_id, "session-2")
     assert host.valid_hash_chain(engagement_id)
     assert host.recovery_tail_count(engagement_id) == 1
     assert host.global_retrieval_contains("HTB{private-root-proof}") is False

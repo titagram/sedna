@@ -282,6 +282,7 @@ def register(ctx: Any) -> None:
         ctx,
         root_resolver=root_resolver,
         settlement_port_factory=PlanningSettlementPortFactory(planning_runtime_factory),
+        runtime_factory=planning_runtime_factory,
     ).register()
 
 

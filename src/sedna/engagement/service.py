@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import AbstractContextManager, contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -14,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from sedna.engagement.events import (
     ChildLaneLinkedPayload,
+    ClosureCancelledPayload,
     ClosureRequestedPayload,
     DecisionRecordedPayload,
     EngagementAbandonedPayload,
@@ -21,12 +23,15 @@ from sedna.engagement.events import (
     EngagementReopenedPayload,
     EngagementResumedPayload,
     EngagementSnapshot,
+    EngagementVerifiedPayload,
     EventPayload,
+    FlagRejectedPayload,
     JournalEvent,
     JournalEventDraft,
     LaneBoundPayload,
     ObjectiveChangedPayload,
     ScopeChangedPayload,
+    SystemCorrelation,
     ToolCallStartedPayload,
     ToolCallTerminatedPayload,
     ToolCorrelation,
@@ -82,7 +87,9 @@ EVENT_APPEND_OWNER_BY_TYPE: dict[str, str] = {
     "scope_changed": "lifecycle_service",
     "decision_recorded": "lifecycle_service",
     "agent_deviation_recorded": "lifecycle_service",
-    "engagement_reopened": "lifecycle_service",
+    "engagement_verified": "lifecycle_commit_capability",
+    "flag_rejected": "lifecycle_commit_capability",
+    "engagement_reopened": "lifecycle_commit_capability",
     "engagement_abandoned": "lifecycle_service",
     "session_started": "hook_adapter",
     "session_checkpointed": "hook_adapter",
@@ -153,6 +160,10 @@ class EngagementNotFoundError(ValueError):
 
     def __init__(self) -> None:
         super().__init__("no matching engagement exists")
+
+
+class EngagementTransitionError(ValueError):
+    """A lifecycle mutation is invalid for the authoritative journal state."""
 
 
 class EngagementMutationResult(BaseModel):
@@ -370,6 +381,253 @@ class PlanningEventCommitCapability:
         return _mutation_result(self._service._repository, engagement_id, result)
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class SettledProofRejectionReceipt:
+    engagement_id: UUID
+    authoritative_revision: JournalRevision
+    situation_sha256: Sha256Hex
+    proof_requirement_id: str
+    assessment_generation: int
+    proof_event_id: UUID
+    rejected_value_sha256: Sha256Hex
+    _issuer_token: object
+
+
+class LifecycleCommitCapability:
+    """Repository-issued append authority for sealed terminal lifecycle facts."""
+
+    def __init__(self, service: EngagementJournalService, token: object):
+        if token is not service._lifecycle_capability_token:
+            raise ValueError("invalid lifecycle capability token")
+        self._service = service
+
+    def commit_verified(
+        self,
+        engagement_id: UUID,
+        draft: JournalEventDraft,
+        *,
+        expected_revision: JournalRevision,
+    ) -> EngagementMutationResult:
+        validated = JournalEventDraft.model_validate(draft.model_dump(mode="python"))
+        snapshot = self._service._repository.load_snapshot(engagement_id)
+        report = snapshot.state.active_report
+        if (
+            validated.type != "engagement_verified"
+            or not isinstance(validated.payload, EngagementVerifiedPayload)
+            or snapshot.revision != expected_revision
+            or snapshot.state.status.value != "closed_unverified"
+            or report is None
+            or validated.payload.report_id != report.report_id
+            or validated.payload.report_revision != report.report_revision
+        ):
+            raise EngagementTransitionError("verification_requires_closed_report")
+        result = self._service._repository.append_batch(
+            engagement_id, (validated,), expected_revision=expected_revision
+        )
+        return _mutation_result(self._service._repository, engagement_id, result)
+
+    def rejection_receipt(
+        self, settlement: Any, flag_event_id: UUID
+    ) -> SettledProofRejectionReceipt:
+        situation = settlement.situation
+        matches = [
+            (proof, reference)
+            for proof in situation.objective_progress.requirements
+            for reference in proof.value_references
+            if reference.proof_event_id == flag_event_id
+            and reference.assessment == "supported"
+            and reference.assessment_generation == proof.assessment_generation
+            and proof.status == "supported"
+        ]
+        if len(matches) != 1:
+            raise EngagementTransitionError("rejection_requires_current_supported_proof")
+        proof, reference = matches[0]
+        return SettledProofRejectionReceipt(
+            engagement_id=situation.engagement_id,
+            authoritative_revision=settlement.authoritative_journal_revision,
+            situation_sha256=situation.state_digest,
+            proof_requirement_id=proof.proof_requirement_id,
+            assessment_generation=proof.assessment_generation,
+            proof_event_id=flag_event_id,
+            rejected_value_sha256=reference.value_sha256,
+            _issuer_token=self._service._lifecycle_capability_token,
+        )
+
+    def commit_rejection_and_reopen(
+        self,
+        engagement_id: UUID,
+        lane: ExecutionLaneKey,
+        rejection: JournalEventDraft,
+        reopen: JournalEventDraft,
+        *,
+        proof_rejection: SettledProofRejectionReceipt,
+        expected_revision: JournalRevision,
+    ) -> EngagementMutationResult:
+        validated = tuple(
+            JournalEventDraft.model_validate(item.model_dump(mode="python"))
+            for item in (rejection, reopen)
+        )
+        snapshot = self._service._repository.load_snapshot(engagement_id)
+        if snapshot.state.status.value == "closed_verified":
+            raise EngagementTransitionError("canonical_revocation_required")
+        if (
+            tuple(item.type for item in validated) != ("flag_rejected", "engagement_reopened")
+            or not isinstance(validated[0].payload, FlagRejectedPayload)
+            or not isinstance(validated[1].payload, EngagementReopenedPayload)
+            or any(item.actor != "system" or item.lane is not None for item in validated)
+            or any(
+                item.system_correlation is None or item.system_correlation.source != "lifecycle"
+                for item in validated
+            )
+            or validated[0].system_correlation != validated[1].system_correlation
+            or validated[0].payload.reason != validated[1].payload.reason
+            or validated[1].payload.prior_status != snapshot.state.status.value
+            or validated[1].payload.proof_revalidation != "retain_rejections"
+            or proof_rejection._issuer_token is not self._service._lifecycle_capability_token
+            or proof_rejection.engagement_id != engagement_id
+            or proof_rejection.authoritative_revision != expected_revision
+            or validated[0].payload.flag_event_id != proof_rejection.proof_event_id
+            or validated[0].payload.rejected_value_sha256 != proof_rejection.rejected_value_sha256
+        ):
+            raise EngagementAppendAuthorityError("invalid sealed lifecycle batch")
+        from sedna.planning.situation import SituationReducer
+
+        current_situation = SituationReducer.rebuild(snapshot)
+        proof_events = [
+            event
+            for event in snapshot.events
+            if event.event_id == proof_rejection.proof_event_id
+            and event.type.value == "objective_proof_observed"
+            and event.payload.proof_requirement_id == proof_rejection.proof_requirement_id
+            and event.payload.assessment_generation == proof_rejection.assessment_generation
+            and event.payload.assessment == "supported"
+            and event.payload.candidate_value.value_sha256 == proof_rejection.rejected_value_sha256
+        ]
+        if (
+            snapshot.revision != expected_revision
+            or snapshot.state.status.value not in {"closed_unverified", "closed_verified"}
+            or current_situation.state_digest != proof_rejection.situation_sha256
+            or len(proof_events) != 1
+        ):
+            raise EngagementTransitionError("rejection_requires_current_supported_proof")
+        result = self._service._repository.append_lifecycle_batch(
+            engagement_id,
+            lane,
+            validated,
+            binding_reason="reject",
+            expected_revision=expected_revision,
+        )
+        return _mutation_result(self._service._repository, engagement_id, result)
+
+    def commit_reopen(
+        self,
+        engagement_id: UUID,
+        lane: ExecutionLaneKey,
+        reopen: JournalEventDraft,
+        *,
+        expected_revision: JournalRevision,
+    ) -> EngagementMutationResult:
+        validated = JournalEventDraft.model_validate(reopen.model_dump(mode="python"))
+        snapshot = self._service._repository.load_snapshot(engagement_id)
+        if snapshot.state.status.value == "closed_verified":
+            raise EngagementTransitionError("canonical_revocation_required")
+        if (
+            validated.type != "engagement_reopened"
+            or not isinstance(validated.payload, EngagementReopenedPayload)
+            or validated.actor != "system"
+            or validated.lane is not None
+            or validated.system_correlation is None
+            or validated.system_correlation.source != "lifecycle"
+            or validated.payload.prior_status != snapshot.state.status.value
+            or validated.payload.proof_revalidation != "invalidate_all"
+        ):
+            raise EngagementAppendAuthorityError("invalid sealed lifecycle batch")
+        if snapshot.revision != expected_revision or snapshot.state.status.value not in {
+            "closing",
+            "closed_unverified",
+            "closed_verified",
+            "abandoned",
+        }:
+            raise EngagementTransitionError("reopen_requires_terminal_state")
+        result = self._service._repository.append_lifecycle_batch(
+            engagement_id,
+            lane,
+            (validated,),
+            binding_reason="reopen",
+            expected_revision=expected_revision,
+        )
+        return _mutation_result(self._service._repository, engagement_id, result)
+
+
+class ProofClosureCapability:
+    """Repository-issued authority for automatic proof-settlement barriers."""
+
+    def __init__(self, service: EngagementJournalService, token: object):
+        if token is not service._proof_closure_capability_token:
+            raise ValueError("invalid proof closure capability token")
+        self._service = service
+
+    def request_proof_close(
+        self,
+        engagement_id: UUID,
+        *,
+        authoritative_revision: JournalRevision,
+        lane: None,
+        reason: str,
+    ) -> EngagementMutationResult:
+        if lane is not None:
+            raise EngagementAppendAuthorityError("proof closure cannot use a host lane")
+        snapshot = self._service._repository.load_snapshot(engagement_id)
+        if snapshot.revision != authoritative_revision or snapshot.state.status.value != "active":
+            raise EngagementTransitionError("proof_closure_requires_active_revision")
+        draft = JournalEventDraft(
+            actor="system",
+            type="closure_requested",
+            payload=ClosureRequestedPayload(
+                terminal_watermark=snapshot.revision.sequence,
+                in_flight_call_ids=snapshot.state.in_flight_call_ids,
+                reason=reason,
+                origin="proof_settlement",
+            ),
+            system_correlation=SystemCorrelation(
+                source="planning", operation_id=self._service._uuid_factory()
+            ),
+        )
+        result = self._service._repository.append_batch(
+            engagement_id, (draft,), expected_revision=authoritative_revision
+        )
+        return _mutation_result(self._service._repository, engagement_id, result)
+
+    def cancel_proof_close(
+        self,
+        engagement_id: UUID,
+        *,
+        authoritative_revision: JournalRevision,
+        reason: str,
+    ) -> EngagementMutationResult:
+        snapshot = self._service._repository.load_snapshot(engagement_id)
+        barrier = snapshot.state.closure
+        if (
+            snapshot.revision != authoritative_revision
+            or snapshot.state.status.value != "closing"
+            or barrier is None
+            or barrier.origin != "proof_settlement"
+        ):
+            raise EngagementTransitionError("proof_closure_barrier_mismatch")
+        draft = JournalEventDraft(
+            actor="system",
+            type="closure_cancelled",
+            payload=ClosureCancelledPayload(closure_event_id=barrier.event_id, reason=reason),
+            system_correlation=SystemCorrelation(
+                source="planning", operation_id=self._service._uuid_factory()
+            ),
+        )
+        result = self._service._repository.append_batch(
+            engagement_id, (draft,), expected_revision=authoritative_revision
+        )
+        return _mutation_result(self._service._repository, engagement_id, result)
+
+
 class EngagementJournalService:
     """Context-managed facade over the engagement journal repository."""
 
@@ -384,9 +642,17 @@ class EngagementJournalService:
         self._clock = clock
         self._uuid_factory = uuid_factory
         self._planning_capability_token = object()
+        self._lifecycle_capability_token = object()
+        self._proof_closure_capability_token = object()
 
     def _issue_planning_event_commit_capability(self) -> PlanningEventCommitCapability:
         return PlanningEventCommitCapability(self, self._planning_capability_token)
+
+    def _issue_lifecycle_commit_capability(self) -> LifecycleCommitCapability:
+        return LifecycleCommitCapability(self, self._lifecycle_capability_token)
+
+    def _issue_proof_closure_capability(self) -> ProofClosureCapability:
+        return ProofClosureCapability(self, self._proof_closure_capability_token)
 
     @classmethod
     @contextmanager
@@ -774,6 +1040,8 @@ class EngagementJournalService:
 
         drafts: list[JournalEventDraft] = []
         snapshot = self._repository.load_snapshot(engagement_id)
+        if snapshot.state.status.value in {"closed_unverified", "closed_verified"}:
+            raise EngagementTransitionError("orchestrated_lifecycle_required")
         if lane.stable_key not in {
             binding.lane.stable_key for binding in snapshot.state.bound_lanes
         }:
@@ -830,6 +1098,9 @@ class EngagementJournalService:
 
     def load_snapshot(self, engagement_id: UUID) -> EngagementSnapshot:
         return self._repository.load_snapshot(engagement_id)
+
+    def report_artifact_status(self, engagement_id: UUID, report) -> tuple[bool, bool]:
+        return self._repository.report_artifact_status(engagement_id, report)
 
     def load_events(
         self,
