@@ -10,6 +10,9 @@ import pytest
 
 from sedna.knowledge.inventory import discover_sources
 from sedna.knowledge.pipeline import IngestionPipeline
+from sedna.knowledge.retrieval.maintenance import RetrievalMaintenanceService
+from sedna.knowledge.retrieval.service import KnowledgeRetrievalService
+from sedna.knowledge.retrieval.sqlite import SQLiteRetrievalIndex
 from sedna.knowledge.schema.manifest import foundation_manifest_digest
 from sedna.knowledge.schema.semantic import (
     SemanticCallMetadata,
@@ -150,9 +153,7 @@ def test_legacy_bundle_is_strategic_only_then_relearns_to_examples(tmp_path: Pat
             adjudication="verified",
             recorded_at=_NOW,
         )
-        extractor_call = _critic_call(
-            purpose="sedna.semantic.extract", model="legacy-extractor"
-        )
+        extractor_call = _critic_call(purpose="sedna.semantic.extract", model="legacy-extractor")
         pipeline.repository.write_semantic_result(
             SemanticCompilationResult(
                 disposition="verified",
@@ -187,6 +188,113 @@ def test_legacy_bundle_is_strategic_only_then_relearns_to_examples(tmp_path: Pat
         second = service2.compile_and_store(prepared)
         assert second.disposition == "unchanged"
         assert host2.calls == []
+
+
+def test_progressive_relearn_keeps_mixed_version_corpus_online(tmp_path: Path) -> None:
+    source_root = tmp_path / "raw_src"
+    for name in ("available.md", "unavailable.md"):
+        source_path = source_root / "01_Information-Gathering" / "Academy" / name
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(f"{_SOURCE_TEXT}\nSource marker: {name}.\n", encoding="utf-8")
+
+    candidates = discover_sources(source_root)
+    with IngestionPipeline(source_root, tmp_path / "knowledge") as pipeline:
+        prepared_sources = tuple(pipeline.prepare(candidate) for candidate in candidates)
+        assert all(prepared is not None for prepared in prepared_sources)
+        prepared_sources = tuple(prepared for prepared in prepared_sources if prepared is not None)
+        parents: dict[str, str] = {}
+        for prepared in prepared_sources:
+            current = SemanticIngestionService(
+                pipeline.repository,
+                SemanticCompiler(
+                    HadesLlmAdapter(_ScriptedHost([_draft_with_example(), _accepting_critic()])),
+                    clock=lambda: _NOW,
+                ),
+            ).compile_and_store(prepared)
+            assert current.bundle is not None and current.verification is not None
+            parents[prepared.manifest.source_id] = current.bundle.references[0].artifact_id
+            legacy = SemanticKnowledgeBundle(
+                schema_version="2.4.0",
+                source_id=prepared.manifest.source_id,
+                source_sha256=prepared.manifest.sha256,
+                compilation_manifest=current.bundle.compilation_manifest.model_copy(
+                    update={
+                        "compiler_version": "8",
+                        "extractor_prompt_version": "1",
+                        "critic_prompt_version": "1",
+                        "repair_prompt_version": "1",
+                        "execution_example_schema_version": None,
+                        "emitted_execution_example_ids": (),
+                    }
+                ),
+                references=current.bundle.references,
+                cases=current.bundle.cases,
+                guidance=current.bundle.guidance,
+            )
+            pipeline.repository.write_semantic_result(
+                SemanticCompilationResult(
+                    disposition="verified",
+                    bundle=legacy,
+                    verification=current.verification,
+                    calls=current.calls,
+                )
+            )
+
+        unavailable = next(
+            prepared
+            for prepared in prepared_sources
+            if Path(prepared.manifest.path).name == "unavailable.md"
+        )
+        (source_root / unavailable.manifest.path).unlink()
+        index_path = tmp_path / "knowledge" / "indexes" / "retrieval.sqlite"
+        with SQLiteRetrievalIndex(index_path) as index:
+            maintenance = RetrievalMaintenanceService(pipeline.repository, index)
+            rebuilt = maintenance.rebuild()
+            assert rebuilt.succeeded and rebuilt.indexed_source_count == 2
+            retrieval = KnowledgeRetrievalService(
+                index,
+                execution_example_loader=pipeline.repository.load_execution_examples,
+            )
+            for source_id, parent_id in parents.items():
+                assert index.get_artifact(parent_id) is not None
+                assert index.get_execution_example_locators(parent_id) == ()
+                assert index.get_source_capability(source_id) == "2.4.0"
+                gap = retrieval.get_execution_examples(parent_id).coverage_gap
+                assert gap is not None
+                assert gap.code.value == "legacy_bundle_without_examples"
+
+            available = next(
+                prepared
+                for prepared in prepared_sources
+                if Path(prepared.manifest.path).name == "available.md"
+            )
+            relearned = SemanticIngestionService(
+                pipeline.repository,
+                SemanticCompiler(
+                    HadesLlmAdapter(_ScriptedHost([_draft_with_example(), _accepting_critic()])),
+                    clock=lambda: _NOW,
+                ),
+            ).compile_and_store(available)
+            assert relearned.disposition == "verified"
+            assert relearned.bundle is not None
+            assert len(relearned.bundle.execution_examples) == 1
+
+            unchanged_host = _ScriptedHost([])
+            unchanged = SemanticIngestionService(
+                pipeline.repository,
+                SemanticCompiler(HadesLlmAdapter(unchanged_host), clock=lambda: _NOW),
+            ).compile_and_store(available)
+            assert unchanged.disposition == "unchanged"
+            assert unchanged_host.calls == []
+
+            assert maintenance.rebuild().succeeded
+            assert maintenance.audit().succeeded
+            assert index.get_source_capability(available.manifest.source_id) == "2.5.0"
+            assert index.get_execution_example_locators(parents[available.manifest.source_id])
+            assert index.get_source_capability(unavailable.manifest.source_id) == "2.4.0"
+            assert (
+                index.get_execution_example_locators(parents[unavailable.manifest.source_id]) == ()
+            )
 
 
 def test_load_execution_examples_filters_parent_and_requires_exact_set(tmp_path: Path) -> None:
@@ -233,9 +341,7 @@ def test_atomic_replacement_keeps_old_or_new_bundle_complete(tmp_path: Path, mon
         service = SemanticIngestionService(pipeline.repository, compiler)
         first = service.compile_and_store(prepared)
         assert first.disposition == "verified" and first.bundle is not None
-        original_example_ids = {
-            example.example_id for example in first.bundle.execution_examples
-        }
+        original_example_ids = {example.example_id for example in first.bundle.execution_examples}
 
         # a failing replacement write must leave the complete old bundle intact
         def fail_bundle_write(*args: Any, **kwargs: Any) -> Any:

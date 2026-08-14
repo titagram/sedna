@@ -1,0 +1,29 @@
+{
+  "engagement": {
+    "display_name": "Authorized multi-service lab",
+    "target": "10.10.10.10",
+    "proof_requirements": ["user-flag", "root-flag"]
+  },
+  "expected_strategy_ids": [
+    "strategy-ftp-enumeration",
+    "strategy-ssh-credential-reuse",
+    "strategy-http-reference-discovery"
+  ],
+  "reactivated_strategy_id": "strategy-ssh-credential-reuse",
+  "events": [
+    {"kind": "service_observed", "service": "ftp"},
+    {"kind": "service_observed", "service": "ssh"},
+    {"kind": "service_observed", "service": "http"},
+    {"kind": "strategy_selected", "strategy_id": "strategy-ssh-credential-reuse"},
+    {"kind": "syntax_error", "strategy_id": "strategy-ssh-credential-reuse"},
+    {"kind": "syntax_corrected", "strategy_id": "strategy-ssh-credential-reuse"},
+    {"kind": "credentials_rejected", "strategy_id": "strategy-ssh-credential-reuse"},
+    {"kind": "bounded_wordlist_exhausted", "strategy_id": "strategy-ssh-credential-reuse"},
+    {"kind": "credential_reference_discovered", "strategy_id": "strategy-http-reference-discovery"},
+    {"kind": "strategy_reactivated", "strategy_id": "strategy-ssh-credential-reuse", "archive_entry_id": "archive-ssh-credential-reuse"},
+    {"kind": "source_command_suggested", "strategy_id": "strategy-ssh-credential-reuse", "source_id": "source-ssh-method", "command_template": "ssh {{source_case_username}}@{{target}}", "credential_binding": "unresolved_source_case"},
+    {"kind": "host_command_adapted", "strategy_id": "strategy-ssh-credential-reuse", "command_template": "ssh {{username}}@{{target}}"},
+    {"kind": "proof_observed", "proof_requirement_id": "user-flag", "terminal": false},
+    {"kind": "proof_observed", "proof_requirement_id": "root-flag", "terminal": true}
+  ]
+}

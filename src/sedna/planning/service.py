@@ -16,6 +16,7 @@ from sedna.engagement import (
     ExecutionLaneKey,
     InterpretationFailedEventPayload,
     InterpretationSucceededEventPayload,
+    JournalRevision,
     RevisionConflictError,
     SettlementReason,
     StrategyArchiveRecordDraft,
@@ -26,8 +27,10 @@ from sedna.engagement.events import (
     CommandBindingEventRecord,
     CommandPlaceholderEventRecord,
     CommandSuggestionEventRecord,
+    EvidenceAttachedPayload,
     EvidenceSliceEventRef,
     ExecutionVariantEventRecord,
+    FacetObservationEventRecord,
     FrontierCriticizedEventPayload,
     FrontierProposalEventRecord,
     FrontierProposedEventPayload,
@@ -36,12 +39,15 @@ from sedna.engagement.events import (
     OutcomeAssessedEventPayload,
     PlanningCallMetadataEventRecord,
     PlanRequestedEventPayload,
+    PrivateValueEventRecord,
     ResearchQueryProposedEventPayload,
     RetryPredicateEventRecord,
     StrategyArchivedEventPayload,
     StrategyFamilyEventRecord,
     StrategyReconciledEventPayload,
     StrategyReconciliationEventOperation,
+    TextFactEventRecord,
+    ToolCallCompletedPayload,
 )
 from sedna.engagement.service import PlanningEventCommitItem
 from sedna.planning.commands import validate_command_suggestion
@@ -50,6 +56,7 @@ from sedna.planning.journal_events import (
     payloads_from_observation_batch,
     payloads_from_planning_attempt,
     payloads_from_reconciliation,
+    payloads_from_research_observations,
 )
 from sedna.planning.ledger import (
     StrategyLedgerReducer,
@@ -64,6 +71,7 @@ from sedna.planning.llm import (
     PlannerCriticRequest,
     PlannerRepairRequest,
     PlannerRequest,
+    PlanningLlmError,
 )
 from sedna.planning.models import (
     EVIDENCE_SLICE_BYTES,
@@ -85,8 +93,12 @@ from sedna.planning.models import (
     InterpretationSucceededSource,
     LocalEventIdBinding,
     NothingPendingSettlementResult,
+    ObjectiveProofObservedSource,
     ObservationBatchDraft,
+    ObservationDraft,
     ObservationEventConversion,
+    ObservationExtractedSource,
+    OutcomeAssessedSource,
     PendingEvidenceRange,
     PlannerCriticVerdict,
     PlannerDraft,
@@ -101,6 +113,14 @@ from sedna.planning.models import (
     PlanningResult,
     PlanRequestAudit,
     PlanRequestedSource,
+    ProofCandidateAdmission,
+    ProofIndexRecord,
+    ResearchEventConversion,
+    ResearchSourceAssessedSource,
+    ResearchSourceAssessmentAudit,
+    ResearchSourceConsultation,
+    ResearchSourceConsultedSource,
+    ResearchSourceObservationDraft,
     SettledSettlementResult,
     SettlementResult,
     SituationProjection,
@@ -141,6 +161,10 @@ class _JournalAppendError(Exception):
     pass
 
 
+class _PlanningLlmUnavailableError(RuntimeError):
+    """Internal boundary marker for planner-host failures only."""
+
+
 class PlanningService:
     def __init__(
         self,
@@ -170,6 +194,8 @@ class PlanningService:
 
     def plan_next(self, lane: ExecutionLaneKey, *, max_proposals: int = 5) -> PlanningResult:
         """Plan outside repository locks with one bounded optimistic restart."""
+        if not 3 <= max_proposals <= 8:
+            raise ValueError("max_proposals must be between 3 and 8")
         for attempt in range(2):
             try:
                 return self._plan_next_once(lane, max_proposals=max_proposals)
@@ -194,12 +220,132 @@ class PlanningService:
                         ledger_digest=replay.ledger_sha256,
                     ),
                 )
+            except _PlanningLlmUnavailableError:
+                return self._publish_llm_unavailable_gap(lane)
         raise AssertionError("bounded planning restart exhausted")
+
+    def _publish_llm_unavailable_gap(self, lane: ExecutionLaneKey) -> PlanningResult:
+        resolution = self._journal.resolve_lane_binding(lane)
+        if resolution.mode != "exact" or resolution.engagement_id is None:
+            raise ValueError("engagement_binding_required") from None
+        engagement_id = resolution.engagement_id
+        snapshot = self._journal.load_snapshot(engagement_id)
+        situation = SituationReducer.rebuild(snapshot)
+        replay = StrategyLedgerReducer.rebuild_state(snapshot)
+        input_digest = sha256(
+            json.dumps(
+                {
+                    "lane_key": lane.stable_key,
+                    "revision": snapshot.revision.model_dump(mode="json"),
+                    "situation_digest": situation.state_digest,
+                    "ledger_digest": replay.ledger_sha256,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        request_id = uuid5(NAMESPACE_URL, f"sedna:llm-unavailable:{input_digest}")
+        gap_event_id = uuid5(request_id, "planning-gap")
+        gap = PlanningGap(
+            request_id=request_id,
+            code="llm_unavailable",
+            summary="The planning language model is unavailable.",
+            retryable=True,
+            situation_digest=situation.state_digest,
+            ledger_digest=replay.ledger_sha256,
+        )
+        metadata = PlanningCallMetadata(
+            purpose="plan",
+            provider="unavailable",
+            model="unavailable",
+            agent_id="planning-service",
+            prompt_id=PLANNER_PROMPT_ID,
+            prompt_version=PLANNER_PROMPT_VERSION,
+            response_schema_version="1",
+            input_digest=input_digest,
+            input_tokens=0,
+            output_tokens=0,
+            elapsed_ms=0,
+        )
+        reconciliation = StrategyReconciliation(
+            input_family_ids=tuple(
+                sorted((item.family_id for item in replay.ledger.families), key=str)
+            ),
+            input_variant_ids=tuple(
+                sorted((item.variant_id for item in replay.ledger.variants), key=str)
+            ),
+            retained_family_ids=tuple(
+                sorted((item.family_id for item in replay.ledger.families), key=str)
+            ),
+            retained_variant_ids=tuple(
+                sorted((item.variant_id for item in replay.ledger.variants), key=str)
+            ),
+        )
+        source = PlanningGapRecordedSource(
+            local_id="planning-gap",
+            request_id=request_id,
+            code="llm_unavailable",
+            summary=gap.summary,
+            retryable=True,
+            situation_digest=situation.state_digest,
+            ledger_digest=replay.ledger_sha256,
+        )
+        conversion = PlanningAttemptEventConversion(
+            local_event_bindings=(
+                LocalEventIdBinding(local_id="planning-gap", event_id=gap_event_id),
+            ),
+            valid_event_ids=tuple(
+                sorted(
+                    (*(event.event_id for event in snapshot.events), gap_event_id),
+                    key=str,
+                )
+            ),
+            valid_evidence_ids=tuple(
+                sorted(
+                    {
+                        event.payload.evidence.evidence_id
+                        for event in snapshot.events
+                        if isinstance(event.payload, EvidenceAttachedPayload)
+                    }
+                )
+            ),
+            valid_family_ids=reconciliation.input_family_ids,
+            valid_variant_ids=reconciliation.input_variant_ids,
+            sources=(source,),
+            reconciliation=reconciliation,
+            call_metadata=metadata,
+            planning_gaps=(gap,),
+        )
+        payload = payloads_from_planning_attempt(conversion)[0]
+        committed = self._commit_planning_events(
+            engagement_id,
+            (
+                PlanningEventCommitItem(
+                    event_id=gap_event_id,
+                    idempotency_key=f"planning:{request_id}:llm-unavailable",
+                    payload=payload,
+                ),
+            ),
+            operation_id=request_id,
+            expected_revision=snapshot.revision,
+        )
+        return PlanningResult(
+            status="gap",
+            engagement_id=engagement_id,
+            current_authoritative_journal_revision=committed.snapshot.revision,
+            gap=gap,
+        )
+
+    def _complete_planning(self, model_type: Any, **kwargs: Any) -> Any:
+        try:
+            return self._llm.complete(model_type, **kwargs)
+        except PlanningLlmError as exc:
+            if exc.reason_code != "transport_failure":
+                raise
+            raise _PlanningLlmUnavailableError from exc
 
     def _plan_next_once(self, lane: ExecutionLaneKey, *, max_proposals: int) -> PlanningResult:
         """Settle evidence, then refuse planning across lifecycle terminal barriers."""
-        if not 3 <= max_proposals <= 8:
-            raise ValueError("max_proposals must be between 3 and 8")
         resolution = self._journal.resolve_lane_binding(lane)
         if resolution.mode != "exact" or resolution.engagement_id is None:
             raise ValueError("engagement_binding_required")
@@ -334,7 +480,7 @@ class PlanningService:
                 current_authoritative_journal_revision=snapshot.revision,
                 frontier=cached,
             )
-        plan_completion = self._llm.complete(
+        plan_completion = self._complete_planning(
             PlannerDraft,
             instructions=PLANNER_PROMPT,
             payload=PlannerRequest(
@@ -363,7 +509,7 @@ class PlanningService:
             secret_references=situation.secret_references,
             execution_examples=knowledge_context.execution_examples,
         )
-        critic_completion = self._llm.complete(
+        critic_completion = self._complete_planning(
             PlannerCriticVerdict,
             instructions=PLANNER_CRITIC_PROMPT,
             payload=PlannerCriticRequest(draft=planned),
@@ -450,7 +596,7 @@ class PlanningService:
                 initial_verdict = verdict
         if not verdict.accepted:
             repaired_once = True
-            repair_completion = self._llm.complete(
+            repair_completion = self._complete_planning(
                 PlannerDraft,
                 instructions=PLANNER_REPAIR_PROMPT,
                 payload=PlannerRepairRequest(draft=planned, critic=verdict),
@@ -469,7 +615,7 @@ class PlanningService:
                 secret_references=situation.secret_references,
                 execution_examples=knowledge_context.execution_examples,
             )
-            critic_completion = self._llm.complete(
+            critic_completion = self._complete_planning(
                 PlannerCriticVerdict,
                 instructions=PLANNER_CRITIC_PROMPT,
                 payload=PlannerCriticRequest(draft=repaired),
@@ -1772,6 +1918,264 @@ class PlanningService:
             elapsed_ms=0,
         )
 
+    def record_research_observations(
+        self,
+        engagement_id: UUID,
+        *,
+        conversion: ResearchEventConversion,
+        expected_revision: JournalRevision,
+    ) -> SituationProjection:
+        """Validate and atomically append one closed research event conversion."""
+        snapshot = self._journal.load_snapshot(engagement_id)
+        allocated_event_ids = tuple(binding.event_id for binding in conversion.local_event_bindings)
+        existing_event_ids = tuple(event.event_id for event in snapshot.events)
+        if set(allocated_event_ids) & set(existing_event_ids):
+            raise ValueError("research_event_id_already_exists")
+        evidence_ids = tuple(
+            sorted(
+                {
+                    event.payload.evidence.evidence_id
+                    for event in snapshot.events
+                    if isinstance(event.payload, EvidenceAttachedPayload)
+                }
+            )
+        )
+        source_ids = tuple(sorted({draft.source_id for draft in conversion.research_sources}))
+        validated = ResearchEventConversion.model_validate(
+            {
+                **conversion.model_dump(mode="python", warnings="error"),
+                "valid_event_ids": tuple(
+                    sorted((*existing_event_ids, *allocated_event_ids), key=str)
+                ),
+                "valid_evidence_ids": evidence_ids,
+                "valid_source_ids": source_ids,
+            }
+        )
+        payloads = payloads_from_research_observations(validated)
+        binding_by_local_id = {
+            binding.local_id: binding.event_id for binding in validated.local_event_bindings
+        }
+        operation_id = uuid5(
+            NAMESPACE_URL,
+            f"sedna:research:{engagement_id}:{validated.call_metadata.input_digest}",
+        )
+        committed = self._commit_planning_events(
+            engagement_id,
+            tuple(
+                PlanningEventCommitItem(
+                    event_id=binding_by_local_id[source.local_id],
+                    idempotency_key=f"research:{operation_id}:{source.local_id}",
+                    payload=payload,
+                )
+                for source, payload in zip(validated.sources, payloads, strict=True)
+            ),
+            operation_id=operation_id,
+            expected_revision=expected_revision,
+        )
+        return SituationReducer.rebuild(committed.snapshot)
+
+    def record_research_result(
+        self,
+        lane: ExecutionLaneKey,
+        *,
+        query_id: UUID,
+        source_id: str,
+        normalized_locator: str,
+        content: bytes,
+        media_type: str,
+        evidence_ids: tuple[str, ...],
+        tool_event_ids: tuple[UUID, ...],
+        assessment: Literal["useful", "contradicted", "stale", "irrelevant", "ambiguous"],
+        confidence: float,
+        summary: str,
+        related_event_ids: tuple[UUID, ...],
+        suggested_registry_status: (
+            Literal["consulted", "useful", "contradicted", "stale"] | None
+        ) = None,
+    ) -> SituationProjection:
+        """Validate one host-provided research result and append its typed events."""
+        resolution = self._journal.resolve_lane_binding(lane)
+        if resolution.mode != "exact" or resolution.engagement_id is None:
+            raise ValueError("engagement_binding_required")
+        engagement_id = resolution.engagement_id
+        snapshot = self._journal.load_snapshot(engagement_id)
+        events_by_id = {event.event_id: event for event in snapshot.events}
+
+        matching_queries = tuple(
+            event
+            for event in snapshot.events
+            if isinstance(event.payload, ResearchQueryProposedEventPayload)
+            and event.payload.query_id == query_id
+        )
+        if len(matching_queries) != 1:
+            raise ValueError("research_query_not_found")
+        query = matching_queries[0].payload
+        assert isinstance(query, ResearchQueryProposedEventPayload)
+        policy_decision, _, normalized_query = self.evaluate_research_query(
+            query.normalized_query,
+            protected_aliases=tuple(
+                sorted({*self._research_aliases, snapshot.manifest.display_name})
+            ),
+            known_flag_values=self._known_flag_values,
+        )
+        if (
+            query.policy_decision != "allowed"
+            or policy_decision != "allowed"
+            or normalized_query != query.normalized_query
+        ):
+            raise ValueError("research_query_not_allowed")
+        if query.candidate_source_ids and source_id not in query.candidate_source_ids:
+            raise ValueError("research_source_not_allowed_by_query")
+
+        if evidence_ids != tuple(sorted(set(evidence_ids))):
+            raise ValueError("research_evidence_ids_not_sorted_unique")
+        if tool_event_ids != tuple(sorted(set(tool_event_ids), key=str)):
+            raise ValueError("research_tool_event_ids_not_sorted_unique")
+        if related_event_ids != tuple(sorted(set(related_event_ids), key=str)):
+            raise ValueError("research_related_event_ids_not_sorted_unique")
+        if not related_event_ids or any(
+            event_id not in events_by_id for event_id in related_event_ids
+        ):
+            raise ValueError("research_related_event_not_in_snapshot")
+
+        protected_values = tuple(value for value in self._known_flag_values if value)
+        if any(
+            protected in value
+            for protected in protected_values
+            for value in (source_id, normalized_locator, summary)
+        ) or any(protected.encode("utf-8") in content for protected in protected_values):
+            raise ValueError("protected_research_value")
+
+        consultation = ResearchSourceConsultation(
+            query_id=query_id,
+            source_id=source_id,
+            normalized_locator=normalized_locator,
+            content=content,
+            media_type=media_type,
+            evidence_ids=evidence_ids,
+            tool_event_ids=tool_event_ids,
+        )
+        attachment_by_evidence_id = {
+            event.payload.evidence.evidence_id: event
+            for event in snapshot.events
+            if isinstance(event.payload, EvidenceAttachedPayload)
+            and event.payload.evidence.evidence_id in evidence_ids
+            and event.lane == lane
+        }
+        attachment_events = tuple(
+            attachment_by_evidence_id[evidence_id]
+            for evidence_id in evidence_ids
+            if evidence_id in attachment_by_evidence_id
+        )
+        if len(attachment_events) != len(evidence_ids) or any(
+            event.payload.evidence.media_type != media_type for event in attachment_events
+        ):
+            raise ValueError("research_evidence_not_in_lane")
+        if not any(
+            self._journal.read_evidence_slice(
+                engagement_id,
+                event.payload.evidence.evidence_id,
+                offset=0,
+                limit=len(content) + 1,
+            ).data
+            == content
+            for event in attachment_events
+        ):
+            raise ValueError("research_content_not_in_evidence")
+        tool_events = tuple(events_by_id.get(event_id) for event_id in tool_event_ids)
+        if not tool_events or any(
+            event is None
+            or event.lane != lane
+            or not isinstance(event.payload, ToolCallCompletedPayload)
+            or event.payload.technical_status != "returned"
+            for event in tool_events
+        ):
+            raise ValueError("research_tool_result_not_in_lane")
+
+        input_digest = sha256(
+            json.dumps(
+                {
+                    "query_id": str(query_id),
+                    "source_id": source_id,
+                    "normalized_locator": normalized_locator,
+                    "content_sha256": sha256(content).hexdigest(),
+                    "media_type": media_type,
+                    "evidence_ids": evidence_ids,
+                    "tool_event_ids": tuple(map(str, tool_event_ids)),
+                    "assessment": assessment,
+                    "confidence": confidence,
+                    "summary": summary,
+                    "related_event_ids": tuple(map(str, related_event_ids)),
+                    "suggested_registry_status": suggested_registry_status,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        consulted_event_id = uuid5(query_id, f"research-result:{input_digest}:consulted")
+        assessed_event_id = uuid5(query_id, f"research-result:{input_digest}:assessed")
+        assessment_related_ids = tuple(sorted({consulted_event_id, *related_event_ids}, key=str))
+        assessment_audit = ResearchSourceAssessmentAudit(
+            query_id=query_id,
+            source_id=source_id,
+            consulted_event_id=consulted_event_id,
+            assessment=assessment,
+            confidence=confidence,
+            summary=summary,
+            related_event_ids=assessment_related_ids,
+            suggested_registry_status=suggested_registry_status,
+        )
+        conversion = ResearchEventConversion(
+            local_event_bindings=(
+                LocalEventIdBinding(local_id="assessed", event_id=assessed_event_id),
+                LocalEventIdBinding(local_id="consulted", event_id=consulted_event_id),
+            ),
+            valid_event_ids=tuple(
+                sorted((*events_by_id, consulted_event_id, assessed_event_id), key=str)
+            ),
+            valid_evidence_ids=evidence_ids,
+            valid_source_ids=(source_id,),
+            sources=(
+                ResearchSourceConsultedSource(local_id="consulted", **consultation.model_dump()),
+                ResearchSourceAssessedSource(local_id="assessed", **assessment_audit.model_dump()),
+            ),
+            research_sources=(
+                ResearchSourceObservationDraft(
+                    source_id=source_id,
+                    assessment={
+                        "useful": "useful",
+                        "contradicted": "not_useful",
+                        "stale": "not_useful",
+                        "irrelevant": "not_useful",
+                        "ambiguous": "inconclusive",
+                    }[assessment],
+                    event_ids=tuple(
+                        sorted((event.event_id for event in attachment_events), key=str)
+                    ),
+                ),
+            ),
+            research_consultations=(consultation,),
+            research_assessments=(assessment_audit,),
+            call_metadata=PlanningCallMetadata(
+                purpose="observe",
+                provider="host",
+                model="research-result",
+                agent_id="planning-service",
+                prompt_id="research-result",
+                prompt_version="1",
+                response_schema_version="1",
+                input_digest=input_digest,
+                input_tokens=0,
+                output_tokens=0,
+                elapsed_ms=0,
+            ),
+        )
+        return self.record_research_observations(
+            engagement_id,
+            conversion=conversion,
+            expected_revision=snapshot.revision,
+        )
+
     def load_situation(self, engagement_id: UUID) -> SituationProjection:
         snapshot = self._journal.load_snapshot(engagement_id)
         try:
@@ -2020,6 +2424,7 @@ class PlanningService:
                 last_attempt_sequence[
                     (event.payload.attachment_event_id, event.payload.evidence_id)
                 ] = event.sequence
+        attachment_sequence = {event.event_id: event.sequence for event in snapshot.events}
         pending = tuple(
             sorted(
                 (
@@ -2032,6 +2437,7 @@ class PlanningService:
                     last_attempt_sequence.get(
                         (item.attachment_event_id, item.reference.evidence_id), 0
                     ),
+                    attachment_sequence[item.attachment_event_id],
                     str(item.attachment_event_id),
                     str(item.reference.evidence_id),
                 ),
@@ -2139,18 +2545,54 @@ class PlanningService:
                     ),
                 )
             )
+            attachment = next(
+                event
+                for event in snapshot.events
+                if event.event_id == descriptor.attachment_event_id
+            )
+            terminal = next(
+                (
+                    event
+                    for event in snapshot.events
+                    if event.sequence == attachment.sequence + 1
+                    and event.lane == attachment.lane
+                    and isinstance(event.payload, ToolCallCompletedPayload)
+                ),
+                None,
+            )
+            terminal_event_id = None if terminal is None else terminal.event_id
             completion = self._llm.complete(
                 ObservationBatchDraft,
-                instructions=OBSERVATION_PROMPT,
+                instructions=(
+                    f"{OBSERVATION_PROMPT}\n"
+                    "Return the authoritative subject exactly. "
+                    f"terminal_tool_event_id={terminal_event_id}."
+                ),
                 payload=request,
                 purpose="sedna.planning.observe",
             )
+            structured_terminal_claim = bool(
+                completion.parsed.outcomes or completion.parsed.objective_proofs
+            )
             subject = InterpretationSubject(
                 attachment_event_id=descriptor.attachment_event_id,
+                terminal_tool_event_id=(terminal_event_id if structured_terminal_claim else None),
                 evidence_id=descriptor.reference.evidence_id,
             )
             if completion.parsed.subject != subject:
                 raise ValueError("observation_subject_mismatch")
+            protected_values = tuple(value for value in self._known_flag_values if value)
+            public_observation_values = (
+                *(draft.text for draft in completion.parsed.observations),
+                *(draft.key for draft in completion.parsed.facets),
+                *(draft.value for draft in completion.parsed.facets),
+            )
+            if any(
+                protected in candidate
+                for protected in protected_values
+                for candidate in public_observation_values
+            ):
+                raise ValueError("protected_observation_value")
             input_digest = sha256(
                 json.dumps(
                     request.model_dump(mode="json"),
@@ -2185,8 +2627,239 @@ class PlanningService:
                 f"{slice_start + len(evidence_slice.data)}"
             )
             success_event_id = uuid5(NAMESPACE_URL, f"sedna:interpreted:{source_key}")
+            terminal_payload = None if terminal is None else terminal.payload
+            if terminal_payload is not None and not isinstance(
+                terminal_payload, ToolCallCompletedPayload
+            ):
+                raise RuntimeError("terminal event payload is not a tool completion")
+            active_decision = next(
+                (item for item in snapshot.state.active_decisions if item.lane == attachment.lane),
+                None,
+            )
+            decision_id = None
+            if structured_terminal_claim:
+                if terminal_payload is None:
+                    raise ValueError("structured_claim_requires_terminal_tool_completion")
+                if attachment.lane is None or active_decision is None:
+                    raise ValueError("structured_claim_requires_active_lane_decision")
+                try:
+                    decision_id = UUID(active_decision.decision_id.removeprefix("decision-"))
+                except ValueError as exc:
+                    raise ValueError("structured_claim_requires_typed_decision_id") from exc
+
+            grounded_drafts = (
+                *completion.parsed.observations,
+                *completion.parsed.facets,
+            )
+            structured_drafts = (
+                *grounded_drafts,
+                *completion.parsed.outcomes,
+                *completion.parsed.objective_proofs,
+            )
+            if any(
+                descriptor.attachment_event_id not in draft.event_ids for draft in structured_drafts
+            ):
+                raise ValueError("structured_claim_requires_subject_attachment_grounding")
+            emitted_sources: list[
+                ObservationExtractedSource | OutcomeAssessedSource | ObjectiveProofObservedSource
+            ] = []
+            emitted_event_ids: list[UUID] = []
+            local_bindings: list[LocalEventIdBinding] = []
+            valid_snapshot_event_ids = {event.event_id for event in snapshot.events}
+            for draft in grounded_drafts:
+                if not set(draft.event_ids).issubset(valid_snapshot_event_ids):
+                    raise ValueError("observation_event_reference_not_in_snapshot")
+            observation_keys = tuple(
+                (draft.kind, draft.text, draft.event_ids)
+                for draft in completion.parsed.observations
+            )
+            facet_keys = tuple(
+                (draft.key, draft.value, draft.event_ids) for draft in completion.parsed.facets
+            )
+            if len(observation_keys) != len(set(observation_keys)):
+                raise ValueError("duplicate_observation")
+            if len(facet_keys) != len(set(facet_keys)):
+                raise ValueError("duplicate_facet_observation")
+            for index, draft in enumerate(completion.parsed.observations):
+                if draft.kind != "text":
+                    raise ValueError("unsupported_generic_observation_kind")
+                event_id = uuid5(success_event_id, f"observation:{index}")
+                local_id = f"observation-{index}"
+                emitted_event_ids.append(event_id)
+                local_bindings.append(LocalEventIdBinding(local_id=local_id, event_id=event_id))
+                emitted_sources.append(
+                    ObservationExtractedSource(
+                        local_id=local_id,
+                        summary=draft.text,
+                        observation=TextFactEventRecord(
+                            subject="evidence observation",
+                            value=draft.text,
+                        ),
+                        confidence=1.0,
+                        evidence_slices=(event_ref,),
+                    )
+                )
+            synthesized_facet_observations: list[ObservationDraft] = []
+            facet_dimensions = {
+                "os_family",
+                "os_version",
+                "cpu_architecture",
+                "execution_environment",
+                "service",
+                "port",
+                "protocol",
+                "technology",
+                "network_position",
+                "security_control",
+            }
+            for index, draft in enumerate(completion.parsed.facets):
+                summary = f"{draft.key}: {draft.value}"
+                event_id = uuid5(success_event_id, f"facet:{index}")
+                local_id = f"facet-{index}"
+                emitted_event_ids.append(event_id)
+                local_bindings.append(LocalEventIdBinding(local_id=local_id, event_id=event_id))
+                synthesized_facet_observations.append(
+                    ObservationDraft(
+                        kind="facet",
+                        text=summary,
+                        event_ids=draft.event_ids,
+                    )
+                )
+                emitted_sources.append(
+                    ObservationExtractedSource(
+                        local_id=local_id,
+                        summary=summary,
+                        observation=FacetObservationEventRecord(
+                            dimension=(draft.key if draft.key in facet_dimensions else "custom"),
+                            key=draft.key,
+                            value=draft.value,
+                            relation="observed",
+                        ),
+                        confidence=1.0,
+                        evidence_slices=(event_ref,),
+                    )
+                )
+            outcome_keys = tuple(
+                (draft.category, draft.summary, draft.event_ids)
+                for draft in completion.parsed.outcomes
+            )
+            if len(outcome_keys) != len(set(outcome_keys)):
+                raise ValueError("duplicate_outcome_assessment")
+            for index, draft in enumerate(completion.parsed.outcomes):
+                if terminal is None or terminal_payload is None or decision_id is None:
+                    raise ValueError("outcome_requires_terminal_tool_completion")
+                event_id = uuid5(success_event_id, f"outcome:{index}")
+                local_id = f"outcome-{index}"
+                emitted_event_ids.append(event_id)
+                local_bindings.append(LocalEventIdBinding(local_id=local_id, event_id=event_id))
+                emitted_sources.append(
+                    OutcomeAssessedSource(
+                        local_id=local_id,
+                        attachment_event_id=descriptor.attachment_event_id,
+                        terminal_tool_event_id=terminal.event_id,
+                        decision_id=decision_id,
+                        tool_call_ids=(terminal_payload.call_id,),
+                        category=draft.category,
+                        summary=draft.summary,
+                        strategic_impact=draft.summary,
+                        evidence_ids=(descriptor.reference.evidence_id,),
+                        source_event_ids=draft.event_ids,
+                    )
+                )
+            proof_progress = {
+                item.proof_requirement_id: item
+                for item in SituationReducer.rebuild(snapshot).objective_progress.requirements
+            }
+            proof_requirement_ids = tuple(
+                draft.proof_requirement_id for draft in completion.parsed.objective_proofs
+            )
+            if len(proof_requirement_ids) != len(set(proof_requirement_ids)):
+                raise ValueError("duplicate_proof_requirement_in_observation")
+            valid_proof_indexes: list[ProofIndexRecord] = []
+            proof_candidate_admissions: list[ProofCandidateAdmission] = []
+            for index, draft in enumerate(completion.parsed.objective_proofs):
+                proof = proof_progress.get(draft.proof_requirement_id)
+                if proof is None:
+                    raise ValueError("proof_requirement_not_in_manifest")
+                if proof.status != "pending":
+                    raise ValueError("proof_requirement_already_assessed")
+                if proof.generation_started_event_id is not None:
+                    generation_started = next(
+                        event
+                        for event in snapshot.events
+                        if event.event_id == proof.generation_started_event_id
+                    )
+                    if attachment.sequence <= generation_started.sequence:
+                        raise ValueError("stale_proof_candidate_generation")
+                if event_ref.sha256 in proof.rejected_value_sha256s:
+                    raise ValueError("previously_rejected_proof_value")
+                valid_proof_indexes.append(
+                    ProofIndexRecord(
+                        proof_requirement_id=draft.proof_requirement_id,
+                        assessment_generation=proof.assessment_generation,
+                        rejection_inventory_digest=sha256(
+                            json.dumps(
+                                proof.rejected_value_sha256s,
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                        ).hexdigest(),
+                    )
+                )
+                proof_candidate_admissions.append(
+                    ProofCandidateAdmission(
+                        proof_requirement_id=draft.proof_requirement_id,
+                        assessment_generation=proof.assessment_generation,
+                        candidate_sha256=event_ref.sha256,
+                        decision="allowed",
+                    )
+                )
+                event_id = uuid5(success_event_id, f"proof:{index}")
+                local_id = f"proof-{index}"
+                emitted_event_ids.append(event_id)
+                local_bindings.append(LocalEventIdBinding(local_id=local_id, event_id=event_id))
+                emitted_sources.append(
+                    ObjectiveProofObservedSource(
+                        local_id=local_id,
+                        proof_requirement_id=draft.proof_requirement_id,
+                        assessment_generation=proof.assessment_generation,
+                        assessment=draft.assessment,
+                        candidate_value=PrivateValueEventRecord(
+                            evidence_slice=event_ref,
+                            value_sha256=event_ref.sha256,
+                        ),
+                        confidence=1.0,
+                        evidence_ids=(descriptor.reference.evidence_id,),
+                        source_event_ids=draft.event_ids,
+                    )
+                )
+            interpretation_source = InterpretationSucceededSource(
+                local_id="interpreted",
+                interpretation_id=uuid5(NAMESPACE_URL, f"sedna:interpretation:{source_key}"),
+                attachment_event_id=descriptor.attachment_event_id,
+                terminal_tool_event_id=(terminal_event_id if structured_terminal_claim else None),
+                evidence_id=descriptor.reference.evidence_id,
+                covered_slices=(event_ref,),
+                emitted_event_ids=tuple(emitted_event_ids),
+            )
+            bindings = tuple(
+                sorted(
+                    (
+                        *local_bindings,
+                        LocalEventIdBinding(local_id="interpreted", event_id=success_event_id),
+                    ),
+                    key=lambda item: item.local_id,
+                )
+            )
+            sources = (*emitted_sources, interpretation_source)
             conversion = ObservationEventConversion(
-                batch=completion.parsed,
+                batch=completion.parsed.model_copy(
+                    update={
+                        "observations": (
+                            *completion.parsed.observations,
+                            *synthesized_facet_observations,
+                        )
+                    }
+                ),
                 call_metadata=metadata,
                 interpretation_audits=(
                     InterpretationAudit(
@@ -2195,13 +2868,28 @@ class PlanningService:
                         status="succeeded",
                     ),
                 ),
-                local_event_bindings=(
-                    LocalEventIdBinding(local_id="interpreted", event_id=success_event_id),
-                ),
+                local_event_bindings=bindings,
                 valid_event_ids=tuple(
-                    sorted((descriptor.attachment_event_id, success_event_id), key=str)
+                    sorted(
+                        (
+                            *(event.event_id for event in snapshot.events),
+                            *emitted_event_ids,
+                            success_event_id,
+                        ),
+                        key=str,
+                    )
                 ),
                 valid_evidence_ids=(descriptor.reference.evidence_id,),
+                valid_proof_indexes=tuple(
+                    sorted(
+                        valid_proof_indexes,
+                        key=lambda item: (
+                            item.proof_requirement_id,
+                            item.assessment_generation,
+                        ),
+                    )
+                ),
+                proof_candidate_admissions=tuple(proof_candidate_admissions),
                 evidence_slices=(
                     EvidenceSliceInput(
                         evidence_id=descriptor.reference.evidence_id,
@@ -2211,28 +2899,20 @@ class PlanningService:
                         content=evidence_slice.data,
                     ),
                 ),
-                sources=(
-                    InterpretationSucceededSource(
-                        local_id="interpreted",
-                        interpretation_id=uuid5(
-                            NAMESPACE_URL, f"sedna:interpretation:{source_key}"
-                        ),
-                        attachment_event_id=descriptor.attachment_event_id,
-                        evidence_id=descriptor.reference.evidence_id,
-                        covered_slices=(event_ref,),
-                        emitted_event_ids=(),
-                    ),
-                ),
+                sources=sources,
             )
-            payload = payloads_from_observation_batch(conversion)[0]
+            payloads = payloads_from_observation_batch(conversion)
+            bindings_by_local_id = {binding.local_id: binding for binding in bindings}
+            payload_bindings = tuple(bindings_by_local_id[source.local_id] for source in sources)
             committed = self._commit_planning_events(
                 engagement_id,
-                (
+                tuple(
                     PlanningEventCommitItem(
-                        event_id=success_event_id,
+                        event_id=binding.event_id,
                         payload=payload,
-                        idempotency_key=f"planning:interpreted:{success_event_id}",
-                    ),
+                        idempotency_key=f"planning:{payload.kind}:{binding.event_id}",
+                    )
+                    for binding, payload in zip(payload_bindings, payloads, strict=True)
                 ),
                 operation_id=uuid5(NAMESPACE_URL, f"sedna:settlement:{success_event_id}"),
                 expected_revision=snapshot.revision,

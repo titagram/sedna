@@ -134,6 +134,12 @@ host-model call for current sources and produces no duplicate canonical or index
 A controlled version change reprocesses once and the next identical run is
 unchanged.
 
+Existing exact `2.4.0` bundles remain strategically retrievable during the `2.5.0` transition.
+After a SQLite-v5 rebuild they expose zero execution-example locators and the typed
+`legacy_bundle_without_examples` gap until their original bytes are relearned. Operators can run
+`sedna_learn_local` one available original root at a time, then maintenance `rebuild` and `audit`;
+unavailable originals stay strategic-only, with no in-place canonical migration or corpus outage.
+
 The Hades plugin now registers four strategic-knowledge tools:
 
 - `sedna_learn_local` learns a supplied local source selection;

@@ -131,6 +131,49 @@ def test_plan_tool_resolves_current_root_and_preserves_exact_lane(
     assert first_result["failure_code"] == second_result["failure_code"] == "planning_failed"
 
 
+def test_plan_tool_preserves_authoritative_llm_unavailable_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = _RegistrationContext(tmp_path / "knowledge")
+
+    class _Planning:
+        def plan_next(self, lane: object, *, max_proposals: int) -> PlanningResult:
+            del lane, max_proposals
+            return PlanningResult.model_validate(
+                {
+                    "status": "gap",
+                    "engagement_id": "00000000-0000-0000-0000-000000000001",
+                    "current_authoritative_journal_revision": {
+                        "sequence": 2,
+                        "event_hash": "2" * 64,
+                    },
+                    "gap": {
+                        "code": "llm_unavailable",
+                        "summary": "The planning language model is unavailable.",
+                        "retryable": True,
+                        "situation_digest": "3" * 64,
+                        "ledger_digest": "4" * 64,
+                    },
+                }
+            )
+
+    @contextmanager
+    def runtime_factory(root: Path) -> Iterator[object]:
+        del root
+        yield SimpleNamespace(planning=_Planning())
+
+    monkeypatch.setattr(plugin_module, "_planning_runtime_factory", lambda _ctx: runtime_factory)
+    register(context)
+    handler = next(item["handler"] for item in context.tools if item["name"] == "sedna_plan_next")
+
+    result = json.loads(handler({}, session_id="session-a", task_id="task-a"))
+
+    assert result["status"] == "gap"
+    assert result["gap"]["code"] == "llm_unavailable"
+    assert result["gap"]["retryable"] is True
+    assert result["failure_code"] is None
+
+
 def test_plan_tool_rejects_missing_lane_before_resolving_root(tmp_path: Path) -> None:
     context = _RegistrationContext(tmp_path / "knowledge")
     register(context)

@@ -17,6 +17,9 @@ from sedna.engagement import (
     JournalEventDraft,
     ProofRequirement,
     SessionCheckpointedPayload,
+    ToolCallCompletedPayload,
+    ToolCallStartedPayload,
+    ToolCorrelation,
 )
 from sedna.engagement.events import (
     ArchivedStrategyEventRecord,
@@ -28,11 +31,14 @@ from sedna.knowledge.retrieval import AuthorizationScope, AuthorizationState, Va
 from sedna.knowledge.schema.execution import PlaceholderKind
 from sedna.planning.commands import CommandBinding, CommandOrigin, CommandSuggestionDraft
 from sedna.planning.frontier import FrontierReducer
+from sedna.planning.llm import PlanningLlmError
 from sedna.planning.models import (
+    FacetObservationDraft,
     FrontierProposalDraft,
     IncompleteSettlementResult,
     InterpretationSubject,
     ObservationBatchDraft,
+    ObservationDraft,
     PendingEvidenceRange,
     PlannerCriticVerdict,
     PlannerDraft,
@@ -81,6 +87,83 @@ class EmptyObservationLlm:
             agent_id="test-agent",
             usage=SimpleNamespace(input_tokens=7, output_tokens=3),
         )
+
+
+class GroundedObservationLlm(EmptyObservationLlm):
+    def complete(self, model_type, **kwargs):
+        completion = super().complete(model_type, **kwargs)
+        event_id = kwargs["payload"].evidence_slices[0].event_id
+        return SimpleNamespace(
+            **{
+                **completion.__dict__,
+                "parsed": ObservationBatchDraft(
+                    subject=self.subject,
+                    observations=(
+                        ObservationDraft(
+                            kind="text",
+                            text="OpenSSH 9.6 is reachable",
+                            event_ids=(event_id,),
+                        ),
+                    ),
+                    facets=(
+                        FacetObservationDraft(
+                            key="service",
+                            value="ssh",
+                            event_ids=(event_id,),
+                        ),
+                    ),
+                ),
+            }
+        )
+
+
+class ProtectedObservationLlm(EmptyObservationLlm):
+    def __init__(self, subject: InterpretationSubject, protected_value: str, kind: str) -> None:
+        super().__init__(subject)
+        self.protected_value = protected_value
+        self.kind = kind
+
+    def complete(self, model_type, **kwargs):
+        completion = super().complete(model_type, **kwargs)
+        event_id = kwargs["payload"].evidence_slices[0].event_id
+        observations = ()
+        facets = ()
+        if self.kind == "text":
+            observations = (
+                ObservationDraft(
+                    kind="text",
+                    text=f"Recovered proof: {self.protected_value}",
+                    event_ids=(event_id,),
+                ),
+            )
+        else:
+            facets = (
+                FacetObservationDraft(
+                    key="proof",
+                    value=self.protected_value,
+                    event_ids=(event_id,),
+                ),
+            )
+        return SimpleNamespace(
+            **{
+                **completion.__dict__,
+                "parsed": ObservationBatchDraft(
+                    subject=self.subject,
+                    observations=observations,
+                    facets=facets,
+                ),
+            }
+        )
+
+
+class PlannerUnavailableLlm:
+    def complete(self, model_type, **kwargs):
+        raise PlanningLlmError("transport_failure")
+
+
+class PlannerProgrammingErrorLlm:
+    def complete(self, model_type, **kwargs):
+        raise TypeError("local programming error")
 
 
 class InvalidSubjectLlm:
@@ -575,6 +658,234 @@ def test_text_attachment_is_read_observed_and_authoritatively_settled(tmp_path) 
     assert successes[0].payload.attachment_event_id == attached.created_event_ids[0]
     assert successes[0].payload.covered_slices[0].start == 0
     assert successes[0].payload.covered_slices[0].end == len(content)
+
+
+def test_grounded_observations_and_facets_are_committed_with_interpretation_atomically(
+    tmp_path,
+) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        evidence, attached = attach_text_evidence(
+            journal,
+            current_manifest,
+            current_lane,
+            content=b"OpenSSH 9.6 is reachable",
+        )
+        subject = InterpretationSubject(
+            attachment_event_id=attached.created_event_ids[0],
+            evidence_id=evidence.evidence_id,
+        )
+
+        result = PlanningService(
+            journal=journal,
+            llm=GroundedObservationLlm(subject),
+            clock=lambda: FIXED_TIME,
+        ).settle_pending_evidence(current_manifest.engagement_id, reason="plan")
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+
+    assert result.status == "settled"
+    assert [
+        event.type
+        for event in snapshot.events
+        if event.type in {"observation_extracted", "interpretation_succeeded"}
+    ] == ["observation_extracted", "observation_extracted", "interpretation_succeeded"]
+    assert tuple(item.text for item in result.situation.facts) == ("OpenSSH 9.6 is reachable",)
+    assert tuple((item.key, item.value) for item in result.situation.facets) == (
+        ("service", "ssh"),
+    )
+    interpretation = next(
+        event for event in snapshot.events if event.type == "interpretation_succeeded"
+    )
+    assert len(interpretation.payload.emitted_event_ids) == 2
+
+
+@pytest.mark.parametrize("observation_kind", ("text", "facet"))
+def test_protected_values_fail_closed_before_public_observation_persistence(
+    tmp_path, observation_kind
+) -> None:
+    protected_value = "HTB{private-root-flag}"
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        evidence, attached = attach_text_evidence(
+            journal,
+            current_manifest,
+            current_lane,
+            content=protected_value.encode(),
+        )
+        subject = InterpretationSubject(
+            attachment_event_id=attached.created_event_ids[0],
+            evidence_id=evidence.evidence_id,
+        )
+        service = PlanningService(
+            journal=journal,
+            llm=ProtectedObservationLlm(subject, protected_value, observation_kind),
+            clock=lambda: FIXED_TIME,
+            known_flag_values=(protected_value,),
+        )
+
+        result = service.settle_pending_evidence(current_manifest.engagement_id, reason="plan")
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+        situation = service.load_situation(current_manifest.engagement_id)
+
+    assert result.status == "failed"
+    assert result.failure_code == "invalid_extractor_output"
+    assert situation.facts == ()
+    assert situation.facets == ()
+    assert not any(event.type == "observation_extracted" for event in snapshot.events)
+    assert protected_value not in snapshot.model_dump_json()
+
+
+def test_planner_unavailability_publishes_an_authoritative_typed_gap(tmp_path) -> None:
+    current_manifest = manifest()
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=lane())
+        result = PlanningService(
+            journal=journal,
+            llm=PlannerUnavailableLlm(),
+            clock=lambda: FIXED_TIME,
+        ).plan_next(lane(), max_proposals=3)
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+
+    assert result.status == "gap"
+    assert result.gap is not None
+    assert result.gap.code == "llm_unavailable"
+    assert result.gap.retryable is True
+    assert result.current_authoritative_journal_revision == snapshot.revision
+    gaps = [event for event in snapshot.events if event.type == "planning_gap_recorded"]
+    assert len(gaps) == 1
+    assert gaps[0].payload.code == "llm_unavailable"
+    assert gaps[0].payload.situation_digest == result.gap.situation_digest
+    assert gaps[0].payload.ledger_digest == result.gap.ledger_digest
+
+
+def test_planner_programming_error_is_not_rewritten_as_llm_unavailable(tmp_path) -> None:
+    current_manifest = manifest()
+    with journal_service(tmp_path) as journal:
+        created = journal.create_from_manifest(current_manifest, lane=lane())
+        service = PlanningService(
+            journal=journal,
+            llm=PlannerProgrammingErrorLlm(),
+            clock=lambda: FIXED_TIME,
+        )
+
+        with pytest.raises(TypeError, match="local programming error"):
+            service.plan_next(lane(), max_proposals=3)
+
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+
+    assert snapshot.revision == created.snapshot.revision
+    assert not any(event.type == "planning_gap_recorded" for event in snapshot.events)
+
+
+def test_research_consultation_and_assessment_are_committed_atomically(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    query_id = UUID("00000000-0000-4000-8000-000000000801")
+    content = b"OpenSSH documents version 9.6."
+    with journal_service(tmp_path) as journal:
+        evidence, attached = attach_text_evidence(
+            journal,
+            current_manifest,
+            current_lane,
+            content=content,
+        )
+        service = PlanningService(
+            journal=journal,
+            llm=PlannerUnavailableLlm(),
+            clock=lambda: FIXED_TIME,
+        )
+        query = service._commit_planning_events(
+            current_manifest.engagement_id,
+            (
+                PlanningEventCommitItem(
+                    event_id=UUID("00000000-0000-4000-8000-000000000802"),
+                    idempotency_key="test:research-query",
+                    payload=service._research_query_payload(
+                        "OpenSSH 9.6",
+                        query_id=query_id,
+                        authoritative_aliases=(current_manifest.display_name,),
+                        related_event_ids=(attached.created_event_ids[0],),
+                    ),
+                ),
+            ),
+            operation_id=UUID("00000000-0000-4000-8000-000000000803"),
+            expected_revision=attached.snapshot.revision,
+        )
+        completed = journal.append_hook_events(
+            current_manifest.engagement_id,
+            (
+                JournalEventDraft(
+                    lane=current_lane,
+                    actor="host_agent",
+                    type="tool_call_started",
+                    payload=ToolCallStartedPayload(
+                        call_id="research-result",
+                        tool_name="fixture",
+                        correlation=ToolCorrelation.uncertain("missing_stable_identity"),
+                        safe_arguments={},
+                    ),
+                ),
+                JournalEventDraft(
+                    lane=current_lane,
+                    actor="host_agent",
+                    type="tool_call_completed",
+                    payload=ToolCallCompletedPayload(
+                        call_id="research-result",
+                        correlation=ToolCorrelation.uncertain("missing_stable_identity"),
+                        technical_status="returned",
+                        duration_ms=1,
+                        evidence_id=evidence.evidence_id,
+                        evidence_attachment_event_id=attached.created_event_ids[0],
+                    ),
+                ),
+            ),
+            expected_revision=query.snapshot.revision,
+        )
+        before = completed.snapshot
+
+        research_result = {
+            "query_id": query_id,
+            "source_id": "source-openssh",
+            "normalized_locator": "https://example.test/openssh",
+            "content": content,
+            "media_type": "text/plain",
+            "evidence_ids": (evidence.evidence_id,),
+            "tool_event_ids": (completed.created_event_ids[1],),
+            "assessment": "useful",
+            "confidence": 0.9,
+            "summary": "The source confirms the observed OpenSSH version.",
+            "related_event_ids": (completed.created_event_ids[1],),
+            "suggested_registry_status": "useful",
+        }
+        with pytest.raises(ValueError, match="research_content_not_in_evidence"):
+            service.record_research_result(
+                current_lane,
+                **{**research_result, "content": b"fabricated result"},
+            )
+        with pytest.raises(ValueError, match="protected_research_value"):
+            PlanningService(
+                journal=journal,
+                llm=PlannerUnavailableLlm(),
+                clock=lambda: FIXED_TIME,
+                known_flag_values=("HTB{private}",),
+            ).record_research_result(
+                current_lane,
+                **{**research_result, "summary": "Leaked HTB{private}"},
+            )
+
+        situation = service.record_research_result(current_lane, **research_result)
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+
+    assert snapshot.revision.sequence == before.revision.sequence + 2
+    assert [event.type for event in snapshot.events[-2:]] == [
+        "research_source_consulted",
+        "research_source_assessed",
+    ]
+    assert snapshot.events[-1].payload.consulted_event_id == snapshot.events[-2].event_id
+    assert situation.authoritative_journal_revision == snapshot.revision
+    assert situation.research_sources[0].source_id == "source-openssh"
 
 
 def test_extractor_failure_returns_last_committed_situation_and_leaves_subject_pending(
@@ -1629,6 +1940,7 @@ def test_archive_cas_conflict_does_not_publish_frontier_events(tmp_path, monkeyp
             llm=AcceptedPlannerLlm(),
             clock=lambda: FIXED_TIME,
         )
+
         def reject_archive(*args, **kwargs):
             from sedna.engagement.repository import RevisionConflictError
 
@@ -1833,8 +2145,7 @@ def test_plan_next_reactivates_typed_retry_and_removes_cold_record(tmp_path) -> 
 
     assert second.status == "success"
     assert (
-        advanced.snapshot.revision.sequence
-        < second.current_authoritative_journal_revision.sequence
+        advanced.snapshot.revision.sequence < second.current_authoritative_journal_revision.sequence
     )
     assert any(event.type == "strategy_reactivated" for event in snapshot.events)
     reactivated = next(

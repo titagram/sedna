@@ -70,6 +70,32 @@ Example local-folder request:
 }
 ```
 
+### Progressive relearn for existing corpora
+
+The semantic schema `2.5.0` and prompt-v2 contract make older bundles stale for learning, but an
+exact valid `2.4.0`/compiler-8/prompt-1 bundle remains strategically retrievable while operators
+relearn a corpus progressively. A SQLite-v5 rebuild indexes its existing strategic artifacts with
+zero execution-example locators; command drill-down returns the typed
+`legacy_bundle_without_examples` capability gap. It never fabricates a command from old canonical
+intent and never attributes one to that legacy source.
+
+For each original source root whose bytes are still available, call the normal plugin request:
+
+```json
+{
+  "tool": "sedna_learn_local",
+  "arguments": {
+    "source_path": "/absolute/path/to/the/original/writeup-corpus"
+  }
+}
+```
+
+Then run `sedna_knowledge_maintenance` with `rebuild` and `audit`. Relearning the same unchanged
+current source is idempotent (`unchanged`) and performs no host LLM calls. Sources whose original
+bytes are unavailable remain strategic-only; do not edit or migrate canonical bundles in place.
+Mixed `2.4.0` and `2.5.0` corpora stay online throughout this process, so no all-corpus outage or
+all-at-once migration is required.
+
 Interpret the report source by source:
 
 - `verified`: new semantic artifacts passed the critic and canonical validation;

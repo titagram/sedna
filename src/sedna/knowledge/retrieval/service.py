@@ -68,17 +68,17 @@ class KnowledgeRetrievalService:
                     parent_artifact_id=canonical_parent,
                     examples=examples,
                 )
-            capability = self.index.get_source_capability(canonical_parent)
+            parent = self.index.get_artifact(canonical_parent)
+            source_id = parent.source_refs[0].source_id if parent is not None else canonical_parent
+            capability = self.index.get_source_capability(source_id)
             if capability == _LEGACY_SEMANTIC_SCHEMA:
                 return ExecutionExampleDrilldown(
                     parent_artifact_id=canonical_parent,
                     coverage_gap=ExecutionExampleCoverageGap(
                         code=ExecutionExampleCoverageCode.LEGACY_BUNDLE_WITHOUT_EXAMPLES,
-                        source_id=canonical_parent,
+                        source_id=source_id,
                         semantic_schema_version=capability,
-                        explanation=(
-                            "the legacy bundle could not represent execution examples"
-                        ),
+                        explanation=("the legacy bundle could not represent execution examples"),
                     ),
                 )
             self._require_revision(revision)
@@ -94,9 +94,7 @@ class KnowledgeRetrievalService:
         examples: tuple[object, ...],
     ) -> None:
 
-        canonical = tuple(
-            _strict_example(example) for example in examples
-        )
+        canonical = tuple(_strict_example(example) for example in examples)
         if any(
             example.parent_artifact_id != parent_artifact_id
             or example.example_id not in example_ids
