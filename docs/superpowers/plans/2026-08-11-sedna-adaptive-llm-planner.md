@@ -21,6 +21,21 @@ commit revisions.
 `json`, `re`, `shlex`, and `sqlite3`/FTS5, Hades/Hermes `complete_structured`, pytest 8,
 pytest-asyncio, Ruff 0.15.10, and the M6A descriptor-confined engagement repository.
 
+## Completion Reconciliation — 2026-08-14
+
+- Tasks 1–14 are implemented, independently reviewed where required, and committed on `main`
+  through `e7a5010`.
+- The post-integration verification on `e7a5010` passed 1,641 tests, `ruff check src tests`, and
+  `git diff --check`; the repository was clean and local/remote `main` matched before this
+  documentation-only reconciliation.
+- Task-step and behavioral final-verification checkboxes below are marked complete from the
+  corresponding RED/GREEN evidence, dedicated commits, review verdicts, and final regression gate.
+- The exact repository-wide `ruff format --check src tests` command remains a pre-existing baseline
+  failure on 30 legacy files. M6B used clean touched-file format gates and deliberately avoided a
+  broad unrelated formatter rewrite. Therefore Task 14 Step 8 and the combined final formatting
+  checkbox remain open and explicitly document this accepted baseline deviation.
+- M6C report/case promotion is a separate successor plan, not unfinished M6B implementation.
+
 ## Global Constraints
 
 - M6A is a hard prerequisite. The public package `sedna.engagement` must provide
@@ -132,7 +147,7 @@ pytest-asyncio, Ruff 0.15.10, and the M6A descriptor-confined engagement reposit
   one typed placeholder, prerequisites/applicability/platform constraints are independently
   source-cited, final flags are rejected, and source-case credentials cannot request automatic
   binding.
-- [ ] **Step 1: Write failing canonical command-template tests**
+- [x] **Step 1: Write failing canonical command-template tests**
 Add tests requiring immutable strict models, deterministic placeholder ordering, exact placeholder
 coverage, `requires_validation=True`, at least one source reference, and the source-case credential
 policy. Require source refs on every prerequisite and platform constraint, and reject an asserted
@@ -189,12 +204,12 @@ def test_source_case_credential_can_never_auto_bind():
             role="password observed only in the source case",
         )
 ```
-- [ ] **Step 2: Write failing draft-parent and local-ID tests**
+- [x] **Step 2: Write failing draft-parent and local-ID tests**
 Construct a draft bundle containing one reference, one case step, and two execution examples.
 Assert that a parent may reference the reference or nested step local ID, but not a case parent,
 guidance item, missing local ID, or another execution example. Assert all artifact, step, and
 execution-example local IDs are globally unique within the response.
-- [ ] **Step 3: Run focused tests and witness RED**
+- [x] **Step 3: Run focused tests and witness RED**
 Run:
 
 ```bash
@@ -203,7 +218,7 @@ pytest -q tests/knowledge/test_execution_examples.py \
 ```
 Expected: collection fails because execution-example models and the draft bundle field do not yet
 exist.
-- [ ] **Step 4: Implement the canonical execution contracts**
+- [x] **Step 4: Implement the canonical execution contracts**
 Define the exact closed vocabulary and strict records in `schema/execution.py`:
 
 ```python
@@ -243,7 +258,7 @@ Define source-backed `ExecutionCondition` plus `ExecutionPlatformConstraint` wit
 (`ApplicabilityContext`), and `.platform_constraints` are explicit and independently cited; they
 do not inherit applicability silently from the parent. Cross-check duplicate/conflicting
 constraints and require every assertion/condition to cite source spans from the same bundle.
-- [ ] **Step 5: Implement draft examples and bundle validation**
+- [x] **Step 5: Implement draft examples and bundle validation**
 Add `DraftExecutionPlaceholder` with the same name/kind/policy/role fields and
 source-cited draft condition/platform-constraint counterparts. Add `DraftExecutionExample` with
 `local_id`, `parent_local_id`, command metadata, explicit `DraftApplicabilityContext`, source-cited
@@ -261,7 +276,7 @@ class SemanticDraftBundle(BaseModel):
 
 Update its validator, `_segment_indexes`, and public exports. Validate parent type using the
 response-local reference and nested case-step maps rather than prose or ordinal position.
-- [ ] **Step 6: Run schema and draft tests GREEN**
+- [x] **Step 6: Run schema and draft tests GREEN**
 Run:
 
 ```bash
@@ -270,7 +285,7 @@ pytest -q tests/knowledge/test_execution_examples.py \
   tests/knowledge/test_semantic_schema.py
 ```
 Expected: PASS.
-- [ ] **Step 7: Commit Task 1**
+- [x] **Step 7: Commit Task 1**
 ```bash
 git add -- src/sedna/knowledge/schema/execution.py src/sedna/knowledge/schema/__init__.py src/sedna/knowledge/__init__.py src/sedna/knowledge/semantic/drafts.py src/sedna/knowledge/semantic/__init__.py tests/knowledge/test_execution_examples.py tests/knowledge/test_semantic_drafts.py
 git commit -m "feat(knowledge): model source execution examples"
@@ -296,19 +311,19 @@ git commit -m "feat(knowledge): model source execution examples"
 - Produces: `MaterializedSemanticContent`, `materialize_semantic_content(...)`, bundle-owned
   `execution_examples`, compiler/prompt version 2.5.0/9/2, and exact manifest example coverage.
 - Preserves: `materialize_bundle(...) -> tuple[CanonicalArtifact, ...]` for existing callers.
-- [ ] **Step 1: Write failing deterministic materialization tests**
+- [x] **Step 1: Write failing deterministic materialization tests**
 Test that two identical prepared sources and draft responses produce byte-identical example IDs;
 different parent, cited span, template, or placeholder role changes the ID. Verify draft local IDs
 never cross the boundary and the canonical parent is the materialized reference or step ID. Also
 assert that changing a prerequisite, applicability assertion, platform constraint, or any of their
 citations changes the example ID.
-- [ ] **Step 2: Write failing compiler attribution and quarantine tests**
+- [x] **Step 2: Write failing compiler attribution and quarantine tests**
 Script an extractor response containing `nmap -sV {{target}}` and an accepting critic. Assert the
 verified bundle contains the example, its source span and extractor metadata, and separate
 `emitted_execution_example_ids`. Script examples containing `HTB{final}` or a non-parameterized
 source-case password and assert deterministic materialization quarantine or a material critic
 finding; neither value may enter a verified bundle.
-- [ ] **Step 3: Run semantic tests and witness RED**
+- [x] **Step 3: Run semantic tests and witness RED**
 Run:
 
 ```bash
@@ -317,7 +332,7 @@ pytest -q tests/knowledge/test_semantic_materialize.py \
   tests/knowledge/test_semantic_llm.py -x
 ```
 Expected: failures because examples are not materialized or included in the call contract.
-- [ ] **Step 4: Add a compatibility-preserving materialization result**
+- [x] **Step 4: Add a compatibility-preserving materialization result**
 Implement:
 
 ```python
@@ -380,7 +395,7 @@ semantic fields, sorted source refs, and placeholders. Do not include examples i
 identity so adding an example does not rename the source-backed strategy. The canonical ID material
 must also contain normalized prerequisites, full applicability context, platform constraints, and
 their sorted source refs.
-- [ ] **Step 5: Extend the bundle and manifest validators**
+- [x] **Step 5: Extend the bundle and manifest validators**
 Add legacy-readable defaults:
 
 ```python
@@ -396,7 +411,7 @@ class SemanticKnowledgeBundle(BaseModel):
 Require sorted unique examples, exact manifest coverage, unique IDs across artifacts/steps/rules/
 examples, bundle-source provenance on each example, and parent membership in the bundle's
 references or nested case steps.
-- [ ] **Step 6: Replace the semantic no-command prompt boundary**
+- [x] **Step 6: Replace the semantic no-command prompt boundary**
 Advance all three prompt versions to `"2"`. The extractor must keep strategic artifacts free of
 tool tutorials while emitting source-backed commands only in `execution_examples`; it must
 parameterize targets and source-case credentials and extract explicit source-cited prerequisites,
@@ -405,7 +420,7 @@ checks source text, parent type, citations, placeholder completeness, every appl
 claim, prerequisite completeness, credential parameterization, `requires_validation`, and absence
 of flags/provider secrets. An unsupported or missing material constraint is a material finding;
 the repair prompt may change an example only when source evidence and critic findings justify it.
-- [ ] **Step 7: Update compiler versions and bundle assembly**
+- [x] **Step 7: Update compiler versions and bundle assembly**
 Set:
 
 ```python
@@ -417,7 +432,7 @@ EXECUTION_EXAMPLE_SCHEMA_VERSION = "1"
 Use `materialize_semantic_content` in `_verified`, record exact example IDs and schema version in
 the manifest, and pass examples into `SemanticKnowledgeBundle`. Preserve the existing two-call or
 four-call state machine and safe failure vocabulary.
-- [ ] **Step 8: Run semantic tests GREEN**
+- [x] **Step 8: Run semantic tests GREEN**
 Run:
 
 ```bash
@@ -428,7 +443,7 @@ pytest -q tests/knowledge/test_execution_examples.py \
   tests/knowledge/test_semantic_schema.py
 ```
 Expected: PASS, with exactly two calls for accepted extraction and four for repaired extraction.
-- [ ] **Step 9: Commit Task 2**
+- [x] **Step 9: Commit Task 2**
 ```bash
 git add -- src/sedna/knowledge/semantic/materialize.py src/sedna/knowledge/semantic/compiler.py src/sedna/knowledge/semantic/prompts.py src/sedna/knowledge/schema/semantic.py tests/knowledge/test_semantic_materialize.py tests/knowledge/test_semantic_compiler.py tests/knowledge/test_semantic_llm.py tests/knowledge/fixtures/semantic/windows-walkthrough.json tests/knowledge/fixtures/semantic/hybrid-reference-case.json
 git commit -m "feat(knowledge): compile verified execution examples"
@@ -450,18 +465,18 @@ git commit -m "feat(knowledge): compile verified execution examples"
 - Consumes: semantic schema/compiler/prompt versions from Task 2.
 - Produces: separate learning-currentness and retrieval-compatibility checks, atomic stale-example
   replacement, and strict bundle drill-down loading by source and parent.
-- [ ] **Step 1: Write failing old-bundle migration test**
+- [x] **Step 1: Write failing old-bundle migration test**
 Seed a valid legacy `2.4.0` bundle with compiler `8`, semantic prompt versions `1`, no example
 schema, and a current foundation manifest. Before relearning, assert repository iteration accepts
 the bundle as strategic-only knowledge with `execution_examples=()`. Learn the same source with a
 scripted v2 response. Assert one extractor/critic sequence produces a `2.5.0` bundle with examples,
 and the next identical learning call returns `unchanged` with zero additional host calls.
-- [ ] **Step 2: Write failing atomic replacement/recovery tests**
+- [x] **Step 2: Write failing atomic replacement/recovery tests**
 Persist v1 with two examples, recompile changed source to v2 with one different example, inject a
 failure at each semantic transaction phase, reopen the repository, and assert recovery yields
 either the complete old bundle or complete new bundle. No stale example may survive outside its
 own bundle because no separately committed command file exists.
-- [ ] **Step 3: Run repository migration tests and witness RED**
+- [x] **Step 3: Run repository migration tests and witness RED**
 Run:
 
 ```bash
@@ -471,7 +486,7 @@ pytest -q tests/knowledge/test_execution_example_migration.py \
 ```
 Expected: old state is incorrectly considered fully current, or the repository rejects the
 otherwise valid legacy strategic bundle.
-- [ ] **Step 4: Split learning currentness from retrieval compatibility**
+- [x] **Step 4: Split learning currentness from retrieval compatibility**
 Add `execution_example_schema_version` to `load_current_semantic_result`,
 `semantic_result_is_current`, `_require_current_retrieval_bundle`, and
 `_require_current_retrieval_quarantine`. `semantic_result_is_current` and
@@ -481,7 +496,7 @@ either that current contract or exactly `2.4.0`/compiler-8/prompt-v1 with no exa
 empty example tuple. Keep this compatibility allowlist local and explicit; malformed bundles,
 unknown versions, legacy bundles containing example records, and stale foundation manifests still
 fail closed. Quarantine follows the same version-specific validation rules as its owning bundle.
-- [ ] **Step 5: Add strict bundle-owned example loading**
+- [x] **Step 5: Add strict bundle-owned example loading**
 Implement:
 
 ```python
@@ -497,7 +512,7 @@ def load_execution_examples(
 The method uses the existing descriptor-relative bundle loader, validates safe IDs, filters only
 the requested parent, sorts by example ID, and when `example_ids` is supplied requires an exact
 set match. It never searches command text or falls back to filesystem paths.
-- [ ] **Step 6: Run migration and repository tests GREEN**
+- [x] **Step 6: Run migration and repository tests GREEN**
 Run:
 
 ```bash
@@ -507,7 +522,7 @@ pytest -q tests/knowledge/test_execution_example_migration.py \
   tests/knowledge/test_semantic_version_migration.py
 ```
 Expected: PASS.
-- [ ] **Step 7: Commit Task 3**
+- [x] **Step 7: Commit Task 3**
 ```bash
 git add -- src/sedna/knowledge/repository.py src/sedna/knowledge/semantic/service.py tests/knowledge/test_execution_example_migration.py tests/knowledge/test_semantic_repository.py tests/knowledge/test_semantic_service.py tests/knowledge/test_semantic_version_migration.py
 git commit -m "feat(knowledge): migrate execution example bundles"
@@ -537,15 +552,15 @@ git commit -m "feat(knowledge): migrate execution example bundles"
   `ExecutionExampleDrilldown`, `RetrievalIndex.get_execution_example_locators`, and
   `KnowledgeRetrievalService.get_execution_examples`.
 - Guarantees: SQLite contains example/parent/source IDs only; command templates cannot match FTS.
-- [ ] **Step 1: Write failing projection and SQLite secrecy tests**
+- [x] **Step 1: Write failing projection and SQLite secrecy tests**
 Index a bundle whose command contains a unique marker `sedna-command-not-searchable-7f31`. Assert
 the marker does not occur in any `artifact_fts` column, artifact `canonical_json`, or
 `execution_example_lookup` row, while the lookup returns the correct example/parent/source IDs.
-- [ ] **Step 2: Write failing source-state parity tests**
+- [x] **Step 2: Write failing source-state parity tests**
 Delete, duplicate, re-parent, and orphan lookup rows. Assert audit reports exact execution-example
 counts and requires rebuild. Assert source projection digests change when example IDs or parent
 relationships change even if ordinary artifact rows are identical.
-- [ ] **Step 3: Write failing drill-down revision tests**
+- [x] **Step 3: Write failing drill-down revision tests**
 Assert `KnowledgeRetrievalService.get_execution_examples(parent_id)`:
 
 - performs ID lookup and canonical bundle load under the same before/after canonical revision;
@@ -554,7 +569,7 @@ Assert `KnowledgeRetrievalService.get_execution_examples(parent_id)`:
 - returns examples with no gap for a current bundle;
 - distinguishes a current parent with no examples from a legacy parent whose bundle could not have
   represented them, using a typed `legacy_bundle_without_examples` coverage gap.
-- [ ] **Step 4: Run focused retrieval tests and witness RED**
+- [x] **Step 4: Run focused retrieval tests and witness RED**
 Run:
 
 ```bash
@@ -564,7 +579,7 @@ pytest -q tests/knowledge/test_retrieval_projection.py \
   tests/knowledge/test_retrieval_maintenance.py -x
 ```
 Expected: failures for missing locator projection and service method.
-- [ ] **Step 5: Extend backend-neutral state and projection**
+- [x] **Step 5: Extend backend-neutral state and projection**
 Define:
 
 ```python
@@ -611,7 +626,7 @@ Add sorted unique example states plus `semantic_schema_version` and nullable
 `SOURCE_PROJECTION_VERSION = "canonical-projection-v3"`. A valid legacy bundle projects its
 strategic artifacts, zero locators, and null example capability; a current bundle with no examples
 projects example schema `1`, which makes the two states unambiguous.
-- [ ] **Step 6: Add the ID-only SQLite table atomically**
+- [x] **Step 6: Add the ID-only SQLite table atomically**
 Advance `_SCHEMA_VERSION` to `5` and add:
 
 ```sql
@@ -631,7 +646,7 @@ Insert/delete lookup rows inside the same source transaction as artifacts. Exten
 orphan checks, source-state enumeration, capability-version parity, and rebuild parity. Do not add
 an FTS trigger or command column. Schema-v5 rebuild must accept exact legacy strategic bundles and
 create zero lookup rows for them rather than dropping their artifacts.
-- [ ] **Step 7: Add revision-guarded drill-down**
+- [x] **Step 7: Add revision-guarded drill-down**
 Extend `RetrievalIndex` with the locator method. Extend `KnowledgeRetrievalService` with optional
 `execution_example_loader`, and implement:
 
@@ -647,7 +662,7 @@ source capability metadata without calling the loader; return `SOURCE_EXAMPLES_U
 canonical drill-down is unavailable. Only a current schema-1 source can return `examples=()` with
 `coverage_gap=None`. In `HadesKnowledgeRuntime.create`, inject
 `repository.load_execution_examples` into the retrieval service.
-- [ ] **Step 8: Run retrieval tests GREEN**
+- [x] **Step 8: Run retrieval tests GREEN**
 Run:
 
 ```bash
@@ -658,7 +673,7 @@ pytest -q tests/knowledge/test_retrieval_models.py \
   tests/knowledge/test_retrieval_maintenance.py
 ```
 Expected: PASS, and the unique command marker is absent from every searchable projection.
-- [ ] **Step 9: Commit Task 4**
+- [x] **Step 9: Commit Task 4**
 ```bash
 git add -- src/sedna/knowledge/retrieval/models.py src/sedna/knowledge/retrieval/projection.py src/sedna/knowledge/retrieval/sqlite.py src/sedna/knowledge/retrieval/service.py src/sedna/knowledge/retrieval/maintenance.py src/sedna/knowledge/retrieval/__init__.py src/sedna/knowledge/hades_runtime.py tests/knowledge/test_retrieval_models.py tests/knowledge/test_retrieval_projection.py tests/knowledge/test_retrieval_sqlite.py tests/knowledge/test_retrieval_service.py tests/knowledge/test_retrieval_maintenance.py
 git commit -m "feat(knowledge): add execution example drilldown"
@@ -679,7 +694,7 @@ git commit -m "feat(knowledge): add execution example drilldown"
   and canonical `ExecutionExample` IDs.
 - Produces: all immutable structured request/response, situation, ledger, archive, frontier,
   critic, settlement, terminal-reconciliation, and planning-result contracts used by Tasks 6–14.
-- [ ] **Step 1: Write failing observation/situation tests**
+- [x] **Step 1: Write failing observation/situation tests**
 Require private evidence text to retain a sample flag, facts and hypotheses to carry non-empty
 event references, outcome categories to match the seven-value design vocabulary, sorted unique
 IDs, and finite confidence. `SituationProjection.authoritative_journal_revision` tracks the CAS
@@ -696,13 +711,13 @@ generation after rejecting digest A and assert a supported proof with the same g
 is invalid, while distinct grounded digest B may support. Add 35 unique rejections and assert the
 newest 32 exact digests, three-entry folded overflow count/digest, and identical reconstruction from
 events after deleting the projection.
-- [ ] **Step 2: Write failing ledger identity and limit tests**
+- [x] **Step 2: Write failing ledger identity and limit tests**
 Construct 32 families, 64 variants, and 16 archive candidates successfully; reject the 33rd,
 65th, and 17th. Retain at most eight recent attempts per variant and 256 across the hot ledger;
 assert older attempt events are represented by deterministic counters/digests rather than dropped
 from authority. Reject duplicate runtime IDs/keys, variant ancestry mismatch, silent removal from
 a reconciliation, invalid score ranges, and archive summaries over 16 KiB.
-- [ ] **Step 3: Write failing frontier/critic/result-shape tests**
+- [x] **Step 3: Write failing frontier/critic/result-shape tests**
 Require runtime proposal IDs, exact state/ledger/cache binding, score and confidence in 0–100,
 three-to-eight normal proposals, fewer only with a constrained rationale, stable score ordering,
 valid event/knowledge/scope refs, and mutually exclusive `validated`, `cached`, and
@@ -722,14 +737,14 @@ safe failure code and may omit the situation/revision only for `journal_unavaila
 and any raw exception/provider-response field. Assert lifecycle-compatible gating accepts only
 `settled`/`nothing_pending`; `incomplete`/`failed` must stop M6C mutation even when the failed
 variant retains a situation.
-- [ ] **Step 4: Run model tests and witness RED**
+- [x] **Step 4: Run model tests and witness RED**
 Run:
 
 ```bash
 pytest -q tests/planning/test_models.py -x
 ```
 Expected: collection fails because the planning package does not exist.
-- [ ] **Step 5: Implement closed enums and bounded primitives**
+- [x] **Step 5: Implement closed enums and bounded primitives**
 Define these exact vocabularies:
 
 ```python
@@ -792,7 +807,7 @@ EVIDENCE_SLICE_BYTES = 32 * 1024
 MAX_EVIDENCE_SLICES_PER_SETTLEMENT = 64
 MAX_EVIDENCE_BYTES_PER_SETTLEMENT = 2 * 1024 * 1024
 ```
-- [ ] **Step 6: Implement observation and situation records**
+- [x] **Step 6: Implement observation and situation records**
 Define `EvidenceSliceInput`, `ObservationDraft`, `HypothesisDraft`, `MissingInformationDraft`,
 `FacetObservationDraft`, `AccessStateDeltaDraft`, `SecretReferenceDraft`,
 `IncompatibilityObservationDraft`, `PrivateValueDraft`, `OutcomeAssessmentDraft`,
@@ -912,7 +927,7 @@ hash the ordered canonical tuples
 rejected_value_sha256)` for all older entries into
 `rejected_value_overflow_digest`; `rejected_value_overflow_count` is that tuple count. Event replay
 must reproduce the exact hot tuple, count, and digest byte-for-byte.
-- [ ] **Step 7: Implement strategy and frontier records**
+- [x] **Step 7: Implement strategy and frontier records**
 Define `RetryPredicate`, `AttemptState`, `ExecutionVariantState`, `StrategyFamilyState`,
 `ArchivedStrategyState`, `StrategyArchive`, `StrategyLedger`, `ExecutionVariantDraft`,
 `StrategyFamilyDraft`, `StrategyReconciliation`, `FrontierProposalDraft`, `FrontierProposal`,
@@ -921,7 +936,7 @@ until the runtime assigns UUIDs. A proposal carries at most one complete command
 its one-proposal journal payload remains below 64 KiB; over-limit drafts fail validation and may be
 critic-repaired, never truncated. Strategy reconciliation is emitted as a complete same-batch
 sequence of one bounded operation/result-snapshot payload per ordinal.
-- [ ] **Step 8: Implement call/result audit records**
+- [x] **Step 8: Implement call/result audit records**
 Define `PlanningCallMetadata` with purpose, provider, model, agent ID, prompt ID/version,
 response-schema version, input digest, token counts, and elapsed milliseconds. Define
 `InterpretationAudit`, `PlanRequestAudit`, `PlannerRepairAudit`, `PlannerRejectionAudit`,
@@ -1168,7 +1183,7 @@ For each proof candidate in the same conversion, include one frozen, `extra="for
 decision `allowed|previously_rejected`, and `matched_rejection_event_id` required only for a
 rejection. `PlanningService` creates these records through `proof_value_was_rejected`; the pure
 converter requires an exact candidate/admission match and emits no supported proof when rejected.
-- [ ] **Step 9: Define a terminal-reconciliation seam without importing M6C**
+- [x] **Step 9: Define a terminal-reconciliation seam without importing M6C**
 In `ports.py`, define this exact data-only result and protocol:
 
 ```python
@@ -1213,14 +1228,14 @@ manifest IDs; the port never receives a separately reconstructed proof list. Aft
 return, Planning reloads the M6A snapshot, cross-checks its lifecycle status/revision against the
 result, and refreshes `SituationProjection.authoritative_journal_revision`; callers never continue
 from the pre-reconciliation snapshot.
-- [ ] **Step 10: Run planning model tests GREEN**
+- [x] **Step 10: Run planning model tests GREEN**
 Run:
 
 ```bash
 pytest -q tests/planning/test_models.py
 ```
 Expected: PASS.
-- [ ] **Step 11: Commit Task 5**
+- [x] **Step 11: Commit Task 5**
 ```bash
 git add -- src/sedna/planning/__init__.py src/sedna/planning/models.py src/sedna/planning/ports.py tests/planning/test_models.py
 git commit -m "feat(planning): define adaptive planner contracts"
@@ -1243,44 +1258,44 @@ git commit -m "feat(planning): define adaptive planner contracts"
   `validate_command_suggestion(...)`, and `render_command_preview(...)`.
 - Guarantees: only authorized-scope target placeholders receive concrete targets; source-case
   credential placeholders remain unresolved.
-- [ ] **Step 1: Write failing source-backed and model-generated command tests**
+- [x] **Step 1: Write failing source-backed and model-generated command tests**
 Test both origins with `curl -i {{target}}`: binding `target` to authorized scope reference
 `scope-0123456789abcdef0123456789abcdef` whose value is `192.0.2.44` must render
 `curl -i 192.0.2.44` and preserve
 `requires_validation=True`. Assert `source_example` requires an exact canonical example match,
 while `model_generated` must not claim an example ID.
-- [ ] **Step 2: Write failing target and credential escape tests**
+- [x] **Step 2: Write failing target and credential escape tests**
 Reject raw `10.10.10.10`, `10.10.10.0/24`, `http://10.10.10.10/`, `box.htb`, an unresolved target,
 an unauthorized scope ref, duplicate binding, and a target binding sourced from a literal. Verify
 a `source_case_credential` remains rendered as `{{source_password}}` even when a current secret has
 the same value or label.
-- [ ] **Step 3: Run command tests and witness RED**
+- [x] **Step 3: Run command tests and witness RED**
 Run:
 
 ```bash
 pytest -q tests/planning/test_commands.py -x
 ```
 Expected: collection fails because command planning contracts do not exist.
-- [ ] **Step 4: Implement template parsing and structured-target rejection**
+- [x] **Step 4: Implement template parsing and structured-target rejection**
 Use a full-match placeholder regex `{{([a-z][a-z0-9_]{0,63})}}`, reject unknown or missing
 tokens, and scan every non-placeholder token for IPv4, IPv6, CIDR, HTTP(S) URL, and dotted-hostname
 shapes. Paths, wordlists, usernames, ports, and credentials that vary at runtime must also use
 typed placeholders. Do not attempt to prove arbitrary shell syntax safe.
-- [ ] **Step 5: Implement exact binding rules and preview rendering**
+- [x] **Step 5: Implement exact binding rules and preview rendering**
 Define origins `source_example`, `model_generated`, and `host_adapted`; planner drafts permit only
 the first two, while journal decision/action records may use `host_adapted`. Resolve target
 bindings by `ScopeReference` ID and exact authorization state. Resolve current credential refs only
 when the draft explicitly names an engagement `SecretReference`. Never resolve
 `source_case_credential`. Render a non-executable preview with placeholder substitution and retain
 the structured template and bindings as the authoritative suggestion.
-- [ ] **Step 6: Run command and model tests GREEN**
+- [x] **Step 6: Run command and model tests GREEN**
 Run:
 
 ```bash
 pytest -q tests/planning/test_commands.py tests/planning/test_models.py
 ```
 Expected: PASS.
-- [ ] **Step 7: Commit Task 6**
+- [x] **Step 7: Commit Task 6**
 ```bash
 git add -- src/sedna/planning/commands.py src/sedna/planning/models.py src/sedna/planning/__init__.py tests/planning/test_commands.py
 git commit -m "feat(planning): bind command suggestions to scope"
@@ -1301,24 +1316,24 @@ git commit -m "feat(planning): bind command suggestions to scope"
 - Consumes: `HostStructuredLlm`, `StructuredResult`, and Task 5 response models.
 - Produces: `PlanningLlmAdapter.complete(...)` with four exact purpose/type contracts and four
   independently versioned prompt constants.
-- [ ] **Step 1: Write failing exact-contract adapter tests**
+- [x] **Step 1: Write failing exact-contract adapter tests**
 For each purpose, assert only its exact request class and response model are accepted. Assert
 subclasses, constructed invalid Pydantic instances, NaN, sets, unknown fields, raw completions,
 missing `parsed`, malformed host metadata, and provider exceptions produce closed safe failures.
 Assert no provider/model override is sent, JSON mode is enabled, and temperature is zero.
-- [ ] **Step 2: Write failing untrusted-data prompt tests**
+- [x] **Step 2: Write failing untrusted-data prompt tests**
 Place instruction-override strings in terminal output, HTML, Markdown, canonical artifacts,
 `sources.md` entries, prior planner output, command literals, and web excerpts. Assert every value
 appears only inside the serialized JSON input item and never inside `instructions` or the appended
 static schema text.
-- [ ] **Step 3: Run LLM tests and witness RED**
+- [x] **Step 3: Run LLM tests and witness RED**
 Run:
 
 ```bash
 pytest -q tests/planning/test_llm.py tests/planning/test_prompt_injection.py -x
 ```
 Expected: collection fails because the planning adapter and prompts do not exist.
-- [ ] **Step 4: Define purpose contracts and safe request envelopes**
+- [x] **Step 4: Define purpose contracts and safe request envelopes**
 Implement:
 
 ```python
@@ -1346,12 +1361,12 @@ cumulative recent-event text, and 512 KiB for the complete canonical JSON reques
 by deterministic priority and preserve omitted historical material through cited aggregate
 digests; if the required situation/ledger/reference core alone exceeds 512 KiB, fail with
 `planner_input_too_large` rather than truncating a model or reference.
-- [ ] **Step 5: Implement the adapter**
+- [x] **Step 5: Implement the adapter**
 Mirror the proven JSON-only structural boundary in `semantic/llm.py` without extending its
 semantic `_CALL_CONTRACTS`. Use `HostStructuredLlm`, local response revalidation, safe usage/model
 attribution, purpose-specific max-token limits, and closed `PlanningLlmError` codes. The adapter
 returns no host `audit` object or raw response.
-- [ ] **Step 6: Define four independent versioned prompts**
+- [x] **Step 6: Define four independent versioned prompts**
 Use IDs and version `"1"`:
 
 ```python
@@ -1367,14 +1382,14 @@ semantics, complete reconciliation, retry conditions, creativity, source-as-exam
 execution-error separation. Critic instructions enforce references, applicability, scope,
 research policy, loop detection, score explanation, command origin, and silent-loss checks. Repair
 instructions permit only critic/source-supported corrections and return a complete replacement.
-- [ ] **Step 7: Run LLM and injection tests GREEN**
+- [x] **Step 7: Run LLM and injection tests GREEN**
 Run:
 
 ```bash
 pytest -q tests/planning/test_llm.py tests/planning/test_prompt_injection.py
 ```
 Expected: PASS, and no hostile fixture crosses into static instructions.
-- [ ] **Step 8: Commit Task 7**
+- [x] **Step 8: Commit Task 7**
 ```bash
 git add -- src/sedna/planning/prompts.py src/sedna/planning/llm.py src/sedna/planning/__init__.py tests/planning/test_llm.py tests/planning/test_prompt_injection.py
 git commit -m "feat(planning): add structured planner llm boundary"
@@ -1406,7 +1421,7 @@ git commit -m "feat(planning): add structured planner llm boundary"
   authority allowed to append the 19 planner event kinds.
 - Guarantees: planning events are authoritative structured facts about what was proposed or
   interpreted; prose-only planner objects are never persisted as an untyped blob.
-- [ ] **Step 1: Write failing closed-union and round-trip tests**
+- [x] **Step 1: Write failing closed-union and round-trip tests**
 Parameterize strict JSON round trips for these exact event payloads:
 
 ```text
@@ -2245,7 +2260,7 @@ planning semantics.
 | `ResearchSourceConsultedEventPayload` | one validated `ResearchSourceObservationDraft` with host evidence | Retain consulted-source/evidence provenance but add no claim | No ledger mutation |
 | `ResearchSourceAssessedEventPayload` | assessment part of `ResearchSourceObservationDraft` after cited observations exist | Retain bounded source assessment; facts still require observation events | May inform a later planner call; never mutates score directly |
 
-- [ ] **Step 2: Write failing planning-model conversion and reducer-effect tests**
+- [x] **Step 2: Write failing planning-model conversion and reducer-effect tests**
 For every table row, construct the named planning input, preallocate stable event UUIDs, call the
 pure converter, and assert the exact payload class, literal `kind`, canonical JSON, digest, bounds,
 and reference mapping. Store the 19 cases in a shared parametrized `planning_event_cases` fixture;
@@ -2255,7 +2270,7 @@ architecture test that parses/imports `sedna.engagement.events` while
 blocking `sedna.planning`; importing and validating all 19 payloads must still succeed. Assert
 `planning/journal_events.py` imports engagement payloads, while no engagement module imports the
 converter or a planning model.
-- [ ] **Step 3: Write failing M6A reducer compatibility tests**
+- [x] **Step 3: Write failing M6A reducer compatibility tests**
 Replay each new event through `EngagementReducer`; assert it advances revision/hash-chain state
 without mutating lifecycle, lane binding, closure barrier, or tool-call state. Replay one malformed
 payload and assert fail-closed behavior. Assert late planning events cannot manufacture an M6A
@@ -2269,7 +2284,7 @@ idempotency_key: str)` values and derives actor/system correlation itself. Reord
 lifecycle/report/promotion event, forging the capability token, or submitting an unrecognized
 future `EventType` fails before repository mutation. Assert the extended owner map and `EventType`
 remain set-equal.
-- [ ] **Step 4: Run event tests and witness RED**
+- [x] **Step 4: Run event tests and witness RED**
 Run:
 
 ```bash
@@ -2279,7 +2294,7 @@ pytest -q tests/engagement/test_events.py \
 ```
 
 Expected: parsing fails at the first unknown planning payload.
-- [ ] **Step 5: Implement data-only payloads in `sedna.engagement`**
+- [x] **Step 5: Implement data-only payloads in `sedna.engagement`**
 Add one frozen, `extra="forbid"`, bounded payload class per event above and extend the discriminated
 M6A `EventPayload` union. Payloads carry only primitives, UUIDs/stable IDs, enum strings,
 bounded structured records, and event/evidence/knowledge/scope references. Do not import
@@ -2316,7 +2331,7 @@ from the exact 19-member `PlanningEventPayload` union, derives
 the normal prospective replay/CAS append. The constructor/factory token stays out of
 `sedna.engagement.__all__`; `PlanningService` receives an issued instance from owned runtime
 composition and never calls generic append for planning facts.
-- [ ] **Step 6: Implement the exhaustive pure planning-to-payload conversion**
+- [x] **Step 6: Implement the exhaustive pure planning-to-payload conversion**
 In `planning/journal_events.py`, implement four public pure functions:
 
 ```python
@@ -2361,7 +2376,7 @@ retrieval, score calculation, event
 append,
 or lifecycle transition. Do not export `_EventPayload`; export only the 19 concrete payload classes
 from engagement and the four converters from planning.
-- [ ] **Step 7: Extend reducer recognition without semantic scoring**
+- [x] **Step 7: Extend reducer recognition without semantic scoring**
 Teach the M6A reducer that these payloads are valid non-lifecycle events. It validates manifest
 proof IDs and structural references but does not calculate situation state, scores, archive
 selection, research quality, or closure. Those remain M6B projections derived by deterministic
@@ -2377,7 +2392,7 @@ transition. The other 12 planning/research/frontier/ledger event kinds are `ACTI
 fail prospective replay outside active. Neither set can bind a lane, cancel a barrier, start work,
 or itself change lifecycle. Add a closing late-contradiction settlement and abandoned-resume
 settlement regression, plus a frontier/research append rejected in every non-active status.
-- [ ] **Step 8: Run event and conversion tests GREEN**
+- [x] **Step 8: Run event and conversion tests GREEN**
 Run:
 
 ```bash
@@ -2394,7 +2409,7 @@ ruff check src/sedna/engagement/events.py src/sedna/engagement/reducer.py \
 ```
 
 Expected: PASS.
-- [ ] **Step 9: Commit Task 8**
+- [x] **Step 9: Commit Task 8**
 ```bash
 git add -- src/sedna/engagement/events.py src/sedna/engagement/reducer.py src/sedna/engagement/service.py src/sedna/engagement/__init__.py src/sedna/planning/journal_events.py src/sedna/planning/__init__.py tests/engagement/test_events.py tests/engagement/test_reducer.py tests/engagement/test_service.py tests/planning/conftest.py tests/planning/test_journal_events.py
 git commit -m "feat(engagement): add typed planning journal events"
@@ -2421,7 +2436,7 @@ git commit -m "feat(engagement): add typed planning journal events"
   SituationProjection-only `state.json` projection. It also produces the M6C-facing data-only
   `ProofRejectionRecord`, `transition_proof_generation(...)`, and
   `proof_value_was_rejected(...)` seams; M6B never imports M6C event classes.
-- [ ] **Step 1: Write failing deterministic replay tests**
+- [x] **Step 1: Write failing deterministic replay tests**
 Create authoritative observation/outcome events for the same journal twice and assert
 byte-equivalent `SituationProjection`, revision, and digest. Add non-material session checkpoint
 events and assert they advance `authoritative_journal_revision` without changing
@@ -2465,7 +2480,7 @@ hypothesis, missing-information, outcome, proof, interpretation coverage/failure
 provenance/assessment produce only their declared situation changes; plan/frontier/critic/repair/
 rejection/gap/reconciliation/archive/reactivation are situation no-ops. A research assessment never
 becomes a fact unless a separate `observation_extracted` event cites its evidence.
-- [ ] **Step 2: Write failing settlement tests**
+- [x] **Step 2: Write failing settlement tests**
 Assert settlement:
 
 - returns `nothing_pending` with no LLM call when all evidence is interpreted;
@@ -2501,7 +2516,7 @@ revision, explicit manifest `required_proof_ids`, derived `all_required_proofs_s
 failure code. A corrupt/unavailable journal returns the only failed variant without a situation;
 extractor, append, concurrency, evidence-read, and terminal-port failures return the exact last
 committed situation. Neither `incomplete` nor `failed` invokes the terminal port.
-- [ ] **Step 3: Write failing required-proof and terminal-seam tests**
+- [x] **Step 3: Write failing required-proof and terminal-seam tests**
 Inject a spy `TerminalSettlementPort`. Assert an empty manifest never invokes it, one supported
 proof out of two invokes it with `all_required_proofs_satisfied=False`, and two supported proofs
 invoke it with `True` and the exact `SituationProjection`/journal revision. Append later
@@ -2514,18 +2529,18 @@ and returns a `SituationProjection` rebound to that authoritative revision. A mi
 `action="failed"` returns
 `FailedSettlementResult(failure_code="terminal_reconciliation_failed")`; it never silently
 continues from the pre-port situation.
-- [ ] **Step 4: Write failing stale-revision and lock tests**
+- [x] **Step 4: Write failing stale-revision and lock tests**
 Use a blocking scripted host and a second writer. Assert the engagement lock is acquirable while
 the extractor is blocked, the stale append is rejected, settlement reloads and retries against the
 new revision once, and it never duplicates evidence interpretation events.
-- [ ] **Step 5: Run situation/service tests and witness RED**
+- [x] **Step 5: Run situation/service tests and witness RED**
 Run:
 
 ```bash
 pytest -q tests/planning/test_situation.py tests/planning/test_service.py -x
 ```
 Expected: collection fails because settlement and reducer do not exist.
-- [ ] **Step 6: Implement the deterministic reducer**
+- [x] **Step 6: Implement the deterministic reducer**
 `SituationReducer` accepts only a strictly validated `EngagementSnapshot` plus ordered typed
 journal events. It derives state from event semantics, not model prose outside events. Assign fact,
 hypothesis, proof, secret-reference, and attempt identities from event identity; preserve event
@@ -2586,7 +2601,7 @@ the folded digest. `SituationReducer` calls this before applying every supported
 different locally grounded digest may become current support. When loading a cached `state.json`,
 settlement may short-circuit only a hot match or an empty overflow; otherwise it must obtain the
 full rejection records from the M6A journal and revalidate the projection before conversion/append.
-- [ ] **Step 7: Implement complete bounded evidence slicing**
+- [x] **Step 7: Implement complete bounded evidence slicing**
 Read evidence through `EngagementJournalService.read_evidence_slice`, never direct paths. Use
 deterministic 32 KiB byte slices with digest/range metadata. Process at most 64 slices and exactly
 2 MiB per settlement invocation; return `incomplete` with pending ranges in the result when more
@@ -2613,7 +2628,7 @@ bounded page/tranche, and set `next_pending_subject` to the first omitted key. T
 retry moves behind never/less-recently attempted subjects and cannot starve them. `state.json` may
 cache but never author this order; rebuild must be byte-identical. Add a fresh-runtime test where the
 first page fails retryably, restart, and prove later subjects are selected before that page repeats.
-- [ ] **Step 8: Implement settlement, projection loading, and optimistic append**
+- [x] **Step 8: Implement settlement, projection loading, and optimistic append**
 Construct the Task 9 `PlanningService` with journal, planning LLM, optional terminal-settlement
 port, and clock; Tasks 10–12 extend the same constructor with archive, retrieval, canonical-
 revision, and bounded source-registry dependencies when those modules exist. Implement the exact
@@ -2655,14 +2670,14 @@ latest committed situation/revision, with no rollback or rewrite of valid situat
 port result, reload the exact M6A snapshot outside the port/locks, require returned revision/status
 to match (or restart once on a newer concurrent revision), and rebuild/rebind the returned
 situation to the post-reconciliation authoritative revision before returning settlement.
-- [ ] **Step 9: Run situation and settlement tests GREEN**
+- [x] **Step 9: Run situation and settlement tests GREEN**
 Run:
 
 ```bash
 pytest -q tests/planning/test_situation.py tests/planning/test_service.py
 ```
 Expected: PASS.
-- [ ] **Step 10: Commit Task 9**
+- [x] **Step 10: Commit Task 9**
 ```bash
 git add -- src/sedna/planning/situation.py src/sedna/planning/service.py src/sedna/planning/ports.py src/sedna/planning/__init__.py tests/planning/test_situation.py tests/planning/test_service.py
 git commit -m "feat(planning): settle engagement evidence"
@@ -2691,7 +2706,7 @@ git commit -m "feat(planning): settle engagement evidence"
   `strategy-ledger.json`/`strategy-archive.jsonl` projections. M6A additionally exposes dedicated
   `load_strategy_archive(...)` and `commit_strategy_archive(...)` operations; no caller supplies a
   path and M6A imports no planning model.
-- [ ] **Step 1: Write failing descriptor-confined archive writer tests**
+- [x] **Step 1: Write failing descriptor-confined archive writer tests**
 Require this M6A service contract:
 
 ```python
@@ -2738,7 +2753,7 @@ count/byte overflow before replace. Load pre-stats and incrementally validates h
 the sorted UUID cursor without materializing the complete file. The API cannot express `../` or an
 alternate filename. Add exact-limit/one-over, oversized-corrupt-file, page-restart, and
 infinite-iterator bounded-consumption tests.
-- [ ] **Step 2: Write failing family/variant/attempt replay tests**
+- [x] **Step 2: Write failing family/variant/attempt replay tests**
 Model an SSH family with common-credential, bounded-wordlist, and credential-reuse variants.
 Assert an exhausted wordlist variant may reach score zero while the SSH family remains deferred
 with retry condition `credential_available`; a later credential event reactivates the existing
@@ -2750,7 +2765,7 @@ Parameterize over the shared 19-event fixture: only `outcome_assessed` attaches 
 attempt result, `strategy_reconciled` applies explicit ledger operations, `strategy_archived`
 moves exact IDs cold, and `strategy_reactivated` restores those IDs. Assert all other 15 event
 kinds are direct ledger no-ops; they may influence only a later LLM-authored reconciliation.
-- [ ] **Step 3: Write failing event-only ledger/archive reconstruction tests**
+- [x] **Step 3: Write failing event-only ledger/archive reconstruction tests**
 Commit families, variants, retry predicates, attempt outcomes, split/merge/tombstone operations,
 archive records, and reactivation as multi-event atomic batches. Persist ledger/archive projections,
 capture their canonical bytes/digests, delete only those derived files in the temporary test root,
@@ -2758,18 +2773,18 @@ and rebuild from manifest plus journal events. Require byte-identical `StrategyL
 `StrategyArchive` payloads/digests. Reject missing, duplicate, mixed-request, out-of-range, or
 non-atomic reconciliation/archive ordinals and any resulting digest mismatch; never fall back to
 IDs/digests without the full snapshots.
-- [ ] **Step 4: Write failing full-reconciliation tests**
+- [x] **Step 4: Write failing full-reconciliation tests**
 Supply every hot entry and selected archive candidate to a planner draft. Reject a response that
 omits one, changes its runtime ID, reparents a variant, creates duplicate keys, archives an
 available item without reason, or exceeds hot limits without an explicit merge/supersede/archive.
 Accept explicit retain, update, merge, split, supersede, complete, block, archive, and reactivate
 operations with critic-approved ancestry.
-- [ ] **Step 5: Write failing archive bound and predicate tests**
+- [x] **Step 5: Write failing archive bound and predicate tests**
 Populate more than 32/64 entries, rebuild deterministic hot/archive projections, and verify only
 typed predicates choose at most 16 candidates. Test all six predicate kinds and ensure unrelated
 new evidence does not reactivate an archived strategy. Assert aggregate summary is deterministic
 and at most 16 KiB.
-- [ ] **Step 6: Run archive/ledger tests and witness RED**
+- [x] **Step 6: Run archive/ledger tests and witness RED**
 Run:
 
 ```bash
@@ -2778,7 +2793,7 @@ pytest -q tests/engagement/test_repository.py \
   tests/planning/test_ledger.py -x
 ```
 Expected: the first new archive-service API assertion fails.
-- [ ] **Step 7: Implement the dedicated M6A archive projection surface**
+- [x] **Step 7: Implement the dedicated M6A archive projection surface**
 Define data-only `StrategyArchiveRecordDraft` and `StrategyArchiveProjectionEnvelope` in
 `sedna.engagement`. The first JSONL line is a canonical envelope with schema ID, archive revision,
 authoritative journal revision, entry count, and entries digest; following lines are canonical
@@ -2789,7 +2804,7 @@ events, not a second append-only authority and not an extension of generic `comm
 Before the authoritative planning batch that would change the cold partition, stream-preflight the
 prospective archive record set against both hard limits. A batch that cannot retain a rebuildable
 projection fails before journal append; recovery repeats the same deterministic preflight.
-- [ ] **Step 8: Implement immutable identity resolution and replay**
+- [x] **Step 8: Implement immutable identity resolution and replay**
 Assign UUIDs only when committing accepted new keys. Existing family/variant IDs must match the
 ledger. Attempt IDs derive from the journaled decision plus ordered tool-call IDs. Rebuild current
 scores, prior scores, statuses, evidence, prerequisites, retry conditions, relationships, and
@@ -2798,7 +2813,7 @@ attempt outcomes entirely from authoritative events. Apply only ordinal-complete
 the resulting state; IDs/digests/reason prose alone are never sufficient. Apply archive and
 reactivation batches the same way, cross-validating their companion tombstone/restored snapshot
 and applying each transaction once, then verify the declared resulting ledger/archive digest.
-- [ ] **Step 9: Implement bounded hot/archive partitioning**
+- [x] **Step 9: Implement bounded hot/archive partitioning**
 Keep available/deferred/selected entries hot, then deterministic recency/status/key order within
 the 32/64 caps. Archive older blocked, exhausted, completed, and superseded entries without
 deleting their authoritative events. Fail reconciliation when limits cannot be satisfied without
@@ -2806,11 +2821,11 @@ silent loss. Retain exactly eight recent attempts per variant and 256 total hot 
 older events contribute to deterministic aggregates. Serialize the complete cold projection only
 through the streaming `commit_strategy_archive()` with both archive and journal CAS revisions;
 consumers always read bounded pages.
-- [ ] **Step 10: Implement retry-predicate matching**
+- [x] **Step 10: Implement retry-predicate matching**
 Match only explicit situation facts, prerequisites, evidence categories, credential-reference
 presence, and revision comparisons. This reducer selects candidates; it does not alter score or
 make a semantic judgment.
-- [ ] **Step 11: Run archive and ledger tests GREEN**
+- [x] **Step 11: Run archive and ledger tests GREEN**
 Run:
 
 ```bash
@@ -2820,7 +2835,7 @@ pytest -q tests/engagement/test_repository.py \
   tests/planning/test_situation.py
 ```
 Expected: PASS.
-- [ ] **Step 12: Commit Task 10**
+- [x] **Step 12: Commit Task 10**
 ```bash
 git add -- src/sedna/planning/ledger.py src/sedna/planning/service.py src/sedna/planning/__init__.py src/sedna/engagement/models.py src/sedna/engagement/repository.py src/sedna/engagement/service.py src/sedna/engagement/__init__.py tests/planning/test_ledger.py tests/engagement/test_repository.py tests/engagement/test_service.py
 git commit -m "feat(planning): retain adaptive strategy ledger"
@@ -2844,24 +2859,24 @@ git commit -m "feat(planning): retain adaptive strategy ledger"
   example drill-down, and the global `SharedSourceRegistry`.
 - Produces: `build_retrieval_queries(...)`, `PlannerKnowledgeContext`, and bounded source-backed
   planner inputs with a canonical revision plus situation-conditioned source/research candidates.
-- [ ] **Step 1: Write failing state-to-query tests**
+- [x] **Step 1: Write failing state-to-query tests**
 Build situations for authorized IPv4, URL, multi-target, unknown OS, known Linux, Windows, and
 invalid target states. Assert one conservative query per active authorized target, exact scope
 membership, evidence-derived terms/facets/services/access/hypotheses/outcomes, and no invented
 architecture or synonyms. Invalid/unauthorized targets stop before index access.
-- [ ] **Step 2: Write failing lane and example-selection tests**
+- [x] **Step 2: Write failing lane and example-selection tests**
 Assert the planner package preserves references, cases, negative evidence, guidance, rejection
 reasons, and lane-local retrieval scores as separate labeled collections. Load execution examples
 only for qualifying parent artifacts, never rejected candidates, cap at 16, and retain exact
 example/source IDs without inserting command text into query terms. Preserve typed execution-
 example coverage gaps beside the affected sources.
-- [ ] **Step 3: Write failing gap/applicability tests**
+- [x] **Step 3: Write failing gap/applicability tests**
 Verify Windows-only knowledge is excluded for known Linux, unknown architecture remains unknown,
 an Android/ADB corpus miss remains a typed gap with research eligibility, and
 `retrieval_unavailable` is not converted to “no knowledge” or a research recommendation. A legacy
 strategic hit remains usable, but `legacy_bundle_without_examples` prevents source-command
 attribution; a labeled `model_generated` suggestion remains allowed.
-- [ ] **Step 4: Write failing bounded shared-source tests**
+- [x] **Step 4: Write failing bounded shared-source tests**
 Keep M6A's parameterless full validated `snapshot()`/`list_entries()` contracts unchanged. Add the
 separate planner-facing `planner_snapshot()` and `list_planner_hints(...)` methods defined below.
 Assert at most 128 managed records/64 KiB in a planner snapshot and at most 16 records/16 KiB in a planner
@@ -2872,7 +2887,7 @@ records and user suggestions while retaining a typed `truncated` indication; giv
 exclude Windows-only sources; given unknown platform, do not invent one. User suggestions are
 priority hints, not an allowlist, so the candidate set may also contain a model-proposed generic
 technical source.
-- [ ] **Step 5: Run source/retrieval tests and witness RED**
+- [x] **Step 5: Run source/retrieval tests and witness RED**
 Run:
 
 ```bash
@@ -2881,7 +2896,7 @@ pytest -q tests/engagement/test_sources.py \
 ```
 Expected: the first new `SharedSourceRegistry.planner_snapshot()`/`list_planner_hints()` assertion fails before
 the missing planner retrieval adapter is implemented.
-- [ ] **Step 6: Implement deterministic query construction**
+- [x] **Step 6: Implement deterministic query construction**
 Implement:
 
 ```python
@@ -2897,7 +2912,7 @@ def build_retrieval_queries(
 Map only evidence-backed state into the existing `CurrentSituation`; never send private secret or
 flag values as retrieval terms. Use symbolic credential availability such as
 `credential available for ssh`, not the credential value.
-- [ ] **Step 7: Implement bounded registry snapshots and source selection**
+- [x] **Step 7: Implement bounded registry snapshots and source selection**
 Define these frozen, extra-forbid planner results and methods without changing M6A's full API:
 
 ```python
@@ -2937,14 +2952,14 @@ why it applies. Serialize these records as untrusted JSON data, never instructio
 Add `inspect.signature` regressions proving M6A `snapshot()` and `list_entries()` remain
 parameterless/full (within their 4,096/1-MiB hard bounds), while the new methods enforce their
 smaller canonical-byte/count limits and deterministic omitted digests.
-- [ ] **Step 8: Implement bounded knowledge assembly**
+- [x] **Step 8: Implement bounded knowledge assembly**
 Call retrieval per query, preserve lane identity, validate canonical revision before and after
 the complete retrieval/example drill-down, and build `PlannerKnowledgeContext` with exact
 artifact/source/example refs, typed coverage gaps, registry digest, and bounded candidate research
 sources. Enforce cumulative text/count bounds and a stable canonical digest. Applicability and
 platform constraints on an `ExecutionExample` are independently checked before it can become a
 source-backed command candidate.
-- [ ] **Step 9: Run retrieval adapter tests GREEN**
+- [x] **Step 9: Run retrieval adapter tests GREEN**
 Run:
 
 ```bash
@@ -2953,7 +2968,7 @@ pytest -q tests/engagement/test_sources.py \
   tests/knowledge/test_retrieval_service.py
 ```
 Expected: PASS.
-- [ ] **Step 10: Commit Task 11**
+- [x] **Step 10: Commit Task 11**
 ```bash
 git add -- src/sedna/planning/retrieval.py src/sedna/planning/service.py src/sedna/planning/__init__.py src/sedna/engagement/sources.py src/sedna/engagement/__init__.py tests/planning/test_retrieval.py tests/engagement/test_sources.py
 git commit -m "feat(planning): retrieve situation-conditioned experience"
@@ -2979,7 +2994,7 @@ git commit -m "feat(planning): retrieve situation-conditioned experience"
 - Produces: `PlanningService.plan_next(self, lane: ExecutionLaneKey, *, max_proposals: int = 5)
   -> PlanningResult`, `FrontierReducer.rebuild(...)`, validated frontier events/projection,
   composite cache, and typed planning gaps.
-- [ ] **Step 1: Write failing accepted and repaired call-path tests**
+- [x] **Step 1: Write failing accepted and repaired call-path tests**
 Script accepted planning and assert purposes are exactly `plan, critic`. Script one material
 finding, repaired output, and acceptance; assert exactly `plan, critic, repair, critic`. Script a
 second material rejection and assert `planning_gap`, no new frontier projection, safe call
@@ -2997,7 +3012,7 @@ knowledge retrieval, zero planner/critic calls, and zero planning-event append. 
 proof-close barrier still `closing` and with an already closed snapshot. A partial-proof settlement
 that cancels only a proof-driven close and reloads `active` may proceed normally; an explicit
 manual-close barrier remains terminal to this planner call.
-- [ ] **Step 2: Write failing semantic guardrail tests**
+- [x] **Step 2: Write failing semantic guardrail tests**
 Reject before frontier/ledger persistence; closed rejection/audit events may still be appended:
 
 - invented event, evidence, knowledge, example, strategy, secret, or scope refs;
@@ -3011,14 +3026,14 @@ Reject before frontier/ledger persistence; closed rejection/audit events may sti
 - invalid archive reconciliation;
 - source command presented as model-generated or vice versa;
 - unsafe current-machine solution/flag research query.
-- [ ] **Step 3: Write failing adaptive-path tests**
+- [x] **Step 3: Write failing adaptive-path tests**
 Use scripted LLM responses to prove a syntax error retains strategic score, rejected common SSH
 credentials lower but do not erase SSH, a complete `rockyou` attempt exhausts only that variant,
 and new credentials reactivate targeted SSH access. Verify each score change cites exact events
 and the planner may add a novel strategy absent from retrieved cases. Assert the planner sees no
 more than eight attempts per variant, 256 hot attempts, 64 recent events, or 64 KiB recent-event
 text, while aggregate digests preserve the omitted history.
-- [ ] **Step 4: Write failing composite-cache tests**
+- [x] **Step 4: Write failing composite-cache tests**
 Assert identical situation, ledger, canonical revision, source-registry digest, and versions reuse
 the frontier with zero LLM calls. Independently change each component and assert replanning. A
 session checkpoint advances `authoritative_journal_revision` but leaves
@@ -3030,11 +3045,11 @@ digest; assert the frontier records old `input_ledger_digest`, new `resulting_le
 published under the resulting digest, and an immediately identical call hits cache with zero LLM
 calls. Assert `max_proposals=3` and `max_proposals=8` use different cache entries and the requested
 bound is included in both planner input and cache material.
-- [ ] **Step 5: Write failing optimistic concurrency/lock tests**
+- [x] **Step 5: Write failing optimistic concurrency/lock tests**
 Block planner and critic calls while another lane appends an event. Assert journal and canonical
 locks are free, stale output is not committed, one bounded restart occurs, and a second concurrent
 change returns `planning_gap(code="concurrent_state_change")` without an infinite retry.
-- [ ] **Step 6: Run service tests and witness RED**
+- [x] **Step 6: Run service tests and witness RED**
 Run:
 
 ```bash
@@ -3043,7 +3058,7 @@ pytest -q tests/planning/test_service.py \
   tests/planning/test_prompt_injection.py -x
 ```
 Expected: settlement tests pass but planning orchestration assertions fail.
-- [ ] **Step 7: Implement the composite cache key**
+- [x] **Step 7: Implement the composite cache key**
 Hash canonical JSON of:
 
 ```python
@@ -3073,7 +3088,7 @@ digest/material revision, current ledger digest against `resulting_ledger_digest
 source revisions, versions, policy, and `max_proposals`. It deliberately ignores a change to only
 `authoritative_journal_revision`; on a hit, retain immutable frontier publication provenance and
 set `PlanningResult.current_authoritative_journal_revision` from the freshly loaded snapshot.
-- [ ] **Step 8: Implement `plan_next` outside locks**
+- [x] **Step 8: Implement `plan_next` outside locks**
 The method resolves the exact lane, calls `settle_pending_evidence(..., reason="plan")`, and uses
 the exact `SettlementResult.situation`; it does not load proof state from M6A. Continue only for
 `settled` or `nothing_pending`. Convert `incomplete` to a retryable typed planning gap that returns
@@ -3095,7 +3110,7 @@ opportunity, then becomes bounded `failed(result_too_large)` with no frontier/ca
 The final host serializer separately checks the complete envelope against
 `MAX_HOST_RESULT_BYTES`. Add maximal eight-proposal exact-under/one-byte-over tests proving an
 unreturnable frontier is never committed or cached.
-- [ ] **Step 9: Implement event-only frontier replay**
+- [x] **Step 9: Implement event-only frontier replay**
 Implement `FrontierReducer` over ordered typed journal events. It assembles all
 `frontier_proposed` ordinals for an accepted initial draft or all `frontier_repaired` ordinals for
 the accepted repair, verifies common request/frontier/count/digests and exact ordinal coverage,
@@ -3105,7 +3120,7 @@ request/frontier ID so `input_ledger_digest` and verified `resulting_ledger_dige
 Critic rejection preserves the prior frontier and a planning gap never creates one.
 `frontier.json` is only a CAS projection of this replay; deletion or corruption triggers
 event-only rebuild with byte-identical canonical payload.
-- [ ] **Step 10: Implement optimistic commit and bounded restart**
+- [x] **Step 10: Implement optimistic commit and bounded restart**
 Before append, recheck engagement event revision and canonical revision. Append proposal,
 critique, repair/rejection/gap, ledger reconciliation/archive/reactivation, and frontier events
 atomically with `expected_revision`; then write rebuildable projections through the dedicated
@@ -3114,7 +3129,7 @@ frontier's `resulting_ledger_digest`, and only then publish the frontier/cache u
 post-commit digest; never key a changed reconciliation solely by its pre-call ledger digest.
 Permit one full restart. Failure or repeated staleness returns a typed gap and leaves authoritative
 evidence unchanged.
-- [ ] **Step 11: Implement research policy validation**
+- [x] **Step 11: Implement research policy validation**
 Allow generic queries about services, versions, errors, protocols, CVEs, and techniques. Reject a
 query containing the current display name or aliases together with `walkthrough`, `writeup`,
 `solution`, `flag`, `user.txt`, `root.txt`, or equivalent configured terms, and reject a known flag
@@ -3123,7 +3138,7 @@ value. User-suggested sources remain priority hints, not an allowlist. Persist a
 settlement emits `research_source_consulted` and `research_source_assessed` only from validated
 host evidence carrying a normalized locator/source identity and assessment refs. Never infer that
 a successful Hades tool return proves the research claim.
-- [ ] **Step 12: Run service tests GREEN**
+- [x] **Step 12: Run service tests GREEN**
 Run:
 
 ```bash
@@ -3135,7 +3150,7 @@ pytest -q tests/planning/test_service.py \
   tests/planning/test_prompt_injection.py
 ```
 Expected: PASS.
-- [ ] **Step 13: Commit Task 12**
+- [x] **Step 13: Commit Task 12**
 ```bash
 git add -- src/sedna/planning/frontier.py src/sedna/planning/service.py src/sedna/planning/models.py src/sedna/planning/commands.py src/sedna/planning/__init__.py tests/planning/test_frontier.py tests/planning/test_service.py tests/planning/test_prompt_injection.py
 git commit -m "feat(planning): orchestrate adaptive frontier"
@@ -3166,7 +3181,7 @@ git commit -m "feat(planning): orchestrate adaptive frontier"
   `PlanningRuntimeFactory`/dynamic `KnowledgeRootResolver`, plugin tool `sedna_plan_next`, completed
   proposal selection/deviation binding, lifecycle settlement wiring, and the Hades protocol
   contract v3.
-- [ ] **Step 1: Write failing runtime composition tests**
+- [x] **Step 1: Write failing runtime composition tests**
 For each settlement or plan invocation, assert one newly opened runtime owns canonical repository,
 retrieval index, M6A journal service, and planning service and closes every owned component exactly
 once. Construct/register the plugin and M6A adapter with spies and assert neither the dynamic root
@@ -3177,7 +3192,7 @@ it before returning. The long-lived adapter owns no runtime/service and has no c
 planner uses the bound host `complete_structured` facade and requires no second provider credential
 or daemon. Assert all M6 packages and `plugin.yaml` remain synchronized at product version `0.2.0`;
 M6B and M6C do not add another product-version bump.
-- [ ] **Step 2: Write failing plugin registration and lane tests**
+- [x] **Step 2: Write failing plugin registration and lane tests**
 Assert `sedna_plan_next` is declared in `plugin.yaml`, receives the exact bound lane from host
 kwargs, rejects missing/ambiguous engagement binding, returns a validated/cached/gap typed result,
 and does not expose raw evidence/provider errors. Assert `_PlanNextInput` inherits the rootless
@@ -3186,11 +3201,11 @@ context at invocation time. Assert the handler opens one runtime for the resolve
 `PlanningRuntimeFactory`, performs resolution before opening, delegates once, and exits the
 context even on typed failure. Verify a decision recorded in one task cannot select another task's
 proposal.
-- [ ] **Step 3: Write failing non-coercive protocol tests**
+- [x] **Step 3: Write failing non-coercive protocol tests**
 Verify an operational action without a proposal remains allowed and journaled as unplanned; the
 next plan assesses it. Verify source/model suggestions state `requires_validation`, Hades may
 record a `host_adapted` command, and neither Sedna nor a hook executes the suggestion.
-- [ ] **Step 4: Write failing mandatory-settlement and hook-ownership tests**
+- [x] **Step 4: Write failing mandatory-settlement and hook-ownership tests**
 Create pending evidence and assert all five M6A/M6B mandatory paths call settlement exactly once
 with reasons `plan`, `resume`, `session_finalize`, `close`, and `reopen`. For each M6A adapter path,
 block the settlement callback and acquire the engagement repository lock from another thread to
@@ -3224,7 +3239,7 @@ M6A alone owns operational capture/correlation; M6B registers no duplicate opera
 never derives strategic success from `result` or a host return status. The observation extractor
 performs interpretation later. `on_session_finalize` is lifecycle orchestration, not an
 operational tool executor.
-- [ ] **Step 5: Run runtime/plugin tests and witness RED**
+- [x] **Step 5: Run runtime/plugin tests and witness RED**
 Run:
 
 ```bash
@@ -3236,7 +3251,7 @@ pytest -q tests/knowledge/test_hades_runtime.py \
   tests/test_plugin_planning.py -x
 ```
 Expected: registration/composition failures for the missing planner.
-- [ ] **Step 6: Implement the one M6A-owned settlement port**
+- [x] **Step 6: Implement the one M6A-owned settlement port**
 Consume the existing `sedna.engagement.EngagementSettlementPort` and `SettlementReason`; do not
 declare a second protocol or enum in planning. The exact reason values are `plan`, `close`,
 `verify`, `reject`, `reopen`, `report`, `resume`, and `session_finalize`, and the exact port call
@@ -3381,7 +3396,7 @@ the corresponding clearly non-clean checkpoint/logbook state, never `reason="fin
 subsequent M6A
 read/write uses a newly opened context after the port returns. M6B composition injects the adapter
 and adds no duplicate hook or M6A import of planning.
-- [ ] **Step 7: Add planning to the composition root**
+- [x] **Step 7: Add planning to the composition root**
 Extend `HadesKnowledgeRuntime` with a public `planning: PlanningService` field. Construct it from
 the same bound host LLM, canonical retrieval/revision guard, M6A journal facade, source-registry
 snapshot provider, lifecycle/terminal ports, and UTC clock. Preserve close ordering and
@@ -3395,7 +3410,7 @@ own current context root once. No planning tool or settlement protocol method ac
 caller-supplied root, and no runtime survives an invocation or profile switch. An alternating
 resolver regression proves one resume/close/reopen/finalize never crosses stores and the next host
 invocation may select the changed profile.
-- [ ] **Step 8: Register `sedna_plan_next`**
+- [x] **Step 8: Register `sedna_plan_next`**
 Add strict input:
 
 ```python
@@ -3420,19 +3435,19 @@ Serialization happens only after the runtime closes. Add safe tool codes
 `interpretation_failed`, `settlement_unavailable`, `journal_unavailable`, `planning_failed`, and
 `result_too_large`; the last is non-retryable unless a smaller `max_proposals` request is allowed by
 policy.
-- [ ] **Step 9: Complete decision recording compatibility**
+- [x] **Step 9: Complete decision recording compatibility**
 Update the M6A `sedna_record_decision` handler schema to accept either exact `proposal_id` or
 `custom_strategy` plus rationale, never both. Validate proposal state/cache revision and lane
 ownership. Reuse M6A's exact optional `HostAdaptedCommandRecord` field and forward it through the
 existing sealed `DecisionRecordedPayload`; Task 13 adds no event type or alternate writer. It
 remains private, bounded, `requires_validation`, and is never treated as a Sedna source suggestion.
-- [ ] **Step 10: Update the host protocol documentation**
+- [x] **Step 10: Update the host protocol documentation**
 Advance `docs/llm/sedna-knowledge-tools.md` to `sedna-knowledge-tools-v3`. Document start/resume,
 plan, decision, `/learn` validation, execution, lazy settlement, replan, research, gaps, and
 non-coercive deviations. Explicitly state that command examples are suggestions and source cases
 are experience, not universal instructions. Document mandatory settlement triggers and that Hades
 `/learn`, authorization, approvals, and operational tool execution remain host-owned.
-- [ ] **Step 11: Run runtime/plugin tests GREEN**
+- [x] **Step 11: Run runtime/plugin tests GREEN**
 Run:
 
 ```bash
@@ -3444,7 +3459,7 @@ pytest -q tests/knowledge/test_hades_runtime.py \
   tests/test_plugin_planning.py
 ```
 Expected: PASS.
-- [ ] **Step 12: Commit Task 13**
+- [x] **Step 12: Commit Task 13**
 ```bash
 git add -- src/sedna/engagement/hades_adapter.py src/sedna/planning/ports.py src/sedna/planning/__init__.py src/sedna/knowledge/hades_runtime.py src/sedna/plugin.py plugin.yaml docs/llm/sedna-knowledge-tools.md README.md tests/knowledge/test_hades_runtime.py tests/engagement/test_hades_adapter.py tests/test_plugin.py tests/test_plugin_knowledge.py tests/test_plugin_planning.py
 git commit -m "feat(plugin): expose adaptive Sedna planning"
@@ -3466,7 +3481,7 @@ git commit -m "feat(plugin): expose adaptive Sedna planning"
 - Consumes: complete M6A+M6B runtime and scripted host/tool evidence.
 - Produces: executable end-to-end acceptance coverage and an exact operator migration/relearn
   procedure for existing corpora.
-- [ ] **Step 1: Write the end-to-end simulated engagement**
+- [x] **Step 1: Write the end-to-end simulated engagement**
 Write `test_adaptive_engagement.py` first so it imports
 `from tests.planning.simulated_planner import SimulatedPlanner`, but do not create that module yet.
 Its first scenario will drive this sequence without real tools:
@@ -3493,7 +3508,7 @@ each score change cites events/knowledge, no unchanged command loops, and planni
 operational tool. Assert both proof events cite their exact requirement IDs; the first proof alone
 does not request terminal success and the second supplies the exact situation to the terminal-port
 spy.
-- [ ] **Step 2: Run the acceptance test and witness a deterministic RED**
+- [x] **Step 2: Run the acceptance test and witness a deterministic RED**
 Run:
 
 ```bash
@@ -3502,7 +3517,7 @@ pytest -q tests/planning/test_adaptive_engagement.py -x
 
 Expected: collection fails with `ModuleNotFoundError: tests.planning.simulated_planner`. This RED is
 independent of strategy scores, fixture contents, and production behavior.
-- [ ] **Step 3: Implement the reusable simulated planner harness**
+- [x] **Step 3: Implement the reusable simulated planner harness**
 Create `tests/planning/simulated_planner.py` as a thin driver over the real plugin handlers,
 engagement service, planning service, scripted `complete_structured` responses, fake clock, and
 temporary knowledge root. Give it typed methods for create/resume, append simulated hook evidence,
@@ -3510,14 +3525,14 @@ plan, select/deviate, settle, finalize, inspect events/projections, and inspect 
 It may never shell out, browse, open a socket, emulate SSH semantics, or special-case Orion. Put
 all scenario data and expected IDs in the two JSON fixtures; production code receives only normal
 typed inputs.
-- [ ] **Step 4: Add applicability, gap, research, and injection acceptance cases**
+- [x] **Step 4: Add applicability, gap, research, and injection acceptance cases**
 Cover Linux rejection of Windows-only cases, unknown architecture, unsupported Android/ADB,
 generic technical research, user-suggested source plus an alternative source, rejected
 `HTB-Orion walkthrough`/flag queries, hostile terminal/canonical/web instructions, false flag, and
 an LLM failure followed by autonomous unplanned Hades action and later recovery. Assert typed
 query/source-consulted/source-assessed research events, placeholder-only target commands, unbound
 source-case credentials, bounded request sizes, and exact archive reactivation IDs.
-- [ ] **Step 5: Run the completed acceptance scenario GREEN**
+- [x] **Step 5: Run the completed acceptance scenario GREEN**
 Run:
 
 ```bash
@@ -3526,7 +3541,7 @@ pytest -q tests/planning/test_adaptive_engagement.py -x
 
 Expected: PASS using the general production reducers and service composition; no fixture-specific
 production branch exists.
-- [ ] **Step 6: Add the progressive corpus relearn procedure**
+- [x] **Step 6: Add the progressive corpus relearn procedure**
 Document the split contract: the `2.5.0`/prompt-v2 bump makes prior bundles stale for learning, but
 an exact valid `2.4.0` bundle remains strategically retrievable before relearn. SQLite-v5 rebuild
 indexes its artifacts, zero examples, and a typed capability gap. Operators may call
@@ -3545,7 +3560,7 @@ Include the exact normal plugin request:
   }
 }
 ```
-- [ ] **Step 7: Verify progressive migration in an isolated corpus fixture**
+- [x] **Step 7: Verify progressive migration in an isolated corpus fixture**
 Seed two old bundles. Rebuild first and assert both are strategically retrievable, their locators
 are empty, and drill-down reports `legacy_bundle_without_examples`. Relearn only the source whose
 raw bytes exist; assert it gains verified examples while the other remains strategic-only. Relearn
@@ -3565,7 +3580,7 @@ git status --short
 ```
 Expected: all tests pass, Ruff and formatting pass, diff check is clean, and only intentional M6B
 source/test/documentation files are modified.
-- [ ] **Step 9: Commit Task 14**
+- [x] **Step 9: Commit Task 14**
 ```bash
 git add -- tests/planning/test_adaptive_engagement.py tests/planning/simulated_planner.py tests/planning/fixtures/multi-service-engagement.json tests/planning/fixtures/adversarial-evidence.json docs/llm/sedna-knowledge-tools.md README.md
 git commit -m "test(planning): verify adaptive engagement flow"
@@ -3575,63 +3590,63 @@ git commit -m "test(planning): verify adaptive engagement flow"
 
 ## Final Verification
 
-- [ ] Confirm M6A public names and method signatures still match the dependency block before Task
+- [x] Confirm M6A public names and method signatures still match the dependency block before Task
   1 implementation begins.
-- [ ] Confirm exact legacy bundles remain strategically retrievable before relearn, expose a typed
+- [x] Confirm exact legacy bundles remain strategically retrievable before relearn, expose a typed
   source-command coverage gap, recompile exactly once when their source is relearned, and undergo
   no in-place canonical migration.
-- [ ] Confirm command templates, example lookup, SQLite canonical artifact JSON, and FTS satisfy
+- [x] Confirm command templates, example lookup, SQLite canonical artifact JSON, and FTS satisfy
   the non-searchable execution-example boundary.
-- [ ] Confirm each current execution example carries source-cited prerequisites, applicability,
+- [x] Confirm each current execution example carries source-cited prerequisites, applicability,
   and platform constraints, and all three participate in canonical identity and critic review.
-- [ ] Confirm every current target in a suggestion resolves from a typed authorized scope ref and
+- [x] Confirm every current target in a suggestion resolves from a typed authorized scope ref and
   every source-case credential remains unbound.
-- [ ] Confirm raw private evidence may retain flags while retrieval, canonical promotion inputs,
+- [x] Confirm raw private evidence may retain flags while retrieval, canonical promotion inputs,
   and command examples exclude final flag values.
-- [ ] Confirm proof/secret authority contains only locally verified candidate-only evidence slices;
+- [x] Confirm proof/secret authority contains only locally verified candidate-only evidence slices;
   a hallucinated inline flag emits no supported proof/auto-close, and trusted M6C reads, hashes,
   then symbolizes the exact bytes before promotion.
-- [ ] Confirm observation, planner, critic, and repair calls use only structured bounded payloads
+- [x] Confirm observation, planner, critic, and repair calls use only structured bounded payloads
   and safe call metadata.
-- [ ] Confirm no lock is held during evidence IO, retrieval, LLM calls, or command rendering.
-- [ ] Confirm `plan`, `resume`, `session_finalize`, `close`, and `reopen` settle exactly once through
+- [x] Confirm no lock is held during evidence IO, retrieval, LLM calls, or command rendering.
+- [x] Confirm `plan`, `resume`, `session_finalize`, `close`, and `reopen` settle exactly once through
   the one M6A-owned port outside
   journal locks, with no caller-supplied root argument and no duplicate operational hooks; dynamic
   profile changes resolve a fresh root/runtime per invocation and close it exactly once.
-- [ ] Confirm M6B maps every private settlement variant to M6A's exact six-code host-neutral
+- [x] Confirm M6B maps every private settlement variant to M6A's exact six-code host-neutral
   `EngagementSettlementOutcome`, and >2-MiB incomplete resume/finalize exposes no stale success.
-- [ ] Confirm `engagement-state.json`, SituationProjection-only `state.json`, and CAS-protected
+- [x] Confirm `engagement-state.json`, SituationProjection-only `state.json`, and CAS-protected
   `strategy-archive.jsonl` remain distinct, descriptor-confined projection surfaces.
-- [ ] Delete `state.json`, `frontier.json`, `strategy-ledger.json`, and
+- [x] Delete `state.json`, `frontier.json`, `strategy-ledger.json`, and
   `strategy-archive.jsonl` in an isolated test engagement and confirm events alone rebuild
   byte-identical projections, including full proposals/commands/retry predicates/hot/cold state.
-- [ ] Confirm every repeated frontier/reconciliation/archive/reactivation batch is atomic,
+- [x] Confirm every repeated frontier/reconciliation/archive/reactivation batch is atomic,
   ordinal-complete, at most 511 planning events with each fully materialized envelope within the
   M6A 64-KiB limit, and fails closed rather
   than truncating a record or splitting a logical transaction across commits.
-- [ ] Confirm empty/partial proof requirements cannot auto-close, all explicit proofs invoke the
+- [x] Confirm empty/partial proof requirements cannot auto-close, all explicit proofs invoke the
   terminal seam, and later contradictory evidence can cancel only a proof-driven closing state.
-- [ ] Confirm plan reloads lifecycle after terminal reconciliation and performs zero retrieval,
+- [x] Confirm plan reloads lifecycle after terminal reconciliation and performs zero retrieval,
   LLM, cache publication, or event append when the engagement is closing/closed/abandoned.
-- [ ] Confirm rejected proof generations retain immutable history, a newly grounded proof can
+- [x] Confirm rejected proof generations retain immutable history, a newly grounded proof can
   support the new generation only with a never-rejected digest, explicit reopen advances all
   requirements to pending, and stale/same-rejected-digest events never reclose. Confirm more than
   32 distinct rejected values rebuild the exact newest-32 tuple plus overflow count/digest, and an
   overflow membership decision always replays authoritative rejection records.
-- [ ] Confirm two distinct attachment/tool completions with identical `EvidenceId` bytes retain two
+- [x] Confirm two distinct attachment/tool completions with identical `EvidenceId` bytes retain two
   interpretation subjects and two exact outcome/attempt links after event-only replay.
-- [ ] Confirm the 8/256 attempt, 64-event/64-KiB text, 512-KiB request, and 32-KiB × 64 evidence
+- [x] Confirm the 8/256 attempt, 64-event/64-KiB text, 512-KiB request, and 32-KiB × 64 evidence
   bounds fail or continue explicitly without silent data loss.
-- [ ] Confirm planner reconciliation cannot silently discard a hot or selected archived strategy.
-- [ ] Confirm a second critic rejection, stale concurrent state, and unavailable journal each
+- [x] Confirm planner reconciliation cannot silently discard a hot or selected archived strategy.
+- [x] Confirm a second critic rejection, stale concurrent state, and unavailable journal each
   produce distinct typed gaps without publishing a false frontier.
-- [ ] Confirm the cache invalidates independently on situation, ledger, canonical corpus,
+- [x] Confirm the cache invalidates independently on situation, ledger, canonical corpus,
   `sources.md`, prompt, schema, research-policy, and command-policy changes.
-- [ ] Confirm checkpoint-only authoritative revision changes reuse cache with authority rebound only
+- [x] Confirm checkpoint-only authoritative revision changes reuse cache with authority rebound only
   in the typed result, and ledger-changing reconciliation caches against its verified resulting
   digest while retaining the input digest for audit.
-- [ ] Confirm Hades remains free to deviate, `/learn` remains authoritative for exact tool
+- [x] Confirm Hades remains free to deviate, `/learn` remains authoritative for exact tool
   operation, and no M6B test or production path invokes an operational tool.
-- [ ] Confirm bounded shared-source records and research query/consulted/assessed events remain
+- [x] Confirm bounded shared-source records and research query/consulted/assessed events remain
   structured untrusted data, and product/plugin versions remain synchronized at `0.2.0`.
 - [ ] Confirm full suite, Ruff, format, diff, and clean-status checks pass before M6B integration.

@@ -17,3 +17,39 @@ Task 11: complete — situation-conditioned bounded knowledge assembly in `plann
 Task 12: complete — adaptive planner/critic orchestration, one bounded repair, composite cache, event-only sequential frontier replay, optimistic CAS, strategy reconciliation, typed archive/reactivation, and fail-closed semantic grounding. Versioned OrgRun remediations closed every independent-review finding, including 128-KiB result repair, stale prior-frontier return, converter-only typed event batches, research policy, archive/reactivation ledger transitions, zero-score evidence semantics, archive compensation, concurrent journal append, and commit-then-raise durability discrimination. Final dedicated v4 review APPROVED with no findings. Final isolated staged gates: 113 focused Task 12 tests GREEN; 1609 full-suite tests GREEN; Ruff src/tests and git diff-check clean; no tracked .pyc or uv.lock noise. Commit message: feat(planning): orchestrate adaptive frontier.
 Task 13: complete — lazy invocation-scoped Hades planning runtime, one M6A-owned settlement adapter for plan/resume/finalize/close/reopen, rootless `sedna_plan_next`, exact lane binding, safe bounded planning serialization, proposal/custom decision compatibility, host-adapted command forwarding, and knowledge protocol v3 documentation. Review remediation added authoritative-frontier proposal validation, removed private pending-range descriptors from host planning results, and made adapter root pinning thread-local across concurrent invocations. Formatter-churn remediation reconstructed five legacy-style files and retained only 132 attributable additions/5 deletions. Independent final review APPROVED with no Critical or Important findings. Focused runtime/plugin gate 121 passed; full suite 1624 passed; Task 13 Ruff, touched-file format, git diff-check and pyc/uv.lock noise checks clean. Commit message: feat(plugin): expose adaptive Sedna planning.
 Task 14: complete — reusable no-I/O acceptance driver and JSON fixtures now exercise the real plugin/planning/journal machine path for multi-service strategy identity, archive/reactivation, source-backed symbolic commands, host adaptation, outcome/proof settlement, terminal-loop prevention, applicability/research policy, hostile evidence, false flags, and LLM-unavailable/unplanned-action recovery. Production remediations add grounded observation/outcome/proof conversion, public research-result ingestion, authoritative transport-failure gaps, and correct legacy capability lookup; the mixed `2.4.0`/`2.5.0` progressive relearn procedure and isolated corpus test preserve strategic availability without fabricated commands. Fixture-removal and recovery-order mutation tests close the prior vacuity findings; independent final re-review t_d0f5bbc5 APPROVED with no Critical/Important findings. Final reconciliation gates: 16 focused Task 14/relearn tests, 255 planning tests, and 1641 full-suite tests GREEN; Ruff src/tests, seven-file format check, git diff-check, and pyc/uv.lock/debug/secret noise checks clean. Commit message: test(planning): verify adaptive engagement flow.
+
+## Final authoritative reconciliation — 2026-08-14
+
+This section supersedes earlier transitional phrases such as “in progress”, “commit pending”, or
+“independent final review pending”. Those phrases record intermediate states and are not current
+work.
+
+- Task 1: `3657048` — `feat(knowledge): model source execution examples`
+- Task 2: `43b4736` — `feat(knowledge): compile verified execution examples`
+- Task 3: `791359e` — `feat(knowledge): migrate execution example bundles`
+- Task 4: `a4f2b23` — `feat(knowledge): add execution example drilldown`
+- Task 5: `7cb3147` — `feat(planning): define adaptive planner contracts`
+- Task 6: `c9c905d` — `feat(planning): bind command suggestions to scope`
+- Task 7: `2bfe442` — `feat(planning): add structured planner llm boundary`
+- Task 8: `94810ac` — `feat(engagement): add typed planning journal events`
+- Task 9: `c246786` — `feat(planning): settle engagement evidence`
+- Task 10: `10bc180` — `feat(planning): retain adaptive strategy ledger`
+- Task 11: `b4bc626` — `feat(planning): retrieve situation-conditioned experience`
+- Task 12: `56b094e` — `feat(planning): orchestrate adaptive frontier`
+- Task 13: `a20ef56` — `feat(plugin): expose adaptive Sedna planning`
+- Task 14: `e7a5010` — `test(planning): verify adaptive engagement flow`
+
+Repository/control-plane closure:
+
+- `main` and `origin/main` both resolved to `e7a5010` before this documentation-only change.
+- Fresh post-completion gate: 1,641 tests passed in 94.06 seconds; `ruff check src tests` and
+  `git diff --check` passed; no Python cache or `uv.lock` noise was introduced.
+- Board `sedna-m6b`: no triage/todo/scheduled/ready/running/blocked cards, no active run, lease, or
+  worker. The milestone monitor is paused, the obsolete dispatcher is stopped, and the completed
+  standing goal is cleared.
+- The repository-wide formatter baseline is intentionally not rewritten here: `ruff format --check
+  src tests` currently reports 30 legacy files that would be reformatted. Per-task/touched-file
+  formatting gates used for M6B were green. The two combined global-format checkboxes in the source
+  plan remain open to represent this known baseline deviation truthfully.
+- M6B Tasks 1–14 are complete. M6C is tracked separately by
+  `docs/superpowers/plans/2026-08-11-sedna-report-case-promotion.md`.
