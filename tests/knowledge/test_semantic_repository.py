@@ -631,6 +631,17 @@ def test_currentness_rejects_empty_source_id_without_dot_lock_fallback(tmp_path:
     assert not (repository.root / "transactions" / ".lock").exists()
 
 
+def test_promotion_publication_guard_is_descriptor_confined_and_source_scoped(
+    tmp_path: Path,
+) -> None:
+    repository = CanonicalKnowledgeRepository(tmp_path / "knowledge")
+
+    with repository.promotion_publication_guard("engagement-case-1"):
+        guard = repository.root / "promotion_publication_guards" / "engagement-case-1.lock"
+        assert guard.is_file()
+        assert guard.stat().st_mode & 0o777 == 0o600
+
+
 def test_semantic_compilation_guard_rejects_empty_id_without_dot_lock_fallback(
     tmp_path: Path,
 ) -> None:

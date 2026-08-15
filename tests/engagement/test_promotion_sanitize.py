@@ -25,6 +25,7 @@ from sedna.engagement.promotion.models import (
 )
 from sedna.engagement.promotion.sanitize import (
     assert_promotion_safe,
+    assert_semantic_promotion_safe,
     symbolize_evidence,
     symbolize_text,
 )
@@ -105,6 +106,22 @@ def test_final_leak_scan_rejects_reintroduced_or_encoded_values() -> None:
         assert_promotion_safe("Recovered OrionAdm%21n%3ASummer2026", _inventory())
     with pytest.raises(ValueError, match="promotion material contains raw flag"):
         assert_promotion_safe("nested HTB%257Buncatalogued%257D", PromotionSecretInventory())
+
+
+@pytest.mark.parametrize("private", ("OrionAdm!n:Summer2026", "OrionAdm%21n%3ASummer2026"))
+def test_semantic_promotion_scan_rejects_private_material_at_nested_boundary(
+    private: str,
+) -> None:
+    from tests.knowledge.test_semantic_repository import _verified_result
+
+    safe = _verified_result()
+    assert safe.bundle is not None
+    manifest = safe.bundle.compilation_manifest.model_copy(update={"extractor_model_id": private})
+    bundle = safe.bundle.model_copy(update={"compilation_manifest": manifest})
+    hostile = safe.model_copy(update={"bundle": bundle})
+
+    with pytest.raises(ValueError, match="promotion material contains private value"):
+        assert_semantic_promotion_safe(hostile, _inventory())
 
 
 def test_recursive_decode_accepts_eight_rounds_and_rejects_budget_exhaustion() -> None:

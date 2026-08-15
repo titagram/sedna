@@ -382,9 +382,7 @@ class SemanticCompiler:
                 key=lambda artifact: artifact.rule_id,
             )
         )
-        emitted_example_ids = tuple(
-            sorted(example.example_id for example in execution_examples)
-        )
+        emitted_example_ids = tuple(sorted(example.example_id for example in execution_examples))
         emitted_ids = tuple(
             sorted(
                 (
@@ -412,9 +410,7 @@ class SemanticCompiler:
                 critic_prompt_version=CRITIC_PROMPT_VERSION,
                 repair_prompt_version=REPAIR_PROMPT_VERSION,
                 execution_example_schema_version=(
-                    EXECUTION_EXAMPLE_SCHEMA_VERSION
-                    if emitted_example_ids
-                    else None
+                    EXECUTION_EXAMPLE_SCHEMA_VERSION if emitted_example_ids else None
                 ),
                 emitted_execution_example_ids=emitted_example_ids,
                 extractor_model_id=extraction.model,

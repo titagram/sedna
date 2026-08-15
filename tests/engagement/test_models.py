@@ -513,12 +513,15 @@ def test_unmatched_tool_completion_requires_exact_lane(lane) -> None:
     )
     with pytest.raises(ValidationError):
         JournalEventDraft(actor="host_agent", type=payload.kind, payload=payload)
-    assert JournalEventDraft(
-        actor="host_agent",
-        lane=lane,
-        type=payload.kind,
-        payload=payload,
-    ).lane == lane
+    assert (
+        JournalEventDraft(
+            actor="host_agent",
+            lane=lane,
+            type=payload.kind,
+            payload=payload,
+        ).lane
+        == lane
+    )
 
 
 def test_session_finalized_settlement_shapes_are_closed() -> None:
@@ -563,12 +566,15 @@ def test_capture_failure_observation_pair_and_reason_are_consistent() -> None:
 
 def test_tool_duration_rejects_bool_and_one_over() -> None:
     correlation = ToolCorrelation.uncertain("missing_stable_identity")
-    assert ToolCallCompletedPayload(
-        call_id="call-1",
-        correlation=correlation,
-        technical_status="returned",
-        duration_ms=MAX_TOOL_DURATION_MS,
-    ).duration_ms == MAX_TOOL_DURATION_MS
+    assert (
+        ToolCallCompletedPayload(
+            call_id="call-1",
+            correlation=correlation,
+            technical_status="returned",
+            duration_ms=MAX_TOOL_DURATION_MS,
+        ).duration_ms
+        == MAX_TOOL_DURATION_MS
+    )
     for duration in (True, MAX_TOOL_DURATION_MS + 1):
         with pytest.raises(ValidationError):
             ToolCallCompletedPayload(
@@ -595,18 +601,21 @@ def test_host_adapted_command_record_is_private_bounded_template() -> None:
 
 
 def test_control_tool_payload_uses_authoritative_closed_names() -> None:
-    assert frozenset(
-        {
-            "sedna_manage_engagement",
-            "sedna_plan_next",
-            "sedna_record_decision",
-            "sedna_add_source",
-            "sedna_learn_local",
-            "sedna_retrieve_knowledge",
-            "sedna_get_knowledge_artifact",
-            "sedna_knowledge_maintenance",
-        }
-    ) == CONTROL_TOOL_NAMES
+    assert (
+        frozenset(
+            {
+                "sedna_manage_engagement",
+                "sedna_plan_next",
+                "sedna_record_decision",
+                "sedna_add_source",
+                "sedna_learn_local",
+                "sedna_retrieve_knowledge",
+                "sedna_get_knowledge_artifact",
+                "sedna_knowledge_maintenance",
+            }
+        )
+        == CONTROL_TOOL_NAMES
+    )
     name = sorted(CONTROL_TOOL_NAMES)[0]
     payload = ControlToolInvokedPayload(
         control_tool=name,
@@ -793,9 +802,7 @@ def test_snapshot_rejects_duplicate_event_ids(
         EngagementSnapshot(**_snapshot_inputs(manifest, broken))
 
 
-def test_snapshot_caps_complete_event_inventory(
-    manifest, event_chain, opened_draft
-) -> None:
+def test_snapshot_caps_complete_event_inventory(manifest, event_chain, opened_draft) -> None:
     event = event_chain(
         manifest,
         opened_draft(scope_references=scope_references(manifest.initial_scope)),

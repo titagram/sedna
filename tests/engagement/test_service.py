@@ -216,6 +216,14 @@ def test_event_append_owner_map_is_complete_and_authoritative() -> None:
         "report_generated": "report_commit_capability",
         "engagement_closed": "report_commit_capability",
         "report_commit_abandoned": "report_recovery_capability",
+        "promotion_requested": "promotion_commit_capability",
+        "promotion_candidate_ready": "promotion_commit_capability",
+        "promotion_source_committed": "promotion_commit_capability",
+        "promotion_semantic_committed": "promotion_commit_capability",
+        "promotion_index_pending": "promotion_commit_capability",
+        "promotion_index_retry_failed": "promotion_commit_capability",
+        "case_promoted": "promotion_commit_capability",
+        "promotion_attempt_terminated": "promotion_commit_capability",
     }
     assert set(EVENT_APPEND_OWNER_BY_TYPE) == {item.value for item in EventType}
 

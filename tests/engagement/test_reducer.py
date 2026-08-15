@@ -66,9 +66,7 @@ def event(
     )
 
 
-def chain(
-    manifest: EngagementManifest, *drafts: JournalEventDraft
-) -> tuple[JournalEvent, ...]:
+def chain(manifest: EngagementManifest, *drafts: JournalEventDraft) -> tuple[JournalEvent, ...]:
     events: list[JournalEvent] = []
     for draft in drafts:
         events.append(event(manifest, draft, events))
@@ -90,9 +88,7 @@ def system_draft(event_type: EventType, payload, *, source: str = "lifecycle"):
 def opened(manifest: EngagementManifest) -> JournalEventDraft:
     return system_draft(
         EventType.ENGAGEMENT_OPENED,
-        EngagementOpenedPayload(
-            scope_references=scope_references(manifest.initial_scope)
-        ),
+        EngagementOpenedPayload(scope_references=scope_references(manifest.initial_scope)),
     )
 
 
@@ -156,9 +152,7 @@ def tool_started(
     )
 
 
-def tool_completed(
-    lane: ExecutionLaneKey, *, call_id: str = "call-1"
-) -> JournalEventDraft:
+def tool_completed(lane: ExecutionLaneKey, *, call_id: str = "call-1") -> JournalEventDraft:
     return JournalEventDraft(
         lane=lane,
         actor="host_agent",
@@ -341,9 +335,7 @@ def user_note() -> JournalEventDraft:
     )
 
 
-def test_open_bind_decide_and_start_call_reduces_to_active_state(
-    manifest, lane
-) -> None:
+def test_open_bind_decide_and_start_call_reduces_to_active_state(manifest, lane) -> None:
     events = chain(
         manifest,
         opened(manifest),
@@ -355,16 +347,12 @@ def test_open_bind_decide_and_start_call_reduces_to_active_state(
     state = reduce_engagement(manifest, events)
 
     assert state.status == "active"
-    assert state.bound_lanes == (
-        LaneBinding(lane=lane, engagement_id=manifest.engagement_id),
-    )
+    assert state.bound_lanes == (LaneBinding(lane=lane, engagement_id=manifest.engagement_id),)
     assert state.active_decisions[0].decision_id == "decision-1"
     assert state.in_flight_call_ids == ("call-1",)
 
 
-def test_close_waits_at_barrier_until_every_captured_call_is_terminal(
-    manifest, lane
-) -> None:
+def test_close_waits_at_barrier_until_every_captured_call_is_terminal(manifest, lane) -> None:
     events = chain(
         manifest,
         opened(manifest),
@@ -470,9 +458,7 @@ def test_exact_barrier_cancellation_then_operational_start_is_atomic(manifest, l
     assert state.in_flight_call_ids == ("late-call",)
 
 
-def test_cancellation_must_be_immediately_followed_by_operational_start(
-    manifest, lane
-) -> None:
+def test_cancellation_must_be_immediately_followed_by_operational_start(manifest, lane) -> None:
     closing = chain(
         manifest,
         opened(manifest),
@@ -745,9 +731,7 @@ def test_closing_rejects_objective_and_scope_changes(manifest, lane) -> None:
             reduce_engagement(manifest, (*closing, event(manifest, draft, closing)))
 
 
-def test_abandoned_allows_inspection_but_requires_reopen_before_new_work(
-    manifest, lane
-) -> None:
+def test_abandoned_allows_inspection_but_requires_reopen_before_new_work(manifest, lane) -> None:
     abandoned_events = chain(
         manifest,
         opened(manifest),
@@ -869,10 +853,7 @@ def test_closed_status_rows_are_inert_until_reopened(status) -> None:
     assert LifecycleEffect.NEW_WORK not in allowed
     assert LifecycleEffect.TOOL_START not in allowed
     assert LifecycleEffect.CLOSURE_REQUEST not in allowed
-    assert (
-        EVENT_LIFECYCLE_EFFECTS[EventType.SESSION_FINALIZED]
-        is LifecycleEffect.CONTROL_PLANE
-    )
+    assert EVENT_LIFECYCLE_EFFECTS[EventType.SESSION_FINALIZED] is LifecycleEffect.CONTROL_PLANE
 
 
 def test_reducer_never_produces_m6c_closed_statuses(manifest, lane) -> None:

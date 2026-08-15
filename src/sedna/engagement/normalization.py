@@ -36,9 +36,7 @@ ALWAYS_REDACTED_HOST_KEYS = frozenset(
 CONTEXTUAL_HOST_SECRET_KEYS = frozenset(
     {"api_key", "apikey", "authorization", "cookie", "secret_access_key", "token"}
 )
-HOST_SECRET_NAMESPACES = frozenset(
-    {"provider", "host_runtime", "transport_auth", "telemetry_auth"}
-)
+HOST_SECRET_NAMESPACES = frozenset({"provider", "host_runtime", "transport_auth", "telemetry_auth"})
 SOURCE_SECRET_KEYS = frozenset(
     {
         *ALWAYS_REDACTED_HOST_KEYS,
@@ -159,9 +157,7 @@ def _sanitized_integrity_tag(
     payload = {
         "value": value,
         "canonical_bytes": (
-            b64encode(canonical_bytes).decode("ascii")
-            if canonical_bytes is not None
-            else None
+            b64encode(canonical_bytes).decode("ascii") if canonical_bytes is not None else None
         ),
         "canonical_digest": canonical_digest,
         "byte_length": byte_length,
@@ -231,9 +227,7 @@ def _sanitize_structure(value: Any) -> tuple[Any, bool]:
     active_containers: set[int] = set()
     redacted = False
     root: list[Any] = [None]
-    stack: list[tuple[str, Any, int, bool, Any, Any]] = [
-        ("enter", value, 0, False, root, 0)
-    ]
+    stack: list[tuple[str, Any, int, bool, Any, Any]] = [("enter", value, 0, False, root, 0)]
 
     while stack:
         action, item, depth, namespace_sensitive, parent, key = stack.pop()
@@ -276,10 +270,10 @@ def _sanitize_structure(value: Any) -> tuple[Any, bool]:
                 for normalized_key, original_key in normalized_to_original.items()
             }
             credential_scope = item.get(casefolded.get("credential_scope", ""))
-            scoped_object = (
-                isinstance(credential_scope, str)
-                and credential_scope.casefold() in {"provider", "host_runtime"}
-            )
+            scoped_object = isinstance(credential_scope, str) and credential_scope.casefold() in {
+                "provider",
+                "host_runtime",
+            }
             result: dict[str, Any] = {}
             parent[key] = result
             active_containers.add(identity)
@@ -288,8 +282,7 @@ def _sanitize_structure(value: Any) -> tuple[Any, bool]:
                 original_key = normalized_to_original[normalized_key]
                 folded = normalized_key.casefold()
                 if folded in ALWAYS_REDACTED_HOST_KEYS or (
-                    folded in CONTEXTUAL_HOST_SECRET_KEYS
-                    and (namespace_sensitive or scoped_object)
+                    folded in CONTEXTUAL_HOST_SECRET_KEYS and (namespace_sensitive or scoped_object)
                 ):
                     result[normalized_key] = REDACTED_HOST_SECRET
                     redacted = True

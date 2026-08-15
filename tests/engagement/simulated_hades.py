@@ -141,9 +141,7 @@ class SimulatedHades:
     def end_session(self, session_id: str) -> None:
         self._hooks["on_session_finalize"](session_id=session_id)
 
-    def resume(
-        self, *, target: str, session_id: str, task_id: str = "root"
-    ) -> _Result:
+    def resume(self, *, target: str, session_id: str, task_id: str = "root") -> _Result:
         result = self._call(
             "sedna_manage_engagement",
             {"action": "resume", "authorization": (target,)},
@@ -151,9 +149,7 @@ class SimulatedHades:
             task_id,
         )
         assert result["ok"], result
-        return _Result(
-            engagement_id=UUID(result["engagement"]["engagement_id"])
-        )
+        return _Result(engagement_id=UUID(result["engagement"]["engagement_id"]))
 
     def close(self, *, reason: str, session_id: str, task_id: str = "root") -> _Result:
         result = self._call(
@@ -182,9 +178,7 @@ class SimulatedHades:
         return _Result(status=state.status)
 
     def logbook_text(self, engagement_id: UUID, session_id: str) -> str:
-        evidence_dir = (
-            self.knowledge_root / "engagements" / str(engagement_id) / "evidence"
-        )
+        evidence_dir = self.knowledge_root / "engagements" / str(engagement_id) / "evidence"
         for path in evidence_dir.glob("*.md"):
             text = path.read_text(encoding="utf-8")
             if f"- Session: {session_id}" in text:
@@ -200,11 +194,7 @@ class SimulatedHades:
 
     def recovery_tail_count(self, engagement_id: UUID) -> int:
         snapshot = self._snapshot(engagement_id)
-        return sum(
-            1
-            for event in snapshot.events
-            if event.type.value == "recovery_warning"
-        )
+        return sum(1 for event in snapshot.events if event.type.value == "recovery_warning")
 
     def global_retrieval_contains(self, text: str) -> bool:
         needle = text.encode("utf-8")
@@ -254,20 +244,12 @@ def _is_private_evidence_path(knowledge_root: Path, path: Path) -> bool:
     except ValueError:
         return False
     parts = relative.parts
-    return (
-        len(parts) >= 4
-        and parts[0] == "engagements"
-        and parts[2] == "evidence"
-    )
+    return len(parts) >= 4 and parts[0] == "engagements" and parts[2] == "evidence"
 
 
-def inject_partial_tail(
-    knowledge_root: Path, engagement_id: UUID, tail: bytes
-) -> None:
+def inject_partial_tail(knowledge_root: Path, engagement_id: UUID, tail: bytes) -> None:
     """Append a partial JSON record as if the host crashed mid-write."""
-    path = (
-        knowledge_root / "engagements" / str(engagement_id) / "events.jsonl"
-    )
+    path = knowledge_root / "engagements" / str(engagement_id) / "events.jsonl"
     flags = os.O_WRONLY | os.O_APPEND
     fd = os.open(path, flags)
     try:

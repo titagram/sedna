@@ -11,6 +11,7 @@ from types import MappingProxyType
 from uuid import UUID
 
 from sedna.engagement.events import (
+    CasePromotedPayload,
     ClosureCancelledPayload,
     ClosureRequestedPayload,
     DecisionRecordedPayload,
@@ -21,6 +22,13 @@ from sedna.engagement.events import (
     JournalEvent,
     LaneBoundPayload,
     LaneUnboundPayload,
+    PromotionAttemptTerminatedPayload,
+    PromotionCandidateReadyPayload,
+    PromotionIndexPendingPayload,
+    PromotionIndexRetryFailedPayload,
+    PromotionRequestedPayload,
+    PromotionSemanticCommittedPayload,
+    PromotionSourceCommittedPayload,
     ReportGeneratedPayload,
     ScopeChangedPayload,
     ToolCallCompletedPayload,
@@ -36,6 +44,9 @@ from sedna.engagement.models import (
     ExecutionLaneKey,
     JournalRevision,
     LaneBinding,
+    PromotionAttemptState,
+    PromotionPublicationLineage,
+    PromotionState,
     ScopeReference,
     scope_references,
 )
@@ -121,6 +132,14 @@ EVENT_LIFECYCLE_EFFECTS: Mapping[EventType, LifecycleEffect] = MappingProxyType(
         EventType.REPORT_GENERATED: LifecycleEffect.REPORT,
         EventType.ENGAGEMENT_CLOSED: LifecycleEffect.CLOSE,
         EventType.REPORT_COMMIT_ABANDONED: LifecycleEffect.BOOKKEEPING,
+        EventType.PROMOTION_REQUESTED: LifecycleEffect.BOOKKEEPING,
+        EventType.PROMOTION_CANDIDATE_READY: LifecycleEffect.BOOKKEEPING,
+        EventType.PROMOTION_SOURCE_COMMITTED: LifecycleEffect.BOOKKEEPING,
+        EventType.PROMOTION_SEMANTIC_COMMITTED: LifecycleEffect.BOOKKEEPING,
+        EventType.PROMOTION_INDEX_PENDING: LifecycleEffect.BOOKKEEPING,
+        EventType.PROMOTION_INDEX_RETRY_FAILED: LifecycleEffect.BOOKKEEPING,
+        EventType.CASE_PROMOTED: LifecycleEffect.BOOKKEEPING,
+        EventType.PROMOTION_ATTEMPT_TERMINATED: LifecycleEffect.BOOKKEEPING,
     }
 )
 
@@ -152,6 +171,18 @@ ACTIVE_PLANNING_EVENT_TYPES = frozenset(
     }
 )
 PLANNING_EVENT_TYPES = SETTLEMENT_BOOKKEEPING_EVENT_TYPES | ACTIVE_PLANNING_EVENT_TYPES
+PROMOTION_EVENT_TYPES = frozenset(
+    {
+        EventType.PROMOTION_REQUESTED,
+        EventType.PROMOTION_CANDIDATE_READY,
+        EventType.PROMOTION_SOURCE_COMMITTED,
+        EventType.PROMOTION_SEMANTIC_COMMITTED,
+        EventType.PROMOTION_INDEX_PENDING,
+        EventType.PROMOTION_INDEX_RETRY_FAILED,
+        EventType.CASE_PROMOTED,
+        EventType.PROMOTION_ATTEMPT_TERMINATED,
+    }
+)
 
 
 RESUMABLE_STATUSES = frozenset(
@@ -202,6 +233,7 @@ _ABANDONED_EFFECTS = frozenset(
 )
 _CLOSED_EFFECTS = frozenset(
     {
+        LifecycleEffect.BOOKKEEPING,
         LifecycleEffect.CONTROL_PLANE,
         LifecycleEffect.SETTLEMENT_BOOKKEEPING,
         LifecycleEffect.REOPEN,
@@ -284,6 +316,13 @@ class _Accumulator:
     reports: list[object] = field(default_factory=list)
     active_report: object | None = None
     pending_report: object | None = None
+    promotion_attempts: list[PromotionAttemptState] = field(default_factory=list)
+    promotion_attempt_count: int = 0
+    promotion_verification_event_id: UUID | None = None
+    promotion_attempt_ordinal: int = 0
+    promotion_folded_count: int = 0
+    promotion_folded_sha256: str | None = None
+    latest_successful_publication: PromotionPublicationLineage | None = None
     revision: JournalRevision = field(
         default_factory=lambda: JournalRevision(sequence=0, event_hash="0" * 64)
     )
@@ -364,6 +403,8 @@ class _Accumulator:
         }.get(item.type)
         if item.type in PLANNING_EVENT_TYPES:
             handler = self._apply_inert
+        if item.type in PROMOTION_EVENT_TYPES:
+            handler = self._apply_promotion
         if handler is None:
             raise EngagementReplayError(f"unsupported event type: {item.type.value}")
         handler(item)
@@ -399,6 +440,139 @@ class _Accumulator:
 
     def _apply_inert(self, item: JournalEvent) -> None:
         del item
+
+    def _active_promotion(self, item: JournalEvent) -> PromotionAttemptState:
+        if not self.promotion_attempts:
+            raise EngagementReplayError(f"{item.type.value} requires an active promotion")
+        attempt = self.promotion_attempts[-1]
+        if (
+            attempt.stage in {"promoted", "terminated"}
+            or attempt.attempt_id != getattr(item.payload, "attempt_id", None)
+            or attempt.promotion_revision != getattr(item.payload, "promotion_revision", None)
+        ):
+            raise EngagementReplayError(f"{item.type.value} does not match the active promotion")
+        return attempt
+
+    def _replace_promotion(self, attempt: PromotionAttemptState, **changes: object) -> None:
+        self.promotion_attempts[-1] = attempt.model_copy(update=changes)
+
+    def _fold_terminal_promotion(self, item: JournalEvent) -> None:
+        del item
+        if len(self.promotion_attempts) <= 64:
+            return
+        evicted = self.promotion_attempts.pop(0)
+        terminal_record = json.dumps(
+            evicted.model_dump(mode="json", warnings="error"),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        previous = (self.promotion_folded_sha256 or "").encode("ascii")
+        self.promotion_folded_sha256 = sha256(previous + b"\x00" + terminal_record).hexdigest()
+        self.promotion_folded_count += 1
+
+    def _apply_promotion(self, item: JournalEvent) -> None:
+        payload = item.payload
+        if isinstance(payload, PromotionRequestedPayload):
+            if self.promotion_attempts and self.promotion_attempts[-1].stage not in {
+                "promoted",
+                "terminated",
+            }:
+                raise EngagementReplayError("only one promotion attempt may be active")
+            expected_revision = self.promotion_attempt_count + 1
+            expected_ordinal = (
+                self.promotion_attempt_ordinal + 1
+                if payload.verification_event_id == self.promotion_verification_event_id
+                else 1
+            )
+            if (
+                payload.attempt_ordinal != expected_ordinal
+                or payload.promotion_revision != expected_revision
+            ):
+                raise EngagementReplayError("promotion ordinal and revision must increase exactly")
+            self.promotion_attempts.append(
+                PromotionAttemptState(
+                    attempt_id=payload.attempt_id,
+                    attempt_ordinal=payload.attempt_ordinal,
+                    promotion_revision=payload.promotion_revision,
+                    idempotency_key=payload.idempotency_key,
+                    verified_revision=payload.verified_revision,
+                    verification_event_id=payload.verification_event_id,
+                    claim_event_id=item.event_id,
+                    claim_expires_at=payload.claim_expires_at,
+                    stage="requested",
+                )
+            )
+            self.promotion_attempt_count = expected_revision
+            self.promotion_verification_event_id = payload.verification_event_id
+            self.promotion_attempt_ordinal = expected_ordinal
+            return
+
+        attempt = self._active_promotion(item)
+        if isinstance(payload, PromotionCandidateReadyPayload):
+            if attempt.stage != "requested":
+                raise EngagementReplayError("promotion candidate is out of order")
+            self._replace_promotion(
+                attempt,
+                stage="candidate_ready",
+                candidate_relative_path=payload.candidate_relative_path,
+                candidate_sha256=payload.candidate_sha256,
+                repair_count=payload.repair_count,
+            )
+        elif isinstance(payload, PromotionSourceCommittedPayload):
+            if attempt.stage != "candidate_ready":
+                raise EngagementReplayError("promotion source commit is out of order")
+            self._replace_promotion(attempt, stage="source_committed", source_id=payload.source_id)
+        elif isinstance(payload, PromotionSemanticCommittedPayload):
+            if attempt.stage != "source_committed" or payload.source_id != attempt.source_id:
+                raise EngagementReplayError("promotion semantic commit is out of order")
+            self._replace_promotion(
+                attempt, stage="semantic_committed", artifact_ids=payload.artifact_ids
+            )
+        elif isinstance(payload, PromotionIndexPendingPayload):
+            if attempt.stage != "semantic_committed" or payload.source_id != attempt.source_id:
+                raise EngagementReplayError("promotion index publication is out of order")
+            self._replace_promotion(attempt, stage="index_pending")
+        elif isinstance(payload, PromotionIndexRetryFailedPayload):
+            if attempt.stage not in {"index_pending", "retry_failed"}:
+                raise EngagementReplayError("promotion retry failure is out of order")
+            if payload.retry_count != attempt.index_retry_count + 1:
+                raise EngagementReplayError("promotion retry count must increase exactly")
+            self._replace_promotion(
+                attempt,
+                stage="retry_failed",
+                index_retry_count=payload.retry_count,
+                reason_code=payload.reason_code,
+            )
+        elif isinstance(payload, CasePromotedPayload):
+            if attempt.stage not in {"index_pending", "retry_failed"}:
+                raise EngagementReplayError("case promotion is out of order")
+            if payload.source_id != attempt.source_id:
+                raise EngagementReplayError("case promotion source does not match")
+            self._replace_promotion(
+                attempt,
+                stage="promoted",
+                case_ids=payload.case_ids,
+                disposition="promoted",
+            )
+            self.latest_successful_publication = PromotionPublicationLineage(
+                attempt_id=payload.attempt_id,
+                promotion_revision=payload.promotion_revision,
+                source_id=payload.source_id,
+                case_ids=payload.case_ids,
+            )
+            self._fold_terminal_promotion(item)
+        elif isinstance(payload, PromotionAttemptTerminatedPayload):
+            self._replace_promotion(
+                attempt,
+                stage="terminated",
+                disposition=payload.disposition,
+                reason_code=payload.reason_code,
+            )
+            self._fold_terminal_promotion(item)
+        else:
+            raise EngagementReplayError("invalid promotion payload")
 
     def _apply_lane_bound(self, item: JournalEvent) -> None:
         lane = self._lane(item)
@@ -592,6 +766,11 @@ class _Accumulator:
             )
         )
         closure_ready = self.closure_ready
+        active_promotion = None
+        terminal_promotions = tuple(self.promotion_attempts)
+        if terminal_promotions and terminal_promotions[-1].disposition is None:
+            active_promotion = terminal_promotions[-1]
+            terminal_promotions = terminal_promotions[:-1]
         return EngagementState(
             revision=self.revision,
             status=self.status,
@@ -603,6 +782,13 @@ class _Accumulator:
             closure_ready=closure_ready,
             reports=tuple(self.reports),
             active_report=self.active_report,
+            promotion=PromotionState(
+                active_attempt=active_promotion,
+                recent_terminal_attempts=terminal_promotions,
+                folded_terminal_count=self.promotion_folded_count,
+                folded_terminal_sha256=self.promotion_folded_sha256,
+                latest_successful_publication=self.latest_successful_publication,
+            ),
         )
 
 

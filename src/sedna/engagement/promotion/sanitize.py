@@ -109,6 +109,12 @@ def assert_promotion_safe(value: object, inventory: PromotionSecretInventory) ->
         raise ValueError("promotion material contains raw flag")
 
 
+def assert_semantic_promotion_safe(value: object, inventory: PromotionSecretInventory) -> None:
+    """Apply the final recursive leak scan to the complete semantic boundary."""
+
+    assert_promotion_safe(value, inventory)
+
+
 def symbolize_text(value: str, inventory: PromotionSecretInventory) -> str:
     safe = value
     replacements = _replacement_table(inventory)

@@ -183,9 +183,7 @@ class SourceRegistrySnapshot(BaseModel):
 
     content_sha256: Sha256Hex
     byte_size: StrictInt = Field(ge=0, le=MAX_SOURCE_REGISTRY_BYTES)
-    entries: tuple[SharedSourceEntry, ...] = Field(
-        max_length=MAX_SOURCE_REGISTRY_ENTRIES
-    )
+    entries: tuple[SharedSourceEntry, ...] = Field(max_length=MAX_SOURCE_REGISTRY_ENTRIES)
 
 
 class PlannerSourceSnapshot(BaseModel):
@@ -227,10 +225,7 @@ class SharedSourceRegistry:
         try:
             fd = os.open(
                 "sources.md",
-                os.O_RDONLY
-                | os.O_NONBLOCK
-                | os.O_NOFOLLOW
-                | getattr(os, "O_CLOEXEC", 0),
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
                 dir_fd=self._root_fd,
             )
         except FileNotFoundError:
@@ -525,11 +520,7 @@ def _replace_registry(root_fd: int, content: bytes) -> None:
     temporary = f".sources.md.tmp-{os.urandom(8).hex()}"
     fd = os.open(
         temporary,
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | os.O_NOFOLLOW
-        | getattr(os, "O_CLOEXEC", 0),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
         0o600,
         dir_fd=root_fd,
     )

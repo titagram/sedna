@@ -16,6 +16,7 @@ from pathlib import Path
 from threading import Event
 from typing import Any
 from urllib.parse import unquote
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
@@ -26,7 +27,11 @@ from sedna.knowledge import SemanticIngestionService as PublicSemanticService
 from sedna.knowledge.inventory import discover_sources
 from sedna.knowledge.parsing import PreparedSource
 from sedna.knowledge.repository import CanonicalKnowledgeRepository
-from sedna.knowledge.semantic import SemanticCompiler, SemanticIngestionService
+from sedna.knowledge.schema import AssetRef
+from sedna.knowledge.semantic import (
+    SemanticCompiler,
+    SemanticIngestionService,
+)
 from sedna.knowledge.semantic.llm import HadesLlmAdapter
 
 FIXTURES = Path(__file__).parent / "fixtures" / "semantic"
@@ -216,6 +221,43 @@ def _prepared_case(
 
 def _purposes(host: _ScriptedHost) -> list[str]:
     return [str(call["purpose"]) for call in host.calls]
+
+
+def _journal_promotion_prepared(
+    repository: CanonicalKnowledgeRepository,
+    prepared: PreparedSource,
+) -> PreparedSource:
+    engagement_id = "11111111-1111-4111-8111-111111111111"
+    source_id = f"source-{uuid5(NAMESPACE_URL, f'sedna:journal-promotion:{engagement_id}')}"
+    relative_path = f"engagements/{engagement_id}/promotion/sources/promotion-v1.md"
+    source_bytes = SOURCE_CASES["reference"].markdown.encode()
+    physical = repository.root / relative_path
+    physical.parent.mkdir(parents=True)
+    physical.write_bytes(source_bytes)
+    provenance_path = relative_path.removesuffix(".md") + ".provenance.json"
+    provenance_bytes = b'{"schema_version":"test"}'
+    (repository.root / provenance_path).write_bytes(provenance_bytes)
+    manifest = prepared.manifest.model_copy(
+        update={
+            "source_id": source_id,
+            "source_namespace": "journal-promotion",
+            "path": relative_path,
+            "sha256": hashlib.sha256(source_bytes).hexdigest(),
+            "assets": (
+                AssetRef(
+                    path=provenance_path,
+                    sha256=hashlib.sha256(provenance_bytes).hexdigest(),
+                ),
+            ),
+        }
+    )
+    return PreparedSource(
+        manifest=manifest,
+        document=prepared.document.model_copy(
+            update={"source_id": source_id, "path": relative_path}
+        ),
+        segments=prepared.segments,
+    )
 
 
 def _recursively_decode(value: str) -> str:

@@ -1003,12 +1003,15 @@ def test_source_projection_digest_changes_when_example_states_change() -> None:
         execution_example_schema_version="1",
     )
     assert first.projection_digest != second.projection_digest
-    assert source_projection_digest(
-        "source-a",
-        "b" * 64,
-        "canonical-projection-v3",
-        (artifact,),
-        execution_examples=first.execution_examples,
-        semantic_schema_version="2.5.0",
-        execution_example_schema_version="1",
-    ) == first.projection_digest
+    assert (
+        source_projection_digest(
+            "source-a",
+            "b" * 64,
+            "canonical-projection-v3",
+            (artifact,),
+            execution_examples=first.execution_examples,
+            semantic_schema_version="2.5.0",
+            execution_example_schema_version="1",
+        )
+        == first.projection_digest
+    )

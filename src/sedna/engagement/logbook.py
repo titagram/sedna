@@ -156,17 +156,14 @@ def render_session_logbook(
     sections.append(f"- Engagement: {_scalar(manifest.display_name)}")
     sections.append(f"- Objective: {_scalar(manifest.initial_objective)}")
     scope_values = " ".join(
-        f"{reference.kind}={_scalar(reference.value)}"
-        for reference in state.scope_references
+        f"{reference.kind}={_scalar(reference.value)}" for reference in state.scope_references
     )
     sections.append(f"- Scope: {_scalar(scope_values)}")
     sections.append(
         f"- Revision: {_scalar(state.revision.sequence)}/{_scalar(state.revision.event_hash[:12])}"
     )
     if state.bound_lanes:
-        bound = ", ".join(
-            _scalar(binding.lane.stable_key) for binding in state.bound_lanes
-        )
+        bound = ", ".join(_scalar(binding.lane.stable_key) for binding in state.bound_lanes)
         sections.append(f"- Bound lanes: {bound}")
     if state.in_flight_call_ids:
         inflight = ", ".join(_scalar(item) for item in state.in_flight_call_ids)
@@ -222,8 +219,7 @@ def render_session_logbook(
                         text = None
                     if text is not None and "\x00" not in text:
                         timeline.append(
-                            f"- Evidence {_code_span(reference.evidence_id[:16])}: "
-                            f"{_inline(text)}"
+                            f"- Evidence {_code_span(reference.evidence_id[:16])}: {_inline(text)}"
                         )
                         inline_total += reference.size
                         continue
@@ -246,9 +242,7 @@ def render_session_logbook(
             )
             continue
         if kind == "recovery_warning":
-            timeline.append(
-                f"- Recovery warning: {_code_span(payload.reason_code)}"
-            )
+            timeline.append(f"- Recovery warning: {_code_span(payload.reason_code)}")
             continue
         if kind in {
             "engagement_opened",
@@ -281,33 +275,20 @@ def render_session_logbook(
     return rendered
 
 
-def logbook_filename(
-    events: Sequence[JournalEvent], display_name: str, session_id: str
-) -> str:
+def logbook_filename(events: Sequence[JournalEvent], display_name: str, session_id: str) -> str:
     """Deterministic YYYYMMDD-HHMMSSffffff-<slug>-<session-digest>.md name."""
-    return (
-        f"{_logbook_timestamp(events)}-{_slug(display_name)}-"
-        f"{_session_digest(session_id)}.md"
-    )
+    return f"{_logbook_timestamp(events)}-{_slug(display_name)}-{_session_digest(session_id)}.md"
 
 
-def rebuild_session_logbooks(
-    repository: Any, engagement_id: UUID
-) -> tuple[Path, ...]:
+def rebuild_session_logbooks(repository: Any, engagement_id: UUID) -> tuple[Path, ...]:
     """Render and atomically publish one logbook per session at the journal head."""
     engagement_fd = repository._engagement_fd(engagement_id)
-    engagement_path = (
-        repository._knowledge_root / "engagements" / str(engagement_id)
-    )
+    engagement_path = repository._knowledge_root / "engagements" / str(engagement_id)
     try:
         for _ in range(MAX_LOGBOOK_REBUILD_RETRIES):
             snapshot = repository.load_snapshot(engagement_id)
             session_ids = sorted(
-                {
-                    event.lane.session_id
-                    for event in snapshot.events
-                    if event.lane is not None
-                }
+                {event.lane.session_id for event in snapshot.events if event.lane is not None}
             )
             reader = RepositoryEvidenceReader(repository, engagement_id)
             rendered_by_session = {
@@ -342,9 +323,7 @@ def rebuild_session_logbooks(
     raise LogbookProjectionConflict(code="logbook_rebuild_conflict")
 
 
-def _publish_logbook(
-    engagement_fd: int, engagement_path: Path, name: str, rendered: str
-) -> Path:
+def _publish_logbook(engagement_fd: int, engagement_path: Path, name: str, rendered: str) -> Path:
     if not _LOGBOOK_NAME.fullmatch(name):
         raise JournalUnavailableError("logbook name is not confined")
     data = rendered.encode("utf-8")
@@ -356,11 +335,7 @@ def _publish_logbook(
             temporary = f".logbook-{uuid4()}.tmp"
             fd = os.open(
                 temporary,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | os.O_NOFOLLOW
-                | getattr(os, "O_CLOEXEC", 0),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
                 0o600,
                 dir_fd=evidence_fd,
             )

@@ -12,7 +12,7 @@ import stat
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal
@@ -21,11 +21,20 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from sedna.engagement.events import (
+    CasePromotedPayload,
+    EventType,
     EvidenceAttachedPayload,
     JournalEvent,
     JournalEventDraft,
     LaneBoundPayload,
     LaneUnboundPayload,
+    PromotionAttemptTerminatedPayload,
+    PromotionCandidateReadyPayload,
+    PromotionIndexPendingPayload,
+    PromotionIndexRetryFailedPayload,
+    PromotionRequestedPayload,
+    PromotionSemanticCommittedPayload,
+    PromotionSourceCommittedPayload,
     RecoveryWarningPayload,
     SystemCorrelation,
 )
@@ -74,6 +83,11 @@ PROJECTION_OWNERS = {
 }
 
 STRATEGY_ARCHIVE_NAME = "strategy-archive.jsonl"
+MAX_PROMOTION_SOURCE_FILE_BYTES = 96 * 1024
+MAX_PROMOTION_PROVENANCE_FILE_BYTES = 64 * 1024
+MAX_PROMOTION_SOURCE_INTENT_BYTES = 256 * 1024
+MAX_PROMOTION_CANDIDATE_FILE_BYTES = 512 * 1024
+MAX_PROMOTION_CANDIDATE_INTENT_BYTES = 8 * 1024
 
 
 class RevisionConflictError(ValueError):
@@ -812,6 +826,92 @@ class _ReportCommitCapability:
         )
 
 
+@dataclass(frozen=True)
+class _PromotionSourceWriteResult:
+    event: JournalEvent
+    revision: JournalRevision
+    created: bool
+
+
+@dataclass(frozen=True)
+class _PromotionClaimWriteResult:
+    event: JournalEvent | None
+    attempt: Any | None
+    revision: JournalRevision
+    disposition: Literal["created", "resumed", "existing", "retry_exhausted"]
+
+
+class _PromotionJournalWriter:
+    """Repository-issued, data-only authority for promotion journal transactions."""
+
+    def __init__(self, repository: Any, token: object) -> None:
+        if token is not repository._promotion_capability_token:
+            raise ValueError("invalid promotion capability token")
+        self._repository = repository
+        self._token = token
+        self._holder_token = object()
+
+    def _require_holder(self) -> None:
+        if self._token is not self._repository._promotion_capability_token:
+            raise ValueError("invalid promotion capability holder")
+
+    def commit_source(self, engagement_id, **values):
+        self._require_holder()
+        return self._repository._commit_promotion_source(engagement_id, **values)
+
+    def claim(self, engagement_id, **values):
+        self._require_holder()
+        return self._repository._claim_promotion(
+            engagement_id,
+            holder_token=self._holder_token,
+            **values,
+        )
+
+    def commit_candidate(self, engagement_id, **values):
+        self._require_holder()
+        return self._repository._commit_promotion_candidate(engagement_id, **values)
+
+    def load_candidate(self, engagement_id, **values):
+        self._require_holder()
+        return self._repository._load_promotion_candidate(engagement_id, **values)
+
+    def terminate(self, engagement_id, **values):
+        self._require_holder()
+        return self._repository._terminate_promotion(
+            engagement_id,
+            holder_token=self._holder_token,
+            **values,
+        )
+
+    def commit_semantic(self, engagement_id, **values):
+        self._require_holder()
+        return self._repository._commit_promotion_semantic(engagement_id, **values)
+
+    def commit_index_pending(self, engagement_id, **values):
+        self._require_holder()
+        return self._repository._commit_promotion_index_pending(engagement_id, **values)
+
+    def commit_index_retry(self, engagement_id, **values):
+        self._require_holder()
+        return self._repository._commit_promotion_index_retry(engagement_id, **values)
+
+    def commit_promoted(self, engagement_id, **values):
+        self._require_holder()
+        return self._repository._commit_promoted_case(engagement_id, **values)
+
+    def load_snapshot(self, engagement_id):
+        self._require_holder()
+        return self._repository.load_snapshot(engagement_id)
+
+    def authenticate_claim(self, engagement_id, **values):
+        self._require_holder()
+        return self._repository._authenticate_promotion_claim_holder(
+            engagement_id,
+            holder_token=self._holder_token,
+            **values,
+        )
+
+
 class EngagementJournalRepository:
     """Append-only engagement repository rooted in retained POSIX descriptors."""
 
@@ -837,6 +937,9 @@ class EngagementJournalRepository:
         self._uuid_factory = uuid_factory or uuid4
         self._closed = False
         self._report_capability_token = object()
+        self._promotion_capability_token = object()
+        self._owned_promotion_attempt_ids: set[UUID] = set()
+        self._promotion_claim_holders: dict[UUID, tuple[UUID, object, int]] = {}
         self._root_fd = self._open_absolute_root(raw)
         try:
             _validate_directory(self._root_fd, label="knowledge root", expected_mode=0o700)
@@ -893,6 +996,12 @@ class EngagementJournalRepository:
         if self._closed:
             return
         self._closed = True
+        for _, _, lock_fd in self._promotion_claim_holders.values():
+            with suppress(OSError):
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            with suppress(OSError):
+                os.close(lock_fd)
+        self._promotion_claim_holders.clear()
         os.close(self._engagements_fd)
         os.close(self._root_fd)
 
@@ -1568,6 +1677,14 @@ class EngagementJournalRepository:
             "report_generated",
             "engagement_closed",
             "report_commit_abandoned",
+            "promotion_requested",
+            "promotion_candidate_ready",
+            "promotion_source_committed",
+            "promotion_semantic_committed",
+            "promotion_index_pending",
+            "promotion_index_retry_failed",
+            "case_promoted",
+            "promotion_attempt_terminated",
         }
         if any(draft.type in repository_owned for draft in drafts):
             raise EngagementAppendAuthorityError(
@@ -1582,6 +1699,872 @@ class EngagementJournalRepository:
 
     def _issue_report_commit_capability(self) -> _ReportCommitCapability:
         return _ReportCommitCapability(self, self._report_capability_token)
+
+    def _issue_promotion_journal_writer(self) -> _PromotionJournalWriter:
+        return _PromotionJournalWriter(self, self._promotion_capability_token)
+
+    def _require_active_promotion_claim(
+        self,
+        state: Any,
+        *,
+        attempt_id: UUID,
+        promotion_revision: int,
+        claim_event_id: UUID | None = None,
+    ) -> Any:
+        active = state.promotion.active_attempt
+        if (
+            active is None
+            or active.attempt_id != attempt_id
+            or active.promotion_revision != promotion_revision
+            or (claim_event_id is not None and active.claim_event_id != claim_event_id)
+        ):
+            raise ValueError("promotion transition does not match the active claim")
+        if active.claim_expires_at is None or self._clock() >= active.claim_expires_at:
+            raise ValueError("promotion claim has expired")
+        return active
+
+    def _commit_promotion_candidate(
+        self,
+        engagement_id: UUID,
+        *,
+        attempt_id: UUID,
+        promotion_revision: int,
+        candidate_bytes: bytes,
+        candidate_sha256: str,
+        repair_count: int,
+        expected_revision: JournalRevision,
+    ) -> _PromotionSourceWriteResult:
+        """Bind one canonical candidate artifact and journal event under the journal lock."""
+
+        if (
+            type(promotion_revision) is not int
+            or promotion_revision < 1
+            or type(repair_count) is not int
+            or repair_count not in {0, 1}
+        ):
+            raise ValueError("invalid promotion candidate identity")
+        if (
+            not isinstance(candidate_bytes, bytes)
+            or not candidate_bytes
+            or len(candidate_bytes) > MAX_PROMOTION_CANDIDATE_FILE_BYTES
+            or sha256(candidate_bytes).hexdigest() != candidate_sha256
+        ):
+            raise ValueError("invalid promotion candidate artifact")
+        name = f"{attempt_id}.json"
+        relative_path = f"engagements/{engagement_id}/promotion/candidates/{name}"
+        intent = _canonical_json(
+            {
+                "attempt_id": str(attempt_id),
+                "candidate_sha256": candidate_sha256,
+                "expected_revision": expected_revision.model_dump(mode="json"),
+                "promotion_revision": promotion_revision,
+                "repair_count": repair_count,
+            }
+        )
+        if len(intent) > MAX_PROMOTION_CANDIDATE_INTENT_BYTES:
+            raise ValueError("promotion candidate intent exceeds its byte bound")
+
+        self._complete_tail_recovery(engagement_id)
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            with _locked_file(engagement_fd, ".journal.lock"):
+                self._recover_pending_append(engagement_fd, engagement_id)
+                manifest, existing, head, journal_bytes = self._load_authoritative_locked(
+                    engagement_fd, engagement_id, allow_tail=False
+                )
+                state = reduce_engagement(manifest, existing)
+                active = self._require_active_promotion_claim(
+                    state,
+                    attempt_id=attempt_id,
+                    promotion_revision=promotion_revision,
+                )
+                matching = tuple(
+                    item
+                    for item in existing
+                    if isinstance(item.payload, PromotionCandidateReadyPayload)
+                    and item.payload.attempt_id == attempt_id
+                )
+                if len(matching) > 1:
+                    raise JournalUnavailableError("duplicate promotion candidate events")
+                with suppress(FileExistsError):
+                    os.mkdir("promotion", 0o700, dir_fd=engagement_fd)
+                promotion_fd = os.open("promotion", _directory_flags(), dir_fd=engagement_fd)
+                try:
+                    _validate_directory(
+                        promotion_fd, label="promotion directory", expected_mode=0o700
+                    )
+                    with suppress(FileExistsError):
+                        os.mkdir("candidates", 0o700, dir_fd=promotion_fd)
+                    candidates_fd = os.open("candidates", _directory_flags(), dir_fd=promotion_fd)
+                    try:
+                        _validate_directory(
+                            candidates_fd,
+                            label="promotion candidates directory",
+                            expected_mode=0o700,
+                        )
+                        if matching:
+                            payload = matching[0].payload
+                            assert isinstance(payload, PromotionCandidateReadyPayload)
+                            if (
+                                payload.promotion_revision != promotion_revision
+                                or payload.candidate_relative_path != relative_path
+                                or payload.candidate_sha256 != candidate_sha256
+                                or payload.repair_count != repair_count
+                                or _read_bounded(
+                                    candidates_fd,
+                                    name,
+                                    MAX_PROMOTION_CANDIDATE_FILE_BYTES,
+                                    "promotion candidate",
+                                )
+                                != candidate_bytes
+                            ):
+                                raise JournalUnavailableError("conflicting promotion candidate")
+                            with suppress(FileNotFoundError):
+                                os.unlink(".candidate-transaction.json", dir_fd=candidates_fd)
+                                os.fsync(candidates_fd)
+                            return _PromotionSourceWriteResult(
+                                event=matching[0], revision=head.revision, created=False
+                            )
+                        if head.revision != expected_revision:
+                            raise RevisionConflictError("expected revision is stale")
+                        if active.stage != "requested":
+                            raise ValueError("promotion candidate does not match the active claim")
+                        try:
+                            retained = _read_bounded(
+                                candidates_fd,
+                                ".candidate-transaction.json",
+                                MAX_PROMOTION_CANDIDATE_INTENT_BYTES,
+                                "promotion candidate transaction",
+                            )
+                        except JournalUnavailableError as exc:
+                            if not _missing_file(exc):
+                                raise
+                            _atomic_write(candidates_fd, ".candidate-transaction.json", intent)
+                        else:
+                            if retained != intent:
+                                raise JournalUnavailableError(
+                                    "conflicting promotion candidate transaction"
+                                )
+                        self._fault("promotion_candidate_after_intent")
+                        try:
+                            current = _read_bounded(
+                                candidates_fd,
+                                name,
+                                MAX_PROMOTION_CANDIDATE_FILE_BYTES,
+                                "promotion candidate",
+                            )
+                        except JournalUnavailableError as exc:
+                            if not _missing_file(exc):
+                                raise
+                            _atomic_write(candidates_fd, name, candidate_bytes)
+                        else:
+                            if current != candidate_bytes:
+                                raise JournalUnavailableError(
+                                    "immutable promotion candidate conflicts"
+                                )
+                        self._fault("promotion_candidate_after_artifact")
+                        draft = JournalEventDraft(
+                            actor="system",
+                            type=EventType.PROMOTION_CANDIDATE_READY,
+                            payload=PromotionCandidateReadyPayload(
+                                attempt_id=attempt_id,
+                                promotion_revision=promotion_revision,
+                                candidate_relative_path=relative_path,
+                                candidate_sha256=candidate_sha256,
+                                repair_count=repair_count,
+                            ),
+                            system_correlation=SystemCorrelation(
+                                source="promotion",
+                                operation_id=uuid5(
+                                    NAMESPACE_URL,
+                                    f"sedna:promotion-candidate:{engagement_id}:{attempt_id}",
+                                ),
+                            ),
+                        )
+                        self._fault("promotion_candidate_before_event_append")
+                        appended = self._append_locked(
+                            engagement_fd,
+                            manifest,
+                            existing,
+                            head,
+                            journal_bytes,
+                            (draft,),
+                        )
+                        self._fault("promotion_candidate_after_event_append")
+                        os.unlink(".candidate-transaction.json", dir_fd=candidates_fd)
+                        os.fsync(candidates_fd)
+                        return _PromotionSourceWriteResult(
+                            event=appended.events[0],
+                            revision=appended.revision,
+                            created=True,
+                        )
+                    finally:
+                        os.close(candidates_fd)
+                finally:
+                    os.close(promotion_fd)
+        finally:
+            os.close(engagement_fd)
+
+    def _load_promotion_candidate(
+        self,
+        engagement_id: UUID,
+        *,
+        attempt_id: UUID,
+        claim_event_id: UUID,
+    ) -> bytes:
+        """Descriptor-confined recovery of the candidate bound to the active claim."""
+
+        self._complete_tail_recovery(engagement_id)
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            with _locked_file(engagement_fd, ".journal.lock"):
+                self._recover_pending_append(engagement_fd, engagement_id)
+                manifest, existing, _head, _journal_bytes = self._load_authoritative_locked(
+                    engagement_fd, engagement_id, allow_tail=False
+                )
+                state = reduce_engagement(manifest, existing)
+                active = state.promotion.active_attempt
+                if (
+                    active is None
+                    or active.attempt_id != attempt_id
+                    or active.claim_event_id != claim_event_id
+                    or active.stage == "requested"
+                    or active.candidate_relative_path is None
+                    or active.candidate_sha256 is None
+                ):
+                    raise ValueError("promotion candidate is not bound to the active claim")
+                expected_path = (
+                    f"engagements/{engagement_id}/promotion/candidates/{attempt_id}.json"
+                )
+                if active.candidate_relative_path != expected_path:
+                    raise JournalUnavailableError("promotion candidate path is not canonical")
+                promotion_fd = os.open("promotion", _directory_flags(), dir_fd=engagement_fd)
+                try:
+                    candidates_fd = os.open("candidates", _directory_flags(), dir_fd=promotion_fd)
+                    try:
+                        candidate = _read_bounded(
+                            candidates_fd,
+                            f"{attempt_id}.json",
+                            MAX_PROMOTION_CANDIDATE_FILE_BYTES,
+                            "promotion candidate",
+                        )
+                    finally:
+                        os.close(candidates_fd)
+                finally:
+                    os.close(promotion_fd)
+                if sha256(candidate).hexdigest() != active.candidate_sha256:
+                    raise JournalUnavailableError("promotion candidate digest does not match")
+                return candidate
+        finally:
+            os.close(engagement_fd)
+
+    def _acquire_promotion_claim_holder(
+        self,
+        engagement_fd: int,
+        engagement_id: UUID,
+        attempt_id: UUID,
+        holder_token: object,
+    ) -> bool:
+        retained = self._promotion_claim_holders.get(engagement_id)
+        if retained is not None:
+            retained_attempt, retained_token, _ = retained
+            return retained_attempt == attempt_id and retained_token is holder_token
+        lock_fd = os.open(
+            ".promotion-claim.lock",
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=engagement_fd,
+        )
+        try:
+            _validate_regular(lock_fd, label="promotion claim lock", expected_mode=0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(lock_fd)
+            return False
+        except Exception:
+            os.close(lock_fd)
+            raise
+        self._promotion_claim_holders[engagement_id] = (attempt_id, holder_token, lock_fd)
+        return True
+
+    def _release_promotion_claim_holder(
+        self,
+        engagement_id: UUID,
+        attempt_id: UUID,
+        holder_token: object,
+    ) -> None:
+        retained = self._promotion_claim_holders.get(engagement_id)
+        if retained is None or retained[0] != attempt_id or retained[1] is not holder_token:
+            return
+        _, _, lock_fd = self._promotion_claim_holders.pop(engagement_id)
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+    def _authenticate_promotion_claim_holder(
+        self,
+        engagement_id: UUID,
+        *,
+        attempt_id: UUID,
+        claim_event_id: UUID,
+        expected_stages: set[str],
+        holder_token: object,
+    ) -> tuple[Any, JournalRevision]:
+        retained = self._promotion_claim_holders.get(engagement_id)
+        if retained is None or retained[0] != attempt_id or retained[1] is not holder_token:
+            raise ValueError("promotion claim holder no longer owns the persisted lease")
+        snapshot = self.load_snapshot(engagement_id)
+        active = snapshot.state.promotion.active_attempt
+        if (
+            active is None
+            or active.attempt_id != attempt_id
+            or active.claim_event_id != claim_event_id
+            or active.stage not in expected_stages
+        ):
+            raise ValueError("promotion publication fence no longer matches the owned attempt")
+        if active.claim_expires_at is None or self._clock() >= active.claim_expires_at:
+            raise ValueError("promotion claim has expired")
+        return active, snapshot.revision
+
+    def _claim_promotion(
+        self,
+        engagement_id: UUID,
+        *,
+        holder_token: object,
+        request: Mapping[str, Any],
+        expected_revision: JournalRevision,
+    ) -> _PromotionClaimWriteResult:
+        """Atomically coalesce or create one repository-authored promotion claim."""
+
+        required = {
+            "verified_revision",
+            "verification_event_id",
+            "compiler_version",
+            "extractor_prompt_version",
+            "critic_prompt_version",
+            "repair_prompt_version",
+            "renderer_version",
+            "semantic_compiler_version",
+            "semantic_prompt_versions",
+        }
+        if set(request) != required:
+            raise ValueError("promotion claim request has an invalid shape")
+        canonical_request = _canonical_json(dict(request))
+        verified_revision = JournalRevision.model_validate(request["verified_revision"])
+        verification_event_id = UUID(str(request["verification_event_id"]))
+
+        self._complete_tail_recovery(engagement_id)
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            with _locked_file(engagement_fd, ".journal.lock"):
+                self._recover_pending_append(engagement_fd, engagement_id)
+                manifest, existing, head, journal_bytes = self._load_authoritative_locked(
+                    engagement_fd, engagement_id, allow_tail=False
+                )
+                state = reduce_engagement(manifest, existing)
+                active = state.promotion.active_attempt
+                if active is not None:
+                    event = next(
+                        item
+                        for item in existing
+                        if isinstance(item.payload, PromotionRequestedPayload)
+                        and item.payload.attempt_id == active.attempt_id
+                    )
+                    payload = event.payload
+                    bound_request = {
+                        key: value
+                        for key, value in payload.model_dump(mode="json", warnings="error").items()
+                        if key in required
+                    }
+                    # A matching retry is an idempotent observation, never a lease transfer.
+                    if _canonical_json(bound_request) == canonical_request:
+                        if (
+                            active.claim_expires_at is None
+                            or self._clock() >= active.claim_expires_at
+                        ):
+                            raise ValueError("promotion claim has expired")
+                        disposition = "existing"
+                        if self._acquire_promotion_claim_holder(
+                            engagement_fd,
+                            engagement_id,
+                            active.attempt_id,
+                            holder_token,
+                        ):
+                            self._owned_promotion_attempt_ids.add(active.attempt_id)
+                            disposition = "resumed"
+                        return _PromotionClaimWriteResult(
+                            event=event,
+                            attempt=active,
+                            revision=head.revision,
+                            disposition=disposition,
+                        )
+                    return _PromotionClaimWriteResult(
+                        event=event,
+                        attempt=active,
+                        revision=head.revision,
+                        disposition="existing",
+                    )
+
+                if head.revision != expected_revision:
+                    raise RevisionConflictError("expected revision is stale")
+                if state.status.value != "closed_verified":
+                    raise ValueError("promotion claim requires a closed verified engagement")
+                verified_event = next(
+                    (item for item in existing if item.event_id == verification_event_id), None
+                )
+                if (
+                    verified_event is None
+                    or verified_event.type != "engagement_verified"
+                    or JournalRevision(
+                        sequence=verified_event.sequence,
+                        event_hash=verified_event.event_hash,
+                    )
+                    != verified_revision
+                ):
+                    raise ValueError("promotion claim does not match the verified revision")
+
+                requested = tuple(
+                    item for item in existing if isinstance(item.payload, PromotionRequestedPayload)
+                )
+                claims = {
+                    item.payload.attempt_id: item.payload
+                    for item in requested
+                    if isinstance(item.payload, PromotionRequestedPayload)
+                }
+                terminal_count = sum(
+                    1
+                    for item in existing
+                    if isinstance(item.payload, PromotionAttemptTerminatedPayload)
+                    and item.payload.attempt_id in claims
+                    and claims[item.payload.attempt_id].verification_event_id
+                    == verification_event_id
+                )
+                if terminal_count >= 3:
+                    return _PromotionClaimWriteResult(
+                        event=None,
+                        attempt=None,
+                        revision=head.revision,
+                        disposition="retry_exhausted",
+                    )
+
+                attempt_id = self._uuid_factory()
+                attempt_ordinal = terminal_count + 1
+                idempotency_identity = {
+                    "engagement_id": str(engagement_id),
+                    "attempt_ordinal": attempt_ordinal,
+                    "verified_revision": verified_revision.model_dump(
+                        mode="json", warnings="error"
+                    ),
+                    "verification_event_id": str(verification_event_id),
+                    "compiler_version": request["compiler_version"],
+                    "extractor_prompt_version": request["extractor_prompt_version"],
+                    "critic_prompt_version": request["critic_prompt_version"],
+                    "repair_prompt_version": request["repair_prompt_version"],
+                    "renderer_version": request["renderer_version"],
+                    "semantic_compiler_version": request["semantic_compiler_version"],
+                    "semantic_prompt_versions": request["semantic_prompt_versions"],
+                }
+                payload = PromotionRequestedPayload(
+                    attempt_id=attempt_id,
+                    attempt_ordinal=attempt_ordinal,
+                    promotion_revision=len(requested) + 1,
+                    idempotency_key=sha256(_canonical_json(idempotency_identity)).hexdigest(),
+                    verified_revision=verified_revision,
+                    verification_event_id=verification_event_id,
+                    compiler_version=request["compiler_version"],
+                    extractor_prompt_version=request["extractor_prompt_version"],
+                    critic_prompt_version=request["critic_prompt_version"],
+                    repair_prompt_version=request["repair_prompt_version"],
+                    renderer_version=request["renderer_version"],
+                    semantic_compiler_version=request["semantic_compiler_version"],
+                    semantic_prompt_versions=tuple(request["semantic_prompt_versions"]),
+                    claim_expires_at=self._clock() + timedelta(minutes=5),
+                )
+                draft = JournalEventDraft(
+                    actor="system",
+                    type=EventType.PROMOTION_REQUESTED,
+                    payload=payload,
+                    system_correlation=SystemCorrelation(
+                        source="promotion",
+                        operation_id=uuid5(
+                            NAMESPACE_URL,
+                            f"sedna:promotion-claim:{engagement_id}:{attempt_id}",
+                        ),
+                    ),
+                )
+                appended = self._append_locked(
+                    engagement_fd,
+                    manifest,
+                    existing,
+                    head,
+                    journal_bytes,
+                    (draft,),
+                )
+                next_state = reduce_engagement(manifest, (*existing, *appended.events))
+                if not self._acquire_promotion_claim_holder(
+                    engagement_fd,
+                    engagement_id,
+                    attempt_id,
+                    holder_token,
+                ):
+                    raise JournalUnavailableError("new promotion claim holder lock is unavailable")
+                self._owned_promotion_attempt_ids.add(attempt_id)
+                return _PromotionClaimWriteResult(
+                    event=appended.events[0],
+                    attempt=next_state.promotion.active_attempt,
+                    revision=appended.revision,
+                    disposition="created",
+                )
+        finally:
+            os.close(engagement_fd)
+
+    def _commit_promotion_semantic(
+        self, engagement_id: UUID, *, expected_revision: JournalRevision, **values: Any
+    ) -> BatchAppendResult:
+        return self._append_promotion_event(
+            engagement_id,
+            PromotionSemanticCommittedPayload(**values),
+            expected_revision=expected_revision,
+        )
+
+    def _commit_promotion_index_pending(
+        self, engagement_id: UUID, *, expected_revision: JournalRevision, **values: Any
+    ) -> BatchAppendResult:
+        return self._append_promotion_event(
+            engagement_id,
+            PromotionIndexPendingPayload(**values),
+            expected_revision=expected_revision,
+        )
+
+    def _commit_promotion_index_retry(
+        self, engagement_id: UUID, *, expected_revision: JournalRevision, **values: Any
+    ) -> BatchAppendResult:
+        return self._append_promotion_event(
+            engagement_id,
+            PromotionIndexRetryFailedPayload(**values),
+            expected_revision=expected_revision,
+        )
+
+    def _commit_promoted_case(
+        self, engagement_id: UUID, *, expected_revision: JournalRevision, **values: Any
+    ) -> BatchAppendResult:
+        return self._append_promotion_event(
+            engagement_id,
+            CasePromotedPayload(**values),
+            expected_revision=expected_revision,
+        )
+
+    def _terminate_promotion(
+        self,
+        engagement_id: UUID,
+        *,
+        holder_token: object,
+        attempt_id: UUID,
+        promotion_revision: int,
+        disposition: Any,
+        reason_code: Any,
+        cleanup_source_id: str | None,
+        cleanup_canonical_revision: str | None,
+        claim_event_id: UUID,
+        expected_revision: JournalRevision,
+    ) -> BatchAppendResult:
+        payload = PromotionAttemptTerminatedPayload(
+            attempt_id=attempt_id,
+            promotion_revision=promotion_revision,
+            disposition=disposition,
+            reason_code=reason_code,
+            cleanup_source_id=cleanup_source_id,
+            cleanup_canonical_revision=cleanup_canonical_revision,
+        )
+        result = self._append_promotion_event(
+            engagement_id,
+            payload,
+            expected_revision=expected_revision,
+            claim_event_id=claim_event_id,
+        )
+        self._release_promotion_claim_holder(engagement_id, attempt_id, holder_token)
+        return result
+
+    def _commit_promotion_source(
+        self,
+        engagement_id: UUID,
+        *,
+        attempt_id: UUID,
+        source_id: str,
+        promotion_revision: int,
+        source_bytes: bytes,
+        source_sha256: str,
+        provenance_bytes: bytes,
+        provenance_sha256: str,
+        verified_revision: JournalRevision,
+        verification_event_id: UUID,
+        expected_revision: JournalRevision,
+    ) -> _PromotionSourceWriteResult:
+        """Atomically bind immutable promotion source bytes to one journal event."""
+
+        if type(promotion_revision) is not int or promotion_revision < 1:
+            raise ValueError("promotion revision must be a positive integer")
+        if not isinstance(source_bytes, bytes) or not isinstance(provenance_bytes, bytes):
+            raise TypeError("promotion source artifacts must be canonical bytes")
+        if (
+            not source_bytes
+            or len(source_bytes) > MAX_PROMOTION_SOURCE_FILE_BYTES
+            or not provenance_bytes
+            or len(provenance_bytes) > MAX_PROMOTION_PROVENANCE_FILE_BYTES
+        ):
+            raise ValueError("promotion source artifact exceeds its byte bound")
+        if (
+            sha256(source_bytes).hexdigest() != source_sha256
+            or sha256(provenance_bytes).hexdigest() != provenance_sha256
+        ):
+            raise ValueError("promotion source artifact digest mismatch")
+        source_name = f"promotion-v{promotion_revision}.md"
+        provenance_name = f"promotion-v{promotion_revision}.provenance.json"
+        prefix = f"engagements/{engagement_id}/promotion/sources"
+        source_relative_path = f"{prefix}/{source_name}"
+        provenance_relative_path = f"{prefix}/{provenance_name}"
+        intent = _canonical_json(
+            {
+                "attempt_id": str(attempt_id),
+                "engagement_id": str(engagement_id),
+                "expected_revision": expected_revision.model_dump(mode="json"),
+                "promotion_revision": promotion_revision,
+                "provenance_sha256": provenance_sha256,
+                "source_id": source_id,
+                "source_sha256": source_sha256,
+                "verification_event_id": str(verification_event_id),
+                "verified_revision": verified_revision.model_dump(mode="json"),
+            }
+        )
+        self._complete_tail_recovery(engagement_id)
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            with _locked_file(engagement_fd, ".journal.lock"):
+                self._recover_pending_append(engagement_fd, engagement_id)
+                manifest, existing, head, journal_bytes = self._load_authoritative_locked(
+                    engagement_fd, engagement_id, allow_tail=False
+                )
+                self._require_active_promotion_claim(
+                    reduce_engagement(manifest, existing),
+                    attempt_id=attempt_id,
+                    promotion_revision=promotion_revision,
+                )
+                matching = tuple(
+                    event
+                    for event in existing
+                    if isinstance(event.payload, PromotionSourceCommittedPayload)
+                    and event.payload.attempt_id == attempt_id
+                )
+                if len(matching) > 1:
+                    raise JournalUnavailableError("duplicate promotion source commit events")
+                with suppress(FileExistsError):
+                    os.mkdir("promotion", 0o700, dir_fd=engagement_fd)
+                promotion_fd = os.open("promotion", _directory_flags(), dir_fd=engagement_fd)
+                try:
+                    _validate_directory(
+                        promotion_fd, label="promotion directory", expected_mode=0o700
+                    )
+                    with suppress(FileExistsError):
+                        os.mkdir("sources", 0o700, dir_fd=promotion_fd)
+                    sources_fd = os.open("sources", _directory_flags(), dir_fd=promotion_fd)
+                    try:
+                        _validate_directory(
+                            sources_fd,
+                            label="promotion sources directory",
+                            expected_mode=0o700,
+                        )
+
+                        def require_artifacts() -> None:
+                            for name, expected, limit in (
+                                (source_name, source_bytes, MAX_PROMOTION_SOURCE_FILE_BYTES),
+                                (
+                                    provenance_name,
+                                    provenance_bytes,
+                                    MAX_PROMOTION_PROVENANCE_FILE_BYTES,
+                                ),
+                            ):
+                                actual = _read_bounded(sources_fd, name, limit, name)
+                                if actual != expected:
+                                    raise JournalUnavailableError(
+                                        "immutable promotion source artifact conflicts"
+                                    )
+
+                        if matching:
+                            payload = matching[0].payload
+                            assert isinstance(payload, PromotionSourceCommittedPayload)
+                            if (
+                                payload.source_id != source_id
+                                or payload.promotion_revision != promotion_revision
+                                or payload.source_relative_path != source_relative_path
+                                or payload.source_sha256 != source_sha256
+                                or payload.provenance_relative_path != provenance_relative_path
+                                or payload.provenance_sha256 != provenance_sha256
+                                or payload.verified_revision != verified_revision
+                                or payload.verification_event_id != verification_event_id
+                            ):
+                                raise JournalUnavailableError("conflicting promotion source commit")
+                            require_artifacts()
+                            with suppress(FileNotFoundError):
+                                os.unlink(".source-transaction.json", dir_fd=sources_fd)
+                                os.fsync(sources_fd)
+                            return _PromotionSourceWriteResult(
+                                event=matching[0], revision=head.revision, created=False
+                            )
+                        if head.revision != expected_revision:
+                            raise RevisionConflictError("expected revision is stale")
+                        try:
+                            retained = _read_bounded(
+                                sources_fd,
+                                ".source-transaction.json",
+                                MAX_PROMOTION_SOURCE_INTENT_BYTES,
+                                "promotion source transaction",
+                            )
+                        except JournalUnavailableError as exc:
+                            if not _missing_file(exc):
+                                raise
+                            _atomic_write(sources_fd, ".source-transaction.json", intent)
+                        else:
+                            if retained != intent:
+                                raise JournalUnavailableError(
+                                    "conflicting promotion source transaction"
+                                )
+                        self._fault("promotion_source_after_intent")
+                        for index, (name, data, limit) in enumerate(
+                            (
+                                (source_name, source_bytes, MAX_PROMOTION_SOURCE_FILE_BYTES),
+                                (
+                                    provenance_name,
+                                    provenance_bytes,
+                                    MAX_PROMOTION_PROVENANCE_FILE_BYTES,
+                                ),
+                            )
+                        ):
+                            try:
+                                current = _read_bounded(sources_fd, name, limit, name)
+                            except JournalUnavailableError as exc:
+                                if not _missing_file(exc):
+                                    raise
+                                _atomic_write(sources_fd, name, data)
+                            else:
+                                if current != data:
+                                    raise JournalUnavailableError(
+                                        "immutable promotion source artifact conflicts"
+                                    )
+                            self._fault(
+                                "promotion_source_after_source"
+                                if index == 0
+                                else "promotion_source_after_provenance"
+                            )
+                        os.fsync(sources_fd)
+                        self._fault("promotion_source_before_event_append")
+                        draft = JournalEventDraft(
+                            actor="system",
+                            type="promotion_source_committed",
+                            payload=PromotionSourceCommittedPayload(
+                                attempt_id=attempt_id,
+                                source_id=source_id,
+                                promotion_revision=promotion_revision,
+                                source_relative_path=source_relative_path,
+                                source_sha256=source_sha256,
+                                provenance_relative_path=provenance_relative_path,
+                                provenance_sha256=provenance_sha256,
+                                verified_revision=verified_revision,
+                                verification_event_id=verification_event_id,
+                            ),
+                            system_correlation=SystemCorrelation(
+                                source="promotion",
+                                operation_id=uuid5(
+                                    engagement_id,
+                                    f"promotion-source:{attempt_id}:{promotion_revision}",
+                                ),
+                            ),
+                        )
+                        appended = self._append_locked(
+                            engagement_fd,
+                            manifest,
+                            existing,
+                            head,
+                            journal_bytes,
+                            (draft,),
+                        )
+                        self._fault("promotion_source_after_event_append")
+                        os.unlink(".source-transaction.json", dir_fd=sources_fd)
+                        os.fsync(sources_fd)
+                        return _PromotionSourceWriteResult(
+                            event=appended.events[0],
+                            revision=appended.revision,
+                            created=True,
+                        )
+                    finally:
+                        os.close(sources_fd)
+                finally:
+                    os.close(promotion_fd)
+        finally:
+            os.close(engagement_fd)
+
+    def _append_promotion_event(
+        self,
+        engagement_id,
+        payload,
+        *,
+        expected_revision,
+        claim_event_id: UUID | None = None,
+    ):
+        allowed = {
+            "promotion_requested",
+            "promotion_candidate_ready",
+            "promotion_semantic_committed",
+            "promotion_index_pending",
+            "promotion_index_retry_failed",
+            "case_promoted",
+            "promotion_attempt_terminated",
+        }
+        if payload.kind not in allowed:
+            raise EngagementAppendAuthorityError("invalid promotion stage event")
+        draft = JournalEventDraft(
+            type=payload.kind,
+            payload=payload,
+            actor="system",
+            system_correlation=SystemCorrelation(
+                source="promotion",
+                operation_id=uuid5(
+                    NAMESPACE_URL,
+                    f"sedna:promotion:{engagement_id}:{payload.attempt_id}:{payload.kind}",
+                ),
+            ),
+        )
+        if isinstance(payload, PromotionRequestedPayload):
+            return self._append_batch(
+                engagement_id,
+                (draft,),
+                expected_revision=expected_revision,
+                defer_tail_recovery=False,
+            )
+        self._complete_tail_recovery(engagement_id)
+        engagement_fd = self._engagement_fd(engagement_id)
+        try:
+            with _locked_file(engagement_fd, ".journal.lock"):
+                self._recover_pending_append(engagement_fd, engagement_id)
+                manifest, existing, head, journal_bytes = self._load_authoritative_locked(
+                    engagement_fd, engagement_id, allow_tail=False
+                )
+                if head.revision != expected_revision:
+                    raise RevisionConflictError("expected revision is stale")
+                self._require_active_promotion_claim(
+                    reduce_engagement(manifest, existing),
+                    attempt_id=payload.attempt_id,
+                    promotion_revision=payload.promotion_revision,
+                    claim_event_id=claim_event_id,
+                )
+                return self._append_locked(
+                    engagement_fd,
+                    manifest,
+                    existing,
+                    head,
+                    journal_bytes,
+                    (draft,),
+                )
+        finally:
+            os.close(engagement_fd)
 
     def _commit_report_snapshot(
         self,

@@ -472,8 +472,7 @@ class SQLiteRetrievalIndex:
         source_id = _validated_source_id(source_id)
         with self._read_snapshot() as connection:
             row = connection.execute(
-                "SELECT semantic_schema_version FROM indexed_sources "
-                "WHERE source_id = ?",
+                "SELECT semantic_schema_version FROM indexed_sources WHERE source_id = ?",
                 (source_id,),
             ).fetchone()
         if row is None:
@@ -874,9 +873,7 @@ class SQLiteRetrievalIndex:
                 else SEMANTIC_SCHEMA_VERSION
             ),
             execution_example_schema_version=(
-                capability["execution_example_schema_version"]
-                if capability is not None
-                else None
+                capability["execution_example_schema_version"] if capability is not None else None
             ),
         )
 
@@ -1064,7 +1061,6 @@ class SQLiteRetrievalIndex:
                     for link in artifact.links
                 ),
             )
-
 
         for example in source_state.execution_examples:
             connection.execute(

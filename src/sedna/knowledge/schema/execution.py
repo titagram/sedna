@@ -60,12 +60,9 @@ class ExecutionPlaceholder(BaseModel):
             raise ValueError("target placeholders require authorized_scope")
         if (
             self.kind is PlaceholderKind.SOURCE_CASE_CREDENTIAL
-            and self.binding_policy
-            is not PlaceholderBindingPolicy.NEVER_AUTO_BIND
+            and self.binding_policy is not PlaceholderBindingPolicy.NEVER_AUTO_BIND
         ):
-            raise ValueError(
-                "source-case credentials can never request automatic binding"
-            )
+            raise ValueError("source-case credentials can never request automatic binding")
         return self
 
 
@@ -122,9 +119,7 @@ class ExecutionExample(BaseModel):
         declared = {placeholder.name for placeholder in ordered}
         tokens = set(_TEMPLATE_TOKEN.findall(self.command_template))
         if tokens != declared:
-            raise ValueError(
-                "template placeholders must exactly cover the declared placeholders"
-            )
+            raise ValueError("template placeholders must exactly cover the declared placeholders")
         _validate_platform_prose(
             self.purpose,
             self.capability_hint,
@@ -167,9 +162,8 @@ def _validate_platform_prose(
     text = f"{purpose} {capability_hint} {observed_role}".casefold()
     constrained = {constraint.dimension for constraint in constraints}
     for dimension, markers in _PLATFORM_MARKERS.items():
-        if any(
-            re.search(rf"\b{re.escape(marker)}\b", text) for marker in markers
-        ) and dimension not in constrained:
-            raise ValueError(
-                f"platform constraint {dimension} is asserted only in prose"
-            )
+        if (
+            any(re.search(rf"\b{re.escape(marker)}\b", text) for marker in markers)
+            and dimension not in constrained
+        ):
+            raise ValueError(f"platform constraint {dimension} is asserted only in prose")

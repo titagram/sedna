@@ -1048,9 +1048,7 @@ def source_projection_digest(
                     "example_id": example.example_id,
                     "parent_artifact_id": example.parent_artifact_id,
                 }
-                for example in sorted(
-                    execution_examples, key=lambda item: item.example_id
-                )
+                for example in sorted(execution_examples, key=lambda item: item.example_id)
             ],
             "artifacts": [
                 {
@@ -1122,8 +1120,6 @@ def _target_ip_address(
     return None
 
 
-
-
 class ExecutionExampleLocator(BaseModel):
     """ID-only lookup identity for one bundle-owned execution example."""
 
@@ -1166,9 +1162,7 @@ class ExecutionExampleDrilldown(BaseModel):
         return self
 
 
-
 @runtime_checkable
-
 class RetrievalIndex(Protocol):
     """Backend-neutral protocol for disposable projections of canonical bundles."""
 

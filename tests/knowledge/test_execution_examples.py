@@ -130,9 +130,7 @@ def test_execution_example_is_frozen_and_rejects_missing_validation() -> None:
     with pytest.raises(ValidationError):
         example.placeholders = ()
     with pytest.raises(ValidationError, match="requires_validation"):
-        ExecutionExample.model_validate(
-            example_payload(requires_validation=False)
-        )
+        ExecutionExample.model_validate(example_payload(requires_validation=False))
 
 
 def test_placeholders_are_sorted_and_template_coverage_is_exact() -> None:
@@ -160,9 +158,7 @@ def test_placeholders_are_sorted_and_template_coverage_is_exact() -> None:
         "path",
     ]
     with pytest.raises(ValidationError, match="placeholder"):
-        ExecutionExample.model_validate(
-            example_payload(command_template="curl {{undeclared}}")
-        )
+        ExecutionExample.model_validate(example_payload(command_template="curl {{undeclared}}"))
     with pytest.raises(ValidationError, match="placeholder"):
         ExecutionExample.model_validate(
             example_payload(
@@ -188,11 +184,7 @@ def test_placeholders_are_sorted_and_template_coverage_is_exact() -> None:
 def test_prerequisite_and_platform_constraints_require_source_refs() -> None:
     with pytest.raises(ValidationError, match="source"):
         ExecutionExample.model_validate(
-            example_payload(
-                prerequisites=(
-                    {"statement": "No source citation here."},
-                )
-            )
+            example_payload(prerequisites=({"statement": "No source citation here."},))
         )
     with pytest.raises(ValidationError, match="source"):
         ExecutionExample.model_validate(
@@ -374,9 +366,7 @@ def test_draft_parent_rejects_case_guidance_missing_or_example(
                 },
             ),
             execution_examples=(
-                DraftExecutionExample.model_validate(
-                    _draft_example("example-a", parent)
-                ),
+                DraftExecutionExample.model_validate(_draft_example("example-a", parent)),
             ),
         )
 
@@ -396,17 +386,13 @@ def test_draft_local_ids_are_unique_across_artifacts_and_examples() -> None:
                 },
             ),
             execution_examples=(
-                DraftExecutionExample.model_validate(
-                    _draft_example("shared-id", "reference-http")
-                ),
+                DraftExecutionExample.model_validate(_draft_example("shared-id", "reference-http")),
             ),
         )
 
 
 def test_draft_execution_example_is_frozen_and_requires_validation() -> None:
-    example = DraftExecutionExample.model_validate(
-        _draft_example("example-a", "reference-http")
-    )
+    example = DraftExecutionExample.model_validate(_draft_example("example-a", "reference-http"))
     with pytest.raises(ValidationError):
         example.placeholders = ()
     with pytest.raises(ValidationError, match="requires_validation"):

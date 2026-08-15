@@ -43,6 +43,9 @@ from sedna.engagement.models import (
     HostAdaptedCommandRecord,
     JournalRevision,
     PendingSubjectCursor,
+    PromotionArtifactId,
+    PromotionCaseId,
+    PromotionSourceId,
     ScopeReference,
     SettlementSafeCode,
     Sha256Hex,
@@ -1579,6 +1582,115 @@ class ReportCommitAbandonedPayload(_Payload):
     displaced_batch_digest: Sha256Hex
 
 
+PromotionTerminationReason: TypeAlias = Literal[
+    "transport_failure",
+    "invalid_structured_response",
+    "invalid_provenance",
+    "unsafe_material",
+    "critic_rejected",
+    "required_case_missing",
+    "source_commit_failed",
+    "semantic_quarantined",
+    "semantic_failure",
+    "promotion_stage_too_large",
+    "canonical_unavailable",
+    "recovery_conflict",
+    "lease_abandoned",
+    "promotion_asset_invalid",
+    "verification_revoked",
+    "engagement_reopened",
+]
+
+
+class PromotionRequestedPayload(_Payload):
+    kind: Literal["promotion_requested"] = "promotion_requested"
+    attempt_id: UUID
+    attempt_ordinal: int = Field(ge=1, le=3)
+    promotion_revision: int = Field(ge=1)
+    idempotency_key: Sha256Hex
+    verified_revision: JournalRevision
+    verification_event_id: UUID
+    compiler_version: str = Field(min_length=1, max_length=64)
+    extractor_prompt_version: str = Field(min_length=1, max_length=64)
+    critic_prompt_version: str = Field(min_length=1, max_length=64)
+    repair_prompt_version: str = Field(min_length=1, max_length=64)
+    renderer_version: str = Field(min_length=1, max_length=64)
+    semantic_compiler_version: str = Field(min_length=1, max_length=64)
+    semantic_prompt_versions: tuple[str, ...] = Field(min_length=1, max_length=8)
+    claim_expires_at: datetime
+
+
+class PromotionCandidateReadyPayload(_Payload):
+    kind: Literal["promotion_candidate_ready"] = "promotion_candidate_ready"
+    attempt_id: UUID
+    promotion_revision: int = Field(ge=1)
+    candidate_relative_path: ConfinedRelativePath
+    candidate_sha256: Sha256Hex
+    repair_count: int = Field(ge=0, le=1)
+
+
+class PromotionSourceCommittedPayload(_Payload):
+    kind: Literal["promotion_source_committed"] = "promotion_source_committed"
+    attempt_id: UUID
+    source_id: PromotionSourceId
+    promotion_revision: int = Field(ge=1)
+    source_relative_path: ConfinedRelativePath
+    source_sha256: Sha256Hex
+    provenance_relative_path: ConfinedRelativePath
+    provenance_sha256: Sha256Hex
+    verified_revision: JournalRevision
+    verification_event_id: UUID
+
+
+class PromotionSemanticCommittedPayload(_Payload):
+    kind: Literal["promotion_semantic_committed"] = "promotion_semantic_committed"
+    attempt_id: UUID
+    promotion_revision: int = Field(ge=1)
+    source_id: PromotionSourceId
+    foundation_manifest_sha256: Sha256Hex
+    artifact_ids: tuple[PromotionArtifactId, ...] = Field(min_length=1, max_length=128)
+
+
+class PromotionIndexPendingPayload(_Payload):
+    kind: Literal["promotion_index_pending"] = "promotion_index_pending"
+    attempt_id: UUID
+    promotion_revision: int = Field(ge=1)
+    source_id: PromotionSourceId
+    expected_canonical_revision: Sha256Hex
+
+
+class PromotionIndexRetryFailedPayload(_Payload):
+    kind: Literal["promotion_index_retry_failed"] = "promotion_index_retry_failed"
+    attempt_id: UUID
+    promotion_revision: int = Field(ge=1)
+    retry_count: int = Field(ge=1, le=3)
+    reason_code: Literal["index_rebuild_failed", "index_unavailable"]
+
+
+class CasePromotedPayload(_Payload):
+    kind: Literal["case_promoted"] = "case_promoted"
+    attempt_id: UUID
+    source_id: PromotionSourceId
+    promotion_revision: int = Field(ge=1)
+    case_ids: tuple[PromotionCaseId, ...] = Field(min_length=1, max_length=128)
+
+
+class PromotionAttemptTerminatedPayload(_Payload):
+    kind: Literal["promotion_attempt_terminated"] = "promotion_attempt_terminated"
+    attempt_id: UUID
+    promotion_revision: int = Field(ge=1)
+    disposition: Literal["quarantined", "failed", "abandoned", "cancelled"]
+    reason_code: PromotionTerminationReason
+    cleanup_source_id: PromotionSourceId | None = None
+    cleanup_canonical_revision: Sha256Hex | None = None
+
+    @model_validator(mode="after")
+    def validate_cleanup(self) -> PromotionAttemptTerminatedPayload:
+        if (self.cleanup_source_id is None) != (self.cleanup_canonical_revision is None):
+            raise ValueError("promotion cleanup identity and revision must occur together")
+        return self
+
+
 EventPayload: TypeAlias = Annotated[
     EngagementOpenedPayload
     | EngagementResumedPayload
@@ -1631,7 +1743,15 @@ EventPayload: TypeAlias = Annotated[
     | ResearchSourceAssessedEventPayload
     | ReportGeneratedPayload
     | EngagementClosedPayload
-    | ReportCommitAbandonedPayload,
+    | ReportCommitAbandonedPayload
+    | PromotionRequestedPayload
+    | PromotionCandidateReadyPayload
+    | PromotionSourceCommittedPayload
+    | PromotionSemanticCommittedPayload
+    | PromotionIndexPendingPayload
+    | PromotionIndexRetryFailedPayload
+    | CasePromotedPayload
+    | PromotionAttemptTerminatedPayload,
     Field(discriminator="kind"),
 ]
 
@@ -1691,6 +1811,14 @@ class EventType(StrEnum):
     REPORT_GENERATED = "report_generated"
     ENGAGEMENT_CLOSED = "engagement_closed"
     REPORT_COMMIT_ABANDONED = "report_commit_abandoned"
+    PROMOTION_REQUESTED = "promotion_requested"
+    PROMOTION_CANDIDATE_READY = "promotion_candidate_ready"
+    PROMOTION_SOURCE_COMMITTED = "promotion_source_committed"
+    PROMOTION_SEMANTIC_COMMITTED = "promotion_semantic_committed"
+    PROMOTION_INDEX_PENDING = "promotion_index_pending"
+    PROMOTION_INDEX_RETRY_FAILED = "promotion_index_retry_failed"
+    CASE_PROMOTED = "case_promoted"
+    PROMOTION_ATTEMPT_TERMINATED = "promotion_attempt_terminated"
 
 
 _LANE_REQUIRED_TYPES = frozenset(
@@ -1749,6 +1877,14 @@ _SYSTEM_SOURCE_BY_TYPE: dict[EventType, str] = {
     EventType.REPORT_GENERATED: "reporting",
     EventType.ENGAGEMENT_CLOSED: "reporting",
     EventType.REPORT_COMMIT_ABANDONED: "recovery",
+    EventType.PROMOTION_REQUESTED: "promotion",
+    EventType.PROMOTION_CANDIDATE_READY: "promotion",
+    EventType.PROMOTION_SOURCE_COMMITTED: "promotion",
+    EventType.PROMOTION_SEMANTIC_COMMITTED: "promotion",
+    EventType.PROMOTION_INDEX_PENDING: "promotion",
+    EventType.PROMOTION_INDEX_RETRY_FAILED: "promotion",
+    EventType.CASE_PROMOTED: "promotion",
+    EventType.PROMOTION_ATTEMPT_TERMINATED: "promotion",
 }
 
 

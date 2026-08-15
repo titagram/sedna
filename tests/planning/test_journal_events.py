@@ -521,54 +521,79 @@ def _conversion(family: str, source: PlanningEventSource):
             )
         elif isinstance(source, HypothesisFormedSource):
             from sedna.planning.models import HypothesisDraft
-            batch = ObservationBatchDraft(hypotheses=(HypothesisDraft(
-                text=source.statement, confidence=source.confidence,
-                event_ids=source.supporting_event_ids,
-            ),))
+
+            batch = ObservationBatchDraft(
+                hypotheses=(
+                    HypothesisDraft(
+                        text=source.statement,
+                        confidence=source.confidence,
+                        event_ids=source.supporting_event_ids,
+                    ),
+                )
+            )
         elif isinstance(source, MissingInformationIdentifiedSource):
             from sedna.planning.models import MissingInformationDraft
-            batch = ObservationBatchDraft(missing_information=(MissingInformationDraft(
-                question=source.question, event_ids=source.related_event_ids,
-            ),))
+
+            batch = ObservationBatchDraft(
+                missing_information=(
+                    MissingInformationDraft(
+                        question=source.question,
+                        event_ids=source.related_event_ids,
+                    ),
+                )
+            )
         elif isinstance(source, OutcomeAssessedSource):
             from sedna.planning import InterpretationSubject, OutcomeAssessmentDraft
+
             batch = ObservationBatchDraft(
                 subject=InterpretationSubject(
                     attachment_event_id=source.attachment_event_id,
                     terminal_tool_event_id=source.terminal_tool_event_id,
                     evidence_id=EVIDENCE_ID,
                 ),
-                outcomes=(OutcomeAssessmentDraft(
-                    category=source.category, summary=source.summary,
-                    event_ids=source.source_event_ids,
-                ),),
+                outcomes=(
+                    OutcomeAssessmentDraft(
+                        category=source.category,
+                        summary=source.summary,
+                        event_ids=source.source_event_ids,
+                    ),
+                ),
             )
         elif isinstance(source, ObjectiveProofObservedSource):
             from sedna.planning.models import ObjectiveProofDraft
-            batch = ObservationBatchDraft(objective_proofs=(ObjectiveProofDraft(
-                proof_requirement_id=source.proof_requirement_id,
-                assessment=source.assessment, event_ids=source.source_event_ids,
-            ),))
+
+            batch = ObservationBatchDraft(
+                objective_proofs=(
+                    ObjectiveProofDraft(
+                        proof_requirement_id=source.proof_requirement_id,
+                        assessment=source.assessment,
+                        event_ids=source.source_event_ids,
+                    ),
+                )
+            )
         elif isinstance(source, (InterpretationSucceededSource, InterpretationFailedSource)):
             from sedna.planning import InterpretationSubject
-            audits = (InterpretationAudit(
-                subject=InterpretationSubject(
-                    attachment_event_id=source.attachment_event_id,
-                    terminal_tool_event_id=source.terminal_tool_event_id,
-                    evidence_id=source.evidence_id,
+
+            audits = (
+                InterpretationAudit(
+                    subject=InterpretationSubject(
+                        attachment_event_id=source.attachment_event_id,
+                        terminal_tool_event_id=source.terminal_tool_event_id,
+                        evidence_id=source.evidence_id,
+                    ),
+                    call_metadata=metadata(),
+                    status=(
+                        "succeeded"
+                        if isinstance(source, InterpretationSucceededSource)
+                        else "failed"
+                    ),
+                    safe_code=(
+                        None
+                        if isinstance(source, InterpretationSucceededSource)
+                        else "invalid_extractor_output"
+                    ),
                 ),
-                call_metadata=metadata(),
-                status=(
-                    "succeeded"
-                    if isinstance(source, InterpretationSucceededSource)
-                    else "failed"
-                ),
-                safe_code=(
-                    None
-                    if isinstance(source, InterpretationSucceededSource)
-                    else "invalid_extractor_output"
-                ),
-            ),)
+            )
         return ObservationEventConversion(batch=batch, interpretation_audits=audits, **common)
     if family == "planning":
         audit = None
@@ -591,71 +616,89 @@ def _conversion(family: str, source: PlanningEventSource):
                 max_proposals=source.max_proposals,
             )
         if isinstance(source, FrontierProposedSource):
-            planner_draft = PlannerDraft(proposals=(FrontierProposalDraft(
-                family_runtime_key="family-ssh",
-                variant_runtime_key="variant-ssh",
-                title=source.proposal.title,
-                score=source.proposal.score,
-                confidence=round(source.proposal.confidence * 100),
-                rationale=source.proposal.rationale,
-            ),))
-            planner_proposals = (PlannerProposalAudit(
-                request_id=source.request_id,
-                frontier_id=source.frontier_id,
-                proposal_ordinal=source.proposal_ordinal,
-                proposal_count=source.proposal_count,
-                proposal=source.proposal,
-                situation_digest=source.situation_digest,
-                input_ledger_digest=source.input_ledger_digest,
-                knowledge_context_digest=source.knowledge_context_digest,
-            ),)
+            planner_draft = PlannerDraft(
+                proposals=(
+                    FrontierProposalDraft(
+                        family_runtime_key="family-ssh",
+                        variant_runtime_key="variant-ssh",
+                        title=source.proposal.title,
+                        score=source.proposal.score,
+                        confidence=round(source.proposal.confidence * 100),
+                        rationale=source.proposal.rationale,
+                    ),
+                )
+            )
+            planner_proposals = (
+                PlannerProposalAudit(
+                    request_id=source.request_id,
+                    frontier_id=source.frontier_id,
+                    proposal_ordinal=source.proposal_ordinal,
+                    proposal_count=source.proposal_count,
+                    proposal=source.proposal,
+                    situation_digest=source.situation_digest,
+                    input_ledger_digest=source.input_ledger_digest,
+                    knowledge_context_digest=source.knowledge_context_digest,
+                ),
+            )
         elif isinstance(source, FrontierCriticizedSource):
-            critic_verdicts = (PlannerCriticVerdict(
-                request_id=source.request_id,
-                frontier_id=source.frontier_id,
-                critic_pass=source.critic_pass,
-                accepted=source.accepted,
-                findings=(),
-                cited_event_ids=source.cited_event_ids,
-            ),)
+            critic_verdicts = (
+                PlannerCriticVerdict(
+                    request_id=source.request_id,
+                    frontier_id=source.frontier_id,
+                    critic_pass=source.critic_pass,
+                    accepted=source.accepted,
+                    findings=(),
+                    cited_event_ids=source.cited_event_ids,
+                ),
+            )
         elif isinstance(source, FrontierRepairedSource):
-            planner_draft = PlannerDraft(proposals=(FrontierProposalDraft(
-                family_runtime_key="family-ssh",
-                variant_runtime_key="variant-ssh",
-                title=source.proposal.title,
-                score=source.proposal.score,
-                confidence=round(source.proposal.confidence * 100),
-                rationale=source.proposal.rationale,
-            ),))
-            repair_audits = (PlannerRepairAudit(
-                call_metadata=metadata(),
-                critic_finding_codes=(),
-                request_id=source.request_id,
-                frontier_id=source.frontier_id,
-                critic_event_id=source.critic_event_id,
-                proposal_ordinal=source.proposal_ordinal,
-                proposal_count=source.proposal_count,
-                proposal=source.proposal,
-            ),)
+            planner_draft = PlannerDraft(
+                proposals=(
+                    FrontierProposalDraft(
+                        family_runtime_key="family-ssh",
+                        variant_runtime_key="variant-ssh",
+                        title=source.proposal.title,
+                        score=source.proposal.score,
+                        confidence=round(source.proposal.confidence * 100),
+                        rationale=source.proposal.rationale,
+                    ),
+                )
+            )
+            repair_audits = (
+                PlannerRepairAudit(
+                    call_metadata=metadata(),
+                    critic_finding_codes=(),
+                    request_id=source.request_id,
+                    frontier_id=source.frontier_id,
+                    critic_event_id=source.critic_event_id,
+                    proposal_ordinal=source.proposal_ordinal,
+                    proposal_count=source.proposal_count,
+                    proposal=source.proposal,
+                ),
+            )
         elif isinstance(source, FrontierRejectedSource):
-            rejection_audits = (PlannerRejectionAudit(
-                call_metadata=metadata(),
-                safe_code="critic_rejected",
-                request_id=source.request_id,
-                frontier_id=source.frontier_id,
-                critic_event_ids=source.critic_event_ids,
-                reason_codes=source.reason_codes,
-            ),)
+            rejection_audits = (
+                PlannerRejectionAudit(
+                    call_metadata=metadata(),
+                    safe_code="critic_rejected",
+                    request_id=source.request_id,
+                    frontier_id=source.frontier_id,
+                    critic_event_ids=source.critic_event_ids,
+                    reason_codes=source.reason_codes,
+                ),
+            )
         elif isinstance(source, PlanningGapRecordedSource):
-            planning_gaps = (PlanningGap(
-                request_id=source.request_id,
-                code=source.code,
-                summary=source.summary,
-                retryable=source.retryable,
-                situation_digest=source.situation_digest,
-                ledger_digest=source.ledger_digest,
-                related_event_ids=source.related_event_ids,
-            ),)
+            planning_gaps = (
+                PlanningGap(
+                    request_id=source.request_id,
+                    code=source.code,
+                    summary=source.summary,
+                    retryable=source.retryable,
+                    situation_digest=source.situation_digest,
+                    ledger_digest=source.ledger_digest,
+                    related_event_ids=source.related_event_ids,
+                ),
+            )
         return PlanningAttemptEventConversion(
             reconciliation=reconciliation(),
             plan_request_audit=audit,
@@ -669,7 +712,8 @@ def _conversion(family: str, source: PlanningEventSource):
         )
     if family == "reconciliation":
         family_id = (
-            source.operation.family_id if isinstance(source, StrategyReconciledSource)
+            source.operation.family_id
+            if isinstance(source, StrategyReconciledSource)
             else (
                 source.archive_record.snapshot.family_id
                 if isinstance(source, StrategyArchivedSource)
@@ -677,54 +721,64 @@ def _conversion(family: str, source: PlanningEventSource):
             )
         )
         reconciliation_value = StrategyReconciliation(
-                input_family_ids=(family_id,), input_variant_ids=(),
-                retained_family_ids=(family_id,), retained_variant_ids=(),
+            input_family_ids=(family_id,),
+            input_variant_ids=(),
+            retained_family_ids=(family_id,),
+            retained_variant_ids=(),
         )
         archive_transitions = ()
         reactivation_transitions = ()
         if isinstance(source, StrategyReconciledSource):
-            reconciliation_value = reconciliation_value.model_copy(update={"items": (
-                StrategyReconciliationItem(
-                    request_id=source.request_id,
-                    frontier_id=source.frontier_id,
-                    reconciliation_id=source.reconciliation_id,
-                    item_ordinal=source.item_ordinal,
-                    item_count=source.item_count,
-                    input_ledger_digest=source.input_ledger_digest,
-                    resulting_ledger_digest=source.resulting_ledger_digest,
-                    operation=source.operation,
-                    resulting_snapshot=source.resulting_snapshot,
-                ),
-            )})
+            reconciliation_value = reconciliation_value.model_copy(
+                update={
+                    "items": (
+                        StrategyReconciliationItem(
+                            request_id=source.request_id,
+                            frontier_id=source.frontier_id,
+                            reconciliation_id=source.reconciliation_id,
+                            item_ordinal=source.item_ordinal,
+                            item_count=source.item_count,
+                            input_ledger_digest=source.input_ledger_digest,
+                            resulting_ledger_digest=source.resulting_ledger_digest,
+                            operation=source.operation,
+                            resulting_snapshot=source.resulting_snapshot,
+                        ),
+                    )
+                }
+            )
         elif isinstance(source, StrategyArchivedSource):
-            archive_transitions = (StrategyArchiveTransition(
-                family_id=source.archive_record.snapshot.family_id,
-                event_id=allocated,
-                rationale=source.archive_record.archive_reason,
-                request_id=source.request_id,
-                archive_batch_id=source.archive_batch_id,
-                entry_ordinal=source.entry_ordinal,
-                entry_count=source.entry_count,
-                archive_record=source.archive_record,
-                resulting_archive_digest=source.resulting_archive_digest,
-            ),)
+            archive_transitions = (
+                StrategyArchiveTransition(
+                    family_id=source.archive_record.snapshot.family_id,
+                    event_id=allocated,
+                    rationale=source.archive_record.archive_reason,
+                    request_id=source.request_id,
+                    archive_batch_id=source.archive_batch_id,
+                    entry_ordinal=source.entry_ordinal,
+                    entry_count=source.entry_count,
+                    archive_record=source.archive_record,
+                    resulting_archive_digest=source.resulting_archive_digest,
+                ),
+            )
         else:
             assert isinstance(source, StrategyReactivatedSource)
-            reactivation_transitions = (StrategyReactivationTransition(
-                family_id=source.restored_snapshot.family_id,
-                event_id=allocated,
-                rationale="Reactivation follows its matched predicate.",
-                request_id=source.request_id,
-                reactivation_batch_id=source.reactivation_batch_id,
-                entry_ordinal=source.entry_ordinal,
-                entry_count=source.entry_count,
-                source_archive_event_id=source.source_archive_event_id,
-                triggering_event_ids=source.triggering_event_ids,
-                matched_predicate_ids=source.matched_predicate_ids,
-                prior_archive_entry_digest=source.prior_archive_entry_digest,
-                resulting_archive_digest=source.resulting_archive_digest,
-                restored_snapshot=source.restored_snapshot,
-            ),)
+            reactivation_transitions = (
+                StrategyReactivationTransition(
+                    family_id=source.restored_snapshot.family_id,
+                    event_id=allocated,
+                    rationale="Reactivation follows its matched predicate.",
+                    request_id=source.request_id,
+                    reactivation_batch_id=source.reactivation_batch_id,
+                    entry_ordinal=source.entry_ordinal,
+                    entry_count=source.entry_count,
+                    source_archive_event_id=source.source_archive_event_id,
+                    triggering_event_ids=source.triggering_event_ids,
+                    matched_predicate_ids=source.matched_predicate_ids,
+                    prior_archive_entry_digest=source.prior_archive_entry_digest,
+                    resulting_archive_digest=source.resulting_archive_digest,
+                    restored_snapshot=source.restored_snapshot,
+                ),
+            )
         return StrategyReconciliationEventConversion(
             reconciliation=reconciliation_value,
             archive_transitions=archive_transitions,
@@ -736,51 +790,67 @@ def _conversion(family: str, source: PlanningEventSource):
     research_consultations = ()
     research_assessments = ()
     if isinstance(source, ResearchSourceConsultedSource):
-        research_sources = (ResearchSourceObservationDraft(
-            source_id=source.source_id, assessment="inconclusive", event_ids=(E0,),
-        ),)
+        research_sources = (
+            ResearchSourceObservationDraft(
+                source_id=source.source_id,
+                assessment="inconclusive",
+                event_ids=(E0,),
+            ),
+        )
     elif isinstance(source, ResearchSourceAssessedSource):
-        research_sources = (ResearchSourceObservationDraft(
-            source_id=source.source_id,
-            assessment="useful" if source.assessment == "useful" else "inconclusive",
-            event_ids=(E0,),
-        ),)
+        research_sources = (
+            ResearchSourceObservationDraft(
+                source_id=source.source_id,
+                assessment="useful" if source.assessment == "useful" else "inconclusive",
+                event_ids=(E0,),
+            ),
+        )
     elif isinstance(source, ResearchQueryProposedSource):
-        research_sources = (ResearchSourceObservationDraft(
-            source_id="source-1", assessment="inconclusive", event_ids=(E0,),
-        ),)
-        policy_decisions = (ResearchPolicyDecision(
-            decision_id=UUID("00000000-0000-0000-0000-000000000113"),
-            allowed=source.policy_decision == "allowed",
-            rationale="The request is within policy.",
-            query_id=source.query_id,
-            normalized_query=source.normalized_query,
-            policy_version=source.policy_version,
-            reason_codes=source.reason_codes,
-            related_event_ids=source.related_event_ids,
-            candidate_source_ids=source.candidate_source_ids,
-        ),)
+        research_sources = (
+            ResearchSourceObservationDraft(
+                source_id="source-1",
+                assessment="inconclusive",
+                event_ids=(E0,),
+            ),
+        )
+        policy_decisions = (
+            ResearchPolicyDecision(
+                decision_id=UUID("00000000-0000-0000-0000-000000000113"),
+                allowed=source.policy_decision == "allowed",
+                rationale="The request is within policy.",
+                query_id=source.query_id,
+                normalized_query=source.normalized_query,
+                policy_version=source.policy_version,
+                reason_codes=source.reason_codes,
+                related_event_ids=source.related_event_ids,
+                candidate_source_ids=source.candidate_source_ids,
+            ),
+        )
     if isinstance(source, ResearchSourceConsultedSource):
-        research_consultations = (ResearchSourceConsultation(
-            query_id=source.query_id,
-            source_id=source.source_id,
-            normalized_locator=source.normalized_locator,
-            content=source.content,
-            media_type=source.media_type,
-            evidence_ids=source.evidence_ids,
-            tool_event_ids=source.tool_event_ids,
-        ),)
+        research_consultations = (
+            ResearchSourceConsultation(
+                query_id=source.query_id,
+                source_id=source.source_id,
+                normalized_locator=source.normalized_locator,
+                content=source.content,
+                media_type=source.media_type,
+                evidence_ids=source.evidence_ids,
+                tool_event_ids=source.tool_event_ids,
+            ),
+        )
     elif isinstance(source, ResearchSourceAssessedSource):
-        research_assessments = (ResearchSourceAssessmentAudit(
-            query_id=source.query_id,
-            source_id=source.source_id,
-            consulted_event_id=source.consulted_event_id,
-            assessment=source.assessment,
-            confidence=source.confidence,
-            summary=source.summary,
-            related_event_ids=source.related_event_ids,
-            suggested_registry_status=source.suggested_registry_status,
-        ),)
+        research_assessments = (
+            ResearchSourceAssessmentAudit(
+                query_id=source.query_id,
+                source_id=source.source_id,
+                consulted_event_id=source.consulted_event_id,
+                assessment=source.assessment,
+                confidence=source.confidence,
+                summary=source.summary,
+                related_event_ids=source.related_event_ids,
+                suggested_registry_status=source.suggested_registry_status,
+            ),
+        )
     return ResearchEventConversion(
         research_sources=research_sources,
         policy_decisions=policy_decisions,
@@ -856,8 +926,11 @@ def test_conversion_rejects_source_not_represented_by_its_authoritative_model(
     kind: str, family: str, error: str
 ) -> None:
     """A payload cannot originate in the payload-shaped allocation side channel."""
-    source = next(source for candidate, source_family, source in planning_event_cases()
-                  if candidate == kind and source_family == family)
+    source = next(
+        source
+        for candidate, source_family, source in planning_event_cases()
+        if candidate == kind and source_family == family
+    )
     conversion = _conversion(family, source)
     if family == "observation":
         conversion = conversion.model_copy(update={"batch": ObservationBatchDraft()})
@@ -1098,7 +1171,8 @@ def test_objective_proof_source_requires_the_current_admitted_proof_index() -> N
 
 def test_observation_source_rejects_an_evidence_slice_digest_not_grounded_in_input_bytes() -> None:
     source = next(
-        source for kind, family, source in planning_event_cases()
+        source
+        for kind, family, source in planning_event_cases()
         if kind == "observation_extracted" and family == "observation"
     )
     bad_slice = source.evidence_slices[0].model_copy(update={"sha256": D})

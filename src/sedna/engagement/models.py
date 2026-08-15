@@ -135,6 +135,13 @@ class ScopeReference(BaseModel):
 EvidenceId: TypeAlias = Annotated[str, Field(pattern=r"^evidence-sha256-[0-9a-f]{64}$")]
 Sha256Hex: TypeAlias = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 PendingSubjectCursor: TypeAlias = Annotated[str, Field(pattern=r"^pending-[0-9a-f]{64}$")]
+PromotionSourceId: TypeAlias = Annotated[
+    str, Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9._:-]*$")
+]
+PromotionArtifactId: TypeAlias = Annotated[
+    str, Field(min_length=1, max_length=256, pattern=r"^[a-z0-9][a-z0-9._:-]*$")
+]
+PromotionCaseId = PromotionArtifactId
 
 
 def validate_confined_relative_path(value: object) -> str:
@@ -470,6 +477,93 @@ class LaneBinding(BaseModel):
     engagement_id: UUID
 
 
+class PromotionAttemptState(BaseModel):
+    """Replay-derived progress for one bounded publication attempt."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    attempt_id: UUID
+    attempt_ordinal: Annotated[StrictInt, Field(ge=1)]
+    promotion_revision: Annotated[StrictInt, Field(ge=1)]
+    idempotency_key: Sha256Hex
+    verified_revision: JournalRevision | None = None
+    verification_event_id: UUID | None = None
+    claim_event_id: UUID | None = None
+    claim_expires_at: datetime | None = None
+    stage: Literal[
+        "requested",
+        "candidate_ready",
+        "source_committed",
+        "semantic_committed",
+        "index_pending",
+        "retry_failed",
+        "promoted",
+        "terminated",
+    ]
+    source_id: PromotionSourceId | None = None
+    candidate_relative_path: ConfinedRelativePath | None = None
+    candidate_sha256: Sha256Hex | None = None
+    repair_count: Annotated[StrictInt, Field(ge=0, le=1)] = 0
+    artifact_ids: tuple[PromotionArtifactId, ...] = ()
+    case_ids: tuple[PromotionCaseId, ...] = ()
+    index_retry_count: Annotated[StrictInt, Field(ge=0, le=3)] = 0
+    disposition: Literal["promoted", "quarantined", "failed", "abandoned", "cancelled"] | None = (
+        None
+    )
+    reason_code: Annotated[str, Field(min_length=1, max_length=128)] | None = None
+
+
+class PromotionPublicationLineage(BaseModel):
+    """Latest successful canonical publication retained by bounded replay."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+    attempt_id: UUID
+    promotion_revision: Annotated[StrictInt, Field(ge=1)]
+    source_id: PromotionSourceId
+    case_ids: tuple[PromotionArtifactId, ...] = Field(min_length=1, max_length=4096)
+
+
+class PromotionState(BaseModel):
+    """Bounded durable replay result for promotion publication."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+    active_attempt: PromotionAttemptState | None = None
+    recent_terminal_attempts: tuple[PromotionAttemptState, ...] = Field(default=(), max_length=64)
+    folded_terminal_count: Annotated[StrictInt, Field(ge=0)] = 0
+    folded_terminal_sha256: Sha256Hex | None = None
+    latest_successful_publication: PromotionPublicationLineage | None = None
+
+    @model_validator(mode="after")
+    def _validate_fold(self) -> Self:
+        if (self.folded_terminal_count == 0) != (self.folded_terminal_sha256 is None):
+            raise ValueError("folded promotion count and digest must be present together")
+        if any(item.disposition is None for item in self.recent_terminal_attempts):
+            raise ValueError("recent promotion attempts must be terminal")
+        if self.active_attempt is not None and self.active_attempt.disposition is not None:
+            raise ValueError("active promotion attempt cannot be terminal")
+        return self
+
+    @property
+    def attempts(self) -> tuple[PromotionAttemptState, ...]:
+        if self.active_attempt is None:
+            return self.recent_terminal_attempts
+        return (*self.recent_terminal_attempts, self.active_attempt)
+
+    @property
+    def promoted_source_ids(self) -> tuple[PromotionSourceId, ...]:
+        if self.latest_successful_publication is None:
+            return ()
+        return (self.latest_successful_publication.source_id,)
+
+    @property
+    def promoted_case_ids(self) -> tuple[PromotionArtifactId, ...]:
+        if self.latest_successful_publication is None:
+            return ()
+        return self.latest_successful_publication.case_ids
+
+
 class EngagementState(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
@@ -480,6 +574,7 @@ class EngagementState(BaseModel):
     active_decisions: tuple[ActiveDecision, ...] = ()
     reports: tuple[ReportRef, ...] = Field(default=(), max_length=MAX_REPORT_REVISIONS)
     active_report: ReportRef | None = None
+    promotion: PromotionState = Field(default_factory=PromotionState)
     in_flight_call_ids: tuple[Annotated[str, Field(min_length=1, max_length=512)], ...] = Field(
         default=(), max_length=MAX_IN_FLIGHT_CALLS
     )

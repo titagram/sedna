@@ -113,22 +113,14 @@ class SemanticCompilationManifest(BaseModel):
             raise ValueError("emitted artifact IDs must be sorted")
         if len(set(self.emitted_artifact_ids)) != len(self.emitted_artifact_ids):
             raise ValueError("emitted artifact IDs must be unique")
-        if (
-            tuple(sorted(self.emitted_execution_example_ids))
-            != self.emitted_execution_example_ids
-        ):
+        if tuple(sorted(self.emitted_execution_example_ids)) != self.emitted_execution_example_ids:
             raise ValueError("emitted execution-example IDs must be sorted")
-        if (
-            len(set(self.emitted_execution_example_ids))
-            != len(self.emitted_execution_example_ids)
-        ):
+        if len(set(self.emitted_execution_example_ids)) != len(self.emitted_execution_example_ids):
             raise ValueError("emitted execution-example IDs must be unique")
-        if (
-            self.execution_example_schema_version is None
-        ) != (not self.emitted_execution_example_ids):
-            raise ValueError(
-                "execution-example schema version must match emitted example IDs"
-            )
+        if (self.execution_example_schema_version is None) != (
+            not self.emitted_execution_example_ids
+        ):
+            raise ValueError("execution-example schema version must match emitted example IDs")
         if self.completed_at < self.started_at:
             raise ValueError("completed_at must not precede started_at")
         return self
@@ -214,9 +206,7 @@ class SemanticKnowledgeBundle(BaseModel):
         self._validate_sorted_unique(self.references, "artifact_id", "references")
         self._validate_sorted_unique(self.cases, "case_id", "cases")
         self._validate_sorted_unique(self.guidance, "rule_id", "guidance")
-        self._validate_sorted_unique(
-            self.execution_examples, "example_id", "execution_examples"
-        )
+        self._validate_sorted_unique(self.execution_examples, "example_id", "execution_examples")
 
         if (
             self.compilation_manifest.source_id != self.source_id
@@ -230,9 +220,7 @@ class SemanticKnowledgeBundle(BaseModel):
             for step in knowledge_case.steps:
                 self._validate_bundle_source_provenance(step.source_refs, "nested case step")
         for example in self.execution_examples:
-            self._validate_bundle_source_provenance(
-                example.source_refs, "execution example"
-            )
+            self._validate_bundle_source_provenance(example.source_refs, "execution example")
 
         nested_ids = (
             tuple(reference.artifact_id for reference in self.references)
@@ -247,25 +235,16 @@ class SemanticKnowledgeBundle(BaseModel):
         example_ids = tuple(example.example_id for example in self.execution_examples)
         if len(set(example_ids)) != len(example_ids):
             raise ValueError("execution example IDs must be unique across the semantic bundle")
-        parent_ids = {
-            reference.artifact_id for reference in self.references
-        } | {
-            step.step_id
-            for knowledge_case in self.cases
-            for step in knowledge_case.steps
+        parent_ids = {reference.artifact_id for reference in self.references} | {
+            step.step_id for knowledge_case in self.cases for step in knowledge_case.steps
         }
         for example in self.execution_examples:
             if example.parent_artifact_id not in parent_ids:
-                raise ValueError(
-                    "execution example parent must be a bundle reference or case step"
-                )
-        if (
-            set(self.compilation_manifest.emitted_execution_example_ids)
-            != {example.example_id for example in self.execution_examples}
-        ):
-            raise ValueError(
-                "compilation manifest example IDs must exactly match bundle examples"
-            )
+                raise ValueError("execution example parent must be a bundle reference or case step")
+        if set(self.compilation_manifest.emitted_execution_example_ids) != {
+            example.example_id for example in self.execution_examples
+        }:
+            raise ValueError("compilation manifest example IDs must exactly match bundle examples")
         return self
 
     @staticmethod

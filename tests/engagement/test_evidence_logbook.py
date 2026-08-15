@@ -94,9 +94,7 @@ class _CapturedArguments(NamedTuple):
 
 @pytest.fixture
 def capture_tool_arguments(initial_drafts):
-    def factory(
-        root: Path, manifest, lane, arguments: dict[str, Any]
-    ) -> _CapturedArguments:
+    def factory(root: Path, manifest, lane, arguments: dict[str, Any]) -> _CapturedArguments:
         """Sanitize and persist tool arguments as a private evidence sidecar."""
         repository = EngagementJournalRepository(root, clock=lambda: LOGBOOK_FIXED_TIME)
         repository.create(manifest, initial_drafts(manifest, lane))
@@ -183,10 +181,13 @@ def test_quota_failure_is_typed_and_does_not_create_partial_sidecar(
 
 
 def test_default_evidence_quota_is_exactly_the_m6a_contract() -> None:
-    assert EvidenceQuota(
-        max_item_bytes=64 * 1024 * 1024,
-        max_engagement_bytes=4 * 1024 * 1024 * 1024,
-    ) == DEFAULT_EVIDENCE_QUOTA
+    assert (
+        EvidenceQuota(
+            max_item_bytes=64 * 1024 * 1024,
+            max_engagement_bytes=4 * 1024 * 1024 * 1024,
+        )
+        == DEFAULT_EVIDENCE_QUOTA
+    )
 
 
 def test_evidence_slice_rejects_unbounded_or_negative_reads(
@@ -427,9 +428,7 @@ def test_provider_credentials_are_removed_before_argument_sidecar_capture(
 def test_logbook_renders_identity_revision_and_tool_metadata(
     tmp_path, manifest, lane, recorded_session_snapshot
 ) -> None:
-    snapshot = recorded_session_snapshot(
-        tmp_path / "knowledge", manifest, lane, "plain output"
-    )
+    snapshot = recorded_session_snapshot(tmp_path / "knowledge", manifest, lane, "plain output")
     loaded = snapshot.repository.load_snapshot(manifest.engagement_id)
     rendered = render_session_logbook(
         loaded.manifest,
@@ -448,8 +447,14 @@ def test_logbook_renders_identity_revision_and_tool_metadata(
 
 
 def test_logbook_link_is_validated_confined_relative_path(
-    tmp_path, manifest, lane, recorded_session_snapshot, initial_drafts,
-    tool_started, tool_completed, evidence_attached_draft,
+    tmp_path,
+    manifest,
+    lane,
+    recorded_session_snapshot,
+    initial_drafts,
+    tool_started,
+    tool_completed,
+    evidence_attached_draft,
 ) -> None:
     root = tmp_path / "knowledge"
     repository = EngagementJournalRepository(root, clock=lambda: LOGBOOK_FIXED_TIME)
@@ -488,9 +493,7 @@ def test_logbook_link_is_validated_confined_relative_path(
 def test_logbook_rebuild_retry_exhaustion_raises_typed_conflict(
     tmp_path, manifest, lane, initial_drafts, user_note_draft, recorded_session_snapshot
 ) -> None:
-    snapshot = recorded_session_snapshot(
-        tmp_path / "knowledge", manifest, lane, "conflict output"
-    )
+    snapshot = recorded_session_snapshot(tmp_path / "knowledge", manifest, lane, "conflict output")
     repository = snapshot.repository
     original = repository.load_snapshot
     calls = {"count": 0}

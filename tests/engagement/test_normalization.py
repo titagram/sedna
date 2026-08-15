@@ -193,15 +193,18 @@ def test_safe_argument_summary_admits_complete_records_until_bounds() -> None:
     assert summary == {"command": "id", "note": "kept"}
     assert omission is not None
     assert omission.omitted_count == 1
-    assert omission.omitted_sha256 == sha256(
-        json.dumps(
-            [{"pad": "x" * 20_000}],
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
+    assert (
+        omission.omitted_sha256
+        == sha256(
+            json.dumps(
+                [{"pad": "x" * 20_000}],
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+    )
 
 
 def test_safe_argument_summary_is_byte_stable_and_within_journal_bounds() -> None:
@@ -259,15 +262,18 @@ def test_safe_argument_summary_omission_digest_is_deterministic_and_covers_omiss
     assert first_summary == second_summary
     assert first_omission == second_omission
     assert first_omission is not None
-    assert first_omission.omitted_sha256 == sha256(
-        json.dumps(
-            [{"a": {"b": {"c": {"d": "leaf"}}}}],
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
+    assert (
+        first_omission.omitted_sha256
+        == sha256(
+            json.dumps(
+                [{"a": {"b": {"c": {"d": "leaf"}}}}],
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+    )
 
 
 def test_safe_argument_summary_never_leaks_secret_or_secret_digest() -> None:

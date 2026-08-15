@@ -5,13 +5,21 @@ from __future__ import annotations
 import json
 import re
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from hashlib import sha256
 from typing import Annotated, Literal, Self, TypeVar
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
-from sedna.engagement.models import EvidenceId, JournalRevision
+from sedna.engagement.models import (
+    ConfinedRelativePath,
+    EvidenceId,
+    JournalRevision,
+    PromotionAttemptState,
+    PromotionSourceId,
+    Sha256Hex,
+)
 
 PROMOTION_DRAFT_SCHEMA_VERSION = "1.0.0"
 PROMOTION_SOURCE_SCHEMA_VERSION = "1.0.0"
@@ -20,6 +28,12 @@ PROMOTION_COMPILER_VERSION = "1"
 MAX_PROMOTION_INPUT_BYTES = 512 * 1024
 MAX_PROMOTION_DRAFT_BYTES = 512 * 1024
 MAX_PROMOTION_SOURCE_BYTES = 1024 * 1024
+MAX_PROMOTION_PROVENANCE_BYTES = 8 * 1024 * 1024
+MAX_PROMOTION_PROVENANCE_SPANS = 4_096
+MAX_PROMOTION_PROVENANCE_EVENT_IDS = 16_384
+MAX_PROMOTION_PROVENANCE_EVIDENCE_IDS = 16_384
+MAX_PROMOTION_SPAN_EVENT_IDS = 256
+MAX_PROMOTION_SPAN_EVIDENCE_IDS = 256
 MAX_PROMOTION_PRIVATE_VALUES = 512
 MAX_PROMOTION_PRIVATE_VALUE_BYTES = 16 * 1024
 MAX_PROMOTION_PRIVATE_BYTES = 512 * 1024
@@ -63,7 +77,9 @@ class _PromotionModel(BaseModel):
         def visit(item: object) -> None:
             if isinstance(item, str):
                 for match in re.finditer(r"<[^>]*>", item):
-                    if _SYMBOL_RE.fullmatch(match.group()) is None:
+                    inner = match.group()[1:-1]
+                    looks_symbolic = not inner or re.fullmatch(r"[A-Z][A-Z0-9_-]*", inner)
+                    if looks_symbolic and _SYMBOL_RE.fullmatch(match.group()) is None:
                         raise ValueError("promotion text contains an invalid symbolic token")
             elif isinstance(item, tuple):
                 for nested in item:
@@ -166,6 +182,102 @@ class PromotionClaim(_PromotionModel):
         return _require_sorted_unique(value, info.field_name)
 
 
+class PromotionClaimRequest(_PromotionModel):
+    """Data-only request; repository authority supplies attempt identity and ordinals."""
+
+    verified_revision: JournalRevision
+    verification_event_id: UUID
+    compiler_version: str = Field(min_length=1, max_length=64)
+    extractor_prompt_version: str = Field(min_length=1, max_length=64)
+    critic_prompt_version: str = Field(min_length=1, max_length=64)
+    repair_prompt_version: str = Field(min_length=1, max_length=64)
+    renderer_version: str = Field(min_length=1, max_length=64)
+    semantic_compiler_version: str = Field(min_length=1, max_length=64)
+    semantic_prompt_versions: tuple[str, ...] = Field(min_length=1, max_length=8)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class PromotionClaimOwnership:
+    attempt_id: UUID
+    claim_event_id: UUID
+    _issuer_token: object
+
+
+@dataclass(frozen=True, slots=True, repr=False, kw_only=True)
+class PromotionSemanticReceipt:
+    attempt_id: UUID
+    promotion_revision: int
+    source_id: str
+    foundation_manifest_sha256: str
+    artifact_ids: tuple[str, ...]
+    _issuer_token: object
+    operation_nonce: object = field(default_factory=object)
+
+
+@dataclass(frozen=True, slots=True, repr=False, kw_only=True)
+class PromotionIndexPendingReceipt:
+    attempt_id: UUID
+    promotion_revision: int
+    source_id: str
+    expected_canonical_revision: str
+    _issuer_token: object
+    operation_nonce: object = field(default_factory=object)
+
+
+@dataclass(frozen=True, slots=True, repr=False, kw_only=True)
+class PromotionIndexFailureReceipt:
+    attempt_id: UUID
+    promotion_revision: int
+    retry_count: int
+    reason_code: Literal["index_rebuild_failed", "index_unavailable"]
+    _issuer_token: object
+    operation_nonce: object = field(default_factory=object)
+
+
+@dataclass(frozen=True, slots=True, repr=False, kw_only=True)
+class PromotionPublicationReceipt:
+    attempt_id: UUID
+    promotion_revision: int
+    source_id: str
+    case_ids: tuple[str, ...]
+    _issuer_token: object
+    operation_nonce: object = field(default_factory=object)
+
+
+@dataclass(frozen=True, slots=True, repr=False, kw_only=True)
+class PromotionCleanupReceipt:
+    attempt_id: UUID
+    promotion_revision: int
+    source_id: str
+    canonical_revision: str
+    _issuer_token: object
+    operation_nonce: object = field(default_factory=object)
+
+
+@dataclass(frozen=True, slots=True)
+class PromotionClaimResult:
+    disposition: Literal["created", "resumed", "existing", "retry_exhausted"]
+    attempt: PromotionAttemptState | None
+    claim_event_id: UUID | None
+    revision: JournalRevision
+    ownership: PromotionClaimOwnership | None
+
+    def __post_init__(self) -> None:
+        owned = self.disposition in {"created", "resumed"}
+        exhausted = self.disposition == "retry_exhausted"
+        if exhausted != (self.attempt is None and self.claim_event_id is None):
+            raise ValueError("promotion claim result has an invalid exhausted shape")
+        if owned != (self.ownership is not None):
+            raise ValueError("only a created or fresh-runtime resumed claim transfers ownership")
+        if self.ownership is not None and (
+            self.attempt is None
+            or self.claim_event_id is None
+            or self.ownership.attempt_id != self.attempt.attempt_id
+            or self.ownership.claim_event_id != self.claim_event_id
+        ):
+            raise ValueError("promotion claim ownership does not match its claim")
+
+
 class PromotionDraft(_PromotionModel):
     schema_version: Literal["1.0.0"]
     title: PromotionText
@@ -187,6 +299,119 @@ class PromotionDraft(_PromotionModel):
         if _canonical_size(self) > MAX_PROMOTION_DRAFT_BYTES:
             raise ValueError("promotion draft exceeds its byte bound")
         return self
+
+
+class PromotionProvenanceSpan(_PromotionModel):
+    start_line: StrictInt = Field(ge=1)
+    end_line: StrictInt = Field(ge=1)
+    event_ids: tuple[UUID, ...] = Field(min_length=1, max_length=MAX_PROMOTION_SPAN_EVENT_IDS)
+    evidence_ids: tuple[EvidenceId, ...] = Field(
+        default=(), max_length=MAX_PROMOTION_SPAN_EVIDENCE_IDS
+    )
+
+    @field_validator("event_ids", "evidence_ids")
+    @classmethod
+    def validate_ids(cls, value: tuple[object, ...], info) -> tuple[object, ...]:
+        return _require_sorted_unique(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_lines(self) -> Self:
+        if self.end_line < self.start_line:
+            raise ValueError("provenance span lines must be ordered")
+        return self
+
+
+class PromotionProvenanceMap(_PromotionModel):
+    schema_version: Literal["1.0.0"] = PROMOTION_PROVENANCE_SCHEMA_VERSION
+    engagement_id: UUID
+    attempt_id: UUID
+    promotion_revision: StrictInt = Field(ge=1)
+    verified_revision: JournalRevision
+    verification_event_id: UUID
+    source_id: PromotionSourceId
+    source_relative_path: ConfinedRelativePath
+    source_sha256: Sha256Hex
+    spans: tuple[PromotionProvenanceSpan, ...] = Field(
+        min_length=1, max_length=MAX_PROMOTION_PROVENANCE_SPANS
+    )
+
+    @model_validator(mode="after")
+    def validate_map(self) -> Self:
+        previous_end = 0
+        event_count = 0
+        evidence_count = 0
+        for span in self.spans:
+            if span.start_line <= previous_end:
+                raise ValueError("provenance spans must be ordered and non-overlapping")
+            previous_end = span.end_line
+            event_count += len(span.event_ids)
+            evidence_count += len(span.evidence_ids)
+        if event_count > MAX_PROMOTION_PROVENANCE_EVENT_IDS:
+            raise ValueError("provenance event IDs exceed their cumulative bound")
+        if evidence_count > MAX_PROMOTION_PROVENANCE_EVIDENCE_IDS:
+            raise ValueError("provenance evidence IDs exceed their cumulative bound")
+        if _canonical_size(self) > MAX_PROMOTION_PROVENANCE_BYTES:
+            raise ValueError("promotion provenance exceeds its byte bound")
+        return self
+
+
+class RenderedPromotionSource(_PromotionModel):
+    source_id: PromotionSourceId
+    source_namespace: Literal["journal-promotion"] = "journal-promotion"
+    promotion_revision: StrictInt = Field(ge=1)
+    title: PromotionText
+    source_relative_path: ConfinedRelativePath
+    markdown: str
+    source_sha256: Sha256Hex
+    provenance_relative_path: ConfinedRelativePath
+    provenance: PromotionProvenanceMap
+    provenance_sha256: Sha256Hex
+
+    @model_validator(mode="after")
+    def validate_rendered_source(self) -> Self:
+        markdown_bytes = self.markdown.encode("utf-8")
+        if not markdown_bytes or len(markdown_bytes) > MAX_PROMOTION_SOURCE_BYTES:
+            raise ValueError("promotion source exceeds its byte bound")
+        if sha256(markdown_bytes).hexdigest() != self.source_sha256:
+            raise ValueError("promotion source digest does not match its bytes")
+        if self.provenance.source_sha256 != self.source_sha256:
+            raise ValueError("promotion source digest does not match provenance")
+        if self.provenance.source_id != self.source_id:
+            raise ValueError("promotion source identity does not match provenance")
+        if self.provenance.promotion_revision != self.promotion_revision:
+            raise ValueError("promotion revision does not match provenance")
+        if self.provenance.source_relative_path != self.source_relative_path:
+            raise ValueError("promotion source path does not match provenance")
+        line_count = len(self.markdown.splitlines())
+        if any(span.end_line > line_count for span in self.provenance.spans):
+            raise ValueError("promotion provenance exceeds physical Markdown lines")
+        engagement_id = self.provenance.engagement_id
+        expected_source_id = (
+            f"source-{uuid5(NAMESPACE_URL, f'sedna:journal-promotion:{engagement_id}')}"
+        )
+        expected_stem = (
+            f"engagements/{engagement_id}/promotion/sources/promotion-v{self.promotion_revision}"
+        )
+        if self.source_id != expected_source_id:
+            raise ValueError("promotion source identity does not match engagement")
+        if self.source_relative_path != expected_stem + ".md":
+            raise ValueError("promotion source path does not match its closed grammar")
+        if self.provenance_relative_path != expected_stem + ".provenance.json":
+            raise ValueError("promotion provenance path does not match its closed grammar")
+        canonical = json.dumps(
+            self.provenance.model_dump(mode="json", warnings="error"),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if sha256(canonical).hexdigest() != self.provenance_sha256:
+            raise ValueError("promotion provenance digest does not match its bytes")
+        return self
+
+
+class CommittedPromotionSource(RenderedPromotionSource):
+    committed_revision: JournalRevision
 
 
 class PromotionCriticFinding(_PromotionModel):
@@ -256,3 +481,36 @@ class PromotionCompilationResult(_PromotionModel):
         if not valid:
             raise ValueError("disposition has an invalid result shape")
         return self
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class PromotionResult:
+    """Closed, private-safe outcome of one promotion invocation."""
+
+    disposition: Literal[
+        "promoted",
+        "unchanged",
+        "in_progress",
+        "retrying",
+        "retry_exhausted",
+        "quarantined",
+        "failed",
+    ]
+    attempt_id: UUID | None = None
+    promotion_revision: int | None = None
+    source_id: str | None = None
+    case_ids: tuple[str, ...] = ()
+    journal_revision: JournalRevision | None = None
+    reason_code: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.attempt_id is not None and type(self.attempt_id) is not UUID:
+            raise TypeError("promotion result attempt_id must be a UUID")
+        if self.promotion_revision is not None and (
+            type(self.promotion_revision) is not int or self.promotion_revision < 1
+        ):
+            raise ValueError("promotion result revision must be a positive integer")
+        if not isinstance(self.case_ids, tuple) or any(
+            type(item) is not str for item in self.case_ids
+        ):
+            raise TypeError("promotion result case_ids must be a tuple of strings")

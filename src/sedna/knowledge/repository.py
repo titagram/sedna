@@ -6,6 +6,7 @@ import fcntl
 import inspect
 import json
 import os
+import re
 import secrets
 import stat
 import threading
@@ -15,6 +16,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path, PurePath
 from typing import Annotated, TypeVar
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import (
     AfterValidator,
@@ -55,6 +57,8 @@ _LEGACY_RETRIEVAL_PROMPT_VERSION = "1"
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 _MAX_SEMANTIC_INVENTORY_FILES = 100_000
 _MAX_SEMANTIC_RECORD_BYTES = 64 * 1024 * 1024
+_MAX_JOURNAL_PROMOTION_SOURCE_BYTES = 16 * 1024 * 1024
+_MAX_JOURNAL_PROMOTION_ASSET_BYTES = 8 * 1024 * 1024
 
 
 def _validate_stable_id(value: str) -> str:
@@ -223,6 +227,7 @@ class CanonicalKnowledgeRepository:
             "ingestion_reports",
             "semantic_bundles",
             "semantic_compilation_guards",
+            "promotion_publication_guards",
             "semantic_verification",
             "semantic_quarantine",
             "transactions",
@@ -458,9 +463,7 @@ class CanonicalKnowledgeRepository:
         if example_ids is not None and set(example_ids) != {
             example.example_id for example in ordered
         }:
-            raise ValueError(
-                "example_ids must exactly match the parent's execution examples"
-            )
+            raise ValueError("example_ids must exactly match the parent's execution examples")
         return ordered
 
     def load_semantic_verification(self, source_id: str) -> SemanticVerificationRecord:
@@ -722,8 +725,7 @@ class CanonicalKnowledgeRepository:
                 and manifest.compiler_version == compiler_version
                 and (
                     not manifest.emitted_execution_example_ids
-                    or manifest.execution_example_schema_version
-                    == execution_example_schema_version
+                    or manifest.execution_example_schema_version == execution_example_schema_version
                 )
             )
             if pin_models:
@@ -752,8 +754,20 @@ class CanonicalKnowledgeRepository:
     @contextmanager
     def semantic_compilation_guard(self, source_id: str) -> Iterator[None]:
         """Serialize check, compile, and persistence for one semantic source."""
+        with self._source_operation_guard("semantic_compilation_guards", source_id):
+            yield
+
+    @contextmanager
+    def promotion_publication_guard(self, source_id: str) -> Iterator[None]:
+        """Serialize promotion publication and revocation for one source."""
+        with self._source_operation_guard("promotion_publication_guards", source_id):
+            yield
+
+    @contextmanager
+    def _source_operation_guard(self, directory: str, source_id: str) -> Iterator[None]:
         _validate_stable_id(source_id)
-        directory_fd = self._open_child_directory("semantic_compilation_guards", create=True)
+        label = directory.removesuffix("s").replace("_", " ")
+        directory_fd = self._open_child_directory(directory, create=True)
         lock_fd = -1
         try:
             try:
@@ -764,11 +778,9 @@ class CanonicalKnowledgeRepository:
                     dir_fd=directory_fd,
                 )
             except OSError as exc:
-                raise ValueError(
-                    f"semantic compilation guard is not a confined regular file: {exc}"
-                ) from exc
+                raise ValueError(f"{label} is not a confined regular file: {exc}") from exc
             if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
-                raise ValueError("semantic compilation guard is not a regular file")
+                raise ValueError(f"{label} is not a regular file")
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             yield
         finally:
@@ -888,6 +900,7 @@ class CanonicalKnowledgeRepository:
                 current_manifest = self.load_manifest(source_id)
             except FileNotFoundError:
                 current_manifest = None
+            self._require_journal_promotion_lineage(manifest, current_manifest)
             current_revision = (
                 None if current_manifest is None else foundation_manifest_digest(current_manifest)
             )
@@ -959,6 +972,50 @@ class CanonicalKnowledgeRepository:
                 raise RuntimeError("canonical foundation changed during projection invalidation")
             self._transition_source_locked(manifest, quarantine)
             self._delete_projection_revision_barrier(source_id)
+
+    @staticmethod
+    def _require_journal_promotion_lineage(
+        target: DocumentManifest,
+        current: DocumentManifest | None,
+    ) -> None:
+        """Protect the stable promotion identity from collisions, reuse, and rollback."""
+        if target.source_namespace != "journal-promotion":
+            if current is not None and current.source_namespace == "journal-promotion":
+                raise ValueError("journal-promotion identity cannot change namespace")
+            return
+        match = re.fullmatch(
+            r"engagements/([0-9a-f-]{36})/promotion/sources/promotion-v([1-9][0-9]*)\.md",
+            target.path,
+        )
+        if match is None:
+            raise ValueError("journal-promotion path does not match its stable lineage")
+        try:
+            engagement_id = UUID(match.group(1))
+        except ValueError as error:
+            raise ValueError("journal-promotion path has an invalid engagement identity") from error
+        identity = uuid5(NAMESPACE_URL, f"sedna:journal-promotion:{engagement_id}")
+        expected_source_id = f"source-{identity}"
+        if target.source_id != expected_source_id:
+            raise ValueError("journal-promotion source identity does not match its engagement")
+        target_revision = int(match.group(2))
+        expected_provenance_path = target.path.removesuffix(".md") + ".provenance.json"
+        if len(target.assets) != 1 or target.assets[0].path != expected_provenance_path:
+            raise ValueError("journal-promotion source and provenance paths must be an exact pair")
+        if current is None:
+            return
+        if current.source_namespace != "journal-promotion":
+            raise ValueError("journal-promotion identity collision with legacy foundation")
+        current_match = re.fullmatch(
+            r"engagements/([0-9a-f-]{36})/promotion/sources/promotion-v([1-9][0-9]*)\.md",
+            current.path,
+        )
+        if current_match is None or current_match.group(1) != match.group(1):
+            raise ValueError("journal-promotion current foundation has a conflicting lineage")
+        current_revision = int(current_match.group(2))
+        if target_revision < current_revision:
+            raise ValueError("journal-promotion revision rollback is forbidden")
+        if target_revision == current_revision and target != current:
+            raise ValueError("journal-promotion same revision must be byte-identical")
 
     def resume_nonaccepted_projection_revision(
         self,
@@ -1292,6 +1349,8 @@ class CanonicalKnowledgeRepository:
                 raise ValueError("semantic state has no foundation manifest") from error
         if foundation.ingestion_status.value != "accepted":
             raise ValueError("semantic state foundation manifest is not accepted")
+        if foundation.source_namespace == "journal-promotion":
+            self._require_journal_promotion_physical_state(foundation)
         semantic_manifest = (
             bundle.compilation_manifest
             if bundle is not None
@@ -1313,6 +1372,83 @@ class CanonicalKnowledgeRepository:
             != foundation_manifest_digest(foundation)
         ):
             raise ValueError("semantic state does not match its current foundation manifest")
+
+    def require_journal_promotion_physical_state(self, foundation: DocumentManifest) -> None:
+        """Revalidate an accepted promotion foundation immediately before persistence."""
+        foundation = DocumentManifest.model_validate(
+            foundation.model_dump(mode="json", warnings="error")
+        )
+        if foundation.source_namespace != "journal-promotion":
+            raise ValueError("physical promotion validation requires journal-promotion namespace")
+        if foundation.ingestion_status.value != "accepted":
+            raise ValueError("physical promotion validation requires an accepted foundation")
+        self._require_journal_promotion_physical_state(foundation)
+
+    def _require_journal_promotion_physical_state(
+        self,
+        foundation: DocumentManifest,
+    ) -> None:
+        """Rehash one promotion source and every bound asset through the retained root."""
+        physical = ((foundation.path, foundation.sha256, _MAX_JOURNAL_PROMOTION_SOURCE_BYTES),)
+        physical += tuple(
+            (asset.path, asset.sha256, _MAX_JOURNAL_PROMOTION_ASSET_BYTES)
+            for asset in foundation.assets
+        )
+        for relative_path, expected_sha256, byte_limit in physical:
+            payload = self._read_confined_physical_file(relative_path, byte_limit=byte_limit)
+            if sha256(payload).hexdigest() != expected_sha256:
+                raise ValueError("journal-promotion physical artifact digest mismatch")
+
+    def _read_confined_physical_file(self, relative_path: str, *, byte_limit: int) -> bytes:
+        """Boundedly read a regular root-relative file without following any symlink."""
+        path = PurePath(relative_path)
+        if (
+            type(relative_path) is not str
+            or not relative_path
+            or path.is_absolute()
+            or any(part in {"", ".", ".."} for part in path.parts)
+        ):
+            raise ValueError("journal-promotion physical artifact path is not confined")
+        with self._descriptor_lock:
+            current_fd = os.dup(self._ensure_open())
+        file_fd = -1
+        try:
+            for part in path.parts[:-1]:
+                next_fd = os.open(part, self._directory_open_flags(), dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            name = path.parts[-1]
+            before = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
+            if not stat.S_ISREG(before.st_mode) or before.st_size > byte_limit:
+                raise ValueError(
+                    "journal-promotion physical artifact is not a bounded regular file"
+                )
+            file_fd = os.open(name, self._file_read_flags(), dir_fd=current_fd)
+            opened = os.fstat(file_fd)
+            if not stat.S_ISREG(opened.st_mode) or self._semantic_file_identity(
+                opened
+            ) != self._semantic_file_identity(before):
+                raise ValueError("journal-promotion physical artifact changed while opening")
+            chunks: list[bytes] = []
+            size = 0
+            while chunk := os.read(file_fd, min(1024 * 1024, byte_limit + 1 - size)):
+                size += len(chunk)
+                if size > byte_limit:
+                    raise ValueError("journal-promotion physical artifact exceeds its byte limit")
+                chunks.append(chunk)
+            final = os.fstat(file_fd)
+            after = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
+            if self._semantic_file_identity(opened) != self._semantic_file_identity(
+                final
+            ) or self._semantic_file_identity(opened) != self._semantic_file_identity(after):
+                raise ValueError("journal-promotion physical artifact changed while reading")
+            return b"".join(chunks)
+        except OSError as error:
+            raise ValueError("journal-promotion physical artifact is unavailable") from error
+        finally:
+            if file_fd >= 0:
+                os.close(file_fd)
+            os.close(current_fd)
 
     def _semantic_inventory_entries(
         self,

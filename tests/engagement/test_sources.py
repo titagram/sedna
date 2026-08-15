@@ -144,9 +144,7 @@ def test_oversized_registry_fails_before_unbounded_parse(tmp_path) -> None:
         SharedSourceRegistry(repository).snapshot()
 
 
-def test_managed_entry_count_limit_is_enforced_before_write(
-    tmp_path, monkeypatch
-) -> None:
+def test_managed_entry_count_limit_is_enforced_before_write(tmp_path, monkeypatch) -> None:
     root = tmp_path / "knowledge"
     monkeypatch.setattr(sources_module, "MAX_SOURCE_REGISTRY_ENTRIES", 2)
     with EngagementJournalRepository(root) as repository:
@@ -165,8 +163,9 @@ def test_symlinked_sources_md_is_rejected(tmp_path) -> None:
     outside = tmp_path / "outside.md"
     outside.write_text("outside", encoding="utf-8")
     (root / "sources.md").symlink_to(outside)
-    with EngagementJournalRepository(root) as repository, pytest.raises(
-        ValueError, match="unsafe file"
+    with (
+        EngagementJournalRepository(root) as repository,
+        pytest.raises(ValueError, match="unsafe file"),
     ):
         SharedSourceRegistry(repository).snapshot()
 

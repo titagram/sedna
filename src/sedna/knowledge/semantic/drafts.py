@@ -44,6 +44,7 @@ CompilationFailureCode = Literal[
     "invalid_structured_response",
     "invalid_input",
     "materialization_failure",
+    "required_case_missing",
     "internal_failure",
 ]
 CANONICAL_COMPILATION_FAILURE_MESSAGES: dict[CompilationFailureCode, str] = {
@@ -52,6 +53,7 @@ CANONICAL_COMPILATION_FAILURE_MESSAGES: dict[CompilationFailureCode, str] = {
     "invalid_structured_response": "The host LLM response failed semantic validation.",
     "invalid_input": "The semantic compiler input failed validation.",
     "materialization_failure": "Semantic artifacts could not be materialized safely.",
+    "required_case_missing": "Journal promotion semantics require at least one case artifact.",
     "internal_failure": "The semantic compiler encountered an internal failure.",
 }
 _SAFE_DRAFT_LOCAL_ID = re.compile(r"^(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -312,13 +314,8 @@ class DraftExecutionPlaceholder(BaseModel):
     def validate_binding_policy(self) -> Self:
         if self.kind == "target" and self.binding_policy != "authorized_scope":
             raise ValueError("target placeholders require authorized_scope")
-        if (
-            self.kind == "source_case_credential"
-            and self.binding_policy != "never_auto_bind"
-        ):
-            raise ValueError(
-                "source-case credentials can never request automatic binding"
-            )
+        if self.kind == "source_case_credential" and self.binding_policy != "never_auto_bind":
+            raise ValueError("source-case credentials can never request automatic binding")
         return self
 
 
@@ -359,9 +356,7 @@ class DraftExecutionExample(BaseModel):
     capability_hint: SearchableNonEmptyString
     purpose: SearchableNonEmptyString
     observed_role: SearchableNonEmptyString
-    applicability: DraftApplicabilityContext = Field(
-        default_factory=DraftApplicabilityContext
-    )
+    applicability: DraftApplicabilityContext = Field(default_factory=DraftApplicabilityContext)
     prerequisites: tuple[DraftExecutionCondition, ...] = ()
     platform_constraints: tuple[DraftExecutionPlatformConstraint, ...] = ()
     citations: tuple[DraftCitation, ...] = Field(min_length=1)
@@ -379,9 +374,7 @@ class DraftExecutionExample(BaseModel):
         declared = {placeholder.name for placeholder in ordered}
         tokens = set(re.findall(r"\{\{\s*([a-z][a-z0-9_]{0,63})\s*\}\}", self.command_template))
         if tokens != declared:
-            raise ValueError(
-                "template placeholders must exactly cover the declared placeholders"
-            )
+            raise ValueError("template placeholders must exactly cover the declared placeholders")
         _validate_platform_prose(
             self.purpose,
             self.capability_hint,
@@ -431,18 +424,20 @@ class SemanticDraftBundle(BaseModel):
     def validate_draft_bundle(self) -> Self:
         """Prevent ambiguous response-local references and invalid ignored indexes."""
         _validate_deterministic_indexes(self.ignored_segment_indexes)
-        local_ids = tuple(artifact.local_id for artifact in self.artifacts) + tuple(
-            step.local_id
-            for artifact in self.artifacts
-            if isinstance(artifact, DraftCase)
-            for step in artifact.steps
-        ) + tuple(example.local_id for example in self.execution_examples)
+        local_ids = (
+            tuple(artifact.local_id for artifact in self.artifacts)
+            + tuple(
+                step.local_id
+                for artifact in self.artifacts
+                if isinstance(artifact, DraftCase)
+                for step in artifact.steps
+            )
+            + tuple(example.local_id for example in self.execution_examples)
+        )
         if len(set(local_ids)) != len(local_ids):
             raise ValueError("draft local IDs must be unique within a bundle")
         parent_ids = {
-            artifact.local_id
-            for artifact in self.artifacts
-            if isinstance(artifact, DraftReference)
+            artifact.local_id for artifact in self.artifacts if isinstance(artifact, DraftReference)
         } | {
             step.local_id
             for artifact in self.artifacts

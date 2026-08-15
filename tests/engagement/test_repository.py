@@ -325,8 +325,6 @@ def test_strategy_archive_accepts_exact_byte_bound_and_rejects_one_over_pre_repl
         rejected.close()
 
 
-
-
 def test_create_retry_finishes_exact_pending_intent_once(
     tmp_path,
     manifest,
@@ -440,9 +438,7 @@ def test_append_retry_rolls_forward_once_and_repairs_projection(
     monkeypatch,
 ) -> None:
     root = tmp_path / "knowledge"
-    draft = user_note_draft("durable").model_copy(
-        update={"idempotency_key": "durable-note"}
-    )
+    draft = user_note_draft("durable").model_copy(update={"idempotency_key": "durable-note"})
     repository = _repository(root, fixed_clock, fixed_uuid_factory)
     opened = repository.create(manifest, initial_drafts(manifest, lane))
     failed = False
@@ -455,9 +451,7 @@ def test_append_retry_rolls_forward_once_and_repairs_projection(
 
     monkeypatch.setattr(repository, "_fault", fail_after_journal)
     with pytest.raises(OSError, match="injected"):
-        repository.append_batch(
-            manifest.engagement_id, (draft,), expected_revision=opened.revision
-        )
+        repository.append_batch(manifest.engagement_id, (draft,), expected_revision=opened.revision)
     repository.close()
 
     with EngagementJournalRepository(root, clock=fixed_clock) as recovered:
@@ -466,12 +460,7 @@ def test_append_retry_rolls_forward_once_and_repairs_projection(
         )
 
     projection = json.loads(
-        (
-            root
-            / "engagements"
-            / str(manifest.engagement_id)
-            / "engagement-state.json"
-        ).read_bytes()
+        (root / "engagements" / str(manifest.engagement_id) / "engagement-state.json").read_bytes()
     )
     assert result.created_event_ids == ()
     assert len(result.existing_event_ids) == 1
@@ -799,9 +788,7 @@ def test_materialized_event_exact_byte_limit_is_rechecked_on_idempotent_replay(
     repository.create(manifest, initial_drafts(manifest, lane))
     existing = repository.load_events(manifest.engagement_id)
     event = repository._materialize(manifest.engagement_id, existing, (draft,))[0]
-    event_size = max(
-        len(repository_module._event_line(item)) for item in (*existing, event)
-    )
+    event_size = max(len(repository_module._event_line(item)) for item in (*existing, event))
     monkeypatch.setattr(repository_module, "MAX_JOURNAL_EVENT_BYTES", event_size)
     repository.append_batch(manifest.engagement_id, (draft,))
 
@@ -923,26 +910,21 @@ def test_prospective_projection_exact_byte_limit_is_accepted_and_one_over_is_pre
         repository.append_batch(manifest.engagement_id, (draft,))
     projection_size = len(
         (
-            _engagement_path(exact_root, manifest.engagement_id)
-            / "engagement-state.json"
+            _engagement_path(exact_root, manifest.engagement_id) / "engagement-state.json"
         ).read_bytes()
     )
 
     accepted_root = tmp_path / "accepted"
     with _repository(accepted_root, fixed_clock, fixed_uuid_factory) as repository:
         repository.create(manifest, initial_drafts(manifest, lane))
-        monkeypatch.setattr(
-            repository_module, "MAX_DERIVED_PROJECTION_BYTES", projection_size
-        )
+        monkeypatch.setattr(repository_module, "MAX_DERIVED_PROJECTION_BYTES", projection_size)
         repository.append_batch(manifest.engagement_id, (draft,))
 
     over_root = tmp_path / "over"
     repository = _repository(over_root, fixed_clock, fixed_uuid_factory)
     repository.create(manifest, initial_drafts(manifest, lane))
     calls = _forbid_repository_writes(monkeypatch)
-    monkeypatch.setattr(
-        repository_module, "MAX_DERIVED_PROJECTION_BYTES", projection_size - 1
-    )
+    monkeypatch.setattr(repository_module, "MAX_DERIVED_PROJECTION_BYTES", projection_size - 1)
     with pytest.raises(ValueError, match="projection exceeds"):
         repository.append_batch(manifest.engagement_id, (draft,))
     repository.close()
@@ -966,9 +948,7 @@ def test_published_engagement_exact_count_is_accepted_and_one_over_is_prewrite(
 
     calls = _forbid_repository_writes(monkeypatch)
     with pytest.raises(ValueError, match="engagement count exceeds"):
-        repository.create(
-            second_manifest, initial_drafts(second_manifest, second_lane)
-        )
+        repository.create(second_manifest, initial_drafts(second_manifest, second_lane))
     repository.close()
     assert calls == []
 
@@ -1018,9 +998,7 @@ def test_constructor_recovers_exact_pending_create_before_reads(
         events = recovered.load_events(manifest.engagement_id)
 
     assert [event.sequence for event in events] == [1, 2]
-    assert not (
-        root / "engagements" / f".pending-create-{manifest.engagement_id}"
-    ).exists()
+    assert not (root / "engagements" / f".pending-create-{manifest.engagement_id}").exists()
 
 
 def test_constructor_removes_empty_preintent_directory_and_fsyncs_parent(
@@ -1085,9 +1063,7 @@ def test_constructor_rejects_conflicting_published_uuid_and_pending_intent(
     assert pending.is_dir()
 
 
-def test_engagement_inventory_uses_incremental_scan_not_listdir(
-    tmp_path, monkeypatch
-) -> None:
+def test_engagement_inventory_uses_incremental_scan_not_listdir(tmp_path, monkeypatch) -> None:
     root = tmp_path / "knowledge"
     engagements = root / "engagements"
     engagements.mkdir(parents=True, mode=0o700)
@@ -1145,9 +1121,7 @@ def test_pending_create_recovery_rejects_a_lane_reserved_by_published_history(
         staging.create(second_manifest, initial_drafts(second_manifest, lane))
     staging.close()
     pending_name = f".pending-create-{second_manifest.engagement_id}"
-    (staging_root / "engagements" / pending_name).rename(
-        root / "engagements" / pending_name
-    )
+    (staging_root / "engagements" / pending_name).rename(root / "engagements" / pending_name)
 
     with pytest.raises(
         (ValueError, JournalUnavailableError), match="lane is already bound|pending create"
@@ -1181,12 +1155,8 @@ def test_abandoned_history_retains_lane_until_exact_unbind_then_releases_it(
         repository.append_batch(manifest.engagement_id, (abandoned,))
         with pytest.raises(ValueError, match="lane is already bound"):
             repository.create(second_manifest, initial_drafts(second_manifest, lane))
-        repository.unbind_lane(
-            manifest.engagement_id, lane, reason="handoff after abandonment"
-        )
-        created = repository.create(
-            second_manifest, initial_drafts(second_manifest, lane)
-        )
+        repository.unbind_lane(manifest.engagement_id, lane, reason="handoff after abandonment")
+        created = repository.create(second_manifest, initial_drafts(second_manifest, lane))
 
     assert created.engagement_id == second_manifest.engagement_id
     assert second_lane != lane
@@ -1205,9 +1175,7 @@ def test_bind_conflict_is_rejected_before_target_lifecycle_mutation(
     second_manifest, second_lane = _second_manifest_and_lane(manifest, new_lane)
     with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
         repository.create(manifest, initial_drafts(manifest, lane))
-        second = repository.create(
-            second_manifest, initial_drafts(second_manifest, second_lane)
-        )
+        second = repository.create(second_manifest, initial_drafts(second_manifest, second_lane))
         with pytest.raises(ValueError, match="lane is already bound"):
             repository.bind_lane(
                 second_manifest.engagement_id,
@@ -1349,10 +1317,7 @@ def test_pending_create_intent_mode_drift_fails_before_recovery(
         repository.create(manifest, initial_drafts(manifest, lane))
     repository.close()
     intent = (
-        root
-        / "engagements"
-        / f".pending-create-{manifest.engagement_id}"
-        / ".create-intent.json"
+        root / "engagements" / f".pending-create-{manifest.engagement_id}" / ".create-intent.json"
     )
     intent.chmod(0o644)
 
@@ -1472,9 +1437,7 @@ def test_competing_binds_for_one_lane_append_to_exactly_one_target(
     reserved = new_lane(session_id="session-shared", task_id="task-shared")
     with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
         repository.create(manifest, initial_drafts(manifest, lane))
-        repository.create(
-            second_manifest, initial_drafts(second_manifest, second_lane)
-        )
+        repository.create(second_manifest, initial_drafts(second_manifest, second_lane))
 
     def bind(identifier: UUID) -> tuple[UUID, bool]:
         try:
@@ -1491,8 +1454,7 @@ def test_competing_binds_for_one_lane_append_to_exactly_one_target(
     assert sum(created for _, created in outcomes) == 1
     with EngagementJournalRepository(root) as repository:
         lengths = {
-            identifier: len(repository.load_events(identifier))
-            for identifier in identifiers
+            identifier: len(repository.load_events(identifier)) for identifier in identifiers
         }
     assert sorted(lengths.values()) == [2, 3]
 
@@ -1513,8 +1475,14 @@ def test_competing_binds_for_one_lane_append_to_exactly_one_target(
     ],
 )
 def test_every_create_crash_window_converges_to_identical_publication(
-    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
-    monkeypatch, fault_point,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+    fault_point,
 ) -> None:
     names = ("engagement.json", "events.jsonl", "journal-head.json", "engagement-state.json")
     root = tmp_path / fault_point
@@ -1561,8 +1529,15 @@ def test_every_create_crash_window_converges_to_identical_publication(
     ],
 )
 def test_every_append_crash_window_converges_to_exact_batch_and_projection(
-    tmp_path, manifest, lane, initial_drafts, user_note_draft, fixed_clock,
-    fixed_uuid_factory, monkeypatch, fault_point,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    user_note_draft,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+    fault_point,
 ) -> None:
     root = tmp_path / fault_point
     draft = user_note_draft(fault_point).model_copy(
@@ -1606,8 +1581,14 @@ def test_every_append_crash_window_converges_to_exact_batch_and_projection(
 
 @pytest.mark.parametrize("projection_state", ["present", "missing", "stale"])
 def test_hash_valid_journal_behind_head_is_corrupt_regardless_of_projection(
-    tmp_path, manifest, lane, initial_drafts, user_note_draft, fixed_clock,
-    fixed_uuid_factory, projection_state,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    user_note_draft,
+    fixed_clock,
+    fixed_uuid_factory,
+    projection_state,
 ) -> None:
     root = tmp_path / projection_state
     with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
@@ -1621,29 +1602,42 @@ def test_hash_valid_journal_behind_head_is_corrupt_regardless_of_projection(
     elif projection_state == "stale":
         projection.write_bytes(b'{"owner":"engagement"}')
     (engagement / "events.jsonl").write_bytes(prefix)
-    with EngagementJournalRepository(root) as repository, pytest.raises(
-        JournalUnavailableError, match="journal_corrupt"
+    with (
+        EngagementJournalRepository(root) as repository,
+        pytest.raises(JournalUnavailableError, match="journal_corrupt"),
     ):
         repository.load_snapshot(manifest.engagement_id)
 
 
 @pytest.mark.parametrize("head_bytes", [None, b"{}"])
 def test_missing_or_malformed_published_head_fails_closed(
-    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory, head_bytes,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+    head_bytes,
 ) -> None:
     root = tmp_path / "knowledge"
     with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
         repository.create(manifest, initial_drafts(manifest, lane))
     head = _engagement_path(root, manifest.engagement_id) / "journal-head.json"
     head.unlink() if head_bytes is None else head.write_bytes(head_bytes)
-    with EngagementJournalRepository(root) as repository, pytest.raises(
-        JournalUnavailableError, match="journal_corrupt|journal head"
+    with (
+        EngagementJournalRepository(root) as repository,
+        pytest.raises(JournalUnavailableError, match="journal_corrupt|journal head"),
     ):
         repository.load_events(manifest.engagement_id)
 
 
 def test_valid_newline_extension_without_matching_intent_is_corrupt(
-    tmp_path, manifest, lane, initial_drafts, user_note_draft, fixed_clock,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    user_note_draft,
+    fixed_clock,
     fixed_uuid_factory,
 ) -> None:
     root = tmp_path / "knowledge"
@@ -1655,14 +1649,20 @@ def test_valid_newline_extension_without_matching_intent_is_corrupt(
         repository.append_batch(manifest.engagement_id, (user_note_draft("valid"),))
     opening_head = repository_module._head(manifest.engagement_id, base_events, base)
     (engagement / "journal-head.json").write_bytes(repository_module._model_bytes(opening_head))
-    with EngagementJournalRepository(root) as repository, pytest.raises(
-        JournalUnavailableError, match="journal_corrupt"
+    with (
+        EngagementJournalRepository(root) as repository,
+        pytest.raises(JournalUnavailableError, match="journal_corrupt"),
     ):
         repository.load_events(manifest.engagement_id)
 
 
 def test_tail_intent_seals_descriptor_prefix_tail_and_exact_recovery_drafts(
-    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
     monkeypatch,
 ) -> None:
     root = tmp_path / "knowledge"
@@ -1676,6 +1676,7 @@ def test_tail_intent_seals_descriptor_prefix_tail_and_exact_recovery_drafts(
         stream.flush()
         os.fsync(stream.fileno())
     with EngagementJournalRepository(root, clock=fixed_clock) as repository:
+
         def crash(point: str) -> None:
             if point == "tail_after_intent":
                 raise OSError("sealed")
@@ -1692,12 +1693,18 @@ def test_tail_intent_seals_descriptor_prefix_tail_and_exact_recovery_drafts(
     assert intent["valid_prefix_revision"]["sequence"] == 2
     assert intent["tail_sha256"] == sha256(tail).hexdigest()
     assert [draft["type"] for draft in intent["drafts"]] == [
-        "evidence_attached", "recovery_warning"
+        "evidence_attached",
+        "recovery_warning",
     ]
 
 
 def test_tail_second_lock_rejects_byte_identical_journal_descriptor_replacement(
-    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
     monkeypatch,
 ) -> None:
     root = tmp_path / "knowledge"
@@ -1712,6 +1719,7 @@ def test_tail_second_lock_rejects_byte_identical_journal_descriptor_replacement(
     original = journal.read_bytes()
     replaced = False
     with EngagementJournalRepository(root, clock=fixed_clock) as repository:
+
         def replace(point: str) -> None:
             nonlocal replaced
             if point == "tail_before_second_lock" and not replaced:
@@ -1745,8 +1753,14 @@ def test_tail_second_lock_rejects_byte_identical_journal_descriptor_replacement(
     ],
 )
 def test_every_tail_evidence_crash_window_recovers_one_exact_pair(
-    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
-    monkeypatch, fault_point,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+    fault_point,
 ) -> None:
     root = tmp_path / fault_point
     with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
@@ -1760,6 +1774,7 @@ def test_every_tail_evidence_crash_window_recovers_one_exact_pair(
         os.fsync(stream.fileno())
     fired = False
     with EngagementJournalRepository(root, clock=fixed_clock) as repository:
+
         def crash_once(point: str) -> None:
             nonlocal fired
             if point == fault_point and not fired:
@@ -1773,9 +1788,7 @@ def test_every_tail_evidence_crash_window_recovers_one_exact_pair(
         events = recovered.load_events(manifest.engagement_id)
         snapshot = recovered.load_snapshot(manifest.engagement_id)
     assert fired
-    assert [event.type.value for event in events[-2:]] == [
-        "evidence_attached", "recovery_warning"
-    ]
+    assert [event.type.value for event in events[-2:]] == ["evidence_attached", "recovery_warning"]
     assert len([event for event in events if event.type.value == "evidence_attached"]) == 1
     blobs = list((engagement / "evidence").glob("blob-*.bin"))
     assert [blob.read_bytes() for blob in blobs] == [tail]
@@ -1785,7 +1798,12 @@ def test_every_tail_evidence_crash_window_recovers_one_exact_pair(
 
 
 def test_tail_recovery_wins_deterministic_private_capture_quota_race(
-    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
     monkeypatch,
 ) -> None:
     root = tmp_path / "knowledge"
@@ -1836,15 +1854,18 @@ def test_tail_recovery_wins_deterministic_private_capture_quota_race(
         events = tail_future.result(timeout=5)
         with pytest.raises(ValueError, match="quota"):
             ordinary_future.result(timeout=5)
-    assert [event.type.value for event in events[-2:]] == [
-        "evidence_attached", "recovery_warning"
-    ]
+    assert [event.type.value for event in events[-2:]] == ["evidence_attached", "recovery_warning"]
     assert [item.read_bytes() for item in (engagement / "evidence").glob("blob-*.bin")] == [tail]
     assert not list((engagement / "evidence").glob(".pending-blob-*.bin"))
 
 
 def test_projection_envelopes_have_digest_cas_and_exact_bounds_for_sealed_names(
-    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
     monkeypatch,
 ) -> None:
     root = tmp_path / "knowledge"
@@ -1863,9 +1884,7 @@ def test_projection_envelopes_have_digest_cas_and_exact_bounds_for_sealed_names(
                 envelope={"payload": {"name": name}},
                 expected_revision=snapshot.revision,
             )
-            loaded = repository.load_projection(
-                manifest.engagement_id, name=name, owner="planning"
-            )
+            loaded = repository.load_projection(manifest.engagement_id, name=name, owner="planning")
             assert loaded is not None
             digest = loaded.pop("projection_digest")
             assert digest == sha256(repository_module._canonical_json(loaded)).hexdigest()
@@ -1905,8 +1924,14 @@ def test_projection_envelopes_have_digest_cas_and_exact_bounds_for_sealed_names(
 
 
 def test_pending_append_revalidates_recovered_totals_before_any_mutation(
-    tmp_path, manifest, lane, initial_drafts, user_note_draft, fixed_clock,
-    fixed_uuid_factory, monkeypatch,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    user_note_draft,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
 ) -> None:
     root = tmp_path / "knowledge"
     repository = _repository(root, fixed_clock, fixed_uuid_factory)
@@ -1923,8 +1948,9 @@ def test_pending_append_revalidates_recovered_totals_before_any_mutation(
         repository.append_batch(manifest.engagement_id, (user_note_draft("over-cap"),))
     repository.close()
     monkeypatch.setattr(repository_module, "MAX_JOURNAL_EVENTS", 2)
-    with EngagementJournalRepository(root) as recovered, pytest.raises(
-        JournalUnavailableError, match="exceeds limits"
+    with (
+        EngagementJournalRepository(root) as recovered,
+        pytest.raises(JournalUnavailableError, match="exceeds limits"),
     ):
         recovered.load_events(manifest.engagement_id)
     assert (engagement / "events.jsonl").read_bytes() == before
@@ -1932,7 +1958,12 @@ def test_pending_append_revalidates_recovered_totals_before_any_mutation(
 
 
 def test_oversized_engagement_projection_is_rebuilt_from_authoritative_journal(
-    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
     monkeypatch,
 ) -> None:
     root = tmp_path / "knowledge"
@@ -1941,9 +1972,7 @@ def test_oversized_engagement_projection_is_rebuilt_from_authoritative_journal(
     projection = _engagement_path(root, manifest.engagement_id) / "engagement-state.json"
     canonical = projection.read_bytes()
     projection.write_bytes(canonical + b"x")
-    monkeypatch.setattr(
-        repository_module, "MAX_DERIVED_PROJECTION_BYTES", len(canonical)
-    )
+    monkeypatch.setattr(repository_module, "MAX_DERIVED_PROJECTION_BYTES", len(canonical))
     with EngagementJournalRepository(root) as recovered:
         snapshot = recovered.load_snapshot(manifest.engagement_id)
     assert snapshot == expected
@@ -1951,7 +1980,12 @@ def test_oversized_engagement_projection_is_rebuilt_from_authoritative_journal(
 
 
 def test_create_preflights_pending_directory_against_total_entry_cap(
-    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
     monkeypatch,
 ) -> None:
     accepted_root = tmp_path / "accepted"
@@ -1981,7 +2015,12 @@ def test_create_preflights_pending_directory_against_total_entry_cap(
 
 
 def test_concurrent_tail_helpers_accept_exact_pair_when_intent_already_cleared(
-    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
 ) -> None:
     root = tmp_path / "knowledge"
     with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
@@ -1997,6 +2036,7 @@ def test_concurrent_tail_helpers_accept_exact_pair_when_intent_already_cleared(
 
     def help_recovery():
         with EngagementJournalRepository(root, clock=fixed_clock) as repository:
+
             def pause(point: str) -> None:
                 if point == "tail_before_second_lock":
                     rendezvous.wait(timeout=3)
@@ -2008,7 +2048,8 @@ def test_concurrent_tail_helpers_accept_exact_pair_when_intent_already_cleared(
         results = tuple(pool.map(lambda _index: help_recovery(), range(2)))
     assert results[0] == results[1]
     assert [event.type.value for event in results[0][-2:]] == [
-        "evidence_attached", "recovery_warning"
+        "evidence_attached",
+        "recovery_warning",
     ]
     assert len([event for event in results[0] if event.type.value == "evidence_attached"]) == 1
     assert not (engagement / ".tail-recovery.json").exists()
@@ -2017,8 +2058,14 @@ def test_concurrent_tail_helpers_accept_exact_pair_when_intent_already_cleared(
 
 @pytest.mark.parametrize("failure", ["write", "fsync"])
 def test_atomic_create_intent_failure_cleans_temp_and_reopen_can_retry(
-    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
-    monkeypatch, failure,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+    failure,
 ) -> None:
     root = tmp_path / failure
     repository = _repository(root, fixed_clock, fixed_uuid_factory)
@@ -2062,7 +2109,12 @@ def test_atomic_create_intent_failure_cleans_temp_and_reopen_can_retry(
 
 
 def test_constructor_promotes_exact_crash_left_create_intent_temp(
-    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
     monkeypatch,
 ) -> None:
     root = tmp_path / "knowledge"
@@ -2101,17 +2153,22 @@ def test_constructor_promotes_exact_crash_left_create_intent_temp(
 
 @pytest.mark.parametrize("operation", ["create", "bind", "unbind"])
 def test_registry_lane_operations_release_before_tail_evidence_lock(
-    tmp_path, manifest, lane, new_lane, initial_drafts, fixed_clock,
-    fixed_uuid_factory, monkeypatch, operation,
+    tmp_path,
+    manifest,
+    lane,
+    new_lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+    operation,
 ) -> None:
     root = tmp_path / operation
     second_manifest, second_lane = _second_manifest_and_lane(manifest, new_lane)
     with _repository(root, fixed_clock, fixed_uuid_factory) as repository:
         repository.create(manifest, initial_drafts(manifest, lane))
         if operation == "bind":
-            repository.create(
-                second_manifest, initial_drafts(second_manifest, second_lane)
-            )
+            repository.create(second_manifest, initial_drafts(second_manifest, second_lane))
     first = _engagement_path(root, manifest.engagement_id)
     with (first / "events.jsonl").open("ab") as stream:
         stream.write(b'{"registry-tail"')
@@ -2135,9 +2192,7 @@ def test_registry_lane_operations_release_before_tail_evidence_lock(
     monkeypatch.setattr(repository_module, "_locked_file", instrumented_lock)
     with EngagementJournalRepository(root, clock=fixed_clock) as repository:
         if operation == "create":
-            repository.create(
-                second_manifest, initial_drafts(second_manifest, second_lane)
-            )
+            repository.create(second_manifest, initial_drafts(second_manifest, second_lane))
         elif operation == "bind":
             repository.bind_lane(
                 second_manifest.engagement_id,
@@ -2152,14 +2207,21 @@ def test_registry_lane_operations_release_before_tail_evidence_lock(
             )
         recovered = repository.load_events(manifest.engagement_id)
     assert [event.type.value for event in recovered[2:4]] == [
-        "evidence_attached", "recovery_warning"
+        "evidence_attached",
+        "recovery_warning",
     ]
 
 
 @pytest.mark.parametrize("quota", ["objects", "bytes"])
 def test_existing_evidence_capture_still_validates_full_inventory_quotas(
-    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
-    monkeypatch, quota,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+    quota,
 ) -> None:
     root = tmp_path / quota
     existing = b"existing-evidence"
@@ -2193,7 +2255,12 @@ def test_existing_evidence_capture_still_validates_full_inventory_quotas(
 
 
 def test_exact_directory_cap_retry_resumes_existing_pending_create(
-    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
     monkeypatch,
 ) -> None:
     root = tmp_path / "knowledge"
@@ -2217,16 +2284,21 @@ def test_exact_directory_cap_retry_resumes_existing_pending_create(
     assert snapshot.revision.sequence == 2
     assert not pending.exists()
     assert sorted(item.name for item in (root / "engagements").iterdir()) == [
-        ".registry.lock", str(manifest.engagement_id)
+        ".registry.lock",
+        str(manifest.engagement_id),
     ]
 
 
-@pytest.mark.parametrize(
-    "staged_name", ["engagement.json", "events.jsonl", "journal-head.json"]
-)
+@pytest.mark.parametrize("staged_name", ["engagement.json", "events.jsonl", "journal-head.json"])
 def test_constructor_promotes_exact_crash_left_authoritative_stage_temp(
-    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
-    monkeypatch, staged_name,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+    staged_name,
 ) -> None:
     root = tmp_path / staged_name
     repository = _repository(root, fixed_clock, fixed_uuid_factory)
@@ -2264,8 +2336,14 @@ def test_constructor_promotes_exact_crash_left_authoritative_stage_temp(
 
 @pytest.mark.parametrize("case", ["unknown", "multiple", "conflicting"])
 def test_constructor_rejects_untrusted_authoritative_stage_temps(
-    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
-    monkeypatch, case,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+    case,
 ) -> None:
     root = tmp_path / case
     repository = _repository(root, fixed_clock, fixed_uuid_factory)
@@ -2304,12 +2382,16 @@ def test_constructor_rejects_untrusted_authoritative_stage_temps(
     assert not _engagement_path(root, manifest.engagement_id).exists()
 
 
-@pytest.mark.parametrize(
-    "staged_name", ["engagement.json", "events.jsonl", "journal-head.json"]
-)
+@pytest.mark.parametrize("staged_name", ["engagement.json", "events.jsonl", "journal-head.json"])
 def test_constructor_discards_incomplete_stage_temp_then_fills_from_intent(
-    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
-    monkeypatch, staged_name,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+    staged_name,
 ) -> None:
     root = tmp_path / f"incomplete-{staged_name}"
     repository = _repository(root, fixed_clock, fixed_uuid_factory)
@@ -2323,9 +2405,7 @@ def test_constructor_discards_incomplete_stage_temp_then_fills_from_intent(
         repository.create(manifest, initial_drafts(manifest, lane))
     repository.close()
     pending = root / "engagements" / f".pending-create-{manifest.engagement_id}"
-    temp = pending / (
-        f".{staged_name}.tmp-dddddddd-dddd-4ddd-8ddd-dddddddddddd"
-    )
+    temp = pending / (f".{staged_name}.tmp-dddddddd-dddd-4ddd-8ddd-dddddddddddd")
     temp.write_bytes(b'{"incomplete"')
     temp.chmod(0o600)
     with EngagementJournalRepository(root) as recovered:
@@ -2337,7 +2417,12 @@ def test_constructor_discards_incomplete_stage_temp_then_fills_from_intent(
 
 
 def test_evidence_publication_retry_counts_hard_links_once_at_exact_byte_quota(
-    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
     monkeypatch,
 ) -> None:
     root = tmp_path / "knowledge"
@@ -2350,11 +2435,10 @@ def test_evidence_publication_retry_counts_hard_links_once_at_exact_byte_quota(
         stream.write(tail)
         stream.flush()
         os.fsync(stream.fileno())
-    monkeypatch.setattr(
-        repository_module, "MAX_EVIDENCE_ENGAGEMENT_BYTES", len(tail)
-    )
+    monkeypatch.setattr(repository_module, "MAX_EVIDENCE_ENGAGEMENT_BYTES", len(tail))
     fired = False
     with EngagementJournalRepository(root, clock=fixed_clock) as repository:
+
         def crash_once(point: str) -> None:
             nonlocal fired
             if point == "evidence_after_publication" and not fired:
@@ -2370,15 +2454,18 @@ def test_evidence_publication_retry_counts_hard_links_once_at_exact_byte_quota(
     assert canonical.stat().st_ino == pending.stat().st_ino
     with EngagementJournalRepository(root, clock=fixed_clock) as recovered:
         events = recovered.load_events(manifest.engagement_id)
-    assert [event.type.value for event in events[-2:]] == [
-        "evidence_attached", "recovery_warning"
-    ]
+    assert [event.type.value for event in events[-2:]] == ["evidence_attached", "recovery_warning"]
     assert canonical.read_bytes() == tail
     assert not list(evidence.glob(".pending-blob-*.bin"))
 
 
 def test_distinct_canonical_evidence_names_sharing_inode_fail_closed(
-    tmp_path, manifest, lane, initial_drafts, fixed_clock, fixed_uuid_factory,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    fixed_clock,
+    fixed_uuid_factory,
     monkeypatch,
 ) -> None:
     root = tmp_path / "knowledge"
@@ -2398,9 +2485,7 @@ def test_distinct_canonical_evidence_names_sharing_inode_fail_closed(
     with EngagementJournalRepository(root) as repository:
         engagement_fd = repository._engagement_fd(manifest.engagement_id)
         try:
-            with pytest.raises(
-                (ValueError, JournalUnavailableError), match="quota|digest"
-            ):
+            with pytest.raises((ValueError, JournalUnavailableError), match="quota|digest"):
                 repository_module._EvidenceObjectStore(engagement_fd).capture(data)
         finally:
             os.close(engagement_fd)
@@ -2408,8 +2493,15 @@ def test_distinct_canonical_evidence_names_sharing_inode_fail_closed(
 
 @pytest.mark.parametrize("head_bytes", [None, b"not-json"])
 def test_exact_pending_append_recovers_missing_or_malformed_head(
-    tmp_path, manifest, lane, initial_drafts, user_note_draft, fixed_clock,
-    fixed_uuid_factory, monkeypatch, head_bytes,
+    tmp_path,
+    manifest,
+    lane,
+    initial_drafts,
+    user_note_draft,
+    fixed_clock,
+    fixed_uuid_factory,
+    monkeypatch,
+    head_bytes,
 ) -> None:
     root = tmp_path / "knowledge"
     repository = _repository(root, fixed_clock, fixed_uuid_factory)

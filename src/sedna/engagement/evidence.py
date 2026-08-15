@@ -139,9 +139,7 @@ class EvidenceStore:
             if not _is_capture_intent_name(entry):
                 continue
             try:
-                raw = _read_bounded(
-                    evidence_fd, entry, MAX_CAPTURE_INTENT_BYTES, "capture intent"
-                )
+                raw = _read_bounded(evidence_fd, entry, MAX_CAPTURE_INTENT_BYTES, "capture intent")
                 value = json.loads(raw)
                 if _canonical_json(value) != raw:
                     raise ValueError("intent is not canonical")
@@ -157,9 +155,7 @@ class EvidenceStore:
                     raise ValueError("invalid temp")
             except Exception:
                 quarantine = f"{QUARANTINE_PREFIX}{uuid4()}.json"
-                os.rename(
-                    entry, quarantine, src_dir_fd=evidence_fd, dst_dir_fd=evidence_fd
-                )
+                os.rename(entry, quarantine, src_dir_fd=evidence_fd, dst_dir_fd=evidence_fd)
                 os.fsync(evidence_fd)
                 continue
             try:
@@ -341,9 +337,7 @@ class EvidenceStore:
                 )
             finally:
                 os.close(evidence_fd)
-        orphans = [
-            name for name in names if name[len("blob-") : -len(".bin")] not in referenced
-        ]
+        orphans = [name for name in names if name[len("blob-") : -len(".bin")] not in referenced]
         total = len(orphans)
         if after_name is not None:
             orphans = [name for name in orphans if name > after_name]
@@ -391,11 +385,7 @@ def _translate_primitive_quota_error(
 def _write_intent_file(evidence_fd: int, name: str, data: bytes) -> None:
     fd = os.open(
         name,
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | os.O_NOFOLLOW
-        | getattr(os, "O_CLOEXEC", 0),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
         0o600,
         dir_fd=evidence_fd,
     )

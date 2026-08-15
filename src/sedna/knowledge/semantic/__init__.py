@@ -24,7 +24,10 @@ from sedna.knowledge.semantic.drafts import (
     SemanticDraftBundle,
 )
 from sedna.knowledge.semantic.compiler import SEMANTIC_COMPILER_VERSION, SemanticCompiler
-from sedna.knowledge.semantic.service import SemanticIngestionService
+from sedna.knowledge.semantic.service import (
+    SemanticAcceptanceProfile,
+    SemanticIngestionService,
+)
 
 __all__ = [
     "CompilationDisposition",
@@ -49,6 +52,7 @@ __all__ = [
     "SemanticCompilationResult",
     "SEMANTIC_COMPILER_VERSION",
     "SemanticCompiler",
+    "SemanticAcceptanceProfile",
     "SemanticIngestionService",
     "SemanticDraftBundle",
 ]

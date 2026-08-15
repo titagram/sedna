@@ -323,6 +323,7 @@ def test_failure_codes_are_closed_and_do_not_reuse_critic_finding_codes():
         "invalid_structured_response",
         "invalid_input",
         "materialization_failure",
+        "required_case_missing",
         "internal_failure",
     )
     with pytest.raises(ValidationError, match="failure_code"):
