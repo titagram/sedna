@@ -246,7 +246,7 @@ class PromotionCompilationResult(_PromotionModel):
             valid = valid and self.failure_code is None
         elif self.disposition == "quarantined":
             valid = (
-                self.draft is not None
+                self.draft is None
                 and self.critic is not None
                 and not self.critic.accepted
                 and self.failure_code == "critic_rejected"

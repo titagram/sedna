@@ -1,5 +1,13 @@
 """Public safe contracts for verified case promotion."""
 
+from sedna.engagement.promotion.compiler import CasePromotionCompiler
+from sedna.engagement.promotion.llm import (
+    PromotionLlmAdapter,
+    PromotionLlmError,
+    SafePromotionCriticRequest,
+    SafePromotionExtractRequest,
+    SafePromotionRepairRequest,
+)
 from sedna.engagement.promotion.models import (
     MAX_PROMOTION_DRAFT_BYTES,
     MAX_PROMOTION_INPUT_BYTES,
@@ -15,13 +23,23 @@ from sedna.engagement.promotion.models import (
     PromotionDraft,
     PromotionEvidenceItem,
     PromotionInput,
+    PromotionSecretInventory,
     PromotionStepDraft,
+)
+from sedna.engagement.promotion.prompts import (
+    PROMOTION_CRITIC_PROMPT,
+    PROMOTION_CRITIC_PROMPT_VERSION,
+    PROMOTION_EXTRACTOR_PROMPT,
+    PROMOTION_EXTRACTOR_PROMPT_VERSION,
+    PROMOTION_REPAIR_PROMPT,
+    PROMOTION_REPAIR_PROMPT_VERSION,
 )
 
 __all__ = [
     "MAX_PROMOTION_DRAFT_BYTES",
     "MAX_PROMOTION_INPUT_BYTES",
     "MAX_PROMOTION_SOURCE_BYTES",
+    "CasePromotionCompiler",
     "PROMOTION_COMPILER_VERSION",
     "PROMOTION_DRAFT_SCHEMA_VERSION",
     "PROMOTION_PROVENANCE_SCHEMA_VERSION",
@@ -33,5 +51,17 @@ __all__ = [
     "PromotionDraft",
     "PromotionEvidenceItem",
     "PromotionInput",
+    "PromotionLlmAdapter",
+    "PromotionLlmError",
+    "PromotionSecretInventory",
     "PromotionStepDraft",
+    "PROMOTION_CRITIC_PROMPT",
+    "PROMOTION_CRITIC_PROMPT_VERSION",
+    "PROMOTION_EXTRACTOR_PROMPT",
+    "PROMOTION_EXTRACTOR_PROMPT_VERSION",
+    "PROMOTION_REPAIR_PROMPT",
+    "PROMOTION_REPAIR_PROMPT_VERSION",
+    "SafePromotionCriticRequest",
+    "SafePromotionExtractRequest",
+    "SafePromotionRepairRequest",
 ]
