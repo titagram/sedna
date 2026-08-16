@@ -241,6 +241,7 @@ class CanonicalKnowledgeRepository:
 
     def __init__(self, root: Path, *, root_fd: int | None = None) -> None:
         self._descriptor_lock = threading.RLock()
+        self._promotion_guard_local = threading.local()
         self._root_fd: int | None = None
         self._require_safe_primitives()
         requested_root = Path(root)
@@ -760,8 +761,20 @@ class CanonicalKnowledgeRepository:
     @contextmanager
     def promotion_publication_guard(self, source_id: str) -> Iterator[None]:
         """Serialize promotion publication and revocation for one source."""
-        with self._source_operation_guard("promotion_publication_guards", source_id):
+        _validate_stable_id(source_id)
+        held_source_ids = getattr(self._promotion_guard_local, "source_ids", None)
+        if held_source_ids is None:
+            held_source_ids = set()
+            self._promotion_guard_local.source_ids = held_source_ids
+        if source_id in held_source_ids:
             yield
+            return
+        with self._source_operation_guard("promotion_publication_guards", source_id):
+            held_source_ids.add(source_id)
+            try:
+                yield
+            finally:
+                held_source_ids.remove(source_id)
 
     @contextmanager
     def _source_operation_guard(self, directory: str, source_id: str) -> Iterator[None]:
@@ -882,6 +895,21 @@ class CanonicalKnowledgeRepository:
         before_foundation_revision_change: Callable[[str], object] | None = None,
     ) -> None:
         """Durably commit one source disposition or recover its previous bytes."""
+        with self.promotion_publication_guard(manifest.source_id):
+            self._transition_source_under_publication_guard(
+                manifest,
+                quarantine,
+                before_foundation_revision_change=before_foundation_revision_change,
+            )
+
+    def _transition_source_under_publication_guard(
+        self,
+        manifest: DocumentManifest,
+        quarantine: QuarantineRecord | None,
+        *,
+        before_foundation_revision_change: Callable[[str], object] | None = None,
+    ) -> None:
+        """Apply a source transition while its promotion publication guard is held."""
         self.validate_source_state(manifest, quarantine)
         if before_foundation_revision_change is not None and not callable(
             before_foundation_revision_change
@@ -1014,8 +1042,30 @@ class CanonicalKnowledgeRepository:
         current_revision = int(current_match.group(2))
         if target_revision < current_revision:
             raise ValueError("journal-promotion revision rollback is forbidden")
-        if target_revision == current_revision and target != current:
-            raise ValueError("journal-promotion same revision must be byte-identical")
+        if target_revision == current_revision:
+            if (
+                current.ingestion_status.value == "excluded"
+                and target.ingestion_status.value == "accepted"
+            ):
+                raise ValueError("journal-promotion excluded revision cannot be reaccepted")
+            immutable_fields = (
+                "source_id",
+                "source_namespace",
+                "path",
+                "sha256",
+                "title",
+                "language",
+                "document_type",
+                "knowledge_role",
+                "parser_profile",
+                "extraction",
+                "assets",
+                "warnings",
+            )
+            if any(getattr(target, field) != getattr(current, field) for field in immutable_fields):
+                raise ValueError(
+                    "journal-promotion same revision changed immutable source material"
+                )
 
     def resume_nonaccepted_projection_revision(
         self,

@@ -23,6 +23,7 @@ from sedna.knowledge.semantic.service import SemanticIngestionService
 
 if TYPE_CHECKING:
     from sedna.engagement.lifecycle import EngagementLifecycleService
+    from sedna.engagement.promotion.adapter import PromotionRecoveryCoordinator
     from sedna.engagement.reporting.service import ReportClosureFinalizer, ReportManagementService
     from sedna.engagement.repository import EngagementJournalRepository
     from sedna.engagement.service import EngagementJournalService
@@ -45,6 +46,7 @@ class HadesKnowledgeRuntime:
     reporting: ReportManagementService | None = None
     report_finalizer: ReportClosureFinalizer | None = None
     engagements: EngagementLifecycleService | None = None
+    promotion: PromotionRecoveryCoordinator | None = None
     _closed: bool = field(default=False, init=False, repr=False)
     _index_closed: bool = field(default=False, init=False, repr=False)
     _repository_closed: bool = field(default=False, init=False, repr=False)
@@ -66,6 +68,14 @@ class HadesKnowledgeRuntime:
             EngagementLifecycleService,
             TerminalSettlementCoordinator,
         )
+        from sedna.engagement.promotion.adapter import (
+            JournalPromotionAdapter,
+            PromotionCommitCapability,
+            PromotionRecoveryCoordinator,
+        )
+        from sedna.engagement.promotion.compiler import CasePromotionCompiler
+        from sedna.engagement.promotion.input import PromotionInputProjector
+        from sedna.engagement.promotion.llm import PromotionLlmAdapter
         from sedna.engagement.reporting.service import (
             ReportClosureFinalizer,
             ReportManagementService,
@@ -170,17 +180,29 @@ class HadesKnowledgeRuntime:
                 planning=planning,
                 finalizer=report_finalizer,
             )
+            promotion_adapter = JournalPromotionAdapter(
+                PromotionCommitCapability(journal_repository._issue_promotion_journal_writer()),
+                inputs=PromotionInputProjector(),
+                compiler=CasePromotionCompiler(PromotionLlmAdapter(host)),
+                semantic=semantic,
+                maintenance=maintenance,
+                evidence_reader=journal_repository.read_evidence_slice,
+            )
+            promotion = PromotionRecoveryCoordinator(journal=journal, adapter=promotion_adapter)
             engagements = EngagementLifecycleService(
                 journal=journal,
                 planning=planning,
                 closure_finalizer=report_finalizer,
                 lifecycle_commits=journal._issue_lifecycle_commit_capability(),
+                promotion_recovery=promotion,
+                promotion_revocation=promotion_adapter,
             )
             return cls(
                 learning=learning,
                 retrieval=retrieval,
                 maintenance=maintenance,
                 planning=planning,
+                promotion=promotion,
                 journal=journal,
                 reporting=reporting,
                 report_finalizer=report_finalizer,

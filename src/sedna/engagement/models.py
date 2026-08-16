@@ -76,6 +76,13 @@ MAX_STRATEGY_ARCHIVE_PAGE = 256
 MAX_STRATEGY_ARCHIVE_RECORD_BYTES = 64 * 1024
 
 
+class PromotionSagaInProgressError(ValueError):
+    """A foreign writer attempted to mutate an engagement during promotion."""
+
+    code = "promotion_saga_in_progress"
+    retryable = True
+
+
 class HostKind(StrEnum):
     HADES = "hades"
     HERMES = "hermes"
@@ -499,6 +506,10 @@ class PromotionAttemptState(BaseModel):
         "retry_failed",
         "promoted",
         "terminated",
+        "cancellation_requested",
+        "revocation_requested",
+        "revoked",
+        "superseded",
     ]
     source_id: PromotionSourceId | None = None
     candidate_relative_path: ConfinedRelativePath | None = None
@@ -511,6 +522,29 @@ class PromotionAttemptState(BaseModel):
         None
     )
     reason_code: Annotated[str, Field(min_length=1, max_length=128)] | None = None
+    cancellation_request_event_id: UUID | None = None
+    revocation_request_event_id: UUID | None = None
+    cleanup_event_id: UUID | None = None
+    cleanup_canonical_revision: Sha256Hex | None = None
+    replacement_attempt_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def _validate_task6_stage_ownership(self) -> Self:
+        if self.stage == "cancellation_requested" and self.cancellation_request_event_id is None:
+            raise ValueError("cancellation request event is required")
+        if self.stage in {"revocation_requested", "revoked"} and (
+            self.revocation_request_event_id is None or self.source_id is None or not self.case_ids
+        ):
+            raise ValueError("revocation request fields are required")
+        if self.stage == "revoked" and (
+            self.cleanup_event_id is None
+            or self.cleanup_canonical_revision is None
+            or self.disposition != "cancelled"
+        ):
+            raise ValueError("revoked cleanup fields are required")
+        if self.stage == "superseded" and self.replacement_attempt_id is None:
+            raise ValueError("superseded replacement attempt is required")
+        return self
 
 
 class PromotionPublicationLineage(BaseModel):

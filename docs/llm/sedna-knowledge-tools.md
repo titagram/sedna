@@ -35,6 +35,37 @@ evidence, provider errors, private paths, or a falsely clean lifecycle state. Re
 typed knowledge gap, but researched material must pass the same local learning and validation
 boundary before it can influence later plans.
 
+### Reports, verification, and promoted cases
+
+Use `sedna_manage_engagement` lifecycle actions in this order when an engagement has reached a
+terminal result:
+
+1. Call `close` after pending evidence is settled. Sedna commits an immutable operational report
+   revision and returns `closed_unverified`; call `report` to read the canonical typed report.
+2. Call `verify` only when an external authority has verified that terminal result, supplying the
+   bounded `verification_kind` and `verification_reference`. Verification is not inferred from a
+   complete-looking report.
+3. Treat `closed_verified` as durable even when strategic case publication is still recovering.
+   `inspect` or `resume` retries an interrupted promotion saga. A retryable
+   `promotion_recovery_failed` means to retry later, not to verify again or learn the report as a
+   local file. While recovery is in progress, any unrelated engagement mutation fails with the
+   safe retryable code `promotion_saga_in_progress`; retry it only after `inspect` or `resume`
+   reaches a terminal promotion state.
+4. Use `reject` for a specific settled proof (`flag_event_id` plus reason), or `reopen` when the
+   verified engagement itself needs correction. Sedna revokes the exact published case lineage (or
+   proves that none was published) before it returns the engagement to `active`.
+
+Only the bounded strategic case draft is eligible for promotion. Report-private evidence bytes,
+credentials, final flags, runtime/provider secrets, private paths, and host-adapted command text are
+excluded. Published cases preserve source and event provenance, applicability, observed outcomes,
+negative evidence, and transfer conditions; they remain analogous experience rather than universal
+instructions. Promotion writes canonical semantics first and treats SQLite retrieval state as a
+rebuildable projection. Exact retries and concurrent recovery are idempotent and must not create a
+second lineage.
+Private report revisions classify promoted, revoked, and superseded case transitions into the
+operational timeline for auditability. They record only the bounded journal transition and never
+embed the public case payload, report-private evidence, or secret material.
+
 ## 1. When to call `sedna_learn_local`
 
 Call `sedna_learn_local` when the user supplies exactly one existing regular, non-symlink local

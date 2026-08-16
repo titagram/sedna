@@ -495,6 +495,7 @@ class PromotionResult:
         "retry_exhausted",
         "quarantined",
         "failed",
+        "revoked",
     ]
     attempt_id: UUID | None = None
     promotion_revision: int | None = None

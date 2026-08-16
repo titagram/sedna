@@ -2,9 +2,10 @@
 
 Contract version: `sedna-engagement-tools-v1`
 
-This guide is the operating contract for the M6A engagement journal surface exposed by the
-Sedna plugin (version `0.2.0`): `sedna_manage_engagement`, `sedna_record_decision`,
-`sedna_add_source`, and the observer hooks that retain host tool calls automatically.
+This guide is the operating contract for the M6 engagement, planning, private-report, and
+verified-case surface exposed by the Sedna plugin (version `0.2.0`):
+`sedna_manage_engagement`, `sedna_record_decision`, `sedna_plan_next`, `sedna_add_source`, and
+the observer hooks that retain host tool calls automatically.
 
 ## 1. Recognize an authorized machine task
 
@@ -93,12 +94,14 @@ private evidence, and a session logbook is rendered for each host session. You d
 to record tool calls manually. Provider or host secrets are redacted before persistence and
 never appear in journals, logbooks, errors, or public tool responses.
 
-## 7. `closing` is waiting for finalization, not a verified success
+## 7. Closing creates a private immutable report, not a verified success
 
-A `close` request moves the engagement to `closing` and records a closure barrier with the
-in-flight calls at that moment. In M6A, `closing` means M6C finalization is pending; it does
-not certify that the proof set was verified. If all in-flight calls are terminated or
-completed, the state reports `closure_ready: true`:
+A `close` request records a closure barrier with the in-flight calls at that moment. Once every
+barrier call is terminal, Sedna commits canonical JSON and an inert Markdown rendering under
+`engagements/<engagement-id>/reports/report-vN.{json,md}`, then moves the lifecycle to
+`closed_unverified`. The report is private: it can retain raw evidence, credentials, flags, and
+host-adapted commands. Its JSON is the future SysReptor integration boundary; the Markdown is
+derived from that same immutable JSON. Closing does not verify the proof set:
 
 ```json
 {
@@ -107,7 +110,27 @@ completed, the state reports `closure_ready: true`:
 }
 ```
 
-## 8. Resolve orphaned calls and reopen after rejected evidence
+## 8. Verify explicitly; sanitized promotion is automatic
+
+After an external platform verifies the private report, bind that durable decision to its kind
+and opaque reference:
+
+```json
+{
+  "action": "verify",
+  "engagement_id": "c2a4f8e0-0000-4000-8000-000000000001",
+  "verification_kind": "platform",
+  "verification_reference": "submission-1234"
+}
+```
+
+Verification automatically starts or resumes a durable promotion saga. Only a sanitized,
+provenance-bound strategic case crosses into canonical knowledge and retrieval. Private report
+content, raw proof values, credentials, flags, and host-adapted commands never cross that
+boundary, and there is no public `learn` or `promote` bypass. `inspect` and `resume` recover an
+interrupted saga; an exact repeated `verify` is idempotent.
+
+## 9. Resolve orphaned calls and revoke before reopening rejected evidence
 
 If a post hook is missing (for example, the host process exited), the tool call stays
 in-flight. Resolve it explicitly with `resolve_call`, using the journal `call_id` shown by
@@ -123,8 +146,20 @@ accepted as journal call IDs):
 }
 ```
 
-If the collected proof is rejected (for example, the platform refuses it), reopen the
-engagement instead of creating a new one:
+If the platform rejects a recorded proof, use `reject` with the exact journal flag event. Sedna
+revokes any published lineage before atomically recording the rejection and reopening:
+
+```json
+{
+  "action": "reject",
+  "engagement_id": "c2a4f8e0-0000-4000-8000-000000000001",
+  "flag_event_id": "00000000-0000-4000-8000-000000000099",
+  "reason": "platform rejected the submitted proof"
+}
+```
+
+For a non-rejection correction, use explicit `reopen`; it still revokes or proves the absence of
+the current publication before making the engagement active:
 
 ```json
 {
@@ -134,7 +169,11 @@ engagement instead of creating a new one:
 }
 ```
 
-## 9. Global sources are optional
+Later report revisions preserve bounded `case_promoted`, `case_promotion_revoked`, and
+`case_promotion_superseded` transitions in their timeline, but never include candidate or public
+case payloads. A report watermark never projects future saga events.
+
+## 10. Global sources are optional
 
 `sedna_add_source` records a shared source suggestion. It is optional and never mandatory;
 the task does not depend on it:
@@ -148,7 +187,7 @@ the task does not depend on it:
 }
 ```
 
-## 10. Respond to every typed error without inventing hidden causes
+## 11. Respond to every typed error without inventing hidden causes
 
 Every control tool returns the same closed envelope on failure:
 
@@ -182,7 +221,20 @@ Known closed codes: `invalid_input`, `host_context_required`, `invalid_target`,
 `lane_unbound`, `journal_unavailable`, `journal_corrupt`, `evidence_capture_failed`,
 `in_flight_limit_exceeded`, `result_too_large`, `source_registry_failed`,
 `unsupported_platform`, `evidence_budget_exhausted`, `interpretation_incomplete`,
-`interpretation_failed`, `settlement_unavailable`.
+`interpretation_failed`, `settlement_unavailable`, `promotion_saga_in_progress`,
+`promotion_recovery_failed`.
+
+`promotion_saga_in_progress` is retryable. It means promotion, cancellation, or revocation owns
+the engagement. Do not mutate, generate a report, write evidence, or call planning operations
+until `inspect`/`resume` finishes recovery. Reads remain safe; the error exposes no saga payload,
+snapshot, frontier, or raw exception.
+
+`promotion_recovery_failed` is retryable. It means `inspect` or `resume` found a durable promotion,
+cancellation, or revocation intent but could not finish its recovery pass. Preserve the private
+journal and canonical store, correct the reported operational fault, then call `inspect`/`resume`
+again; do not reopen, reject verification, plan, or publish a replacement while recovery remains
+incomplete. The public error remains bounded and never includes case payloads, private evidence,
+credentials, flags, source identifiers, canonical revisions, or raw exceptions.
 
 When you see a typed error, respond to that exact code with the documented behavior. Never
 invent a hidden cause, retry a non-retryable error blindly, or guess an engagement where the
@@ -190,10 +242,9 @@ tool reports ambiguity.
 
 ## Scope notes
 
-- M6A has **no planner yet**: `sedna_plan_next` is reserved for M6B and is not registered.
-- Continue using the existing Sedna knowledge retrieval tools
-  (`sedna_retrieve_knowledge` and friends) until M6B lands; engagement evidence does not
-  flow into the knowledge index.
-- `closing` state, proof verification, settlement composition, and richer lifecycle
-  services arrive with M6B/M6C; this contract is versioned and stable at
-  `sedna-engagement-tools-v1`.
+- `sedna_plan_next` plans from settled private engagement evidence; it does not publish evidence.
+- Continue using the existing Sedna knowledge retrieval tools (`sedna_retrieve_knowledge` and
+  friends) for canonical knowledge. Only verification-gated sanitized cases enter that surface.
+- Report artifacts remain under the configured absolute private knowledge root. Public tool
+  responses expose bounded references and status, not report bytes or arbitrary filesystem paths.
+- This contract remains versioned as `sedna-engagement-tools-v1`.

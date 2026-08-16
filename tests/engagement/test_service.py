@@ -224,6 +224,10 @@ def test_event_append_owner_map_is_complete_and_authoritative() -> None:
         "promotion_index_retry_failed": "promotion_commit_capability",
         "case_promoted": "promotion_commit_capability",
         "promotion_attempt_terminated": "promotion_commit_capability",
+        "promotion_attempt_cancellation_requested": "promotion_commit_capability",
+        "promotion_revocation_requested": "promotion_commit_capability",
+        "case_promotion_revoked": "revocation_lifecycle_commit_capability",
+        "case_promotion_superseded": "promotion_commit_capability",
     }
     assert set(EVENT_APPEND_OWNER_BY_TYPE) == {item.value for item in EventType}
 

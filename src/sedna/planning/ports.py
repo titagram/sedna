@@ -45,6 +45,15 @@ class OwnedPlanningRuntime(Protocol):
     planning: PlanningOperations
 
 
+class PromotionRecoveryResult(Protocol):
+    disposition: str
+    reason_code: str | None
+
+
+class PromotionRecoveryOperations(Protocol):
+    def resume_for_engagement(self, engagement_id: UUID) -> PromotionRecoveryResult: ...
+
+
 class OwnedSednaRuntime(OwnedPlanningRuntime, Protocol):
     """One invocation-owned runtime exposing all cross-domain service surfaces."""
 
@@ -52,6 +61,7 @@ class OwnedSednaRuntime(OwnedPlanningRuntime, Protocol):
     engagements: EngagementLifecycleService
     reporting: ReportManagementService
     report_finalizer: ReportClosureFinalizer
+    promotion: PromotionRecoveryOperations | None
 
 
 SednaRuntimeFactory = Callable[[Path], AbstractContextManager[OwnedSednaRuntime]]

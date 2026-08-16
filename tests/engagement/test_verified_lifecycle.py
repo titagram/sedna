@@ -72,7 +72,15 @@ class _Commits:
         return SimpleNamespace()
 
 
-def _snapshot(*, status: str, closure_ready: bool = False, active_report=None):
+class _Recovery:
+    def __init__(self) -> None:
+        self.engagement_ids: list[UUID] = []
+
+    def recover_after_verification(self, engagement_id: UUID) -> None:
+        self.engagement_ids.append(engagement_id)
+
+
+def _snapshot(*, status: str, closure_ready: bool = False, active_report=None, events=()):
     return SimpleNamespace(
         engagement_id=UUID("11111111-1111-4111-8111-111111111111"),
         revision=SimpleNamespace(sequence=4),
@@ -81,6 +89,7 @@ def _snapshot(*, status: str, closure_ready: bool = False, active_report=None):
             closure_ready=closure_ready,
             active_report=active_report,
         ),
+        events=events,
     )
 
 
@@ -132,6 +141,47 @@ def test_verify_settles_then_requires_a_closed_report() -> None:
             verification_reference="submission-42",
         )
 
+    assert planning.reasons == ["verify"]
+
+
+def test_repeated_exact_verification_recovers_without_a_second_commit(monkeypatch) -> None:
+    event_id = UUID("22222222-2222-4222-8222-222222222222")
+    verified_event = SimpleNamespace(
+        event_id=event_id,
+        type="engagement_verified",
+        payload=SimpleNamespace(
+            verification_kind="platform",
+            verification_reference="submission-42",
+        ),
+    )
+    snapshot = _snapshot(
+        status="closed_verified",
+        active_report=object(),
+        events=(verified_event,),
+    )
+    commits = _Commits()
+    planning = _Planning()
+    recovery = _Recovery()
+    monkeypatch.setattr(
+        "sedna.engagement.lifecycle.EngagementMutationResult",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    lifecycle = EngagementLifecycleService(
+        journal=_Journal(snapshot),
+        planning=planning,
+        closure_finalizer=_Finalizer(snapshot),
+        lifecycle_commits=commits,
+        promotion_recovery=recovery,
+    )
+
+    result = lifecycle.verify(
+        snapshot.engagement_id,
+        verification_kind="platform",
+        verification_reference="submission-42",
+    )
+
+    assert result.existing_event_ids == (event_id,)
+    assert recovery.engagement_ids == [snapshot.engagement_id]
     assert planning.reasons == ["verify"]
 
 

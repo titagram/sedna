@@ -138,6 +138,10 @@ EVENT_APPEND_OWNER_BY_TYPE: dict[str, str] = {
     "promotion_index_retry_failed": "promotion_commit_capability",
     "case_promoted": "promotion_commit_capability",
     "promotion_attempt_terminated": "promotion_commit_capability",
+    "promotion_attempt_cancellation_requested": "promotion_commit_capability",
+    "promotion_revocation_requested": "promotion_commit_capability",
+    "case_promotion_revoked": "revocation_lifecycle_commit_capability",
+    "case_promotion_superseded": "promotion_commit_capability",
 }
 
 SettlementReason = Literal[
@@ -650,7 +654,7 @@ class EngagementJournalService:
         self._clock = clock
         self._uuid_factory = uuid_factory
         self._planning_capability_token = object()
-        self._lifecycle_capability_token = object()
+        self._lifecycle_capability_token = repository._lifecycle_capability_token
         self._proof_closure_capability_token = object()
 
     def _issue_planning_event_commit_capability(self) -> PlanningEventCommitCapability:

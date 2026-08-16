@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Barrier, Event, Lock, Thread
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
 import sedna.knowledge.semantic.compiler as compiler_module
 import sedna.knowledge.semantic.service as semantic_service_module
+from sedna.engagement.models import ExecutionLaneKey, HostKind
 from sedna.engagement.repository import JournalUnavailableError
 from sedna.knowledge.hades_runtime import HadesKnowledgeRuntime
 from sedna.knowledge.inventory import discover_sources
@@ -24,6 +27,7 @@ from sedna.knowledge.retrieval import (
     ValidatedTarget,
 )
 from sedna.knowledge.retrieval.sqlite import SQLiteRetrievalIndex
+from tests.engagement.test_promotion_input import _build_verified_journal
 from tests.knowledge.test_semantic_service import (
     SOURCE_CASES,
     _load_responses,
@@ -113,7 +117,25 @@ def test_runtime_composes_planning_with_the_same_owned_journal(tmp_path: Path) -
 
 
 def test_runtime_owns_reporting_and_terminal_lifecycle_on_the_same_journal(tmp_path: Path) -> None:
-    runtime = HadesKnowledgeRuntime.create(_ScriptedHost([]), tmp_path / "knowledge")
+    root = tmp_path / "knowledge"
+    lane = ExecutionLaneKey(
+        host_kind=HostKind.HADES,
+        session_id="runtime-session",
+        task_id="runtime-task",
+    )
+    scope = AuthorizationScope(
+        state=AuthorizationState.AUTHORIZED,
+        exact_targets=(ValidatedTarget.parse("192.0.2.44"),),
+    )
+    manager, _service, verified, *_ = _build_verified_journal(
+        tmp_path,
+        scope,
+        lane,
+        lambda: datetime(2026, 8, 16, tzinfo=UTC),
+        uuid4,
+    )
+    manager.__exit__(None, None, None)
+    runtime = HadesKnowledgeRuntime.create(_ScriptedHost([]), root)
 
     try:
         assert runtime.journal is runtime._journal
@@ -124,6 +146,25 @@ def test_runtime_owns_reporting_and_terminal_lifecycle_on_the_same_journal(tmp_p
         assert runtime.engagements._journal is runtime.journal
         assert runtime.engagements._planning is runtime.planning
         assert runtime.planning._terminal_settlement_port._journal is runtime.journal
+        assert runtime.promotion._journal is runtime.journal
+        assert (
+            runtime.promotion._adapter._capability._writer._repository
+            is runtime._journal_repository
+        )
+        assert runtime.engagements._promotion_recovery is runtime.promotion
+        assert runtime.engagements._promotion_revocation is runtime.promotion._adapter
+        revoked = runtime.promotion._adapter.revoke_after_settlement(
+            verified.engagement_id,
+            lane=lane,
+            expected_revision=verified.revision,
+            operation="reopen",
+            reason="runtime-owned revocation",
+        )
+        assert revoked.snapshot.state.status.value == "active"
+        assert (
+            revoked.snapshot.revision
+            == runtime.journal.load_snapshot(verified.engagement_id).revision
+        )
     finally:
         runtime.close()
 

@@ -44,6 +44,28 @@ from sedna.engagement.service import PlanningEventCommitItem
 def test_report_event_classification_exhaustively_covers_the_closed_union() -> None:
     assert REPORT_PROJECTED_EVENT_TYPES.isdisjoint(REPORT_IGNORED_EVENT_TYPES)
     assert frozenset(EventType) == REPORT_PROJECTED_EVENT_TYPES | REPORT_IGNORED_EVENT_TYPES
+    promotion_transition_types = frozenset(
+        {
+            EventType.CASE_PROMOTED,
+            EventType.CASE_PROMOTION_REVOKED,
+            EventType.CASE_PROMOTION_SUPERSEDED,
+        }
+    )
+    saga_internal_event_types = frozenset(
+        {
+            EventType.PROMOTION_REQUESTED,
+            EventType.PROMOTION_CANDIDATE_READY,
+            EventType.PROMOTION_SOURCE_COMMITTED,
+            EventType.PROMOTION_SEMANTIC_COMMITTED,
+            EventType.PROMOTION_INDEX_PENDING,
+            EventType.PROMOTION_INDEX_RETRY_FAILED,
+            EventType.PROMOTION_ATTEMPT_TERMINATED,
+            EventType.PROMOTION_ATTEMPT_CANCELLATION_REQUESTED,
+            EventType.PROMOTION_REVOCATION_REQUESTED,
+        }
+    )
+    assert promotion_transition_types <= REPORT_PROJECTED_EVENT_TYPES
+    assert saga_internal_event_types <= REPORT_IGNORED_EVENT_TYPES
 
 
 def test_projector_is_bounded_and_deterministic(

@@ -251,9 +251,26 @@ def _build_verified_journal(
     return manager, service, verified, verification_event_id, references, event_ids
 
 
-def test_promotion_event_classification_exhaustively_covers_closed_union() -> None:
+def test_promotion_event_classification_exhaustively_covers_the_closed_union() -> None:
     assert PROMOTION_PROJECTED_EVENT_TYPES.isdisjoint(PROMOTION_IGNORED_EVENT_TYPES)
     assert frozenset(EventType) == PROMOTION_PROJECTED_EVENT_TYPES | PROMOTION_IGNORED_EVENT_TYPES
+    saga_event_types = frozenset(
+        {
+            EventType.PROMOTION_REQUESTED,
+            EventType.PROMOTION_CANDIDATE_READY,
+            EventType.PROMOTION_SOURCE_COMMITTED,
+            EventType.PROMOTION_SEMANTIC_COMMITTED,
+            EventType.PROMOTION_INDEX_PENDING,
+            EventType.PROMOTION_INDEX_RETRY_FAILED,
+            EventType.CASE_PROMOTED,
+            EventType.PROMOTION_ATTEMPT_TERMINATED,
+            EventType.PROMOTION_ATTEMPT_CANCELLATION_REQUESTED,
+            EventType.PROMOTION_REVOCATION_REQUESTED,
+            EventType.CASE_PROMOTION_REVOKED,
+            EventType.CASE_PROMOTION_SUPERSEDED,
+        }
+    )
+    assert saga_event_types == saga_event_types & PROMOTION_IGNORED_EVENT_TYPES
 
 
 def test_projected_strategic_records_preserve_nested_event_provenance() -> None:

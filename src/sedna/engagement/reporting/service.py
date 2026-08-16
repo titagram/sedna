@@ -6,7 +6,7 @@ from typing import Literal, Protocol
 from uuid import UUID
 
 from sedna.engagement.events import EngagementSnapshot
-from sedna.engagement.models import JournalRevision
+from sedna.engagement.models import JournalRevision, PromotionSagaInProgressError
 from sedna.engagement.reporting.markdown import render_operational_report
 from sedna.engagement.reporting.models import OperationalReport, ReportCommitResult, ReportRef
 from sedna.engagement.reporting.projector import OperationalReportProjector
@@ -122,6 +122,7 @@ class ReportManagementService:
         self._planning = planning
 
     def request_close(self, engagement_id: UUID, *, lane, reason: str):
+        self._require_no_active_promotion(engagement_id)
         self._settle(engagement_id)
         snapshot = self._journal.load_snapshot(engagement_id)
         closing = self._journal.request_close(
@@ -137,6 +138,7 @@ class ReportManagementService:
     def generate_report_revision(
         self, engagement_id: UUID, *, reason: Literal["repair_json", "manual_report"]
     ) -> ReportRef:
+        self._require_no_active_promotion(engagement_id)
         self._settle(engagement_id)
         snapshot = self._journal.load_snapshot(engagement_id)
         if snapshot.state.status.value not in {"closed_unverified", "closed_verified"}:
@@ -144,6 +146,7 @@ class ReportManagementService:
         return self._finalizer.commit_later_revision(snapshot=snapshot, reason=reason)
 
     def regenerate_markdown(self, engagement_id: UUID, report_revision: int) -> ReportRef:
+        self._require_no_active_promotion(engagement_id)
         self._settle(engagement_id)
         snapshot = self._journal.load_snapshot(engagement_id)
         if snapshot.state.status.value not in {"closed_unverified", "closed_verified"}:
@@ -152,6 +155,7 @@ class ReportManagementService:
 
     def report(self, engagement_id: UUID) -> ReportRef:
         """Settle once, then triage the current immutable report artifacts."""
+        self._require_no_active_promotion(engagement_id)
         self._settle(engagement_id)
         snapshot = self._journal.load_snapshot(engagement_id)
         if snapshot.state.status.value not in {"closed_unverified", "closed_verified"}:
@@ -172,6 +176,11 @@ class ReportManagementService:
         result = self._planning.settle_pending_evidence(engagement_id, reason="report")
         if result.status not in {"settled", "nothing_pending"}:
             raise ValueError("report_requires_complete_settlement")
+
+    def _require_no_active_promotion(self, engagement_id: UUID) -> None:
+        snapshot = self._journal.load_snapshot(engagement_id)
+        if getattr(getattr(snapshot.state, "promotion", None), "active_attempt", None) is not None:
+            raise PromotionSagaInProgressError()
 
 
 __all__ = ["ReportClosureFinalizer", "ReportManagementService"]

@@ -1602,6 +1602,66 @@ PromotionTerminationReason: TypeAlias = Literal[
 ]
 
 
+class RevocationLifecycleIntent(BaseModel):
+    """Durable, self-authenticating lifecycle authority for promotion cleanup."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    operation: Literal["reject", "reopen"]
+    lane: ExecutionLaneKey
+    reopen_reason: Annotated[str, Field(min_length=1, max_length=2048)]
+    prior_status: Literal["closed_verified"] = "closed_verified"
+    proof_revalidation: Literal["retain_rejections", "invalidate_all"]
+    receipt_authoritative_revision: JournalRevision | None = None
+    situation_sha256: Sha256Hex | None = None
+    proof_requirement_id: Annotated[str | None, Field(min_length=1, max_length=128)] = None
+    assessment_generation: int | None = Field(default=None, ge=1)
+    flag_event_id: UUID | None = None
+    rejected_value_sha256: Sha256Hex | None = None
+    intent_sha256: Sha256Hex
+
+    @classmethod
+    def canonical_digest(cls, value: RevocationLifecycleIntent) -> str:
+        payload = value.model_dump(mode="json", warnings="error")
+        payload.pop("intent_sha256", None)
+        canonical = json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return sha256(canonical).hexdigest()
+
+    @classmethod
+    def build(cls, **values: Any) -> RevocationLifecycleIntent:
+        provisional = cls.model_construct(intent_sha256="0" * 64, **values)
+        return cls(intent_sha256=cls.canonical_digest(provisional), **values)
+
+    @model_validator(mode="after")
+    def validate_intent(self) -> RevocationLifecycleIntent:
+        receipt_fields = (
+            self.receipt_authoritative_revision,
+            self.situation_sha256,
+            self.proof_requirement_id,
+            self.assessment_generation,
+            self.flag_event_id,
+            self.rejected_value_sha256,
+        )
+        if self.operation == "reject":
+            if self.proof_revalidation != "retain_rejections" or any(
+                item is None for item in receipt_fields
+            ):
+                raise ValueError("reject revocation intent requires the complete proof receipt")
+        elif self.proof_revalidation != "invalidate_all" or any(
+            item is not None for item in receipt_fields
+        ):
+            raise ValueError("reopen revocation intent forbids proof receipt fields")
+        if self.intent_sha256 != self.canonical_digest(self):
+            raise ValueError("revocation lifecycle intent digest does not match")
+        return self
+
+
 class PromotionRequestedPayload(_Payload):
     kind: Literal["promotion_requested"] = "promotion_requested"
     attempt_id: UUID
@@ -1691,6 +1751,49 @@ class PromotionAttemptTerminatedPayload(_Payload):
         return self
 
 
+class PromotionAttemptCancellationRequestedPayload(_Payload):
+    kind: Literal["promotion_attempt_cancellation_requested"] = (
+        "promotion_attempt_cancellation_requested"
+    )
+    attempt_id: UUID
+    promotion_revision: int = Field(ge=1)
+    verification_event_id: UUID
+    stage: Literal[
+        "requested",
+        "candidate_ready",
+        "source_committed",
+        "semantic_committed",
+        "index_pending",
+    ]
+    reason: Literal["flag_rejected", "reopened"]
+    lifecycle_intent: RevocationLifecycleIntent
+
+
+class PromotionRevocationRequestedPayload(_Payload):
+    kind: Literal["promotion_revocation_requested"] = "promotion_revocation_requested"
+    attempt_id: UUID
+    source_id: PromotionSourceId
+    promoted_case_ids: tuple[PromotionCaseId, ...] = Field(min_length=1, max_length=128)
+    reason: Literal["flag_rejected", "reopened"]
+    lifecycle_intent: RevocationLifecycleIntent
+
+
+class CasePromotionRevokedPayload(_Payload):
+    kind: Literal["case_promotion_revoked"] = "case_promotion_revoked"
+    attempt_id: UUID
+    source_id: PromotionSourceId
+    removed_case_ids: tuple[PromotionCaseId, ...] = Field(min_length=1, max_length=128)
+    canonical_revision: Sha256Hex
+
+
+class CasePromotionSupersededPayload(_Payload):
+    kind: Literal["case_promotion_superseded"] = "case_promotion_superseded"
+    prior_attempt_id: UUID
+    replacement_attempt_id: UUID
+    source_id: PromotionSourceId
+    removed_case_ids: tuple[PromotionCaseId, ...] = Field(min_length=1, max_length=128)
+
+
 EventPayload: TypeAlias = Annotated[
     EngagementOpenedPayload
     | EngagementResumedPayload
@@ -1751,7 +1854,11 @@ EventPayload: TypeAlias = Annotated[
     | PromotionIndexPendingPayload
     | PromotionIndexRetryFailedPayload
     | CasePromotedPayload
-    | PromotionAttemptTerminatedPayload,
+    | PromotionAttemptTerminatedPayload
+    | PromotionAttemptCancellationRequestedPayload
+    | PromotionRevocationRequestedPayload
+    | CasePromotionRevokedPayload
+    | CasePromotionSupersededPayload,
     Field(discriminator="kind"),
 ]
 
@@ -1819,6 +1926,10 @@ class EventType(StrEnum):
     PROMOTION_INDEX_RETRY_FAILED = "promotion_index_retry_failed"
     CASE_PROMOTED = "case_promoted"
     PROMOTION_ATTEMPT_TERMINATED = "promotion_attempt_terminated"
+    PROMOTION_ATTEMPT_CANCELLATION_REQUESTED = "promotion_attempt_cancellation_requested"
+    PROMOTION_REVOCATION_REQUESTED = "promotion_revocation_requested"
+    CASE_PROMOTION_REVOKED = "case_promotion_revoked"
+    CASE_PROMOTION_SUPERSEDED = "case_promotion_superseded"
 
 
 _LANE_REQUIRED_TYPES = frozenset(
@@ -1885,6 +1996,10 @@ _SYSTEM_SOURCE_BY_TYPE: dict[EventType, str] = {
     EventType.PROMOTION_INDEX_RETRY_FAILED: "promotion",
     EventType.CASE_PROMOTED: "promotion",
     EventType.PROMOTION_ATTEMPT_TERMINATED: "promotion",
+    EventType.PROMOTION_ATTEMPT_CANCELLATION_REQUESTED: "promotion",
+    EventType.PROMOTION_REVOCATION_REQUESTED: "promotion",
+    EventType.CASE_PROMOTION_REVOKED: "promotion",
+    EventType.CASE_PROMOTION_SUPERSEDED: "promotion",
 }
 
 

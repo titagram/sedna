@@ -70,6 +70,23 @@ def test_ledger_event_effect_table_exhaustively_covers_report_events() -> None:
         EventType.ENGAGEMENT_CLOSED,
         EventType.REPORT_COMMIT_ABANDONED,
     } <= LEDGER_NO_OP_EVENT_TYPES
+    saga_event_types = frozenset(
+        {
+            EventType.PROMOTION_REQUESTED,
+            EventType.PROMOTION_CANDIDATE_READY,
+            EventType.PROMOTION_SOURCE_COMMITTED,
+            EventType.PROMOTION_SEMANTIC_COMMITTED,
+            EventType.PROMOTION_INDEX_PENDING,
+            EventType.PROMOTION_INDEX_RETRY_FAILED,
+            EventType.CASE_PROMOTED,
+            EventType.PROMOTION_ATTEMPT_TERMINATED,
+            EventType.PROMOTION_ATTEMPT_CANCELLATION_REQUESTED,
+            EventType.PROMOTION_REVOCATION_REQUESTED,
+            EventType.CASE_PROMOTION_REVOKED,
+            EventType.CASE_PROMOTION_SUPERSEDED,
+        }
+    )
+    assert saga_event_types == saga_event_types & LEDGER_NO_OP_EVENT_TYPES
 
 
 FIXED_TIME = datetime(2026, 8, 11, 12, 30, tzinfo=UTC)

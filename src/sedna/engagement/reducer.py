@@ -12,6 +12,8 @@ from uuid import UUID
 
 from sedna.engagement.events import (
     CasePromotedPayload,
+    CasePromotionRevokedPayload,
+    CasePromotionSupersededPayload,
     ClosureCancelledPayload,
     ClosureRequestedPayload,
     DecisionRecordedPayload,
@@ -22,11 +24,13 @@ from sedna.engagement.events import (
     JournalEvent,
     LaneBoundPayload,
     LaneUnboundPayload,
+    PromotionAttemptCancellationRequestedPayload,
     PromotionAttemptTerminatedPayload,
     PromotionCandidateReadyPayload,
     PromotionIndexPendingPayload,
     PromotionIndexRetryFailedPayload,
     PromotionRequestedPayload,
+    PromotionRevocationRequestedPayload,
     PromotionSemanticCommittedPayload,
     PromotionSourceCommittedPayload,
     ReportGeneratedPayload,
@@ -140,6 +144,10 @@ EVENT_LIFECYCLE_EFFECTS: Mapping[EventType, LifecycleEffect] = MappingProxyType(
         EventType.PROMOTION_INDEX_RETRY_FAILED: LifecycleEffect.BOOKKEEPING,
         EventType.CASE_PROMOTED: LifecycleEffect.BOOKKEEPING,
         EventType.PROMOTION_ATTEMPT_TERMINATED: LifecycleEffect.BOOKKEEPING,
+        EventType.PROMOTION_ATTEMPT_CANCELLATION_REQUESTED: LifecycleEffect.BOOKKEEPING,
+        EventType.PROMOTION_REVOCATION_REQUESTED: LifecycleEffect.BOOKKEEPING,
+        EventType.CASE_PROMOTION_REVOKED: LifecycleEffect.BOOKKEEPING,
+        EventType.CASE_PROMOTION_SUPERSEDED: LifecycleEffect.BOOKKEEPING,
     }
 )
 
@@ -181,6 +189,10 @@ PROMOTION_EVENT_TYPES = frozenset(
         EventType.PROMOTION_INDEX_RETRY_FAILED,
         EventType.CASE_PROMOTED,
         EventType.PROMOTION_ATTEMPT_TERMINATED,
+        EventType.PROMOTION_ATTEMPT_CANCELLATION_REQUESTED,
+        EventType.PROMOTION_REVOCATION_REQUESTED,
+        EventType.CASE_PROMOTION_REVOKED,
+        EventType.CASE_PROMOTION_SUPERSEDED,
     }
 )
 
@@ -446,7 +458,7 @@ class _Accumulator:
             raise EngagementReplayError(f"{item.type.value} requires an active promotion")
         attempt = self.promotion_attempts[-1]
         if (
-            attempt.stage in {"promoted", "terminated"}
+            attempt.stage in {"promoted", "terminated", "revoked", "superseded"}
             or attempt.attempt_id != getattr(item.payload, "attempt_id", None)
             or attempt.promotion_revision != getattr(item.payload, "promotion_revision", None)
         ):
@@ -478,6 +490,8 @@ class _Accumulator:
             if self.promotion_attempts and self.promotion_attempts[-1].stage not in {
                 "promoted",
                 "terminated",
+                "revoked",
+                "superseded",
             }:
                 raise EngagementReplayError("only one promotion attempt may be active")
             expected_revision = self.promotion_attempt_count + 1
@@ -509,8 +523,117 @@ class _Accumulator:
             self.promotion_attempt_ordinal = expected_ordinal
             return
 
+        if isinstance(payload, PromotionRevocationRequestedPayload):
+            if not self.promotion_attempts:
+                raise EngagementReplayError("promotion revocation requires a published attempt")
+            promoted = self.promotion_attempts[-1]
+            lineage = self.latest_successful_publication
+            if (
+                promoted.stage != "promoted"
+                or promoted.disposition != "promoted"
+                or promoted.attempt_id != payload.attempt_id
+                or promoted.source_id != payload.source_id
+                or promoted.case_ids != payload.promoted_case_ids
+                or lineage is None
+                or lineage.attempt_id != payload.attempt_id
+                or lineage.source_id != payload.source_id
+                or lineage.case_ids != payload.promoted_case_ids
+            ):
+                raise EngagementReplayError(
+                    "promotion revocation does not match pinned publication"
+                )
+            self.promotion_attempts.append(
+                promoted.model_copy(
+                    update={
+                        "stage": "revocation_requested",
+                        "disposition": None,
+                        "revocation_request_event_id": item.event_id,
+                    }
+                )
+            )
+            return
+
+        if isinstance(payload, CasePromotionRevokedPayload):
+            if not self.promotion_attempts:
+                raise EngagementReplayError("promotion cleanup requires a revocation request")
+            attempt = self.promotion_attempts[-1]
+            if (
+                attempt.stage != "revocation_requested"
+                or attempt.attempt_id != payload.attempt_id
+                or attempt.source_id != payload.source_id
+                or attempt.case_ids != payload.removed_case_ids
+            ):
+                raise EngagementReplayError("promotion cleanup does not match revocation request")
+            self._replace_promotion(
+                attempt,
+                stage="revoked",
+                disposition="cancelled",
+                cleanup_event_id=item.event_id,
+                cleanup_canonical_revision=payload.canonical_revision,
+            )
+            self._fold_terminal_promotion(item)
+            return
+
+        if isinstance(payload, CasePromotionSupersededPayload):
+            if not self.promotion_attempts:
+                raise EngagementReplayError("promotion supersession requires a replacement")
+            replacement = self.promotion_attempts[-1]
+            prior_index = next(
+                (
+                    index
+                    for index in range(len(self.promotion_attempts) - 2, -1, -1)
+                    if self.promotion_attempts[index].attempt_id == payload.prior_attempt_id
+                ),
+                None,
+            )
+            if prior_index is None:
+                lineage = self.latest_successful_publication
+                if (
+                    lineage is None
+                    or lineage.attempt_id != payload.prior_attempt_id
+                    or lineage.source_id != payload.source_id
+                    or lineage.case_ids != payload.removed_case_ids
+                    or replacement.attempt_id != payload.replacement_attempt_id
+                    or replacement.source_id != payload.source_id
+                    or replacement.stage not in {"index_pending", "retry_failed"}
+                    or replacement.promotion_revision <= lineage.promotion_revision
+                ):
+                    raise EngagementReplayError(
+                        "promotion supersession folded lineage does not match"
+                    )
+                return
+            prior = self.promotion_attempts[prior_index]
+            if (
+                prior.stage not in {"promoted", "revoked"}
+                or prior.source_id != payload.source_id
+                or prior.case_ids != payload.removed_case_ids
+                or replacement.attempt_id != payload.replacement_attempt_id
+                or replacement.source_id != payload.source_id
+                or replacement.stage not in {"index_pending", "retry_failed"}
+                or replacement.promotion_revision <= prior.promotion_revision
+            ):
+                raise EngagementReplayError("promotion supersession identity does not match")
+            self.promotion_attempts[prior_index] = prior.model_copy(
+                update={
+                    "stage": "superseded",
+                    "replacement_attempt_id": replacement.attempt_id,
+                }
+            )
+            return
+
         attempt = self._active_promotion(item)
-        if isinstance(payload, PromotionCandidateReadyPayload):
+        if isinstance(payload, PromotionAttemptCancellationRequestedPayload):
+            if (
+                attempt.stage != payload.stage
+                or attempt.verification_event_id != payload.verification_event_id
+            ):
+                raise EngagementReplayError("promotion cancellation does not match active stage")
+            self._replace_promotion(
+                attempt,
+                stage="cancellation_requested",
+                cancellation_request_event_id=item.event_id,
+            )
+        elif isinstance(payload, PromotionCandidateReadyPayload):
             if attempt.stage != "requested":
                 raise EngagementReplayError("promotion candidate is out of order")
             self._replace_promotion(
@@ -709,7 +832,7 @@ class _Accumulator:
                 raise EngagementReplayError("report closure barrier is not ready")
             if not self.closure_ready or report.journal_revision != self.revision:
                 raise EngagementReplayError("report does not match a ready closure barrier")
-            if self.pending_report is not None or self.reports:
+            if self.pending_report is not None or report.report_revision != len(self.reports) + 1:
                 raise EngagementReplayError("closure report revision has already been used")
             self.pending_report = report
             return

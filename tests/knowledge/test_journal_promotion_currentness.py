@@ -3,6 +3,7 @@
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event, Thread
 from uuid import UUID
 
 import pytest
@@ -322,6 +323,68 @@ def test_nonaccepted_promotion_manifest_preserves_lineage_and_excludes(
         assert excluded.quality_reason_codes == (reason,)
         assert not excluded.emitted_artifact_ids
         assert not excluded.quarantine_reasons
+
+
+def test_excluded_promotion_revision_cannot_be_resurrected_by_stale_accepted_manifest(
+    tmp_path: Path,
+) -> None:
+    with _prepared_case(tmp_path, "reference") as (pipeline, prepared, _path, _raw):
+        accepted = _journal_promotion_prepared(pipeline.repository, prepared).manifest
+        pipeline.repository.transition_source(accepted, None)
+        excluded = build_nonaccepted_promotion_manifest(
+            accepted,
+            reason="verification_revoked",
+        )
+        pipeline.repository.transition_source(excluded, None)
+        manifest_before = pipeline.repository.load_manifest(accepted.source_id)
+        semantic_before = pipeline.repository.semantic_bundle_snapshot()
+        source_before = (pipeline.repository.root / accepted.path).read_bytes()
+        provenance_before = (pipeline.repository.root / accepted.assets[0].path).read_bytes()
+
+        with pytest.raises(ValueError, match="excluded revision cannot be reaccepted"):
+            pipeline.repository.transition_source(accepted, None)
+
+        assert pipeline.repository.load_manifest(accepted.source_id) == manifest_before
+        assert pipeline.repository.semantic_bundle_snapshot() == semantic_before
+        assert (pipeline.repository.root / accepted.path).read_bytes() == source_before
+        assert (
+            pipeline.repository.root / accepted.assets[0].path
+        ).read_bytes() == provenance_before
+
+
+def test_promotion_source_transition_uses_reentrant_publication_guard(tmp_path: Path) -> None:
+    with _prepared_case(tmp_path, "reference") as (pipeline, prepared, _path, _raw):
+        accepted = _journal_promotion_prepared(pipeline.repository, prepared).manifest
+        pipeline.repository.transition_source(accepted, None)
+        excluded = build_nonaccepted_promotion_manifest(
+            accepted,
+            reason="verification_revoked",
+        )
+        attempted = Event()
+        completed = Event()
+        errors: list[BaseException] = []
+
+        def transition() -> None:
+            attempted.set()
+            try:
+                pipeline.repository.transition_source(excluded, None)
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                completed.set()
+
+        with pipeline.repository.promotion_publication_guard(accepted.source_id):
+            pipeline.repository.transition_source(accepted, None)
+            worker = Thread(target=transition)
+            worker.start()
+            assert attempted.wait(timeout=1)
+            assert not completed.wait(timeout=0.1)
+            assert pipeline.repository.load_manifest(accepted.source_id) == accepted
+
+        worker.join(timeout=1)
+        assert completed.is_set()
+        assert not errors
+        assert pipeline.repository.load_manifest(accepted.source_id) == excluded
 
 
 def test_receipts_are_minted_by_exact_semantic_canonical_and_index_operations(tmp_path) -> None:

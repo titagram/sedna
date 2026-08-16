@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal, Protocol
 from uuid import UUID
+
+from pydantic import Field
 
 from sedna.engagement.events import (
     EngagementReopenedPayload,
@@ -12,18 +14,55 @@ from sedna.engagement.events import (
     JournalEventDraft,
     SystemCorrelation,
 )
-from sedna.engagement.models import EngagementStatus, ExecutionLaneKey
-from sedna.engagement.service import EngagementMutationResult
+from sedna.engagement.models import (
+    EngagementStatus,
+    ExecutionLaneKey,
+    JournalRevision,
+    PromotionSagaInProgressError,
+)
+from sedna.engagement.service import EngagementMutationResult, SettledProofRejectionReceipt
+
+
+class PromotionRecoveryPort(Protocol):
+    """Dependency-neutral recovery hook invoked after canonical verification."""
+
+    def recover_after_verification(self, engagement_id: UUID) -> None: ...
+
+
+class PromotionRevocationPort(Protocol):
+    """Dependency-neutral revocation hook for verified lifecycle mutations."""
+
+    def revoke_after_settlement(
+        self,
+        engagement_id: UUID,
+        *,
+        lane: ExecutionLaneKey,
+        expected_revision: JournalRevision,
+        operation: Literal["reject", "reopen"],
+        reason: Annotated[str, Field(min_length=1, max_length=2048)],
+        proof_rejection: SettledProofRejectionReceipt | None = None,
+    ) -> EngagementMutationResult: ...
 
 
 class EngagementLifecycleService:
     """Settle pending evidence before every terminal lifecycle mutation."""
 
-    def __init__(self, *, journal, planning, closure_finalizer, lifecycle_commits) -> None:
+    def __init__(
+        self,
+        *,
+        journal,
+        planning,
+        closure_finalizer,
+        lifecycle_commits,
+        promotion_recovery: PromotionRecoveryPort | None = None,
+        promotion_revocation: PromotionRevocationPort | None = None,
+    ) -> None:
         self._journal = journal
         self._planning = planning
         self._closure_finalizer = closure_finalizer
         self._lifecycle_commits = lifecycle_commits
+        self._promotion_recovery = promotion_recovery
+        self._promotion_revocation = promotion_revocation
 
     @staticmethod
     def _status(snapshot) -> str:
@@ -65,6 +104,28 @@ class EngagementLifecycleService:
     ) -> EngagementMutationResult:
         self._settle(engagement_id, "verify")
         snapshot = self._journal.load_snapshot(engagement_id)
+        if self._status(snapshot) == "closed_verified":
+            verification = next(
+                (
+                    event
+                    for event in reversed(snapshot.events)
+                    if getattr(event.type, "value", event.type) == "engagement_verified"
+                ),
+                None,
+            )
+            if (
+                verification is None
+                or verification.payload.verification_kind != verification_kind
+                or verification.payload.verification_reference != verification_reference
+            ):
+                raise ValueError("verification_conflict")
+            if self._promotion_recovery is not None:
+                self._promotion_recovery.recover_after_verification(engagement_id)
+                snapshot = self._journal.load_snapshot(engagement_id)
+            return EngagementMutationResult(
+                snapshot=snapshot,
+                existing_event_ids=(verification.event_id,),
+            )
         if self._status(snapshot) != "closed_unverified" or snapshot.state.active_report is None:
             raise ValueError("verification_requires_closed_report")
         report = snapshot.state.active_report
@@ -82,11 +143,17 @@ class EngagementLifecycleService:
                 operation_id=UUID(int=report.report_id.int ^ snapshot.revision.sequence),
             ),
         )
-        return self._lifecycle_commits.commit_verified(
+        result = self._lifecycle_commits.commit_verified(
             engagement_id,
             draft,
             expected_revision=snapshot.revision,
         )
+        if self._promotion_recovery is not None:
+            self._promotion_recovery.recover_after_verification(engagement_id)
+            return result.model_copy(
+                update={"snapshot": self._journal.load_snapshot(engagement_id)}
+            )
+        return result
 
     def reopen(
         self,
@@ -95,10 +162,22 @@ class EngagementLifecycleService:
         lane: ExecutionLaneKey,
         reason: str,
     ) -> EngagementMutationResult:
+        snapshot = self._journal.load_snapshot(engagement_id)
+        if getattr(getattr(snapshot.state, "promotion", None), "active_attempt", None) is not None:
+            raise PromotionSagaInProgressError()
         self._settle(engagement_id, "reopen")
         snapshot = self._journal.load_snapshot(engagement_id)
         status = self._status(snapshot)
         if status == "closed_verified":
+            if self._promotion_revocation is not None:
+                return self._promotion_revocation.revoke_after_settlement(
+                    engagement_id,
+                    lane=lane,
+                    expected_revision=snapshot.revision,
+                    operation="reopen",
+                    reason=reason,
+                    proof_rejection=None,
+                )
             raise ValueError("canonical_revocation_required")
         if status not in {"closing", "closed_unverified", "closed_verified", "abandoned"}:
             raise ValueError("reopen_requires_terminal_state")
@@ -125,10 +204,23 @@ class EngagementLifecycleService:
         flag_event_id: UUID,
         reason: str,
     ) -> EngagementMutationResult:
+        snapshot = self._journal.load_snapshot(engagement_id)
+        if getattr(getattr(snapshot.state, "promotion", None), "active_attempt", None) is not None:
+            raise PromotionSagaInProgressError()
         settled = self._settle(engagement_id, "reject")
         snapshot = self._journal.load_snapshot(engagement_id)
         status = self._status(snapshot)
         if status == "closed_verified":
+            if self._promotion_revocation is not None:
+                receipt = self._lifecycle_commits.rejection_receipt(settled, flag_event_id)
+                return self._promotion_revocation.revoke_after_settlement(
+                    engagement_id,
+                    lane=lane,
+                    expected_revision=snapshot.revision,
+                    operation="reject",
+                    reason=reason,
+                    proof_rejection=receipt,
+                )
             raise ValueError("canonical_revocation_required")
         if status not in {"closed_unverified", "closed_verified"}:
             raise ValueError("rejection_requires_closed_engagement")

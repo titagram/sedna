@@ -15,27 +15,34 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from sedna.engagement.events import (
     CasePromotedPayload,
+    CasePromotionRevokedPayload,
+    CasePromotionSupersededPayload,
+    EngagementReopenedPayload,
     EventType,
     EvidenceAttachedPayload,
+    FlagRejectedPayload,
     JournalEvent,
     JournalEventDraft,
     LaneBoundPayload,
     LaneUnboundPayload,
+    PromotionAttemptCancellationRequestedPayload,
     PromotionAttemptTerminatedPayload,
     PromotionCandidateReadyPayload,
     PromotionIndexPendingPayload,
     PromotionIndexRetryFailedPayload,
     PromotionRequestedPayload,
+    PromotionRevocationRequestedPayload,
     PromotionSemanticCommittedPayload,
     PromotionSourceCommittedPayload,
     RecoveryWarningPayload,
+    RevocationLifecycleIntent,
     SystemCorrelation,
 )
 from sedna.engagement.models import (
@@ -66,6 +73,7 @@ from sedna.engagement.models import (
     ExecutionLaneKey,
     JournalRevision,
     OrphanEvidencePage,
+    PromotionSagaInProgressError,
     StrategyArchiveCommitResult,
     StrategyArchivePage,
     StrategyArchiveProjectionEnvelope,
@@ -841,6 +849,12 @@ class _PromotionClaimWriteResult:
     disposition: Literal["created", "resumed", "existing", "retry_exhausted"]
 
 
+@dataclass(frozen=True)
+class _PromotionMutationWriteResult:
+    event_id: UUID
+    revision: JournalRevision
+
+
 class _PromotionJournalWriter:
     """Repository-issued, data-only authority for promotion journal transactions."""
 
@@ -899,6 +913,43 @@ class _PromotionJournalWriter:
         self._require_holder()
         return self._repository._commit_promoted_case(engagement_id, **values)
 
+    def commit_superseded_and_promoted(self, engagement_id, **values):
+        self._require_holder()
+        return self._repository._commit_superseded_and_promoted(engagement_id, **values)
+
+    def request_cancellation(self, engagement_id, **values):
+        self._require_holder()
+        return self._repository._request_promotion_cancellation(engagement_id, **values)
+
+    def request_revocation(self, engagement_id, **values):
+        self._require_holder()
+        return self._repository._request_promotion_revocation(engagement_id, **values)
+
+    def commit_cleanup_and_reopen(self, engagement_id, **values):
+        self._require_holder()
+        return self._repository._commit_promotion_cleanup_and_reopen(engagement_id, **values)
+
+    def commit_cleanup_reject_and_reopen(self, engagement_id, **values):
+        self._require_holder()
+        return self._repository._commit_promotion_cleanup_and_reopen(engagement_id, **values)
+
+    def commit_empty_reject_and_reopen(self, engagement_id, **values):
+        self._require_holder()
+        return self._repository._commit_empty_revocation(
+            engagement_id,
+            operation="reject",
+            **values,
+        )
+
+    def commit_empty_and_reopen(self, engagement_id, **values):
+        self._require_holder()
+        return self._repository._commit_empty_revocation(
+            engagement_id,
+            operation="reopen",
+            proof_rejection=None,
+            **values,
+        )
+
     def load_snapshot(self, engagement_id):
         self._require_holder()
         return self._repository.load_snapshot(engagement_id)
@@ -938,6 +989,7 @@ class EngagementJournalRepository:
         self._closed = False
         self._report_capability_token = object()
         self._promotion_capability_token = object()
+        self._lifecycle_capability_token = object()
         self._owned_promotion_attempt_ids: set[UUID] = set()
         self._promotion_claim_holders: dict[UUID, tuple[UUID, object, int]] = {}
         self._root_fd = self._open_absolute_root(raw)
@@ -1685,6 +1737,10 @@ class EngagementJournalRepository:
             "promotion_index_retry_failed",
             "case_promoted",
             "promotion_attempt_terminated",
+            "promotion_attempt_cancellation_requested",
+            "promotion_revocation_requested",
+            "case_promotion_revoked",
+            "case_promotion_superseded",
         }
         if any(draft.type in repository_owned for draft in drafts):
             raise EngagementAppendAuthorityError(
@@ -1722,6 +1778,11 @@ class EngagementJournalRepository:
         if active.claim_expires_at is None or self._clock() >= active.claim_expires_at:
             raise ValueError("promotion claim has expired")
         return active
+
+    @staticmethod
+    def _require_no_active_promotion(state: Any) -> None:
+        if state.promotion.active_attempt is not None:
+            raise PromotionSagaInProgressError()
 
     def _commit_promotion_candidate(
         self,
@@ -2253,6 +2314,635 @@ class EngagementJournalRepository:
             expected_revision=expected_revision,
         )
 
+    def _commit_superseded_and_promoted(
+        self,
+        engagement_id: UUID,
+        *,
+        replacement: object,
+        expected_revision: JournalRevision,
+    ) -> _PromotionMutationWriteResult:
+        snapshot = self.load_snapshot(engagement_id)
+        active = snapshot.state.promotion.active_attempt
+        prior = snapshot.state.promotion.latest_successful_publication
+        receipt = cast(Any, replacement)
+        if (
+            snapshot.revision != expected_revision
+            or active is None
+            or active.stage not in {"index_pending", "retry_failed"}
+            or active.source_id is None
+            or prior is None
+            or prior.attempt_id == active.attempt_id
+            or prior.source_id != active.source_id
+            or getattr(receipt, "attempt_id", None) != active.attempt_id
+            or getattr(receipt, "promotion_revision", None) != active.promotion_revision
+            or getattr(receipt, "source_id", None) != active.source_id
+            or not getattr(receipt, "case_ids", ())
+        ):
+            raise ValueError("promotion supersession fence does not match")
+        correlation = SystemCorrelation(
+            source="promotion",
+            operation_id=uuid5(
+                NAMESPACE_URL,
+                f"sedna:promotion:{engagement_id}:{active.attempt_id}:supersession",
+            ),
+        )
+        result = self._append_batch(
+            engagement_id,
+            (
+                JournalEventDraft(
+                    actor="system",
+                    type=EventType.CASE_PROMOTION_SUPERSEDED,
+                    payload=CasePromotionSupersededPayload(
+                        prior_attempt_id=prior.attempt_id,
+                        replacement_attempt_id=active.attempt_id,
+                        source_id=prior.source_id,
+                        removed_case_ids=prior.case_ids,
+                    ),
+                    system_correlation=correlation,
+                ),
+                JournalEventDraft(
+                    actor="system",
+                    type=EventType.CASE_PROMOTED,
+                    payload=CasePromotedPayload(
+                        attempt_id=active.attempt_id,
+                        source_id=active.source_id,
+                        promotion_revision=active.promotion_revision,
+                        case_ids=receipt.case_ids,
+                    ),
+                    system_correlation=correlation,
+                ),
+            ),
+            expected_revision=expected_revision,
+            defer_tail_recovery=False,
+            allow_active_promotion=True,
+        )
+        return _PromotionMutationWriteResult(
+            event_id=result.events[-1].event_id,
+            revision=result.revision,
+        )
+
+    def _resolve_exact_promotion_request_replay(
+        self,
+        snapshot: Any,
+        *,
+        engagement_id: UUID,
+        lane: ExecutionLaneKey,
+        attempt_id: UUID,
+        operation: Literal["reject", "reopen"],
+        reopen_reason: str,
+        proof_rejection: object | None,
+        expected_revision: JournalRevision,
+        request_type: EventType,
+    ) -> _PromotionMutationWriteResult | None:
+        request = next(
+            (
+                event
+                for event in reversed(snapshot.events)
+                if event.type == request_type
+                and getattr(event.payload, "attempt_id", None) == attempt_id
+            ),
+            None,
+        )
+        if request is None:
+            return None
+        preceding = snapshot.events[request.sequence - 2] if request.sequence > 1 else None
+        reserved_in_batch = (
+            preceding is not None
+            and preceding.type == EventType.LANE_BOUND
+            and preceding.payload.lane == lane
+            and preceding.idempotency_key == f"lane-bind:{lane.stable_key}:{engagement_id}"
+        )
+        base_sequence = request.sequence - (2 if reserved_in_batch else 1)
+        base_revision = (
+            JournalRevision(sequence=0, event_hash="0" * 64)
+            if base_sequence == 0
+            else JournalRevision(
+                sequence=base_sequence,
+                event_hash=snapshot.events[base_sequence - 1].event_hash,
+            )
+        )
+        if base_revision != expected_revision:
+            return None
+        if operation == "reopen":
+            if proof_rejection is not None:
+                return None
+            expected_intent = RevocationLifecycleIntent.build(
+                operation="reopen",
+                lane=lane,
+                reopen_reason=reopen_reason,
+                proof_revalidation="invalidate_all",
+            )
+        else:
+            self._authenticate_settled_proof_rejection(
+                snapshot,
+                engagement_id=engagement_id,
+                receipt=proof_rejection,
+            )
+            receipt = cast(Any, proof_rejection)
+            expected_intent = RevocationLifecycleIntent.build(
+                operation="reject",
+                lane=lane,
+                reopen_reason=reopen_reason,
+                proof_revalidation="retain_rejections",
+                receipt_authoritative_revision=receipt.authoritative_revision,
+                situation_sha256=receipt.situation_sha256,
+                proof_requirement_id=receipt.proof_requirement_id,
+                assessment_generation=receipt.assessment_generation,
+                flag_event_id=receipt.proof_event_id,
+                rejected_value_sha256=receipt.rejected_value_sha256,
+            )
+        if request.payload.lifecycle_intent != expected_intent:
+            return None
+        return _PromotionMutationWriteResult(
+            event_id=request.event_id,
+            revision=snapshot.revision,
+        )
+
+    def _request_promotion_revocation(
+        self,
+        engagement_id: UUID,
+        *,
+        lane: ExecutionLaneKey,
+        attempt_id: UUID,
+        operation: Literal["reject", "reopen"],
+        reopen_reason: str,
+        proof_rejection: object | None,
+        expected_revision: JournalRevision,
+    ) -> _PromotionMutationWriteResult:
+        snapshot = self.load_snapshot(engagement_id)
+        active = snapshot.state.promotion.active_attempt
+        if (
+            active is not None
+            and active.attempt_id == attempt_id
+            and active.stage == "revocation_requested"
+        ):
+            replay = self._resolve_exact_promotion_request_replay(
+                snapshot,
+                engagement_id=engagement_id,
+                lane=lane,
+                attempt_id=attempt_id,
+                operation=operation,
+                reopen_reason=reopen_reason,
+                proof_rejection=proof_rejection,
+                expected_revision=expected_revision,
+                request_type=EventType.PROMOTION_REVOCATION_REQUESTED,
+            )
+            if replay is not None:
+                return replay
+            raise ValueError("promotion revocation replay intent does not match")
+        lineage = snapshot.state.promotion.latest_successful_publication
+        published = next(
+            (
+                attempt
+                for attempt in reversed(snapshot.state.promotion.recent_terminal_attempts)
+                if lineage is not None and attempt.attempt_id == lineage.attempt_id
+            ),
+            None,
+        )
+        if (
+            snapshot.revision != expected_revision
+            or snapshot.state.status.value != "closed_verified"
+            or lineage is None
+            or published is None
+            or published.attempt_id != attempt_id
+            or published.stage != "promoted"
+            or published.disposition != "promoted"
+        ):
+            raise ValueError("promotion revocation does not match an active publication")
+        if operation == "reopen":
+            if proof_rejection is not None:
+                raise ValueError("reopen revocation forbids a proof rejection receipt")
+            intent = RevocationLifecycleIntent.build(
+                operation="reopen",
+                lane=lane,
+                reopen_reason=reopen_reason,
+                proof_revalidation="invalidate_all",
+            )
+        else:
+            receipt = cast(Any, proof_rejection)
+            if (
+                proof_rejection is None
+                or getattr(receipt, "_issuer_token", None) is not self._lifecycle_capability_token
+                or getattr(receipt, "engagement_id", None) != engagement_id
+                or getattr(receipt, "authoritative_revision", None) != expected_revision
+            ):
+                raise ValueError("reject revocation requires an authentic current receipt")
+            intent = RevocationLifecycleIntent.build(
+                operation="reject",
+                lane=lane,
+                reopen_reason=reopen_reason,
+                proof_revalidation="retain_rejections",
+                receipt_authoritative_revision=receipt.authoritative_revision,
+                situation_sha256=receipt.situation_sha256,
+                proof_requirement_id=receipt.proof_requirement_id,
+                assessment_generation=receipt.assessment_generation,
+                flag_event_id=receipt.proof_event_id,
+                rejected_value_sha256=receipt.rejected_value_sha256,
+            )
+        result = self._append_promotion_request_with_lane(
+            engagement_id,
+            lane,
+            PromotionRevocationRequestedPayload(
+                attempt_id=attempt_id,
+                source_id=lineage.source_id,
+                promoted_case_ids=lineage.case_ids,
+                reason="flag_rejected" if operation == "reject" else "reopened",
+                lifecycle_intent=intent,
+            ),
+            expected_revision=expected_revision,
+            claim_event_id=published.claim_event_id,
+            proof_rejection=proof_rejection,
+        )
+        return _PromotionMutationWriteResult(
+            event_id=result.events[-1].event_id,
+            revision=result.revision,
+        )
+
+    def _request_promotion_cancellation(
+        self,
+        engagement_id: UUID,
+        *,
+        lane: ExecutionLaneKey,
+        attempt_id: UUID,
+        operation: Literal["reject", "reopen"],
+        reopen_reason: str,
+        proof_rejection: object | None,
+        expected_revision: JournalRevision,
+    ) -> _PromotionMutationWriteResult:
+        snapshot = self.load_snapshot(engagement_id)
+        active = snapshot.state.promotion.active_attempt
+        if (
+            active is not None
+            and active.attempt_id == attempt_id
+            and active.stage == "cancellation_requested"
+        ):
+            replay = self._resolve_exact_promotion_request_replay(
+                snapshot,
+                engagement_id=engagement_id,
+                lane=lane,
+                attempt_id=attempt_id,
+                operation=operation,
+                reopen_reason=reopen_reason,
+                proof_rejection=proof_rejection,
+                expected_revision=expected_revision,
+                request_type=EventType.PROMOTION_ATTEMPT_CANCELLATION_REQUESTED,
+            )
+            if replay is not None:
+                return replay
+            raise ValueError("promotion cancellation replay intent does not match")
+        if (
+            snapshot.revision != expected_revision
+            or snapshot.state.status.value != "closed_verified"
+            or active is None
+            or active.attempt_id != attempt_id
+            or active.stage
+            not in {
+                "requested",
+                "candidate_ready",
+                "source_committed",
+                "semantic_committed",
+                "index_pending",
+            }
+        ):
+            raise ValueError("promotion cancellation does not match an active recoverable claim")
+        if operation == "reopen":
+            if proof_rejection is not None:
+                raise ValueError("reopen cancellation forbids a proof rejection receipt")
+            intent = RevocationLifecycleIntent.build(
+                operation="reopen",
+                lane=lane,
+                reopen_reason=reopen_reason,
+                proof_revalidation="invalidate_all",
+            )
+        else:
+            required = (
+                "authoritative_revision",
+                "situation_sha256",
+                "proof_requirement_id",
+                "assessment_generation",
+                "proof_event_id",
+                "rejected_value_sha256",
+            )
+            if proof_rejection is None or any(
+                not hasattr(proof_rejection, field) for field in required
+            ):
+                raise ValueError("reject cancellation requires a settled proof receipt")
+            receipt = cast(Any, proof_rejection)
+            if (
+                getattr(receipt, "_issuer_token", None) is not self._lifecycle_capability_token
+                or getattr(receipt, "engagement_id", None) != engagement_id
+                or receipt.authoritative_revision != expected_revision
+            ):
+                raise ValueError("reject cancellation requires an authentic current receipt")
+            intent = RevocationLifecycleIntent.build(
+                operation="reject",
+                lane=lane,
+                reopen_reason=reopen_reason,
+                proof_revalidation="retain_rejections",
+                receipt_authoritative_revision=receipt.authoritative_revision,
+                situation_sha256=receipt.situation_sha256,
+                proof_requirement_id=receipt.proof_requirement_id,
+                assessment_generation=receipt.assessment_generation,
+                flag_event_id=receipt.proof_event_id,
+                rejected_value_sha256=receipt.rejected_value_sha256,
+            )
+        result = self._append_promotion_request_with_lane(
+            engagement_id,
+            lane,
+            PromotionAttemptCancellationRequestedPayload(
+                attempt_id=attempt_id,
+                promotion_revision=active.promotion_revision,
+                verification_event_id=active.verification_event_id,
+                stage=cast(
+                    Literal[
+                        "requested",
+                        "candidate_ready",
+                        "source_committed",
+                        "semantic_committed",
+                        "index_pending",
+                    ],
+                    active.stage,
+                ),
+                reason="flag_rejected" if operation == "reject" else "reopened",
+                lifecycle_intent=intent,
+            ),
+            expected_revision=expected_revision,
+            claim_event_id=active.claim_event_id,
+            proof_rejection=proof_rejection,
+        )
+        return _PromotionMutationWriteResult(
+            event_id=result.events[-1].event_id,
+            revision=result.revision,
+        )
+
+    def _commit_empty_revocation(
+        self,
+        engagement_id: UUID,
+        *,
+        operation: Literal["reject", "reopen"],
+        lane: ExecutionLaneKey,
+        reason: str,
+        proof_rejection: object | None,
+        absence_proof: object,
+        expected_revision: JournalRevision,
+    ) -> BatchAppendResult:
+        snapshot = self.load_snapshot(engagement_id)
+        verified = next(
+            (event for event in reversed(snapshot.events) if event.type == "engagement_verified"),
+            None,
+        )
+        proof = cast(Any, absence_proof)
+        promotion = snapshot.state.promotion
+        current_terminal = (
+            None
+            if verified is None
+            else next(
+                (
+                    attempt
+                    for attempt in reversed(promotion.recent_terminal_attempts)
+                    if attempt.verification_event_id == verified.event_id
+                ),
+                None,
+            )
+        )
+        lineage = promotion.latest_successful_publication
+        lineage_attempt = (
+            None
+            if lineage is None
+            else next(
+                (
+                    attempt
+                    for attempt in reversed(promotion.recent_terminal_attempts)
+                    if attempt.attempt_id == lineage.attempt_id
+                ),
+                None,
+            )
+        )
+        historical_lineage_is_inactive = lineage is None or (
+            (current_terminal is None or current_terminal.attempt_id != lineage.attempt_id)
+            and (lineage_attempt is None or lineage_attempt.stage in {"revoked", "superseded"})
+        )
+        current_terminal_is_empty = current_terminal is None or (
+            current_terminal.stage == "terminated"
+            and current_terminal.cleanup_canonical_revision is None
+        )
+        expected_attempt_id = None if current_terminal is None else current_terminal.attempt_id
+        if (
+            promotion.active_attempt is not None
+            or not historical_lineage_is_inactive
+            or not current_terminal_is_empty
+            or verified is None
+            or getattr(proof, "engagement_id", None) != engagement_id
+            or getattr(proof, "verification_event_id", None) != verified.event_id
+            or getattr(proof, "attempt_id", None) != expected_attempt_id
+            or getattr(proof, "purpose", None) != "direct_empty"
+            or getattr(proof, "request_event_id", None) is not None
+            or getattr(proof, "canonical_state", None) != "absent"
+            or getattr(proof, "canonical_revision", None) is not None
+            or getattr(proof, "source_id", None) is not None
+            or getattr(proof, "removed_case_ids", None) != ()
+        ):
+            raise ValueError("direct-empty revocation absence fence does not match")
+        drafts: list[JournalEventDraft] = []
+        if operation == "reject":
+            receipt = cast(Any, proof_rejection)
+            if (
+                proof_rejection is None
+                or getattr(receipt, "_issuer_token", None) is not self._lifecycle_capability_token
+                or getattr(receipt, "engagement_id", None) != engagement_id
+                or getattr(receipt, "authoritative_revision", None) != expected_revision
+            ):
+                raise ValueError("direct rejection requires an authentic current receipt")
+            self._authenticate_settled_proof_rejection(
+                snapshot,
+                engagement_id=engagement_id,
+                receipt=proof_rejection,
+            )
+            drafts.append(
+                JournalEventDraft(
+                    actor="system",
+                    type=EventType.FLAG_REJECTED,
+                    payload=FlagRejectedPayload(
+                        flag_event_id=receipt.proof_event_id,
+                        rejected_value_sha256=receipt.rejected_value_sha256,
+                        reason=reason,
+                    ),
+                    system_correlation=SystemCorrelation(
+                        source="lifecycle",
+                        operation_id=receipt.proof_event_id,
+                    ),
+                    idempotency_key=(
+                        f"direct-empty:{operation}:{proof.guard_nonce}:proof-rejection"
+                    ),
+                )
+            )
+        elif proof_rejection is not None:
+            raise ValueError("direct reopen forbids a proof rejection receipt")
+        drafts.append(
+            JournalEventDraft(
+                actor="system",
+                type=EventType.ENGAGEMENT_REOPENED,
+                payload=EngagementReopenedPayload(
+                    reason=reason,
+                    prior_status="closed_verified",
+                    proof_revalidation=(
+                        "retain_rejections" if operation == "reject" else "invalidate_all"
+                    ),
+                ),
+                system_correlation=SystemCorrelation(
+                    source="lifecycle",
+                    operation_id=verified.event_id,
+                ),
+                idempotency_key=f"direct-empty:{operation}:{proof.guard_nonce}:reopen",
+            )
+        )
+        if (
+            snapshot.revision != expected_revision
+            or snapshot.state.status.value != "closed_verified"
+        ) and snapshot.state.status.value != "active":
+            raise ValueError("direct-empty revocation absence fence does not match")
+        return self.append_lifecycle_batch(
+            engagement_id,
+            lane,
+            tuple(drafts),
+            binding_reason=operation,
+            expected_revision=expected_revision,
+        )
+
+    def _commit_promotion_cleanup_and_reopen(
+        self,
+        engagement_id: UUID,
+        *,
+        request_event_id: UUID,
+        absence_proof: object,
+        expected_revision: JournalRevision,
+    ) -> BatchAppendResult:
+        snapshot = self.load_snapshot(engagement_id)
+        active = snapshot.state.promotion.active_attempt
+        request = next(
+            (event for event in snapshot.events if event.event_id == request_event_id),
+            None,
+        )
+        request_payload = None if request is None else request.payload
+        is_cancellation = isinstance(
+            request_payload,
+            PromotionAttemptCancellationRequestedPayload,
+        )
+        is_revocation = isinstance(request_payload, PromotionRevocationRequestedPayload)
+        if (
+            snapshot.revision != expected_revision
+            or snapshot.state.status.value != "closed_verified"
+            or active is None
+            or (
+                is_cancellation
+                and (
+                    active.stage != "cancellation_requested"
+                    or active.cancellation_request_event_id != request_event_id
+                )
+            )
+            or (
+                is_revocation
+                and (
+                    active.stage != "revocation_requested"
+                    or active.revocation_request_event_id != request_event_id
+                )
+            )
+            or not (is_cancellation or is_revocation)
+        ):
+            raise ValueError("promotion cleanup request fence no longer matches")
+        proof = cast(Any, absence_proof)
+        if (
+            getattr(proof, "engagement_id", None) != engagement_id
+            or getattr(proof, "verification_event_id", None) != active.verification_event_id
+            or getattr(proof, "attempt_id", None) != active.attempt_id
+            or getattr(proof, "purpose", None) != "request_cleanup"
+            or getattr(proof, "request_event_id", None) != request_event_id
+            or getattr(proof, "canonical_state", None) not in {"absent", "excluded"}
+        ):
+            raise ValueError("promotion cleanup absence proof does not match the request")
+        intent = request_payload.lifecycle_intent
+        correlation = SystemCorrelation(source="lifecycle", operation_id=request_event_id)
+        if is_revocation:
+            if (
+                proof.canonical_state != "excluded"
+                or active.source_id is None
+                or proof.source_id != active.source_id
+                or proof.removed_case_ids != active.case_ids
+                or proof.canonical_revision is None
+            ):
+                raise ValueError("published cleanup requires excluded canonical lineage")
+            cleanup_payload = CasePromotionRevokedPayload(
+                attempt_id=active.attempt_id,
+                source_id=active.source_id,
+                removed_case_ids=active.case_ids,
+                canonical_revision=proof.canonical_revision,
+            )
+            cleanup_type = EventType.CASE_PROMOTION_REVOKED
+        else:
+            cleanup_payload = PromotionAttemptTerminatedPayload(
+                attempt_id=active.attempt_id,
+                promotion_revision=active.promotion_revision,
+                disposition="cancelled",
+                reason_code=(
+                    "verification_revoked"
+                    if intent.operation == "reject"
+                    else "engagement_reopened"
+                ),
+                cleanup_source_id=(
+                    proof.source_id if proof.canonical_state == "excluded" else None
+                ),
+                cleanup_canonical_revision=(
+                    proof.canonical_revision if proof.canonical_state == "excluded" else None
+                ),
+            )
+            cleanup_type = EventType.PROMOTION_ATTEMPT_TERMINATED
+        drafts: list[JournalEventDraft] = [
+            JournalEventDraft(
+                actor="system",
+                type=cleanup_type,
+                payload=cleanup_payload,
+                system_correlation=SystemCorrelation(
+                    source="promotion",
+                    operation_id=request_event_id,
+                ),
+            )
+        ]
+        if intent.operation == "reject":
+            if intent.flag_event_id is None or intent.rejected_value_sha256 is None:
+                raise ValueError("reject lifecycle intent is incomplete")
+            drafts.append(
+                JournalEventDraft(
+                    actor="system",
+                    type=EventType.FLAG_REJECTED,
+                    payload=FlagRejectedPayload(
+                        flag_event_id=intent.flag_event_id,
+                        rejected_value_sha256=intent.rejected_value_sha256,
+                        reason=intent.reopen_reason,
+                    ),
+                    system_correlation=correlation,
+                )
+            )
+        drafts.append(
+            JournalEventDraft(
+                actor="system",
+                type=EventType.ENGAGEMENT_REOPENED,
+                payload=EngagementReopenedPayload(
+                    reason=intent.reopen_reason,
+                    prior_status="closed_verified",
+                    proof_revalidation=intent.proof_revalidation,
+                ),
+                system_correlation=correlation,
+            )
+        )
+        return self.append_lifecycle_batch(
+            engagement_id,
+            intent.lane,
+            tuple(drafts),
+            binding_reason=intent.operation,
+            expected_revision=expected_revision,
+            allow_active_promotion=True,
+        )
+
     def _terminate_promotion(
         self,
         engagement_id: UUID,
@@ -2501,6 +3191,183 @@ class EngagementJournalRepository:
         finally:
             os.close(engagement_fd)
 
+    def _authenticate_settled_proof_rejection(
+        self,
+        snapshot: Any,
+        *,
+        engagement_id: UUID,
+        receipt: object | None,
+    ) -> None:
+        """Authenticate every settled receipt field against its authoritative replay."""
+
+        from sedna.planning.situation import SituationReducer
+
+        value = cast(Any, receipt)
+        if (
+            receipt is None
+            or getattr(value, "_issuer_token", None) is not self._lifecycle_capability_token
+            or getattr(value, "engagement_id", None) != engagement_id
+        ):
+            raise ValueError("reject promotion request requires an authentic current receipt")
+        try:
+            authoritative_revision = value.authoritative_revision
+            if authoritative_revision.sequence > len(snapshot.events):
+                raise ValueError("receipt revision is ahead of the journal")
+            if authoritative_revision.sequence == 0:
+                if authoritative_revision.event_hash != "0" * 64:
+                    raise ValueError("receipt revision hash does not match")
+                authoritative_events = ()
+            else:
+                authoritative_events = snapshot.events[: authoritative_revision.sequence]
+                if authoritative_events[-1].event_hash != authoritative_revision.event_hash:
+                    raise ValueError("receipt revision hash does not match")
+            authoritative = self._snapshot(
+                snapshot.manifest,
+                authoritative_events,
+                reduce_engagement(snapshot.manifest, authoritative_events),
+            )
+            if authoritative.state.status.value != "closed_verified":
+                raise ValueError("receipt revision is not verified")
+            situation = SituationReducer.rebuild(authoritative)
+            proof = next(
+                item
+                for item in situation.objective_progress.requirements
+                if item.proof_requirement_id == value.proof_requirement_id
+            )
+            reference = next(
+                item
+                for item in proof.value_references
+                if item.proof_event_id == value.proof_event_id
+            )
+            proof_event = next(
+                item for item in authoritative.events if item.event_id == value.proof_event_id
+            )
+            verification = next(
+                item
+                for item in reversed(authoritative.events)
+                if item.type == EventType.ENGAGEMENT_VERIFIED
+            )
+        except (AttributeError, StopIteration, TypeError, ValueError) as exc:
+            raise ValueError(
+                "reject promotion request requires an authentic current receipt"
+            ) from exc
+        proof_payload = proof_event.payload
+        if (
+            situation.state_digest != value.situation_sha256
+            or proof.assessment_generation != value.assessment_generation
+            or reference.proof_requirement_id != value.proof_requirement_id
+            or reference.assessment_generation != value.assessment_generation
+            or reference.assessment != "supported"
+            or reference.value_sha256 != value.rejected_value_sha256
+            or proof_event.type != EventType.OBJECTIVE_PROOF_OBSERVED
+            or getattr(proof_payload, "proof_requirement_id", None) != value.proof_requirement_id
+            or getattr(proof_payload, "assessment_generation", None) != value.assessment_generation
+            or getattr(proof_payload, "assessment", None) != "supported"
+            or getattr(getattr(proof_payload, "candidate_value", None), "value_sha256", None)
+            != value.rejected_value_sha256
+            or proof_event.sequence > verification.sequence
+            or verification.sequence > value.authoritative_revision.sequence
+        ):
+            raise ValueError("reject promotion request requires an authentic current receipt")
+
+    def _append_promotion_request_with_lane(
+        self,
+        engagement_id: UUID,
+        lane: ExecutionLaneKey,
+        payload: PromotionAttemptCancellationRequestedPayload | PromotionRevocationRequestedPayload,
+        *,
+        expected_revision: JournalRevision,
+        claim_event_id: UUID | None,
+        proof_rejection: object | None,
+    ) -> BatchAppendResult:
+        """Reserve the lifecycle lane and append its request under one registry CAS."""
+
+        request_draft = JournalEventDraft(
+            type=EventType(payload.kind),
+            payload=payload,
+            actor="system",
+            system_correlation=SystemCorrelation(
+                source="promotion",
+                operation_id=uuid5(
+                    NAMESPACE_URL,
+                    f"sedna:promotion:{engagement_id}:{payload.attempt_id}:{payload.kind}",
+                ),
+            ),
+        )
+
+        def attempt() -> BatchAppendResult:
+            with _locked_file(self._engagements_fd, ".registry.lock"):
+                self._assert_lane_available(lane, exclude=engagement_id)
+                snapshot = self._load_snapshot_registry_locked(engagement_id)
+                if snapshot.revision != expected_revision:
+                    raise RevisionConflictError("expected revision is stale")
+                if payload.lifecycle_intent.operation == "reject":
+                    self._authenticate_settled_proof_rejection(
+                        snapshot,
+                        engagement_id=engagement_id,
+                        receipt=proof_rejection,
+                    )
+                state = snapshot.state
+                if isinstance(payload, PromotionAttemptCancellationRequestedPayload):
+                    active = state.promotion.active_attempt
+                    if (
+                        active is None
+                        or active.attempt_id != payload.attempt_id
+                        or (claim_event_id is not None and active.claim_event_id != claim_event_id)
+                        or active.stage != payload.stage
+                        or active.promotion_revision != payload.promotion_revision
+                        or active.verification_event_id != payload.verification_event_id
+                    ):
+                        raise ValueError("promotion revocation fence no longer matches")
+                else:
+                    lineage = state.promotion.latest_successful_publication
+                    published = next(
+                        (
+                            item
+                            for item in reversed(state.promotion.recent_terminal_attempts)
+                            if lineage is not None and item.attempt_id == lineage.attempt_id
+                        ),
+                        None,
+                    )
+                    if (
+                        lineage is None
+                        or published is None
+                        or published.attempt_id != payload.attempt_id
+                        or published.stage != "promoted"
+                        or published.disposition != "promoted"
+                        or published.source_id != payload.source_id
+                        or published.case_ids != payload.promoted_case_ids
+                        or (
+                            claim_event_id is not None
+                            and published.claim_event_id != claim_event_id
+                        )
+                    ):
+                        raise ValueError("promotion revocation fence no longer matches")
+                batch: tuple[JournalEventDraft, ...] = (request_draft,)
+                if not any(binding.lane == lane for binding in state.bound_lanes):
+                    batch = (
+                        JournalEventDraft(
+                            lane=lane,
+                            actor="host_agent",
+                            type=EventType.LANE_BOUND,
+                            payload=LaneBoundPayload(
+                                lane=lane,
+                                binding_reason="promotion lifecycle request",
+                            ),
+                            idempotency_key=f"lane-bind:{lane.stable_key}:{engagement_id}",
+                        ),
+                        request_draft,
+                    )
+                return self._append_batch(
+                    engagement_id,
+                    batch,
+                    expected_revision=expected_revision,
+                    defer_tail_recovery=True,
+                    allow_active_promotion=True,
+                )
+
+        return self._retry_registry_tail_recovery(attempt)
+
     def _append_promotion_event(
         self,
         engagement_id,
@@ -2517,6 +3384,9 @@ class EngagementJournalRepository:
             "promotion_index_retry_failed",
             "case_promoted",
             "promotion_attempt_terminated",
+            "promotion_attempt_cancellation_requested",
+            "promotion_revocation_requested",
+            "case_promotion_superseded",
         }
         if payload.kind not in allowed:
             raise EngagementAppendAuthorityError("invalid promotion stage event")
@@ -2538,6 +3408,7 @@ class EngagementJournalRepository:
                 (draft,),
                 expected_revision=expected_revision,
                 defer_tail_recovery=False,
+                allow_active_promotion=True,
             )
         self._complete_tail_recovery(engagement_id)
         engagement_fd = self._engagement_fd(engagement_id)
@@ -2549,12 +3420,49 @@ class EngagementJournalRepository:
                 )
                 if head.revision != expected_revision:
                     raise RevisionConflictError("expected revision is stale")
-                self._require_active_promotion_claim(
-                    reduce_engagement(manifest, existing),
-                    attempt_id=payload.attempt_id,
-                    promotion_revision=payload.promotion_revision,
-                    claim_event_id=claim_event_id,
-                )
+                state = reduce_engagement(manifest, existing)
+                active = state.promotion.active_attempt
+                if isinstance(payload, PromotionAttemptCancellationRequestedPayload):
+                    if (
+                        active is None
+                        or active.attempt_id != payload.attempt_id
+                        or (claim_event_id is not None and active.claim_event_id != claim_event_id)
+                        or active.stage != payload.stage
+                        or active.promotion_revision != payload.promotion_revision
+                        or active.verification_event_id != payload.verification_event_id
+                    ):
+                        raise ValueError("promotion revocation fence no longer matches")
+                elif isinstance(payload, PromotionRevocationRequestedPayload):
+                    lineage = state.promotion.latest_successful_publication
+                    published = next(
+                        (
+                            attempt
+                            for attempt in reversed(state.promotion.recent_terminal_attempts)
+                            if lineage is not None and attempt.attempt_id == lineage.attempt_id
+                        ),
+                        None,
+                    )
+                    if (
+                        lineage is None
+                        or published is None
+                        or published.attempt_id != payload.attempt_id
+                        or published.stage != "promoted"
+                        or published.disposition != "promoted"
+                        or published.source_id != payload.source_id
+                        or published.case_ids != payload.promoted_case_ids
+                        or (
+                            claim_event_id is not None
+                            and published.claim_event_id != claim_event_id
+                        )
+                    ):
+                        raise ValueError("promotion revocation fence no longer matches")
+                else:
+                    self._require_active_promotion_claim(
+                        state,
+                        attempt_id=payload.attempt_id,
+                        promotion_revision=payload.promotion_revision,
+                        claim_event_id=claim_event_id,
+                    )
                 return self._append_locked(
                     engagement_fd,
                     manifest,
@@ -2671,6 +3579,7 @@ class EngagementJournalRepository:
                     engagement_fd, engagement_id, allow_tail=False
                 )
                 snapshot = self._snapshot(manifest, events, reduce_engagement(manifest, events))
+                self._require_no_active_promotion(snapshot.state)
                 if snapshot.revision != expected_revision:
                     raise RevisionConflictError("expected revision is stale")
                 ref = next(
@@ -2776,6 +3685,7 @@ class EngagementJournalRepository:
                     engagement_fd, engagement_id, allow_tail=False
                 )
                 snapshot = self._snapshot(manifest, existing, reduce_engagement(manifest, existing))
+                self._require_no_active_promotion(snapshot.state)
                 already_payload = next(
                     (
                         event.payload
@@ -2972,6 +3882,7 @@ class EngagementJournalRepository:
         *,
         expected_revision: JournalRevision | None,
         defer_tail_recovery: bool,
+        allow_active_promotion: bool = False,
     ) -> BatchAppendResult:
         self._require_open()
         if not isinstance(drafts, Sequence) or isinstance(drafts, (str, bytes)):
@@ -3003,6 +3914,9 @@ class EngagementJournalRepository:
                     ) = self._load_authoritative_locked(
                         engagement_fd, engagement_id, allow_tail=False
                     )
+                if not allow_active_promotion:
+                    state = reduce_engagement(manifest, existing)
+                    self._require_no_active_promotion(state)
                 abandoned = self._abandon_report_transaction_locked(
                     engagement_fd,
                     manifest,
@@ -3502,6 +4416,7 @@ class EngagementJournalRepository:
                     engagement_fd, engagement_id, allow_tail=False
                 )
                 state = reduce_engagement(manifest, events)
+                self._require_no_active_promotion(state)
                 engagement_projection = self._projection_bytes(head.revision, state)
                 try:
                     current_projection = _read_bounded(
@@ -3711,9 +4626,10 @@ class EngagementJournalRepository:
         try:
             with _locked_file(engagement_fd, ".journal.lock"):
                 self._recover_pending_append(engagement_fd, engagement_id)
-                _, _, head, _ = self._load_authoritative_locked(
+                manifest, events, head, _ = self._load_authoritative_locked(
                     engagement_fd, engagement_id, allow_tail=False
                 )
+                self._require_no_active_promotion(reduce_engagement(manifest, events))
                 if head.revision != expected_journal_revision:
                     raise RevisionConflictError("strategy archive journal revision is stale")
                 with _locked_file(engagement_fd, ".strategy-archive.lock"):
@@ -3821,6 +4737,10 @@ class EngagementJournalRepository:
         try:
             with _locked_file(engagement_fd, ".journal.lock"):
                 self._recover_pending_append(engagement_fd, engagement_id)
+                manifest, events, _head, _journal_bytes = self._load_authoritative_locked(
+                    engagement_fd, engagement_id, allow_tail=False
+                )
+                self._require_no_active_promotion(reduce_engagement(manifest, events))
                 with _locked_file(engagement_fd, ".strategy-archive.lock"):
                     current = self._load_strategy_archive_locked(engagement_fd)
                     if (
@@ -3856,17 +4776,23 @@ class EngagementJournalRepository:
         self._complete_tail_recovery(engagement_id)
         engagement_fd = self._engagement_fd(engagement_id)
         try:
-            store = EvidenceStore(
-                engagement_fd,
-                quota=self._evidence_quota,
-                fault=self._fault,
-            )
-            result = store.capture_with_intent(
-                data,
-                media_type=media_type,
-                representation=representation,
-                capture_limitations=capture_limitations,
-            )
+            with _locked_file(engagement_fd, ".journal.lock"):
+                self._recover_pending_append(engagement_fd, engagement_id)
+                manifest, events, _head, _journal_bytes = self._load_authoritative_locked(
+                    engagement_fd, engagement_id, allow_tail=False
+                )
+                self._require_no_active_promotion(reduce_engagement(manifest, events))
+                store = EvidenceStore(
+                    engagement_fd,
+                    quota=self._evidence_quota,
+                    fault=self._fault,
+                )
+                result = store.capture_with_intent(
+                    data,
+                    media_type=media_type,
+                    representation=representation,
+                    capture_limitations=capture_limitations,
+                )
         finally:
             os.close(engagement_fd)
         return result.reference
@@ -3965,6 +4891,7 @@ class EngagementJournalRepository:
         *,
         binding_reason: str,
         expected_revision: JournalRevision,
+        allow_active_promotion: bool = False,
     ) -> BatchAppendResult:
         """Atomically derive an optional lane binding and append a lifecycle batch."""
 
@@ -3989,6 +4916,7 @@ class EngagementJournalRepository:
                     batch,
                     expected_revision=expected_revision,
                     defer_tail_recovery=True,
+                    allow_active_promotion=allow_active_promotion,
                 )
 
         return self._retry_registry_tail_recovery(attempt)

@@ -200,8 +200,9 @@ unplanned actions remain allowed and are assessed on the next planning pass.
 
 - **Root layout.** Engagements live under the selected knowledge root in
   `engagements/<engagement-uuid>/`: `events.jsonl` (append-only, hash-chained events),
-  `manifest.json`, `engagement-state.json` (M6A projection; M6B owns a richer `state.json`),
+  `manifest.json`, `engagement-state.json`, `state.json`,
   `evidence/` (private blobs, session logbooks), and a `journal-head.json` commit anchor.
+  Current runtimes treat both state files as one integrated engagement projection.
 - **Explicit proofs.** `create` accepts explicit `required_proofs` (flag/access/custom).
   An empty list means *no proofs declared*, never "already complete".
 - **Privacy.** Evidence blobs and logbooks are private to the engagement. Provider or host
@@ -222,6 +223,20 @@ unplanned actions remain allowed and are assessed on the next planning pass.
   performs one settlement per mandatory plan/resume/finalize/close/reopen path through the
   planning port. Incomplete or unavailable settlement exposes only bounded safe status and never
   claims a clean lifecycle transition.
+- **Reports and verified case promotion.** Closing an engagement commits immutable canonical JSON
+  and inert Markdown report revisions before the lifecycle becomes terminal. A later explicit
+  `verify` promotes only the sanitized, provenance-bound strategic case projection through the
+  same canonical semantic repository and disposable retrieval index; report-private evidence,
+  credentials, flags, and host-adapted commands never cross that boundary. Promotion is a durable,
+  idempotent journal saga: `inspect` and `resume` recover interrupted work, index failure remains
+  retryable without discarding canonical semantics, and exact retries do not duplicate cases.
+  While that saga owns the engagement, foreign journal, evidence, report, and planning-projection
+  writes fail closed with retryable `promotion_saga_in_progress`; promotion-owned recovery and
+  cancellation remain available. Later private report revisions retain promoted, revoked, and
+  superseded transitions in their timeline without exposing public case payloads.
+  Rejecting a proof or reopening a verified engagement first revokes or supersedes the published
+  lineage, then atomically reopens the lifecycle. If no canonical lineage was published, the same
+  path proves its absence and performs no destructive cleanup.
 
 The LLM-facing operating contract with complete JSON examples is in the
 [Sedna engagement tools guide](docs/llm/sedna-engagement-tools.md).

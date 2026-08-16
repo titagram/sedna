@@ -14,7 +14,7 @@ from typing import Annotated, Any, Literal, TypeVar
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from sedna.engagement.hades_adapter import HadesEngagementAdapter
-from sedna.engagement.models import ExecutionLaneKey, HostKind
+from sedna.engagement.models import ExecutionLaneKey, HostKind, PromotionSagaInProgressError
 from sedna.knowledge.hades_runtime import HadesKnowledgeRuntime
 from sedna.knowledge.retrieval import (
     AuthorizationScope,
@@ -372,6 +372,13 @@ def _plan_next_handler(
         return _serialize_planning_result(result)
     except _ToolBoundaryError as error:
         return _json_error(error.code)
+    except PromotionSagaInProgressError:
+        return _json_payload(
+            {
+                "ok": False,
+                "error": {"code": "promotion_saga_in_progress", "retryable": True},
+            }
+        )
     except ValidationError:
         return _json_error("invalid_input")
     except Exception:

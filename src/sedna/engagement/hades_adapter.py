@@ -50,6 +50,7 @@ from sedna.engagement.models import (
     HostAdaptedCommandRecord,
     HostKind,
     JournalRevision,
+    PromotionSagaInProgressError,
     ProofRequirement,
     Sha256Hex,
 )
@@ -658,6 +659,17 @@ class HadesEngagementAdapter:
                 if payload.action == "inspect":
                     if payload.engagement_id is None:
                         return self._error("engagement_not_found")
+                    snapshot = journal.load_snapshot(payload.engagement_id)
+                    if (
+                        runtime.promotion is not None
+                        and snapshot.state.status.value == "closed_verified"
+                    ):
+                        recovery = runtime.promotion.resume_for_engagement(payload.engagement_id)
+                        if recovery.disposition == "failed":
+                            return self._error(
+                                recovery.reason_code or "promotion_recovery_failed",
+                                retryable=True,
+                            )
                     return self._result(
                         {
                             "ok": True,
@@ -709,6 +721,17 @@ class HadesEngagementAdapter:
                     )
                     if settlement.status != "complete":
                         return self._settlement_error(settlement)
+                    snapshot = journal.load_snapshot(resumed.engagement_id)
+                    if (
+                        runtime.promotion is not None
+                        and snapshot.state.status.value == "closed_verified"
+                    ):
+                        recovery = runtime.promotion.resume_for_engagement(resumed.engagement_id)
+                        if recovery.disposition == "failed":
+                            return self._error(
+                                recovery.reason_code or "promotion_recovery_failed",
+                                retryable=True,
+                            )
                     store_digest = sha256(str(root).encode("utf-8")).hexdigest()
                     self._rebuild_logbook(
                         journal,
@@ -1045,6 +1068,8 @@ class HadesEngagementAdapter:
     ) -> None:
         try:
             self._record_pre_tool(tool_name, args, task_id, kwargs)
+        except PromotionSagaInProgressError:
+            raise
         except Exception:
             return None
 
@@ -1077,9 +1102,11 @@ class HadesEngagementAdapter:
                     )
                 else:
                     engagement_id = resolved.engagement_id
+                snapshot = service.load_snapshot(engagement_id)
+                if snapshot.state.promotion.active_attempt is not None:
+                    raise PromotionSagaInProgressError()
                 sanitized = sanitize_host_arguments(args)
                 correlation = self._correlation(lane, tool_name, sanitized, kwargs)
-                snapshot = service.load_snapshot(engagement_id)
                 if (
                     correlation.stable_key is not None
                     and self._find_stable_start(service, correlation) is not None
@@ -1193,6 +1220,8 @@ class HadesEngagementAdapter:
                     )
                 service.append_hook_events(engagement_id, tuple(drafts))
                 self._rebuild_logbook(service, engagement_id, store_digest, session_id)
+        except PromotionSagaInProgressError:
+            raise
         except Exception:
             self._health.record(store_digest, session_id, "journal_unavailable")
 
@@ -1212,6 +1241,9 @@ class HadesEngagementAdapter:
                 resolved = service.resolve_lane_binding(lane)
                 if resolved.engagement_id is None:
                     return None
+                snapshot = service.load_snapshot(resolved.engagement_id)
+                if snapshot.state.promotion.active_attempt is not None:
+                    raise PromotionSagaInProgressError()
                 sanitized = sanitize_host_arguments(kwargs.get("args") or {})
                 correlation = self._correlation(lane, tool_name, sanitized, kwargs)
                 draft = JournalEventDraft(
@@ -1236,6 +1268,8 @@ class HadesEngagementAdapter:
                     store_digest,
                     session_id,
                 )
+        except PromotionSagaInProgressError:
+            raise
         except Exception:
             self._health.record(store_digest, session_id, "journal_unavailable")
 
@@ -1268,6 +1302,8 @@ class HadesEngagementAdapter:
     ) -> None:
         try:
             self._record_post_tool(tool_name, args, result, task_id, duration_ms, kwargs)
+        except PromotionSagaInProgressError:
+            raise
         except Exception:
             return None
 
@@ -1289,6 +1325,11 @@ class HadesEngagementAdapter:
         store_digest = self._pinned_store_digest()
         try:
             with self._open_service() as service:
+                resolved = service.resolve_lane_binding(lane)
+                if resolved.engagement_id is not None:
+                    snapshot = service.load_snapshot(resolved.engagement_id)
+                    if snapshot.state.promotion.active_attempt is not None:
+                        raise PromotionSagaInProgressError()
                 sanitized = sanitize_host_arguments(args or {})
                 correlation = self._correlation(lane, tool_name, sanitized, kwargs)
                 status = _host_technical_status(
@@ -1301,6 +1342,9 @@ class HadesEngagementAdapter:
                         self._health.record(store_digest, session_id, "unmatched_completion")
                         return None
                     engagement_id, call_id = start
+                    snapshot = service.load_snapshot(engagement_id)
+                    if snapshot.state.promotion.active_attempt is not None:
+                        raise PromotionSagaInProgressError()
                     terminal = self._terminal_kind(service, engagement_id, call_id)
                     if terminal == "tool_call_completed":
                         # Duplicate stable post delivery: idempotent no-op.
@@ -1321,12 +1365,19 @@ class HadesEngagementAdapter:
                     candidates = self._uncertain_candidates(service, lane)
                     if len(candidates) == 1:
                         engagement_id, call_id = candidates[0]
+                        snapshot = service.load_snapshot(engagement_id)
+                        if snapshot.state.promotion.active_attempt is not None:
+                            raise PromotionSagaInProgressError()
                     else:
                         engagements = {eid for eid, _ in candidates}
                         if len(engagements) == 1:
+                            engagement_id = next(iter(engagements))
+                            snapshot = service.load_snapshot(engagement_id)
+                            if snapshot.state.promotion.active_attempt is not None:
+                                raise PromotionSagaInProgressError()
                             self._append_unmatched(
                                 service,
-                                next(iter(engagements)),
+                                engagement_id,
                                 lane,
                                 correlation,
                                 status,
@@ -1335,7 +1386,7 @@ class HadesEngagementAdapter:
                             )
                             self._rebuild_logbook(
                                 service,
-                                next(iter(engagements)),
+                                engagement_id,
                                 store_digest,
                                 session_id,
                             )
@@ -1358,6 +1409,8 @@ class HadesEngagementAdapter:
                     store_digest,
                     session_id,
                 )
+        except PromotionSagaInProgressError:
+            raise
         except Exception:
             self._health.record(store_digest, session_id, "journal_unavailable")
 
@@ -2147,6 +2200,8 @@ def _mapped_error(exc: Exception) -> dict[str, Any]:
     if isinstance(exc, EngagementAmbiguousError):
         return {"ok": False, "error": {"code": "engagement_ambiguous", "retryable": False}}
     host_code = getattr(exc, "code", None)
+    if host_code == "promotion_saga_in_progress":
+        return {"ok": False, "error": {"code": host_code, "retryable": True}}
     if isinstance(host_code, str) and host_code in {
         "invalid_input",
         "invalid_target",

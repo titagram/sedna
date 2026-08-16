@@ -21,7 +21,8 @@ from sedna.engagement.events import (
     PromotionSemanticCommittedPayload,
     PromotionSourceCommittedPayload,
 )
-from sedna.engagement.models import JournalRevision
+from sedna.engagement.hades_adapter import _mapped_error
+from sedna.engagement.models import JournalRevision, PromotionSagaInProgressError
 from sedna.engagement.promotion.adapter import (
     JournalPromotionAdapter,
     PromotionCommitCapability,
@@ -42,7 +43,13 @@ from sedna.engagement.promotion.render import (
     promotion_source_id,
     render_promotion_source,
 )
-from sedna.engagement.repository import EngagementJournalRepository, RevisionConflictError
+from sedna.engagement.repository import (
+    EngagementJournalRepository,
+    RevisionConflictError,
+)
+from sedna.engagement.repository import (
+    PromotionSagaInProgressError as RepositoryPromotionSagaInProgressError,
+)
 from sedna.engagement.service import EVENT_APPEND_OWNER_BY_TYPE
 
 from .test_promotion_input import _build_verified_journal
@@ -320,6 +327,82 @@ def test_repository_authors_atomic_claim_and_coalesces_without_transferring_leas
         assert sum(event.type == "promotion_requested" for event in snapshot.events) == 1
     finally:
         manager.__exit__(None, None, None)
+
+
+def test_active_promotion_fences_foreign_journal_and_sidecar_writes(
+    tmp_path,
+    authorized_scope,
+    lane,
+    fixed_clock,
+    fixed_uuid_factory,
+) -> None:
+    manager, service, verified, verification_event_id, *_ = _build_verified_journal(
+        tmp_path, authorized_scope, lane, fixed_clock, fixed_uuid_factory
+    )
+    capability = PromotionCommitCapability(service._repository._issue_promotion_journal_writer())
+    claimed = capability.claim(
+        verified.engagement_id,
+        _claim_request(verified.revision, verification_event_id),
+        expected_revision=verified.revision,
+    )
+    root = tmp_path / "knowledge"
+
+    def persisted_files() -> tuple[tuple[str, bytes], ...]:
+        return tuple(
+            (path.relative_to(root).as_posix(), path.read_bytes())
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        )
+
+    before = persisted_files()
+    try:
+        mutations = (
+            lambda: service.change_objective(
+                verified.engagement_id,
+                lane=lane,
+                objective="foreign objective mutation",
+                authorization_basis="manual",
+                expected_revision=claimed.revision,
+            ),
+            lambda: service.write_evidence(
+                verified.engagement_id,
+                b"foreign evidence",
+                media_type="text/plain",
+                representation="utf-8",
+            ),
+            lambda: service._repository.write_projection(
+                verified.engagement_id,
+                name="state",
+                owner="planning",
+                envelope={"payload": {}},
+                expected_revision=claimed.revision,
+            ),
+            lambda: service._repository.commit_strategy_archive(
+                verified.engagement_id,
+                schema_id="sedna.strategy-archive.v1",
+                records=(),
+                expected_archive_revision=None,
+                expected_journal_revision=claimed.revision,
+            ),
+        )
+        for mutate in mutations:
+            with pytest.raises(PromotionSagaInProgressError) as error:
+                mutate()
+            assert error.value.code == "promotion_saga_in_progress"
+            assert error.value.retryable is True
+
+        assert service.load_snapshot(verified.engagement_id).revision == claimed.revision
+        assert persisted_files() == before
+    finally:
+        manager.__exit__(None, None, None)
+
+
+def test_promotion_saga_fence_maps_to_safe_retryable_public_error() -> None:
+    assert RepositoryPromotionSagaInProgressError is PromotionSagaInProgressError
+    assert _mapped_error(PromotionSagaInProgressError()) == {
+        "ok": False,
+        "error": {"code": "promotion_saga_in_progress", "retryable": True},
+    }
 
 
 def test_fresh_repository_runtime_authenticates_matching_live_claim_for_recovery(

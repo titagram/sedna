@@ -49,6 +49,7 @@ from sedna.engagement.events import (
     TextFactEventRecord,
     ToolCallCompletedPayload,
 )
+from sedna.engagement.models import PromotionSagaInProgressError
 from sedna.engagement.service import PlanningEventCommitItem
 from sedna.planning.commands import validate_command_suggestion
 from sedna.planning.frontier import FrontierReducer
@@ -196,6 +197,12 @@ class PlanningService:
         """Plan outside repository locks with one bounded optimistic restart."""
         if not 3 <= max_proposals <= 8:
             raise ValueError("max_proposals must be between 3 and 8")
+        resolution = self._journal.resolve_lane_binding(lane)
+        if resolution.mode != "exact" or resolution.engagement_id is None:
+            raise ValueError("engagement_binding_required")
+        snapshot = self._journal.load_snapshot(resolution.engagement_id)
+        if snapshot.state.promotion.active_attempt is not None:
+            raise PromotionSagaInProgressError()
         for attempt in range(2):
             try:
                 return self._plan_next_once(lane, max_proposals=max_proposals)
@@ -2241,6 +2248,8 @@ class PlanningService:
                     if attempt:
                         raise
             raise AssertionError("unreachable")
+        except PromotionSagaInProgressError:
+            raise
         except Exception as exc:
             if "terminal_reconciliation_failed" in str(exc):
                 failure_code = "terminal_reconciliation_failed"

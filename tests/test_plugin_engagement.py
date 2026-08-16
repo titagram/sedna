@@ -211,7 +211,7 @@ def test_manage_schema_exposes_verified_lifecycle_and_report_actions(
     assert "rejected_value_sha256" not in parameters["properties"]
 
 
-def test_owned_sedna_runtime_protocol_has_exact_typed_task_two_surfaces() -> None:
+def test_owned_sedna_runtime_protocol_has_exact_typed_m6c_surfaces() -> None:
     from sedna.planning.ports import OwnedSednaRuntime, SednaRuntimeFactory
 
     annotations = get_type_hints(OwnedSednaRuntime)
@@ -222,6 +222,7 @@ def test_owned_sedna_runtime_protocol_has_exact_typed_task_two_surfaces() -> Non
         "report_finalizer",
         "reporting",
         "engagements",
+        "promotion",
     }
     assert all(surface is not Any for surface in annotations.values())
     assert SednaRuntimeFactory is not None
@@ -388,7 +389,7 @@ def test_registered_manage_lifecycle_matrix_switches_profiles_with_one_runtime_p
 
         with EngagementJournalService.open(root) as journal:
             before_reopen = journal.load_snapshot(engagement_uuid)
-        denied_reopen = call_tool(
+        reopened_result = call_tool(
             context,
             "sedna_manage_engagement",
             {"action": "reopen", "engagement_id": engagement_id, "reason": "continue"},
@@ -402,11 +403,10 @@ def test_registered_manage_lifecycle_matrix_switches_profiles_with_one_runtime_p
         assert results[2]["engagement"]["status"] == "closed_unverified"
         assert results[3]["engagement"]["status"] == "closed_verified"
         assert results[4]["report"]["report_revision"] == 2
-        assert denied_reopen == {
-            "ok": False,
-            "error": {"code": "invalid_transition", "retryable": False},
-        }
-        assert after_reopen == before_reopen
+        assert reopened_result["ok"] is True
+        assert reopened_result["engagement"]["status"] == "active"
+        assert after_reopen.state.status.value == "active"
+        assert after_reopen.revision.sequence == before_reopen.revision.sequence + 1
 
     expected_roots = [
         tmp_path / "profile-a" / "knowledge" / "sedna",
@@ -421,8 +421,64 @@ def test_registered_manage_lifecycle_matrix_switches_profiles_with_one_runtime_p
         and runtime.report_finalizer is not None
         and runtime.reporting is not None
         and runtime.engagements is not None
+        and runtime.promotion is not None
         for _, runtime in opened
     )
+
+
+def test_inspect_maps_promotion_recovery_failure_to_retryable_typed_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sedna.engagement.promotion.adapter import PromotionRecoveryCoordinator
+
+    context = HookContext(configured_root=tmp_path / "knowledge")
+    register(context)
+    lane = {"session_id": "session-recovery", "task_id": "root-recovery"}
+    created = call_tool(
+        context,
+        "sedna_manage_engagement",
+        create_payload("Orion-recovery"),
+        **lane,
+    )
+    engagement_id = created["engagement"]["engagement_id"]
+    closed = call_tool(
+        context,
+        "sedna_manage_engagement",
+        {"action": "close", "engagement_id": engagement_id, "reason": "complete"},
+        **lane,
+    )
+    assert closed["ok"] is True
+
+    failed = SimpleNamespace(disposition="failed", reason_code="promotion_recovery_failed")
+    monkeypatch.setattr(
+        PromotionRecoveryCoordinator,
+        "resume_for_engagement",
+        lambda self, engagement_id: failed,
+    )
+    verified = call_tool(
+        context,
+        "sedna_manage_engagement",
+        {
+            "action": "verify",
+            "engagement_id": engagement_id,
+            "verification_kind": "platform",
+            "verification_reference": "submission-recovery",
+        },
+        **lane,
+    )
+    inspected = call_tool(
+        context,
+        "sedna_manage_engagement",
+        {"action": "inspect", "engagement_id": engagement_id},
+        **lane,
+    )
+
+    assert verified["ok"] is True
+    assert verified["engagement"]["status"] == "closed_verified"
+    assert inspected == {
+        "ok": False,
+        "error": {"code": "promotion_recovery_failed", "retryable": True},
+    }
 
 
 @pytest.mark.parametrize(
@@ -633,18 +689,11 @@ def test_registered_reject_reopens_only_unverified_current_proof(
 
     with EngagementJournalService.open(root) as journal:
         reopened = journal.load_snapshot(engagement_id)
-    if verified:
-        assert before_reject is not None
-        assert rejected == {
-            "ok": False,
-            "error": {"code": "invalid_transition", "retryable": False},
-        }
-        assert reopened == before_reject
-        return
-
+    baseline = before_reject if verified else closed
+    assert baseline is not None
     assert rejected["ok"] is True, rejected
     assert rejected["engagement"]["status"] == "active"
-    assert reopened.revision.sequence == closed.revision.sequence + 2
+    assert reopened.revision.sequence == baseline.revision.sequence + 2
     assert tuple(event.type for event in reopened.events[-2:]) == (
         "flag_rejected",
         "engagement_reopened",
