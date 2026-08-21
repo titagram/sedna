@@ -80,6 +80,9 @@ class _MissingParsedHostResult:
 
 class _RecordingHost:
     runtime_api_key = "runtime-host-key-must-not-cross"
+    # Capability flag mirrors OllamaHost: when True the adapter forwards the
+    # concrete JSON schema for structured output instead of json_schema=None.
+    accepts_schema: bool = False
 
     def __init__(self, result: object | Exception) -> None:
         self.result = result
@@ -353,6 +356,77 @@ def test_source_authored_credential_examples_reach_recorded_extractor_unchanged(
     assert call["json_schema"] is None
     assert call["json_mode"] is True
     assert "runtime-host-key-must-not-cross" not in call["input"][0]["text"]
+
+
+def test_structured_schema_only_forwarded_to_schema_capable_host() -> None:
+    """OllamaHost-style hosts receive the real schema; others stay json_schema=None."""
+    prepared = _prepared_with_credential_examples()
+    payload = build_safe_source_payload(prepared)
+    expected_schema = json.loads(
+        json.dumps(
+            SemanticDraftBundle.model_json_schema(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+
+    # Capable host: receives the concrete schema for structured output.
+    capable = _RecordingHost(_HostResult(parsed={"artifacts": [], "ignored_segment_indexes": [0]}))
+    capable.accepts_schema = True
+    HadesLlmAdapter(capable).complete(
+        SemanticDraftBundle,
+        instructions=EXTRACTOR_PROMPT,
+        payload=payload,
+        purpose="sedna.semantic.extract",
+    )
+    assert capable.calls[0]["json_schema"] == expected_schema
+
+    # Plain host: stays None (preserves codex/host-facade behaviour).
+    plain = _RecordingHost(_HostResult(parsed={"artifacts": [], "ignored_segment_indexes": [0]}))
+    HadesLlmAdapter(plain).complete(
+        SemanticDraftBundle,
+        instructions=EXTRACTOR_PROMPT,
+        payload=payload,
+        purpose="sedna.semantic.extract",
+    )
+    assert plain.calls[0]["json_schema"] is None
+
+
+def test_extract_host_schema_capable_receives_flat_segment_text() -> None:
+    """Schema-capable hosts get flat segment text (with indexes) for extract;
+    plain hosts keep the JSON serialization."""
+    prepared = _prepared_with_credential_examples()
+    payload = build_safe_source_payload(prepared)
+
+    capable = _RecordingHost(_HostResult(parsed={"artifacts": [], "ignored_segment_indexes": [0]}))
+    capable.accepts_schema = True
+    HadesLlmAdapter(capable).complete(
+        SemanticDraftBundle,
+        instructions=EXTRACTOR_PROMPT,
+        payload=payload,
+        purpose="sedna.semantic.extract",
+    )
+    cap_text = capable.calls[0]["input"][0]["text"]
+    assert "--- segment " in cap_text
+    assert "--- segment 0 " in cap_text
+    # Flat text is NOT valid JSON: parsing it must raise.
+    try:
+        json.loads(cap_text)
+        raise AssertionError("flat segment text should not be valid JSON")
+    except ValueError:
+        pass
+
+    plain = _RecordingHost(_HostResult(parsed={"artifacts": [], "ignored_segment_indexes": [0]}))
+    HadesLlmAdapter(plain).complete(
+        SemanticDraftBundle,
+        instructions=EXTRACTOR_PROMPT,
+        payload=payload,
+        purpose="sedna.semantic.extract",
+    )
+    plain_text = plain.calls[0]["input"][0]["text"]
+    parsed = json.loads(plain_text)
+    assert "segments" in parsed  # JSON serialized for non-schema hosts
 
 
 def test_safe_segment_models_do_not_classify_source_examples_as_real_credentials():

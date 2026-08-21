@@ -90,6 +90,11 @@ class OllamaHost:
         else:
             self._api_mode = api_mode
 
+    # This host can consume a real JSON Schema as structured output. The
+    # HadesLlmAdapter gates on this to hand us the schema instead of forcing us
+    # to reverse-engineer it from the prompt text.
+    accepts_schema = True
+
     def complete_structured(
         self,
         *,
@@ -108,7 +113,7 @@ class OllamaHost:
         profile: str | None = None,
         purpose: str | None = None,
     ) -> OllamaResult:
-        del json_schema, json_mode, schema_name, provider, agent_id, profile, max_tokens
+        del json_mode, schema_name, provider, agent_id, profile, max_tokens
         eff_model = model or self._model
         # Local models are slow; the upstream HadesLlmAdapter passes a 120s
         # timeout which qwen/gpt-oss routinely exceed on large payloads. Use our
@@ -129,15 +134,35 @@ class OllamaHost:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": user_content})
 
+        # Structured output: when a real JSON Schema is supplied (our adapter
+        # passes it because accepts_schema=True), constrain the sampler to it
+        # instead of a bare "json" hint. This is what lets otherwise weak
+        # models (deepseek-v4-flash, gpt-oss) emit schema-conformant JSON.
+        if isinstance(json_schema, Mapping):
+            schema_dict = dict(json_schema)
+            schema_dict.setdefault("additionalProperties", False)
+            if self._api_mode == "openai":
+                response_format = {
+                    "type": "json_schema",
+                    "json_schema": {"name": "response", "schema": schema_dict},
+                }
+            else:
+                response_format = schema_dict
+        else:
+            response_format = None
+
         # Build payload depending on endpoint mode.
         if self._api_mode == "openai":
-            payload = {
+            payload: dict[str, Any] = {
                 "model": eff_model,
                 "messages": messages,
                 "stream": False,
                 "temperature": temperature if temperature is not None else 0,
-                "response_format": {"type": "json_object"},
             }
+            if response_format is not None:
+                payload["response_format"] = response_format
+            else:
+                payload["response_format"] = {"type": "json_object"}
             url = f"{self._base_url}/chat/completions"
             headers = {"Content-Type": "application/json"}
             if self._api_key:
@@ -147,9 +172,11 @@ class OllamaHost:
                 "model": eff_model,
                 "messages": messages,
                 "stream": False,
-                "format": "json",
                 "options": {"temperature": temperature if temperature is not None else 0},
             }
+            # Native Ollama /api/chat accepts the schema object directly in
+            # "format" (structured output); a plain "json" is the loose fallback.
+            payload["format"] = response_format if response_format is not None else "json"
             url = f"{self._base_url}/api/chat"
             headers = {"Content-Type": "application/json"}
 

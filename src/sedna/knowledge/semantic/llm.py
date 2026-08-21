@@ -17,6 +17,7 @@ from sedna.knowledge.schema import DocumentType, KnowledgeRole, SourceQuality
 from sedna.knowledge.schema.common import SearchableNonEmptyString, SearchableString
 from sedna.knowledge.schema.semantic import CANONICAL_FINDING_MESSAGES
 from sedna.knowledge.semantic.drafts import CriticVerdict, SemanticDraftBundle
+from sedna.knowledge.semantic.prompts import COMPACT_EXTRACTOR_PROMPT
 
 SemanticLlmPurpose = Literal[
     "sedna.semantic.extract",
@@ -244,6 +245,30 @@ def _payload_segment_count(payload: SafeRequestPayload) -> int:
     return 0
 
 
+def _payload_to_segment_text(payload: SafeRequestPayload) -> str:
+    """Render the source segments as flat text with explicit segment indexes.
+
+    Structured-output hosts (accepts_schema=True) handle this far more reliably
+    than the full JSON-serialized SafePreparedSourcePayload, which overflows
+    cloud models (deepseek-v4-flash, gpt-oss). Segment accounting is preserved:
+    the model cites or ignores each index, and Sedna recomputes the ignored set
+    deterministically. For critic/repair payloads we fall back to the nested
+    JSON so the drafts/critic evidence is not flattened.
+    """
+    source = None
+    if isinstance(payload, SafePreparedSourcePayload):
+        source = payload
+    elif isinstance(payload, (SafeCriticRequestPayload, SafeRepairRequestPayload)):
+        source = getattr(payload, "source", None)
+    if not isinstance(source, SafePreparedSourcePayload):
+        return ""
+    parts = [f"# {source.title}", f"type={source.document_type} role={source.knowledge_role}"]
+    for segment in source.segments:
+        parts.append(f"\n--- segment {segment.index} (lines {segment.start_line}-{segment.end_line}) ---")
+        parts.append(segment.text)
+    return "\n".join(parts)
+
+
 def _normalize_segment_accounting(response_obj: dict, segment_count: int) -> None:
     """Ensure every input segment is cited or explicitly ignored.
 
@@ -451,6 +476,11 @@ class HadesLlmAdapter:
         contract = _CALL_CONTRACTS.get(purpose)
         if contract is None or type(payload) is not contract[0] or model_type is not contract[1]:
             raise TypeError("purpose, payload, and response model must match semantic contract")
+        # Structured-output hosts (accepts_schema=True) receive the compact extractor
+        # instruction set. The verbose EXTRACTOR_PROMPT overflows cloud models; the
+        # compact variant keeps the same semantic invariants while remaining reliable.
+        if purpose == "sedna.semantic.extract" and getattr(self._host, "accepts_schema", False):
+            instructions = COMPACT_EXTRACTOR_PROMPT
         try:
             payload_data = payload.model_dump(mode="python", warnings="error")
             validated_payload = type(payload).model_validate(payload_data)
@@ -476,11 +506,29 @@ class HadesLlmAdapter:
             f"{instructions}\n\nReturn one JSON object matching this schema exactly:\n"
             f"{response_schema}"
         )
+        # Structured-output hosts (OllamaHost) consume the real JSON Schema so
+        # the sampler is constrained to it. The codex CLI and the host facade
+        # historically get json_schema=None (a bare schema broke gpt-5.5), so we
+        # gate on an explicit accepts_schema capability flag.
+        json_schema_arg: Mapping[str, object] | None = None
+        if getattr(self._host, "accepts_schema", False):
+            json_schema_arg = json.loads(response_schema)
+        # Structured-output hosts also receive the source as flat segment text
+        # (with explicit indexes) instead of the full JSON payload, which
+        # overflows cloud models. Other hosts keep the JSON serialization.
+        use_segment_text = (
+            getattr(self._host, "accepts_schema", False)
+            and purpose == "sedna.semantic.extract"
+            and _payload_to_segment_text(payload)
+        )
+        input_payload_text = (
+            _payload_to_segment_text(payload) if use_segment_text else serialized_payload
+        )
         try:
             host_result = self._host.complete_structured(
                 instructions=schema_instructions,
-                input=[{"type": "text", "text": serialized_payload}],
-                json_schema=None,
+                input=[{"type": "text", "text": input_payload_text}],
+                json_schema=json_schema_arg,
                 json_mode=True,
                 schema_name=model_type.__name__,
                 temperature=0,
