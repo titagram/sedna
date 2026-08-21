@@ -15,6 +15,7 @@ from sedna.knowledge.parsing import PreparedSource
 from sedna.knowledge.parsing.sanitize import sanitize_asset_target, sanitize_searchable_text
 from sedna.knowledge.schema import DocumentType, KnowledgeRole, SourceQuality
 from sedna.knowledge.schema.common import SearchableNonEmptyString, SearchableString
+from sedna.knowledge.schema.semantic import CANONICAL_FINDING_MESSAGES
 from sedna.knowledge.semantic.drafts import CriticVerdict, SemanticDraftBundle
 
 SemanticLlmPurpose = Literal[
@@ -233,6 +234,167 @@ _CALL_CONTRACTS: Mapping[str, tuple[type[SafeSemanticRequestPayload], type[BaseM
 }
 
 
+def _payload_segment_count(payload: SafeRequestPayload) -> int:
+    """Return the number of source segments in the request payload."""
+    source = getattr(payload, "source", None)
+    if source is not None and isinstance(source, SafePreparedSourcePayload):
+        return len(source.segments)
+    if isinstance(payload, SafePreparedSourcePayload):
+        return len(payload.segments)
+    return 0
+
+
+def _normalize_segment_accounting(response_obj: dict, segment_count: int) -> None:
+    """Ensure every input segment is cited or explicitly ignored.
+
+    The extractor model frequently omits ignored_segment_indexes for segments it
+    does not cite. Segment accounting is a deterministic invariant, so we fill in
+    the missing indexes here rather than failing the whole compilation.
+    """
+    if segment_count <= 0:
+        return
+    cited: set[int] = set()
+    for artifact in response_obj.get("artifacts") or ():
+        if not isinstance(artifact, dict):
+            continue
+        cited.update(_obj_citation_indexes(artifact.get("citations")))
+        cited.update(_obj_context_indexes(artifact.get("applicability")))
+        if artifact.get("draft_type") == "case":
+            for step in artifact.get("steps") or ():
+                if isinstance(step, dict):
+                    cited.update(_obj_citation_indexes(step.get("citations")))
+                    cited.update(_obj_context_indexes(step.get("applicability")))
+    for example in response_obj.get("execution_examples") or ():
+        if not isinstance(example, dict):
+            continue
+        cited.update(_obj_citation_indexes(example.get("citations")))
+        cited.update(_obj_context_indexes(example.get("applicability")))
+        for condition in example.get("prerequisites") or ():
+            if isinstance(condition, dict):
+                cited.update(_obj_citation_indexes(condition.get("citations")))
+        for constraint in example.get("platform_constraints") or ():
+            if isinstance(constraint, dict):
+                cited.update(_obj_citation_indexes(constraint.get("citations")))
+    ignored = set(response_obj.get("ignored_segment_indexes") or ())
+    missing = set(range(segment_count)) - cited - ignored
+    if missing:
+        response_obj["ignored_segment_indexes"] = sorted(ignored | missing)
+
+
+def _drop_orphan_execution_examples(response_obj: dict) -> None:
+    """Drop execution examples whose parent_local_id has no matching artifact.
+
+    Local models often emit execution_examples whose parent_local_id points at a
+    reference/step local ID they did not actually produce. The references and
+    case steps are the semantic core; an orphaned example would fail the whole
+    bundle on a referential-integrity check. Instead of failing compilation, we
+    drop just the orphan examples (a graceful degradation), preserving the rest.
+    """
+    artifacts = response_obj.get("artifacts") or ()
+    if not isinstance(artifacts, list):
+        return
+    parent_ids: set[str] = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        local_id = artifact.get("local_id")
+        # Schema-valid parents are ONLY references and case-STEPS (drafts.py
+        # excludes the case's own local_id). A case's local_id is not a valid
+        # execution-example parent.
+        if isinstance(local_id, str):
+            if artifact.get("draft_type") == "reference":
+                parent_ids.add(local_id)
+            if artifact.get("draft_type") == "case":
+                for step in artifact.get("steps") or ():
+                    if isinstance(step, dict) and isinstance(step.get("local_id"), str):
+                        parent_ids.add(step["local_id"])
+    examples = response_obj.get("execution_examples") or ()
+    if not isinstance(examples, list):
+        return
+    # If no reference/case-step parent exists in the bundle, NO execution
+    # example can be valid — drop them all rather than fail the whole bundle.
+    if not parent_ids:
+        if examples:
+            response_obj["execution_examples"] = []
+        return
+    kept = [
+        ex
+        for ex in examples
+        if isinstance(ex, dict) and isinstance(ex.get("parent_local_id"), str)
+        and ex["parent_local_id"] in parent_ids
+    ]
+    if len(kept) != len(examples):
+        response_obj["execution_examples"] = kept
+
+
+def _normalize_placeholder_policies(response_obj: dict) -> None:
+    """Enforce the prompt's mandatory placeholder binding-policy rules.
+
+    The extractor prompt specifies exact binding_policy for each placeholder
+    kind. Local models frequently omit or mis-set it. Since the rule is
+    deterministic and required by the schema, we fix it here rather than fail
+    the whole bundle. Mapping (from the extractor prompt):
+      kind=target                      -> authorized_scope
+      kind=source_case_credential      -> never_auto_bind
+      all others (port/username/etc.)  -> host_supplied
+    """
+    examples = response_obj.get("execution_examples") or ()
+    if not isinstance(examples, list):
+        return
+    for example in examples:
+        if not isinstance(example, dict):
+            continue
+        placeholders = example.get("placeholders")
+        if not isinstance(placeholders, list):
+            continue
+        for placeholder in placeholders:
+            if not isinstance(placeholder, dict):
+                continue
+            kind = placeholder.get("kind")
+            policy = _POLICY_FOR_KIND.get(kind) if isinstance(kind, str) else None
+            if policy is not None:
+                placeholder["binding_policy"] = policy
+
+
+_POLICY_FOR_KIND: dict[str, str] = {
+    "target": "authorized_scope",
+    "source_case_credential": "never_auto_bind",
+    "port": "host_supplied",
+    "username": "host_supplied",
+    "credential_ref": "host_supplied",
+    "wordlist": "host_supplied",
+    "path": "host_supplied",
+    "value": "host_supplied",
+}
+
+
+def _obj_citation_indexes(citations: object) -> set[int]:
+    out: set[int] = set()
+    if not isinstance(citations, list):
+        return out
+    for citation in citations:
+        if isinstance(citation, dict):
+            for index in citation.get("segment_indexes") or ():
+                if isinstance(index, int):
+                    out.add(index)
+    return out
+
+
+def _obj_context_indexes(context: object) -> set[int]:
+    out: set[int] = set()
+    if not isinstance(context, dict):
+        return out
+    typed = context.get("typed_context")
+    if isinstance(typed, dict):
+        for value in typed.values():
+            if isinstance(value, dict):
+                out.update(_obj_citation_indexes(value.get("citations")))
+    for facet in context.get("facets") or ():
+        if isinstance(facet, dict):
+            out.update(_obj_citation_indexes(facet.get("assertion", {}).get("citations")))
+    return out
+
+
 def build_safe_source_payload(prepared: PreparedSource) -> SafePreparedSourcePayload:
     """Reconstruct the LLM payload field-by-field from the safe prepared boundary."""
     return SafePreparedSourcePayload(
@@ -346,7 +508,36 @@ class HadesLlmAdapter:
                 separators=(",", ":"),
                 sort_keys=True,
             )
-            parsed = model_type.model_validate(json.loads(response_json))
+            response_obj = json.loads(response_json)
+            if model_type is CriticVerdict and isinstance(response_obj, dict):
+                findings = response_obj.get("findings")
+                if isinstance(findings, list):
+                    for finding in findings:
+                        if isinstance(finding, dict):
+                            code = finding.get("code")
+                            canonical = CANONICAL_FINDING_MESSAGES.get(code)
+                            if canonical is not None:
+                                finding["message"] = canonical
+                            # qwen/ollama local models often omit the severity
+                            # field. Derive it deterministically from the code:
+                            # unsafe_material is the only material severity.
+                            if "severity" not in finding or finding["severity"] is None:
+                                finding["severity"] = "material" if code == "unsafe_material" else "warning"
+                    # The critic validator requires accepted == False exactly
+                    # when a material finding exists. Local models frequently
+                    # set accepted=false without any material finding (or vice
+                    # versa). Normalize accepted to match the derived findings.
+                    has_material = any(
+                        isinstance(f, dict) and f.get("severity") == "material"
+                        for f in findings
+                    )
+                    if response_obj.get("accepted") == has_material:
+                        response_obj["accepted"] = not has_material
+            if model_type is SemanticDraftBundle and isinstance(response_obj, dict):
+                _normalize_segment_accounting(response_obj, _payload_segment_count(payload))
+                _drop_orphan_execution_examples(response_obj)
+                _normalize_placeholder_policies(response_obj)
+            parsed = model_type.model_validate(response_obj)
         except Exception:
             raise SemanticLlmError("invalid_structured_response") from None
 

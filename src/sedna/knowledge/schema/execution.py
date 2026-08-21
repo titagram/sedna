@@ -138,8 +138,14 @@ class ExecutionExample(BaseModel):
 
 
 def _validate_command_template(template: str) -> None:
-    if any(ord(character) < 32 or ord(character) == 127 for character in template):
-        raise ValueError("command template must not contain control characters")
+    # Allow whitespace control characters that legitimately appear in multi-line
+    # shell command templates (\n newline, \t tab, \r carriage return) but reject
+    # all other control characters (NUL, ESC, etc.) which are never valid in a
+    # command template.
+    for character in template:
+        code = ord(character)
+        if code < 32 and code not in (9, 10, 13) or code == 127:
+            raise ValueError("command template must not contain control characters")
     _reject_final_flag_material(template)
 
 

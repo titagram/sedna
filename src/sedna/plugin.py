@@ -532,6 +532,22 @@ def _runtime_for_context(
 
 
 def _structured_host(ctx: Any) -> object:
+    # Opt-in to the local Codex CLI host for semantic extraction, bypassing
+    # Hermes' auxiliary LLM routing (which may 402 on an exhausted fallback
+    # provider like OpenRouter). Enabled only when SEDNA_CODEX_LLM=1 and the
+    # codex binary is available; otherwise fail closed through the host facade.
+    if os.environ.get("SEDNA_OLLAMA_LLM", "") == "1":
+        try:
+            from sedna.knowledge.semantic.ollama_host import OllamaHost
+        except Exception:
+            raise _ToolBoundaryError("structured_llm_unavailable") from None
+        return OllamaHost()
+    if os.environ.get("SEDNA_CODEX_LLM", "") == "1":
+        try:
+            from sedna.knowledge.semantic.codex_host import CodexCliHost
+        except Exception:
+            raise _ToolBoundaryError("structured_llm_unavailable") from None
+        return CodexCliHost()
     try:
         host = ctx.llm
         complete_structured = host.complete_structured

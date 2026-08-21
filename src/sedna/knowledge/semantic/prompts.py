@@ -3,9 +3,9 @@
 from typing import Final
 
 EXTRACTOR_PROMPT_ID: Final = "sedna-semantic-extractor"
-EXTRACTOR_PROMPT_VERSION: Final = "2"
+EXTRACTOR_PROMPT_VERSION: Final = "7"
 CRITIC_PROMPT_ID: Final = "sedna-semantic-critic"
-CRITIC_PROMPT_VERSION: Final = "2"
+CRITIC_PROMPT_VERSION: Final = "3"
 REPAIR_PROMPT_ID: Final = "sedna-semantic-repair"
 REPAIR_PROMPT_VERSION: Final = "2"
 
@@ -27,6 +27,40 @@ strategic artifacts or prose tutorials. Parameterize every current-target value 
 placeholder, keep source-case credentials symbolic, and extract explicit source-cited
 prerequisites, applicability, OS family/version, CPU architecture, and execution-environment
 constraints for every example.
+
+Placeholder binding policy is mandatory and must follow these exact rules:
+- A placeholder whose `kind` is `target` MUST set `binding_policy` to `authorized_scope`.
+- A placeholder whose `kind` is `source_case_credential` MUST set `binding_policy` to
+  `never_auto_bind`.
+- All other placeholder kinds (port, username, credential_ref, wordlist, path, value) MUST set
+  `binding_policy` to `host_supplied`.
+Do not use `host_supplied` for `target` placeholders and do not use `host_supplied` for
+`source_case_credential` placeholders; those combinations are rejected by the schema.
+
+Platform constraints must be declared structurally, never only in prose. If any of
+`purpose`, `capability_hint`, or `observed_role` mentions an OS family (linux, windows, macos,
+darwin, freebsd), a CPU architecture (x86_64, amd64, aarch64, arm64, i386, armv7), or an
+execution environment (docker, container, wsl, kubernetes, k8s), you MUST also emit a matching
+entry in `platform_constraints` with the corresponding `dimension` (`os_family`,
+`cpu_architecture`, or `execution_environment`), the appropriate `relation`, and the concrete
+`value`. Never assert a platform only in prose.
+
+For every `execution_example`, the `command_template` placeholders and the declared
+`placeholders` list MUST match exactly. Every `{{name}}` token appearing in `command_template`
+MUST have a corresponding entry in `placeholders` with the same `name`, and every declared
+placeholder MUST appear as a `{{name}}` token in `command_template`. There must be no
+placeholder declared but unused, and no template token without a declared placeholder. Use
+lowercase snake_case names (e.g. `{{target_ip}}`, `{{username}}`, `{{port}}`).
+
+Every `execution_example.parent_local_id` MUST reference an existing `local_id` of a reference
+artifact or of a case-step in the same bundle. Reuse the exact `local_id` you assigned to that
+reference or step; never invent a parent id that does not exist among your emitted artifacts
+and steps.
+
+Segment accounting is mandatory: EVERY input segment index MUST be either cited by at least one
+artifact, step, example, condition, or constraint, OR listed in `ignored_segment_indexes`.
+There must be no segment that is neither cited nor explicitly ignored. Enumerate the full range
+of segment indexes present in the source and account for each one.
 """.strip()
 
 CRITIC_PROMPT: Final = """
@@ -56,6 +90,10 @@ Use exactly these code and message pairs:
 - unsafe_material: The artifact contains unsafe material.
 - lost_negative_evidence: Negative evidence from the source is missing.
 - invalid_provenance: The artifact provenance is invalid.
+
+The `message` field of every finding MUST be the exact canonical string paired with its `code`
+above, verbatim — never paraphrased, reworded, or extended. Do not add your own wording to the
+message. The `code` and `message` must always be the matching pair from this list.
 
 Set accepted to false when one or more findings are material. Accepted must be true exactly when
 there are no material findings. Warning-only findings do not prevent acceptance.
