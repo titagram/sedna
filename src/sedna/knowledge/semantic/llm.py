@@ -245,6 +245,43 @@ def _payload_segment_count(payload: SafeRequestPayload) -> int:
     return 0
 
 
+def _resolve_schema_refs(schema: Mapping[str, object]) -> dict[str, object]:
+    """Resolve all JSON-Schema ``$ref`` inline and drop the ``$defs`` block.
+
+    Structured-output hosts (accepts_schema=True) receive the schema in the
+    response_format AND the prompt. The Pydantic ``model_json_schema()`` emits
+    a ``$defs`` block of 20+ type definitions. Cloud models frequently echo
+    those ``$defs`` back into their output, which Sedna then rejects as
+    ``extra_forbidden`` -- a false failure with valid content. By inlining all
+    ``$ref`` and removing ``$defs``, the model never sees the definitions and
+    cannot reflect them. The schema is only used to constrain the LLM output;
+    Sedna still validates with the real Pydantic model (which keeps $defs).
+    The reference graph here is acyclic, so a simple recursive inline is safe.
+    """
+    defs = dict(schema.get("$defs") or {})
+
+    def resolve(node: object) -> object:
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/$defs/"):
+                name = ref[len("#/$defs/"):]
+                target = defs.get(name)
+                if isinstance(target, dict):
+                    # Drop the $ref key and merge the target's definition inline.
+                    merged = {k: v for k, v in node.items() if k != "$ref"}
+                    for k, v in target.items():
+                        merged.setdefault(k, resolve(v))
+                    return merged
+            return {k: resolve(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [resolve(v) for v in node]
+        return node
+
+    out = resolve({k: v for k, v in schema.items() if k != "$defs"})
+    assert isinstance(out, dict)
+    return out
+
+
 def _payload_to_segment_text(payload: SafeRequestPayload) -> str:
     """Render the source segments as flat text with explicit segment indexes.
 
@@ -393,6 +430,144 @@ _POLICY_FOR_KIND: dict[str, str] = {
 }
 
 
+# Chunking threshold: when a schema-capable extract payload exceeds this many
+# segments, we decompose into per-chunk extract calls and merge. Keeps each
+# individual model call small enough that cloud models stay reliable.
+_DECOMPOSE_EXTRACT_SEGMENT_THRESHOLD = 5
+
+
+def _chunk_segments(source: SafePreparedSourcePayload) -> list[list[SafeSourceSegment]]:
+    """Split a source's segments into chunks of at most the threshold size."""
+    segments = list(source.segments)
+    chunks: list[list[SafeSourceSegment]] = []
+    for i in range(0, len(segments), _DECOMPOSE_EXTRACT_SEGMENT_THRESHOLD):
+        chunks.append(segments[i:i + _DECOMPOSE_EXTRACT_SEGMENT_THRESHOLD])
+    return chunks
+
+
+def _chunk_to_flat_text(source: SafePreparedSourcePayload, chunk: list[SafeSourceSegment]) -> str:
+    """Render one chunk as flat segment text keeping GLOBAL segment indexes."""
+    parts = [f"# {source.title}", f"type={source.document_type} role={source.knowledge_role}"]
+    for segment in chunk:
+        parts.append(f"\n--- segment {segment.index} (lines {segment.start_line}-{segment.end_line}) ---")
+        parts.append(segment.text)
+    return "\n".join(parts)
+
+
+def _offset_citation_indexes(node: object, offset: int) -> None:
+    """Shift every segment_index in a draft bundle dict by `offset` in place.
+
+    Each chunk extract cites its LOCAL segment indexes (0..k-1). When merging
+    chunks back into the full bundle, we must re-base those indexes to the
+    GLOBAL source positions (chunk_offset + local_index). This walks all
+    citation-bearing structures: artifact/step/example citations and the
+    context assertions.
+    """
+    def shift_citations(citations: object) -> None:
+        if not isinstance(citations, list):
+            return
+        for citation in citations:
+            if isinstance(citation, dict):
+                idxs = citation.get("segment_indexes")
+                if isinstance(idxs, list):
+                    citation["segment_indexes"] = [i + offset for i in idxs if isinstance(i, int)]
+
+    def shift_context(context: object) -> None:
+        if not isinstance(context, dict):
+            return
+        typed = context.get("typed_context")
+        if isinstance(typed, dict):
+            for value in typed.values():
+                if isinstance(value, dict):
+                    shift_citations(value.get("citations"))
+        for facet in context.get("facets") or ():
+            if isinstance(facet, dict):
+                shift_citations(facet.get("assertion", {}).get("citations"))
+        for service in (typed.get("services") if isinstance(typed, dict) else ()) or ():
+            if isinstance(service, dict):
+                shift_citations(service.get("identity", {}).get("citations"))
+        for privilege in (typed.get("privileges") if isinstance(typed, dict) else ()) or ():
+            if isinstance(privilege, dict):
+                shift_citations(privilege.get("citations"))
+        for control in (typed.get("security_controls") if isinstance(typed, dict) else ()) or ():
+            if isinstance(control, dict):
+                shift_citations(control.get("citations"))
+
+    if isinstance(node, dict):
+        for artifact in node.get("artifacts") or ():
+            if isinstance(artifact, dict):
+                shift_citations(artifact.get("citations"))
+                shift_context(artifact.get("applicability"))
+                for step in artifact.get("steps") or ():
+                    if isinstance(step, dict):
+                        shift_citations(step.get("citations"))
+                        shift_context(step.get("applicability"))
+        for example in node.get("execution_examples") or ():
+            if isinstance(example, dict):
+                shift_citations(example.get("citations"))
+                shift_context(example.get("applicability"))
+                for condition in example.get("prerequisites") or ():
+                    if isinstance(condition, dict):
+                        shift_citations(condition.get("citations"))
+                for constraint in example.get("platform_constraints") or ():
+                    if isinstance(constraint, dict):
+                        shift_citations(constraint.get("citations"))
+
+
+def _merge_draft_bundles(parts: list[dict[str, object]]) -> dict[str, object]:
+    """Merge per-chunk SemanticDraftBundle dicts into one bundle.
+
+    Each chunk is produced by a separate extract call, so its local_id values
+    may collide across chunks. We rename every local_id (and every
+    execution_example.parent_local_id) with a chunk-index prefix to guarantee
+    bundle-wide uniqueness, then concatenate artifacts and execution_examples
+    and union the ignored_segment_indexes. Callers MUST have already applied
+    `_offset_citation_indexes(part, chunk_offset)` so citations carry the global
+    segment indexes before merging.
+    """
+    artifacts: list[object] = []
+    examples: list[object] = []
+    ignored: set[int] = set()
+
+    def remap_id(local_id: object, prefix: str) -> str | None:
+        if isinstance(local_id, str):
+            return f"{prefix}{local_id}"
+        return None
+
+    for idx, part in enumerate(parts):
+        prefix = f"c{idx}_"
+        # Remap artifact local_id (and nested step local_id).
+        for artifact in part.get("artifacts") or ():
+            if not isinstance(artifact, dict):
+                continue
+            new_lid = remap_id(artifact.get("local_id"), prefix)
+            if new_lid is not None:
+                artifact["local_id"] = new_lid
+            for step in artifact.get("steps") or ():
+                if isinstance(step, dict):
+                    s_lid = remap_id(step.get("local_id"), prefix)
+                    if s_lid is not None:
+                        step["local_id"] = s_lid
+            artifacts.append(artifact)
+        # Remap execution_example parent_local_id.
+        for example in part.get("execution_examples") or ():
+            if not isinstance(example, dict):
+                continue
+            p_lid = remap_id(example.get("parent_local_id"), prefix)
+            if p_lid is not None:
+                example["parent_local_id"] = p_lid
+            examples.append(example)
+        for i in part.get("ignored_segment_indexes") or ():
+            if isinstance(i, int):
+                ignored.add(i)
+
+    return {
+        "artifacts": artifacts,
+        "execution_examples": examples,
+        "ignored_segment_indexes": sorted(ignored),
+    }
+
+
 def _obj_citation_indexes(citations: object) -> set[int]:
     out: set[int] = set()
     if not isinstance(citations, list):
@@ -403,6 +578,37 @@ def _obj_citation_indexes(citations: object) -> set[int]:
                 if isinstance(index, int):
                     out.add(index)
     return out
+
+
+def _collect_cited_indexes(merged: dict[str, object]) -> set[int]:
+    """Collect every segment index cited anywhere in a merged draft bundle dict.
+
+    Mirrors _normalize_segment_accounting's citation collection, used by the
+    decomposed path to compute ignored indexes deterministically across chunks.
+    """
+    cited: set[int] = set()
+    for artifact in merged.get("artifacts") or ():
+        if not isinstance(artifact, dict):
+            continue
+        cited.update(_obj_citation_indexes(artifact.get("citations")))
+        cited.update(_obj_context_indexes(artifact.get("applicability")))
+        if artifact.get("draft_type") == "case":
+            for step in artifact.get("steps") or ():
+                if isinstance(step, dict):
+                    cited.update(_obj_citation_indexes(step.get("citations")))
+                    cited.update(_obj_context_indexes(step.get("applicability")))
+    for example in merged.get("execution_examples") or ():
+        if not isinstance(example, dict):
+            continue
+        cited.update(_obj_citation_indexes(example.get("citations")))
+        cited.update(_obj_context_indexes(example.get("applicability")))
+        for condition in example.get("prerequisites") or ():
+            if isinstance(condition, dict):
+                cited.update(_obj_citation_indexes(condition.get("citations")))
+        for constraint in example.get("platform_constraints") or ():
+            if isinstance(constraint, dict):
+                cited.update(_obj_citation_indexes(constraint.get("citations")))
+    return cited
 
 
 def _obj_context_indexes(context: object) -> set[int]:
@@ -418,6 +624,166 @@ def _obj_context_indexes(context: object) -> set[int]:
         if isinstance(facet, dict):
             out.update(_obj_citation_indexes(facet.get("assertion", {}).get("citations")))
     return out
+
+
+def _dedup_citation_indexes(response_obj: dict) -> None:
+    """Deduplicate segment_indexes in every citation across the bundle.
+
+    Cloud models frequently emit repeated segment indexes (e.g. [3, 3]); the
+    DraftCitation schema rejects duplicates deterministically. Since a citation
+    is a set of segment references, dedup is a safe deterministic normalization
+    rather than a semantic change. Runs on artifacts, case steps, execution
+    examples, prerequisites, platform constraints, and context assertions.
+    """
+    def normalize_citations(citations: object) -> None:
+        if not isinstance(citations, list):
+            return
+        for citation in citations:
+            if not isinstance(citation, dict):
+                continue
+            indexes = citation.get("segment_indexes")
+            if isinstance(indexes, list):
+                # Preserve order but drop duplicates.
+                seen: set[int] = set()
+                deduped: list[object] = []
+                for idx in indexes:
+                    if isinstance(idx, int) and idx not in seen:
+                        seen.add(idx)
+                        deduped.append(idx)
+                citation["segment_indexes"] = deduped
+
+    for artifact in response_obj.get("artifacts") or ():
+        if not isinstance(artifact, dict):
+            continue
+        normalize_citations(artifact.get("citations"))
+        _dedup_context_citations(artifact.get("applicability"))
+        for step in artifact.get("steps") or ():
+            if isinstance(step, dict):
+                normalize_citations(step.get("citations"))
+                _dedup_context_citations(step.get("applicability"))
+    for example in response_obj.get("execution_examples") or ():
+        if not isinstance(example, dict):
+            continue
+        normalize_citations(example.get("citations"))
+        _dedup_context_citations(example.get("applicability"))
+        for condition in example.get("prerequisites") or ():
+            if isinstance(condition, dict):
+                normalize_citations(condition.get("citations"))
+        for constraint in example.get("platform_constraints") or ():
+            if isinstance(constraint, dict):
+                normalize_citations(constraint.get("citations"))
+
+
+def _dedup_context_citations(context: object) -> None:
+    """Deduplicate citation indexes inside an applicability context."""
+    if not isinstance(context, dict):
+        return
+    typed = context.get("typed_context")
+    if isinstance(typed, dict):
+        for value in typed.values():
+            if isinstance(value, dict):
+                _dedup_citations_in_assertion(value)
+    for facet in context.get("facets") or ():
+        if isinstance(facet, dict):
+            _dedup_citations_in_assertion(facet.get("assertion"))
+    for service in (typed.get("services") if isinstance(typed, dict) else ()) or ():
+        if isinstance(service, dict):
+            _dedup_citations_in_assertion(service.get("identity"))
+    for privilege in (typed.get("privileges") if isinstance(typed, dict) else ()) or ():
+        if isinstance(privilege, dict):
+            _dedup_citations_in_assertion(privilege)
+    for control in (typed.get("security_controls") if isinstance(typed, dict) else ()) or ():
+        if isinstance(control, dict):
+            _dedup_citations_in_assertion(control)
+
+
+def _dedup_citations_in_assertion(assertion: object) -> None:
+    if not isinstance(assertion, dict):
+        return
+    citations = assertion.get("citations")
+    if not isinstance(citations, list):
+        return
+    for citation in citations:
+        if isinstance(citation, dict) and isinstance(citation.get("segment_indexes"), list):
+            seen: set[int] = set()
+            deduped: list[object] = []
+            for idx in citation["segment_indexes"]:
+                if isinstance(idx, int) and idx not in seen:
+                    seen.add(idx)
+                    deduped.append(idx)
+            citation["segment_indexes"] = deduped
+
+
+def _drop_incomplete_optional_assertions(response_obj: dict) -> None:
+    """Drop incomplete optional context assertions instead of failing the bundle.
+
+    DraftContextAssertion requires value/relation/origin/confidence/citations and
+    at least one citation. Cloud models frequently emit an optional typed-context
+    field (e.g. os_family) with missing confidence or empty citations. Since these
+    are optional assertions, dropping an incomplete one is a graceful degradation
+    that preserves the case core rather than invalidating the whole bundle.
+    This mirrors the guidance to keep origin checks but discard incomplete optional
+    assertions. It does NOT relax any content-level fail-closed rule.
+    """
+    required_keys = ("value", "relation", "origin", "confidence", "citations")
+
+    def is_complete(assertion: object) -> bool:
+        if not isinstance(assertion, dict):
+            return False
+        for key in required_keys:
+            if key not in assertion:
+                return False
+        citations = assertion.get("citations")
+        if not isinstance(citations, list) or len(citations) == 0:
+            return False
+        return True
+
+    def normalize_typed(typed: object) -> None:
+        if not isinstance(typed, dict):
+            return
+        # Optional scalar assertions: drop incomplete ones by setting to None.
+        for key in (
+            "os_family", "os_version", "cpu_architecture", "execution_environment",
+            "system_role", "identity_context", "initial_access", "network_position",
+            "observation_date",
+        ):
+            if key in typed and not is_complete(typed[key]):
+                typed[key] = None
+        # Lists of assertions: drop incomplete elements.
+        for key in ("privileges", "security_controls"):
+            items = typed.get(key)
+            if isinstance(items, list):
+                typed[key] = [i for i in items if is_complete(i)]
+        # Services: identity is required; drop services with incomplete identity.
+        services = typed.get("services")
+        if isinstance(services, list):
+            kept = []
+            for service in services:
+                if isinstance(service, dict) and is_complete(service.get("identity")):
+                    kept.append(service)
+            typed["services"] = kept
+
+    def normalize_context(context: object) -> None:
+        if isinstance(context, dict):
+            normalize_typed(context.get("typed_context"))
+            facets = context.get("facets")
+            if isinstance(facets, list):
+                kept = []
+                for facet in facets:
+                    if isinstance(facet, dict) and is_complete(facet.get("assertion")):
+                        kept.append(facet)
+                context["facets"] = kept
+
+    for artifact in response_obj.get("artifacts") or ():
+        if not isinstance(artifact, dict):
+            continue
+        normalize_context(artifact.get("applicability"))
+        for step in artifact.get("steps") or ():
+            if isinstance(step, dict):
+                normalize_context(step.get("applicability"))
+    for example in response_obj.get("execution_examples") or ():
+        if isinstance(example, dict):
+            normalize_context(example.get("applicability"))
 
 
 def build_safe_source_payload(prepared: PreparedSource) -> SafePreparedSourcePayload:
@@ -481,6 +847,17 @@ class HadesLlmAdapter:
         # compact variant keeps the same semantic invariants while remaining reliable.
         if purpose == "sedna.semantic.extract" and getattr(self._host, "accepts_schema", False):
             instructions = COMPACT_EXTRACTOR_PROMPT
+        # Decompose large schema-capable extract payloads into per-chunk calls and
+        # merge. This keeps each individual model call small enough that cloud
+        # models (gpt-oss:120b) stay schema-conformant. Only applies when the
+        # source has more than the threshold segments.
+        if (
+            purpose == "sedna.semantic.extract"
+            and getattr(self._host, "accepts_schema", False)
+            and isinstance(payload, SafePreparedSourcePayload)
+            and len(payload.segments) > _DECOMPOSE_EXTRACT_SEGMENT_THRESHOLD
+        ):
+            return self._complete_extract_decomposed(model_type, payload)
         try:
             payload_data = payload.model_dump(mode="python", warnings="error")
             validated_payload = type(payload).model_validate(payload_data)
@@ -496,8 +873,16 @@ class HadesLlmAdapter:
             separators=(",", ":"),
             sort_keys=True,
         )
+        # Schema sent to the LLM. For structured-output hosts we inline all
+        # $ref and drop $defs so cloud models cannot reflect the definitions
+        # back into their output (which Sedna rejects as extra_forbidden).
+        # For other hosts keep the raw schema text in the prompt as before.
+        if getattr(self._host, "accepts_schema", False):
+            llm_schema = _resolve_schema_refs(model_type.model_json_schema())
+        else:
+            llm_schema = model_type.model_json_schema()
         response_schema = json.dumps(
-            model_type.model_json_schema(),
+            llm_schema,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
@@ -585,6 +970,8 @@ class HadesLlmAdapter:
                 _normalize_segment_accounting(response_obj, _payload_segment_count(payload))
                 _drop_orphan_execution_examples(response_obj)
                 _normalize_placeholder_policies(response_obj)
+                _dedup_citation_indexes(response_obj)
+                _drop_incomplete_optional_assertions(response_obj)
             parsed = model_type.model_validate(response_obj)
         except Exception:
             raise SemanticLlmError("invalid_structured_response") from None
@@ -604,6 +991,74 @@ class HadesLlmAdapter:
             agent_id=agent_id,
             usage=usage,
             audit=MappingProxyType({"purpose": purpose}),
+        )
+
+    def _complete_extract_decomposed(
+        self,
+        model_type: type[ModelT],
+        payload: SafePreparedSourcePayload,
+    ) -> StructuredResult[ModelT]:
+        """Run extract per segment-chunk and merge the bundles.
+
+        Each chunk is a small SafePreparedSourcePayload (at most
+        _DECOMPOSE_EXTRACT_SEGMENT_THRESHOLD segments). We call `complete` for
+        each chunk (which uses the flat-segment-text path), then re-base citation
+        indexes to the global source position, merge artifact/example lists, and
+        validate the merged bundle against the full segment count.
+        """
+        chunks = _chunk_segments(payload)
+        merged_parts: list[dict[str, object]] = []
+        total_in_tokens = 0
+        total_out_tokens = 0
+        provider = ""
+        model = ""
+        agent_id = ""
+        chunk_offset = 0
+        for chunk in chunks:
+            sub_payload = payload.model_copy(
+                update={"segments": tuple(chunk)}
+            )
+            result = self.complete(
+                model_type,
+                instructions=COMPACT_EXTRACTOR_PROMPT,
+                payload=sub_payload,
+                purpose="sedna.semantic.extract",
+            )
+            part_dict = (
+                result.parsed.model_dump(mode="json", warnings="error")
+                if isinstance(result.parsed, BaseModel)
+                else result.parsed
+            )
+            if not isinstance(part_dict, dict):
+                raise SemanticLlmError("invalid_structured_response")
+            _offset_citation_indexes(part_dict, chunk_offset)
+            merged_parts.append(part_dict)
+            total_in_tokens += result.usage.input_tokens
+            total_out_tokens += result.usage.output_tokens
+            provider = result.provider
+            model = result.model
+            agent_id = result.agent_id
+            chunk_offset += len(chunk)
+
+        merged = _merge_draft_bundles(merged_parts)
+        merged["ignored_segment_indexes"] = sorted(
+            set(range(len(payload.segments))) - _collect_cited_indexes(merged)
+        )
+        try:
+            parsed = model_type.model_validate(merged)
+        except Exception:
+            raise SemanticLlmError("invalid_structured_response") from None
+        usage = StructuredUsage(
+            input_tokens=total_in_tokens,
+            output_tokens=total_out_tokens,
+        )
+        return StructuredResult(
+            parsed=parsed,
+            provider=provider,
+            model=model,
+            agent_id=agent_id,
+            usage=usage,
+            audit=MappingProxyType({"purpose": "sedna.semantic.extract"}),
         )
 
 

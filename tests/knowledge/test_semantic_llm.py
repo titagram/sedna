@@ -33,6 +33,7 @@ from sedna.knowledge.semantic.llm import (
     SafeSegmentAsset,
     SafeSourceSegment,
     SemanticLlmError,
+    _resolve_schema_refs,
     build_safe_source_payload,
 )
 from sedna.knowledge.semantic.prompts import (
@@ -362,14 +363,8 @@ def test_structured_schema_only_forwarded_to_schema_capable_host() -> None:
     """OllamaHost-style hosts receive the real schema; others stay json_schema=None."""
     prepared = _prepared_with_credential_examples()
     payload = build_safe_source_payload(prepared)
-    expected_schema = json.loads(
-        json.dumps(
-            SemanticDraftBundle.model_json_schema(),
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-    )
+    # Capable host receives the schema with $refs resolved inline ($defs dropped).
+    expected_schema = _resolve_schema_refs(SemanticDraftBundle.model_json_schema())
 
     # Capable host: receives the concrete schema for structured output.
     capable = _RecordingHost(_HostResult(parsed={"artifacts": [], "ignored_segment_indexes": [0]}))
@@ -427,6 +422,128 @@ def test_extract_host_schema_capable_receives_flat_segment_text() -> None:
     plain_text = plain.calls[0]["input"][0]["text"]
     parsed = json.loads(plain_text)
     assert "segments" in parsed  # JSON serialized for non-schema hosts
+
+
+def test_resolve_schema_refs_inlines_and_drops_defs() -> None:
+    """$defs/$ref resolution must inline references and remove $defs entirely."""
+    schema = SemanticDraftBundle.model_json_schema()
+    assert "$defs" in schema
+    resolved = _resolve_schema_refs(schema)
+    assert "$defs" not in resolved
+
+    def count_refs(node: object) -> int:
+        if isinstance(node, dict):
+            n = 1 if "$ref" in node else 0
+            return n + sum(count_refs(v) for v in node.values())
+        if isinstance(node, list):
+            return sum(count_refs(v) for v in node)
+        return 0
+
+    assert count_refs(resolved) == 0
+    # Inlined body still has the top-level properties.
+    assert "artifacts" in resolved["properties"]
+
+
+def test_dedup_citation_indexes_removes_duplicates() -> None:
+    """Duplicated segment indexes across citations must be deduplicated."""
+    from sedna.knowledge.semantic.llm import _dedup_citation_indexes
+    response = {
+        "artifacts": [
+            {
+                "citations": [{"segment_indexes": [3, 3, 1]}],
+                "applicability": {
+                    "typed_context": {
+                        "os_family": {
+                            "citations": [{"segment_indexes": [2, 2, 0]}],
+                        }
+                    }
+                },
+                "steps": [{"citations": [{"segment_indexes": [5, 5, 5]}]}],
+            }
+        ],
+        "execution_examples": [{"citations": [{"segment_indexes": [7, 7, 8]}]}],
+    }
+    _dedup_citation_indexes(response)
+    assert response["artifacts"][0]["citations"][0]["segment_indexes"] == [3, 1]
+    assert response["artifacts"][0]["applicability"]["typed_context"]["os_family"]["citations"][0]["segment_indexes"] == [2, 0]
+    assert response["artifacts"][0]["steps"][0]["citations"][0]["segment_indexes"] == [5]
+    assert response["execution_examples"][0]["citations"][0]["segment_indexes"] == [7, 8]
+
+
+def test_drop_incomplete_optional_assertions_preserves_complete_core() -> None:
+    """Incomplete optional assertions are dropped; complete ones and the core are kept."""
+    from sedna.knowledge.semantic.llm import _drop_incomplete_optional_assertions
+    response = {
+        "artifacts": [
+            {
+                "applicability": {
+                    "typed_context": {
+                        # missing confidence -> drop
+                        "os_family": {"value": "linux", "relation": "required",
+                                      "origin": "explicit", "citations": [{"segment_indexes": [0]}]},
+                        # empty citations -> drop
+                        "os_version": {"value": "5", "relation": "required",
+                                       "origin": "explicit", "confidence": 0.9, "citations": []},
+                        # complete -> keep
+                        "cpu_architecture": {"value": "x86_64", "relation": "required",
+                                             "origin": "explicit", "confidence": 0.9,
+                                             "citations": [{"segment_indexes": [1]}]},
+                    }
+                }
+            }
+        ]
+    }
+    _drop_incomplete_optional_assertions(response)
+    typed = response["artifacts"][0]["applicability"]["typed_context"]
+    assert typed["os_family"] is None
+    assert typed["os_version"] is None
+    assert typed["cpu_architecture"] is not None
+    assert typed["cpu_architecture"]["value"] == "x86_64"
+
+
+def test_chunk_and_merge_preserves_global_indexes() -> None:
+    """Decomposed chunking + merge must re-base citations to global indexes and
+    prefix local_ids so the merged bundle is schema-valid."""
+    from sedna.knowledge.semantic.llm import (
+        _chunk_segments,
+        _merge_draft_bundles,
+        _offset_citation_indexes,
+    )
+    segments = [
+        SafeSourceSegment(index=i, start_line=2 * i + 1, end_line=2 * i + 2, text=f"seg {i}")
+        for i in range(7)
+    ]
+    source = SafePreparedSourcePayload(
+        source_id="s", title="t", document_type="machine_walkthrough",
+        knowledge_role="case_study", quality="complete", segments=tuple(segments),
+    )
+    chunks = _chunk_segments(source)
+    assert chunks == [
+        segments[0:5],
+        segments[5:7],
+    ]
+
+    part0 = {"artifacts": [{"local_id": "r1", "citations": [{"segment_indexes": [0, 2]}]}],
+             "execution_examples": [{"parent_local_id": "r1"}],
+             "ignored_segment_indexes": [3]}
+    part1 = {"artifacts": [{"local_id": "r1", "citations": [{"segment_indexes": [1]}]}],
+             "execution_examples": [{"parent_local_id": "r1"}],
+             "ignored_segment_indexes": [0]}
+    _offset_citation_indexes(part0, 0)
+    _offset_citation_indexes(part1, 5)
+    merged = _merge_draft_bundles([part0, part1])
+
+    # Citation indexes re-based: chunk1 local 1 -> global 6.
+    assert merged["artifacts"][0]["citations"][0]["segment_indexes"] == [0, 2]
+    assert merged["artifacts"][1]["citations"][0]["segment_indexes"] == [6]
+    # local_ids prefixed for uniqueness.
+    assert merged["artifacts"][0]["local_id"] == "c0_r1"
+    assert merged["artifacts"][1]["local_id"] == "c1_r1"
+    # parent_local_id remapped to match.
+    assert merged["execution_examples"][0]["parent_local_id"] == "c0_r1"
+    assert merged["execution_examples"][1]["parent_local_id"] == "c1_r1"
+    # ignored indexes unioned.
+    assert merged["ignored_segment_indexes"] == [0, 3]
 
 
 def test_safe_segment_models_do_not_classify_source_examples_as_real_credentials():
