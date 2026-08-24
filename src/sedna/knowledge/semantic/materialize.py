@@ -214,7 +214,8 @@ def _materialize_execution_examples(
                 requires_validation=True,
             )
         )
-    return _sorted_models(examples)
+    unique_by_id = {example.example_id: example for example in examples}
+    return tuple(unique_by_id[example_id] for example_id in sorted(unique_by_id))
 
 
 def stable_execution_example_id(

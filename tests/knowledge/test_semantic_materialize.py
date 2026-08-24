@@ -466,6 +466,25 @@ def test_execution_example_ids_are_deterministic_and_content_scoped():
     assert first.execution_examples[0].example_id.startswith("execution-example-")
 
 
+def test_execution_examples_are_sorted_by_canonical_example_id():
+    examples = tuple(
+        _draft_example(
+            local_id=f"example-{index}",
+            command_template=f"curl -i {{{{target}}}}/path-{index}",
+        )
+        for index in range(10)
+    )
+    content = materialize_semantic_content(
+        _prepared_source(),
+        _bundle(_reference(), execution=examples),
+        _call_metadata(),
+        VerificationStatus.VERIFIED,
+    )
+
+    example_ids = tuple(example.example_id for example in content.execution_examples)
+    assert example_ids == tuple(sorted(example_ids))
+
+
 def test_execution_example_parent_is_canonical_and_draft_ids_never_cross():
     content = _content_with_example()
     reference = content.artifacts[0]
