@@ -1,0 +1,114 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-sea",
+      "origin": "explicit",
+      "title": "WonderCMS RCE to SSH and log injection root (Sea)",
+      "starting_access": "unauthenticated web access to a WonderCMS bike page on sea.htb",
+      "source_quality": "complete",
+      "difficulty": "medium",
+      "outcome": "root via command injection in a system-monitor log analyzer",
+      "transferable_properties": [
+        "fuzz themes folders to find CMS version README files",
+        "WonderCMS 3.2.0 is vulnerable to CVE-2023-41425",
+        "a contact form can deliver an exploit link for the admin to click",
+        "crack bcrypt hashes with hashcat mode 3200",
+        "use SSH port forwarding to reach internal services",
+        "URL-encode RCE payloads in web forms (CTRL+U in Burp)"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["Apache httpd", "WonderCMS bike page"],
+            "privileges": []
+          },
+          "observations": ["ports 22 and 80 open", "gobuster finds /themes", "ffuf finds /themes/bike README.md"],
+          "hypotheses": [{"statement": "the WonderCMS version is vulnerable to a public RCE", "origin": "inferred"}],
+          "selected_action": {"intent": "identify the CMS version and locate a public exploit"},
+          "evidence": [{"summary": "found WonderCMS 3.2.0 via /themes/bike/README.md, vulnerable to CVE-2023-41425", "origin": "explicit", "category": "recon"}],
+          "state_after": {
+            "access": "unauthenticated",
+            "environment": ["WonderCMS 3.2.0"],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [0]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["WonderCMS 3.2.0"],
+            "privileges": []
+          },
+          "observations": ["CVE-2023-41425 installs a malicious theme module", "the admin must click the exploit link"],
+          "hypotheses": [{"statement": "delivering the exploit link via the contact form triggers a reverse shell", "origin": "inferred"}],
+          "selected_action": {"intent": "run the exploit, send the link via the contact form, and catch a reverse shell"},
+          "evidence": [{"summary": "sent the exploit link through /contact.php, the admin clicked it, and a reverse shell returned as www-data", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "shell as www-data",
+            "environment": [],
+            "privileges": ["www-data"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [0]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "shell as www-data",
+            "environment": [],
+            "privileges": ["www-data"]
+          },
+          "observations": ["database.js in /var/www/sea/data contains a bcrypt password hash"],
+          "hypotheses": [{"statement": "cracking the hash yields a password reused for SSH", "origin": "inferred"}],
+          "selected_action": {"intent": "crack the bcrypt hash and try it over SSH"},
+          "evidence": [{"summary": "cracked the hash with hashcat mode 3200 and logged in over SSH as amay", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "shell as amay",
+            "environment": [],
+            "privileges": ["amay"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [0]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-4",
+          "ordinal": 4,
+          "state_before": {
+            "access": "shell as amay",
+            "environment": [],
+            "privileges": ["amay"]
+          },
+          "observations": ["no sudo for amay", "an HTTP server runs on internal port 8080"],
+          "hypotheses": [{"statement": "the internal system-monitor web app has a command injection", "origin": "inferred"}],
+          "selected_action": {"intent": "forward port 8080 over SSH and inject a command into the log analyzer"},
+          "evidence": [{"summary": "found a log analyzer form vulnerable to command injection and obtained a root reverse shell", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "root shell",
+            "environment": [],
+            "privileges": ["root"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [0]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0]}]
+    }
+  ],
+  "execution_examples": [],
+  "ignored_segment_indexes": []
+}

@@ -1,0 +1,113 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-blocky",
+      "origin": "explicit",
+      "title": "Hardcoded JAR credentials to WordPress blog (Blocky)",
+      "starting_access": "unauthenticated web access to WordPress blog on blocky.htb",
+      "source_quality": "complete",
+      "difficulty": "easy",
+      "outcome": "root via reused DB password and sudo -l ALL",
+      "transferable_properties": [
+        "download and analyse custom JAR/class files for hardcoded credentials",
+        "strings on a JAR reveals plaintext secrets",
+        "WordPress author enumeration via ?author=1",
+        "database credentials often reused as system passwords",
+        "sudo -l (ALL : ALL) ALL means instant root with sudo su"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["Apache 2.4.18", "ProFTPD 1.3.5a", "SSH"],
+            "privileges": []
+          },
+          "observations": ["ports 21/22/80 open", "FTP anonymous denied", "WordPress blog on port 80"],
+          "hypotheses": [{"statement": "the web application and downloadable artefacts hide credentials", "origin": "inferred"}],
+          "selected_action": {"intent": "enumerate the WordPress site and inspect exposed files"},
+          "evidence": [{"summary": "found /plugins/ directory with BlockyCore.jar and griefprevention JAR", "origin": "explicit", "category": "recon"}],
+          "state_after": {
+            "access": "unauthenticated",
+            "environment": ["WordPress on blocky.htb"],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [0, 1, 2]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["WordPress on blocky.htb"],
+            "privileges": []
+          },
+          "observations": ["BlockyCore.jar accessible", "WordPress author notch enumerated"],
+          "hypotheses": [{"statement": "the JAR contains hardcoded credentials", "origin": "inferred"}],
+          "selected_action": {"intent": "download and run strings on BlockyCore.jar to find secrets"},
+          "evidence": [{"summary": "found hardcoded sqlUser=root and sqlPass in BlockyCore.class", "origin": "explicit", "category": "credential_extraction"}],
+          "state_after": {
+            "access": "unauthenticated",
+            "environment": ["BlockyCore.jar"],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [2]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["BlockyCore.jar"],
+            "privileges": []
+          },
+          "observations": ["DB password extracted from JAR"],
+          "hypotheses": [{"statement": "the DB password is reused as the system user notch password", "origin": "inferred"}],
+          "selected_action": {"intent": "try the DB password on SSH as notch"},
+          "evidence": [{"summary": "logged in over SSH as notch with the reused database password", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "shell as notch",
+            "environment": [],
+            "privileges": ["notch"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-4",
+          "ordinal": 4,
+          "state_before": {
+            "access": "shell as notch",
+            "environment": [],
+            "privileges": ["notch"]
+          },
+          "observations": ["sudo -l shows (ALL : ALL) ALL"],
+          "hypotheses": [{"statement": "sudo su grants instant root", "origin": "inferred"}],
+          "selected_action": {"intent": "run sudo su to escalate to root"},
+          "evidence": [{"summary": "ran sudo su and obtained a root shell", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "root shell",
+            "environment": [],
+            "privileges": ["root"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0, 1, 2, 3, 4]}]
+    }
+  ],
+  "execution_examples": [],
+  "ignored_segment_indexes": [5, 6]
+}

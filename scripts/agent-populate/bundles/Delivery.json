@@ -1,0 +1,113 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-delivery",
+      "origin": "explicit",
+      "title": "osTicket email alias to Mattermost and config credential leak (Delivery)",
+      "starting_access": "unauthenticated access to nginx and Mattermost on a Debian 10 host",
+      "source_quality": "complete",
+      "difficulty": "medium",
+      "outcome": "root via Mattermost MySQL hash crack and credential leak",
+      "transferable_properties": [
+        "business logic flaws don't need CVEs, two legitimate systems can bypass email verification",
+        "read all messages in internal platforms, developers share credentials in private channels",
+        "application config files like config.json contain database credentials",
+        "password hints narrow the cracking space dramatically",
+        "full port scan is mandatory, Mattermost on 8065 was missed by a default scan"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["nginx 1.14.2", "Mattermost 8065"],
+            "privileges": []
+          },
+          "observations": ["ports 22/80/8065 open", "page source reveals helpdesk.delivery.htb and Mattermost", "Mattermost registration requires a @delivery.htb email"],
+          "hypotheses": [{"statement": "osTicket can hand out a @delivery.htb email alias that satisfies Mattermost registration", "origin": "inferred"}],
+          "selected_action": {"intent": "open a guest ticket on osTicket to obtain a @delivery.htb alias, then register on Mattermost"},
+          "evidence": [{"summary": "opened an osTicket guest ticket that got assigned 4662359@delivery.htb, used it to register on Mattermost and received the verification link in the ticket", "origin": "explicit", "category": "recon"}],
+          "state_after": {
+            "access": "authenticated Mattermost",
+            "environment": ["Mattermost internal channel"],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [1, 2, 3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "authenticated Mattermost",
+            "environment": ["Mattermost internal channel"],
+            "privileges": []
+          },
+          "observations": ["internal channel contains credentials and a password hint"],
+          "hypotheses": [{"statement": "the leaked maildeliverer credentials work over SSH", "origin": "inferred"}],
+          "selected_action": {"intent": "read the internal channel and try the leaked credentials over SSH"},
+          "evidence": [{"summary": "found maildeliverer:[REDACTED] in the internal channel and logged in over SSH as maildeliverer", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "shell as maildeliverer",
+            "environment": [],
+            "privileges": ["maildeliverer"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "shell as maildeliverer",
+            "environment": [],
+            "privileges": ["maildeliverer"]
+          },
+          "observations": ["no sudo", "no SUID", "/opt/mattermost/config/config.json has MySQL credentials"],
+          "hypotheses": [{"statement": "the MySQL config reveals a root bcrypt hash we can crack with the hinted base word", "origin": "inferred"}],
+          "selected_action": {"intent": "dump the Mattermost Users table and crack the root bcrypt hash with rules"},
+          "evidence": [{"summary": "extracted the root bcrypt hash from MySQL and cracked it using the PleaseSubscribe! base word with john best64 rules", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "root credentials",
+            "environment": [],
+            "privileges": ["root"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-4",
+          "ordinal": 4,
+          "state_before": {
+            "access": "root credentials",
+            "environment": [],
+            "privileges": []
+          },
+          "observations": ["the cracked password is the root system password"],
+          "hypotheses": [{"statement": "su root with the cracked password grants a root shell", "origin": "inferred"}],
+          "selected_action": {"intent": "run su root with the cracked password"},
+          "evidence": [{"summary": "used su root with the cracked password and obtained a root shell", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "root shell",
+            "environment": [],
+            "privileges": ["root"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0, 1, 2, 3, 4]}]
+    }
+  ],
+  "execution_examples": [],
+  "ignored_segment_indexes": [5, 6, 7]
+}

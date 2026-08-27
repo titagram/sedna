@@ -1,0 +1,92 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-solidstate",
+      "origin": "explicit",
+      "title": "Apache James RCE to email credentials and cron tmp.py root (SolidState)",
+      "starting_access": "unauthenticated access to Apache James and web services on a Linux host",
+      "source_quality": "complete",
+      "difficulty": "medium",
+      "outcome": "root via overwriting a root-executed cron script",
+      "transferable_properties": [
+        "Apache James 2.3.2 Remote Administration Tool has a known RCE via user/path injection",
+        "the James admin can reset any user's password to read their email",
+        "email services can leak SSH credentials",
+        "check all linpeas output and the full attack surface, not just the web",
+        "a root cron script in a world-writable path is a privesc vector"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["Apache James 2.3.2", "SMTP/POP3/NNTP", "web"],
+            "privileges": []
+          },
+          "observations": ["ports 22/25/80/110/119/4555 open", "James Remote Administration Tool on 4555", "a CVE allows injecting a bash_completion user executed at login"],
+          "hypotheses": [{"statement": "Apache James RCE and password reset can yield credentials", "origin": "inferred"}],
+          "selected_action": {"intent": "exploit James to plant a payload and reset the mindy password to read her email"},
+          "evidence": [{"summary": "planted a bash_completion.d payload via James, reset mindy's password, and read an email containing SSH credentials", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "email read as mindy",
+            "environment": [],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [0]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "email read as mindy",
+            "environment": [],
+            "privileges": []
+          },
+          "observations": ["the email reveals mindy's SSH password", "the planted payload fires on SSH login"],
+          "hypotheses": [{"statement": "SSHing as mindy triggers the reverse shell", "origin": "inferred"}],
+          "selected_action": {"intent": "log in over SSH as mindy to trigger the planted payload and read the user flag"},
+          "evidence": [{"summary": "logged in over SSH as mindy, the payload gave a reverse shell, and the user flag was obtained", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "shell as mindy",
+            "environment": [],
+            "privileges": ["mindy"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [0]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "shell as mindy",
+            "environment": [],
+            "privileges": ["mindy"]
+          },
+          "observations": ["linpeas shows no easy SUID/CVE path", "/opt/tmp.py is world-writable and executed by root via cron"],
+          "hypotheses": [{"statement": "overwriting tmp.py makes root execute a reverse shell", "origin": "inferred"}],
+          "selected_action": {"intent": "overwrite /opt/tmp.py with a reverse shell and wait for the root cron"},
+          "evidence": [{"summary": "overwrote tmp.py with a nc reverse shell and obtained a root shell when the cron fired", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "root shell",
+            "environment": [],
+            "privileges": ["root"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [0]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0]}]
+    }
+  ],
+  "execution_examples": [],
+  "ignored_segment_indexes": []
+}

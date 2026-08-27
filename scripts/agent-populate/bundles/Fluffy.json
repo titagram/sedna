@@ -1,0 +1,114 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-fluffy",
+      "origin": "explicit",
+      "title": "CVE-2025-24071 NTLM hash leak to certipy shadow and ESC16 (Fluffy)",
+      "starting_access": "j.fleischman credentials with read/write access to the IT SMB share on a Windows Server 2019 domain controller",
+      "source_quality": "complete",
+      "difficulty": "hard",
+      "outcome": "Administrator via certipy shadow and ESC16 CA abuse",
+      "transferable_properties": [
+        "an SMB share with write access lets you plant a malicious zip to capture NTLM hashes",
+        "CVE-2025-24071 leaks NTLMv2 hashes when a zip is decompressed, capture them with responder",
+        "certipy shadow auto extracts NT hashes for accounts with shadow credential access",
+        "BloodHound reveals the path from an owned user to privileged service accounts",
+        "ESC16 changes a user UPN to impersonate Administrator when the CA security extension is disabled",
+        "netexec adcs module finds ADCS enrollment servers"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "j.fleischman with IT share write access",
+            "environment": ["Windows Server 2019 AD", "SMB IT share"],
+            "privileges": ["j.fleischman"]
+          },
+          "observations": ["the IT share has READ and WRITE", "it contains a KeePass and an upgrade notice about CVEs", "CVE-2025-24071 leaks NTLM hashes when a zip is decompressed"],
+          "hypotheses": [{"statement": "planting a malicious zip in the share leaks an NTLM hash when decompressed", "origin": "inferred"}],
+          "selected_action": {"intent": "run responder, plant a CVE-2025-24071 exploit zip in the IT share, and crack the captured hash"},
+          "evidence": [{"summary": "captured p.agila's NTLMv2 hash via responder and cracked it with hashcat", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "p.agila credentials",
+            "environment": [],
+            "privileges": ["p.agila"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [0]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "p.agila credentials",
+            "environment": [],
+            "privileges": ["p.agila"]
+          },
+          "observations": ["BloodHound shows p.agila can reach winrm_svc through service accounts", "certipy shadow can extract NT hashes for ca_svc and winrm_svc"],
+          "hypotheses": [{"statement": "adding p.agila to service accounts and using certipy shadow yields service account hashes", "origin": "inferred"}],
+          "selected_action": {"intent": "add p.agila to service accounts, sync the clock, and run certipy shadow for ca_svc and winrm_svc"},
+          "evidence": [{"summary": "used certipy shadow to extract NT hashes for ca_svc and winrm_svc, then logged into winrm_svc via evil-winrm", "origin": "explicit", "category": "lateral_movement"}],
+          "state_after": {
+            "access": "shell as winrm_svc",
+            "environment": [],
+            "privileges": ["winrm_svc"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [0]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "shell as winrm_svc",
+            "environment": [],
+            "privileges": ["winrm_svc"]
+          },
+          "observations": ["netexec adcs finds an enrollment server on DC01", "certipy find shows the CA is vulnerable to ESC16 (security extension disabled)"],
+          "hypotheses": [{"statement": "changing ca_svc's UPN to administrator lets the CA issue an Administrator certificate", "origin": "inferred"}],
+          "selected_action": {"intent": "update ca_svc's UPN to administrator, request a certificate, then restore the UPN"},
+          "evidence": [{"summary": "requested an Administrator certificate via the UPN change, restored the UPN, and used certipy auth to retrieve the Administrator NT hash", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "Administrator NT hash",
+            "environment": [],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [1]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-4",
+          "ordinal": 4,
+          "state_before": {
+            "access": "Administrator NT hash",
+            "environment": [],
+            "privileges": []
+          },
+          "observations": ["the Administrator hash works over WinRM"],
+          "hypotheses": [{"statement": "pass-the-hash gives a shell as Administrator", "origin": "inferred"}],
+          "selected_action": {"intent": "connect with evil-winrm using the Administrator NT hash"},
+          "evidence": [{"summary": "connected as Administrator and obtained the root flag", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "Administrator shell",
+            "environment": [],
+            "privileges": ["Administrator"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [1]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0, 1]}]
+    }
+  ],
+  "execution_examples": [],
+  "ignored_segment_indexes": []
+}

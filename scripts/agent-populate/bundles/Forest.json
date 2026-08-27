@@ -1,0 +1,114 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-forest",
+      "origin": "explicit",
+      "title": "AS-REP roast to Exchange WriteDACL DCSync and PTH (Forest)",
+      "starting_access": "no credentials on a Windows Server 2016 Active Directory domain controller",
+      "source_quality": "complete",
+      "difficulty": "medium",
+      "outcome": "domain Administrator via DCSync and pass-the-hash",
+      "transferable_properties": [
+        "RPC null sessions reveal the full user list without credentials",
+        "service accounts are prime AS-REP Roasting targets",
+        "Exchange in AD creates an Account Operators + Exchange Windows Permissions WriteDACL attack path",
+        "BloodHound is essential to reveal multi-hop AD privilege chains",
+        "WriteDACL on the domain object is functionally equivalent to Domain Admin via DCSync",
+        "pass-the-hash with Evil-WinRM avoids cracking the Administrator hash"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "no credentials",
+            "environment": ["Windows Server 2016 AD", "DC with Exchange"],
+            "privileges": []
+          },
+          "observations": ["full DC profile with WinRM open", "RPC null session reveals users", "svc-alfresco service account present"],
+          "hypotheses": [{"statement": "svc-alfresco has preauthentication disabled and is AS-REP roastable", "origin": "inferred"}],
+          "selected_action": {"intent": "enumerate users via RPC and AS-REP roast the service accounts"},
+          "evidence": [{"summary": "AS-REP roasted svc-alfresco, cracked the hash, and logged in over WinRM as svc-alfresco", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "shell as svc-alfresco",
+            "environment": [],
+            "privileges": ["svc-alfresco"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [1, 2, 3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "shell as svc-alfresco",
+            "environment": [],
+            "privileges": ["svc-alfresco"]
+          },
+          "observations": ["BloodHound reveals svc-alfresco -> Account Operators -> Exchange Windows Permissions (WriteDACL)"],
+          "hypotheses": [{"statement": "adding a user to Exchange Windows Permissions lets us grant DCSync on the domain", "origin": "inferred"}],
+          "selected_action": {"intent": "create a user, add it to Exchange Windows Permissions, and grant it DCSync with PowerView"},
+          "evidence": [{"summary": "created the hacker user, added it to Exchange Windows Permissions, and granted DCSync rights with PowerView Add-DomainObjectAcl", "origin": "explicit", "category": "lateral_movement"}],
+          "state_after": {
+            "access": "hacker with DCSync",
+            "environment": [],
+            "privileges": ["hacker", "DCSync"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "hacker with DCSync",
+            "environment": [],
+            "privileges": ["hacker", "DCSync"]
+          },
+          "observations": ["DCSync rights let us dump all domain hashes", "Administrator hash can be used for pass-the-hash"],
+          "hypotheses": [{"statement": "secretsdump DCSync yields the Administrator NT hash", "origin": "inferred"}],
+          "selected_action": {"intent": "run secretsdump.py to DCSync the Administrator hash"},
+          "evidence": [{"summary": "dumped the Administrator NTLM hash with secretsdump.py via DCSync", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "Administrator NT hash",
+            "environment": [],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-4",
+          "ordinal": 4,
+          "state_before": {
+            "access": "Administrator NT hash",
+            "environment": [],
+            "privileges": []
+          },
+          "observations": ["pass-the-hash works over WinRM"],
+          "hypotheses": [{"statement": "evil-winrm with the Administrator hash gives a shell as Administrator", "origin": "inferred"}],
+          "selected_action": {"intent": "connect with evil-winrm using the Administrator NT hash"},
+          "evidence": [{"summary": "connected as Administrator via pass-the-hash and obtained the root flag", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "Administrator shell",
+            "environment": [],
+            "privileges": ["Administrator"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0, 1, 2, 3, 4]}]
+    }
+  ],
+  "execution_examples": [],
+  "ignored_segment_indexes": [5, 6, 7]
+}

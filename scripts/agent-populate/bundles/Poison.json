@@ -1,0 +1,92 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-poison",
+      "origin": "explicit",
+      "title": "LFI log poisoning to base64 password and VNC root (Poison)",
+      "starting_access": "unauthenticated web access to Apache/PHP on a FreeBSD host",
+      "source_quality": "complete",
+      "difficulty": "medium",
+      "outcome": "root via a root VNC session",
+      "transferable_properties": [
+        "search for logs when PHP code can be executed to poison them",
+        "LFI to log poisoning upgrades file read into RCE",
+        "base64-encoded passwords may be encoded many times, decode repeatedly",
+        "search for root-owned processes, VNC sessions are a good entry point",
+        "forward localhost-only VNC ports over SSH"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["Apache 2.4.29", "PHP 5.6.32", "FreeBSD"],
+            "privileges": []
+          },
+          "observations": ["ports 22/80/8000 open", "browse.php has a scriptname form", "LFI reads /etc/passwd", "http wrapper disabled"],
+          "hypotheses": [{"statement": "LFI to log poisoning gives RCE", "origin": "inferred"}],
+          "selected_action": {"intent": "poison the Apache access log with a PHP payload and execute it via LFI"},
+          "evidence": [{"summary": "injected a PHP webshell into the User-Agent, parsed the log via LFI, and got RCE", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "RCE as www",
+            "environment": [],
+            "privileges": ["www"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [0]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "RCE as www",
+            "environment": [],
+            "privileges": ["www"]
+          },
+          "observations": ["pwdbackup.txt contains a base64 password encoded 13 times"],
+          "hypotheses": [{"statement": "decoding the base64 13 times yields a usable system password", "origin": "inferred"}],
+          "selected_action": {"intent": "decode the password repeatedly and try it over SSH as charix"},
+          "evidence": [{"summary": "decoded the password and logged in over SSH as charix, obtaining the user flag", "origin": "explicit", "category": "lateral_movement"}],
+          "state_after": {
+            "access": "shell as charix",
+            "environment": [],
+            "privileges": ["charix"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [0]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "shell as charix",
+            "environment": [],
+            "privileges": ["charix"]
+          },
+          "observations": ["a VNC server runs as root but only on localhost", "secret.zip in charix home holds the VNC password"],
+          "hypotheses": [{"statement": "forwarding the VNC port and using the extracted password gives a root VNC session", "origin": "inferred"}],
+          "selected_action": {"intent": "forward the VNC port over SSH and connect with the extracted password"},
+          "evidence": [{"summary": "connected to the root VNC session and obtained the root flag", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "root VNC session",
+            "environment": [],
+            "privileges": ["root"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [0]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0]}]
+    }
+  ],
+  "execution_examples": [],
+  "ignored_segment_indexes": []
+}

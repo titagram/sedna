@@ -1,0 +1,223 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-nibbles",
+      "origin": "explicit",
+      "title": "NibbleBlog RCE and sudo monitor.sh privesc (Nibbles)",
+      "starting_access": "unauthenticated web access to Apache port 80",
+      "source_quality": "complete",
+      "difficulty": "easy",
+      "outcome": "root flag via crafted sudo monitor.sh",
+      "transferable_properties": [
+        "check page source for hidden dirs",
+        "guess common admin passwords",
+        "sudo NOPASSWD script with missing file"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated web",
+            "environment": [
+              "Apache port 80"
+            ],
+            "privileges": []
+          },
+          "observations": [
+            "page source reveals /nibbleblog directory",
+            "gobuster finds admin.php"
+          ],
+          "hypotheses": [
+            {
+              "statement": "NibbleBlog 4.0.3 has a public RCE CVE",
+              "origin": "inferred"
+            }
+          ],
+          "selected_action": {
+            "intent": "enumerate /nibbleblog and locate the admin panel"
+          },
+          "evidence": [
+            {
+              "summary": "found /nibbleblog/admin.php login and users.xml with admin user",
+              "origin": "explicit",
+              "category": "recon"
+            }
+          ],
+          "state_after": {
+            "access": "unauthenticated web",
+            "environment": [
+              "NibbleBlog 4.0.3"
+            ],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [
+            {
+              "segment_indexes": [
+                0
+              ]
+            }
+          ]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "unauthenticated web",
+            "environment": [
+              "NibbleBlog 4.0.3"
+            ],
+            "privileges": []
+          },
+          "observations": [
+            "username admin known, password guessed from common list"
+          ],
+          "hypotheses": [
+            {
+              "statement": "valid credentials enable the RCE exploit",
+              "origin": "inferred"
+            }
+          ],
+          "selected_action": {
+            "intent": "guess admin password and run the NibbleBlog 4.0.3 RCE exploit"
+          },
+          "evidence": [
+            {
+              "summary": "logged in as admin and got RCE as user nibbler via nibbleblog_4.0.3.py",
+              "origin": "explicit",
+              "category": "exploitation"
+            }
+          ],
+          "state_after": {
+            "access": "shell as nibbler",
+            "environment": [],
+            "privileges": [
+              "nibbler"
+            ]
+          },
+          "origin": "explicit",
+          "citations": [
+            {
+              "segment_indexes": [
+                0
+              ]
+            }
+          ]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "shell as nibbler",
+            "environment": [],
+            "privileges": [
+              "nibbler"
+            ]
+          },
+          "observations": [
+            "sudo -l allows NOPASSWD monitor.sh",
+            "monitor.sh does not exist"
+          ],
+          "hypotheses": [
+            {
+              "statement": "a missing sudo script path can be created by us",
+              "origin": "inferred"
+            }
+          ],
+          "selected_action": {
+            "intent": "create monitor.sh with a bash payload and execute it via sudo"
+          },
+          "evidence": [
+            {
+              "summary": "created monitor.sh with /bin/bash and ran it via sudo for root",
+              "origin": "explicit",
+              "category": "privilege_escalation"
+            }
+          ],
+          "state_after": {
+            "access": "root shell",
+            "environment": [],
+            "privileges": [
+              "root"
+            ]
+          },
+          "origin": "explicit",
+          "citations": [
+            {
+              "segment_indexes": [
+                0
+              ]
+            }
+          ]
+        }
+      ],
+      "citations": [
+        {
+          "segment_indexes": [
+            0
+          ]
+        }
+      ]
+    }
+  ],
+  "execution_examples": [
+    {
+      "local_id": "ex-nibbles-1",
+      "parent_local_id": "step-3",
+      "command_template": "sudo /home/nibbler/personal/stuff/{{script}}",
+      "placeholders": [
+        {
+          "name": "script",
+          "kind": "path",
+          "binding_policy": "host_supplied",
+          "role": "sudoable script path"
+        }
+      ],
+      "capability_hint": "execute arbitrary commands as root via a sudoable script",
+      "purpose": "privilege escalation from nibbler to root",
+      "observed_role": "attacker shell as nibbler",
+      "prerequisites": [
+        {
+          "statement": "user can sudo the script without a password",
+          "citations": [
+            {
+              "segment_indexes": [
+                0
+              ]
+            }
+          ]
+        }
+      ],
+      "platform_constraints": [
+        {
+          "dimension": "os_family",
+          "relation": "required",
+          "value": "linux",
+          "citations": [
+            {
+              "segment_indexes": [
+                0
+              ]
+            }
+          ]
+        }
+      ],
+      "citations": [
+        {
+          "segment_indexes": [
+            0
+          ]
+        }
+      ]
+    }
+  ],
+  "ignored_segment_indexes": []
+}

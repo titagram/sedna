@@ -1,0 +1,114 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-eighteen",
+      "origin": "explicit",
+      "title": "MSSQL IMPERSONATE to BadSuccessor dMSA and PTH admin (Eighteen)",
+      "starting_access": "no credentials on a Windows Server 2025 Active Directory host",
+      "source_quality": "complete",
+      "difficulty": "hard",
+      "outcome": "eighteen/administrator via BadSuccessor dMSA and pass-the-hash",
+      "transferable_properties": [
+        "MSSQL IMPERSONATE privilege can switch execution context to other SQL users",
+        "spray a recovered password across enumerated users with netexec",
+        "BadSuccessor abuses CreateChild over an OU to impersonate Administrator via dMSA",
+        "chisel needs sudo to forward low ports like Kerberos 88 and SMB 445",
+        "sync Kerberos clock to UTC first then set the time to avoid skew",
+        "getST.py -dmsa previous keys rc4_hmac holds the impersonated user's NT hash"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "no credentials",
+            "environment": ["Windows Server 2025 AD", "MSSQL 1433", "WinRM 5985"],
+            "privileges": []
+          },
+          "observations": ["ports 80/1433/5985 open", "MSSQL accessible with valid credentials", "user has IMPERSONATE privilege over other SQL users"],
+          "hypotheses": [{"statement": "the IMPERSONATE privilege lets us act as appdev to extract hashes", "origin": "inferred"}],
+          "selected_action": {"intent": "connect to MSSQL and abuse IMPERSONATE to act as appdev"},
+          "evidence": [{"summary": "connected to MSSQL as kevin, used EXECUTE AS LOGIN to impersonate appdev, and extracted an admin password hash", "origin": "explicit", "category": "recon"}],
+          "state_after": {
+            "access": "MSSQL as appdev context",
+            "environment": [],
+            "privileges": ["appdev"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [0]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "MSSQL as appdev context",
+            "environment": [],
+            "privileges": ["appdev"]
+          },
+          "observations": ["admin hash extracted and cracked offline", "password sprayable across enumerated users"],
+          "hypotheses": [{"statement": "the recovered password works for a domain user over WinRM", "origin": "inferred"}],
+          "selected_action": {"intent": "crack the admin hash and spray the password across domain users"},
+          "evidence": [{"summary": "cracked the admin password and used it to log in over WinRM as adam.scott, obtaining the user flag", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "WinRM shell as adam.scott",
+            "environment": [],
+            "privileges": ["adam.scott", "IT group"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [0]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "WinRM shell as adam.scott",
+            "environment": [],
+            "privileges": ["adam.scott", "IT group"]
+          },
+          "observations": ["adam.scott is in the IT group with CreateChild over OU=Staff", "BadSuccessor can create a dMSA that impersonates Administrator"],
+          "hypotheses": [{"statement": "a dMSA created via BadSuccessor yields the Administrator NT hash", "origin": "inferred"}],
+          "selected_action": {"intent": "run BadSuccessor to create a dMSA impersonating Administrator, then getST.py for the ticket"},
+          "evidence": [{"summary": "created a dMSA with BadSuccessor, tunneled Kerberos with chisel, and obtained the Administrator NT hash from getST.py -dmsa", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "Administrator NT hash",
+            "environment": [],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [1]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-4",
+          "ordinal": 4,
+          "state_before": {
+            "access": "Administrator NT hash",
+            "environment": [],
+            "privileges": []
+          },
+          "observations": ["the NT hash can be used for pass-the-hash over WinRM"],
+          "hypotheses": [{"statement": "pass-the-hash with the Administrator hash yields a shell as eighteen/administrator", "origin": "inferred"}],
+          "selected_action": {"intent": "connect with evil-winrm using the Administrator NT hash"},
+          "evidence": [{"summary": "connected as eighteen/administrator via pass-the-hash and obtained the root flag", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "eighteen/administrator",
+            "environment": [],
+            "privileges": ["Administrator"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [1]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0, 1]}]
+    }
+  ],
+  "execution_examples": [],
+  "ignored_segment_indexes": []
+}

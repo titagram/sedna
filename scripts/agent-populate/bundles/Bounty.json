@@ -1,0 +1,107 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-bounty",
+      "origin": "explicit",
+      "title": "web.config upload RCE and JuicyPotato SYSTEM (Bounty)",
+      "starting_access": "unauthenticated access to an IIS 7.5 web server on Windows Server 2008 R2",
+      "source_quality": "complete",
+      "difficulty": "easy",
+      "outcome": "NT AUTHORITY/SYSTEM via SeImpersonatePrivilege and JuicyPotato",
+      "transferable_properties": [
+        "on IIS always test .config uploads, .aspx/.asp are usually blocked",
+        "IIS version fingerprinting guides the methodology, IIS 7.5 = Server 2008 R2",
+        "client-side validation is worthless, send POST directly",
+        "ASP.NET ViewState tokens must be extracted before POSTing",
+        "SeImpersonatePrivilege enables the Potato attack family",
+        "use Set-Content in PowerShell for bat files, not echo",
+        "when JuicyPotato reverse shell fails use a bat + icacls workaround"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["IIS 7.5"],
+            "privileges": []
+          },
+          "observations": ["only port 80 open", "IIS 7.5 = Windows Server 2008 R2", "/transfer.aspx is a file upload form", "/UploadedFiles/ exists"],
+          "hypotheses": [{"statement": "the upload filter may allow .config files which IIS can execute", "origin": "inferred"}],
+          "selected_action": {"intent": "fuzz allowed upload extensions and test for a malicious web.config"},
+          "evidence": [{"summary": "found that .config uploads are accepted while .aspx/.asp are blocked", "origin": "explicit", "category": "recon"}],
+          "state_after": {
+            "access": "unauthenticated",
+            "environment": [".config upload accepted"],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [1, 2]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": [".config upload accepted"],
+            "privileges": []
+          },
+          "observations": ["a web.config can register a Classic ASP handler", "we can embed executable ASP code in it"],
+          "hypotheses": [{"statement": "uploading a malicious web.config gives RCE on IIS", "origin": "inferred"}],
+          "selected_action": {"intent": "upload a web.config with a Classic ASP handler and a command payload"},
+          "evidence": [{"summary": "uploaded web.config and confirmed RCE as bounty/merlin, then upgraded to a PowerShell reverse shell", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "shell as bounty/merlin",
+            "environment": [],
+            "privileges": ["merlin"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "shell as bounty/merlin",
+            "environment": [],
+            "privileges": ["merlin"]
+          },
+          "observations": ["SeImpersonatePrivilege enabled", "Windows Server 2008 R2", "JuicyPotato with BITS CLSID gives SYSTEM"],
+          "hypotheses": [{"statement": "JuicyPotato token impersonation yields SYSTEM", "origin": "inferred"}],
+          "selected_action": {"intent": "download JuicyPotato and use a bat + icacls workaround to read the flags as SYSTEM"},
+          "evidence": [{"summary": "ran JuicyPotato with the BITS CLSID and read both flags as SYSTEM", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "NT AUTHORITY/SYSTEM",
+            "environment": [],
+            "privileges": ["SYSTEM"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0, 1, 2, 3, 4]}]
+    }
+  ],
+  "execution_examples": [
+    {
+      "local_id": "ex-bounty-1",
+      "parent_local_id": "step-3",
+      "command_template": "JuicyPotato.exe -l 1343 -p C:\\Windows\\Temp\\readroot.bat -t * -c {4991d34b-80a1-4291-83b6-3328366b9097}",
+      "placeholders": [],
+      "capability_hint": "privilege escalation via SeImpersonatePrivilege and JuicyPotato token impersonation",
+      "purpose": "escalate to NT AUTHORITY/SYSTEM on Windows Server 2008 R2 via the BITS COM object",
+      "observed_role": "attacker shell as merlin",
+      "prerequisites": [{"statement": "the shell has SeImpersonatePrivilege and the BITS CLSID is valid", "citations": [{"segment_indexes": [4]}]}],
+      "platform_constraints": [{"dimension": "os_family", "relation": "required", "value": "windows", "citations": [{"segment_indexes": [4]}]}],
+      "citations": [{"segment_indexes": [4]}]
+    }
+  ],
+  "ignored_segment_indexes": [5, 6, 7]
+}

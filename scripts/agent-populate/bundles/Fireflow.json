@@ -1,0 +1,350 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "fireflow-case",
+      "origin": "explicit",
+      "title": "Fireflow: Langflow to host root via MCP JWT and Kubernetes nodes/proxy",
+      "starting_access": "none/unauthenticated",
+      "source_quality": "complete",
+      "difficulty": "medium",
+      "outcome": "User and root access obtained through Langflow, SSH, MCP and kubelet exec",
+      "transferable_properties": [
+        "Leaked flow IDs can expose Langflow RCE.",
+        "Credential reuse can provide SSH access.",
+        "JWT alg=none can enable admin impersonation.",
+        "nodes/proxy plus a privileged host-root pod enables kubelet exec."
+      ],
+      "non_transferable_properties": [
+        "Exact target credentials, flow ID, pod name and host address."
+      ],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "fireflow-step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "none / unauthenticated",
+            "environment": [
+              "Linux HTB target"
+            ],
+            "privileges": []
+          },
+          "state_after": {
+            "access": "unauthenticated access to flow.fireflow.htb",
+            "environment": [
+              "Linux HTB target"
+            ],
+            "privileges": []
+          },
+          "observations": [
+            "Nmap exposes SSH and Nginx.",
+            "TLS SAN exposes fireflow.htb and wildcard subdomains.",
+            "The Open Agent link leads to flow.fireflow.htb and a Langflow playground flow_id."
+          ],
+          "hypotheses": [
+            {
+              "statement": "A public Langflow flow_id is available for testing.",
+              "origin": "explicit"
+            }
+          ],
+          "selected_action": {
+            "intent": "Enumerate web vhosts and identify the leaked flow_id.",
+            "capability_ref": null
+          },
+          "evidence": [
+            {
+              "summary": "A distinct Langflow vhost and flow_id were found.",
+              "origin": "explicit",
+              "category": "observation"
+            }
+          ],
+          "negative_evidence": [],
+          "transfer_conditions": [
+            "Web enumeration reveals an application flow_id."
+          ],
+          "case_specific_details": [],
+          "origin": "explicit",
+          "citations": [
+            {
+              "segment_indexes": [
+                1
+              ]
+            }
+          ]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "fireflow-step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "unauthenticated Langflow access",
+            "environment": [
+              "Linux HTB target"
+            ],
+            "privileges": []
+          },
+          "state_after": {
+            "access": "code execution as www-data",
+            "environment": [
+              "Linux HTB target"
+            ],
+            "privileges": []
+          },
+          "observations": [
+            "CVE-2026-33017 provides unauthenticated RCE through build_public_tmp with a valid flow_id.",
+            "The payload yields a www-data reverse shell.",
+            "Langflow .env exposes a reusable superuser password."
+          ],
+          "hypotheses": [
+            {
+              "statement": "The known flow_id is sufficient for unauthenticated Langflow RCE.",
+              "origin": "explicit"
+            }
+          ],
+          "selected_action": {
+            "intent": "Exploit the public flow with a custom component payload.",
+            "capability_ref": null
+          },
+          "evidence": [
+            {
+              "summary": "The crafted build request returns a www-data shell.",
+              "origin": "explicit",
+              "category": "exploitation"
+            }
+          ],
+          "negative_evidence": [],
+          "transfer_conditions": [
+            "Langflow is reachable and a public flow_id is known."
+          ],
+          "case_specific_details": [
+            "Code executes during component graph build; place attacker code in the component method."
+          ],
+          "origin": "explicit",
+          "citations": [
+            {
+              "segment_indexes": [
+                2
+              ]
+            }
+          ]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "fireflow-step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "www-data host shell",
+            "environment": [
+              "Linux HTB target"
+            ],
+            "privileges": []
+          },
+          "state_after": {
+            "access": "SSH as nightfall and RCE as mcp in a Kubernetes pod",
+            "environment": [
+              "Linux HTB target"
+            ],
+            "privileges": []
+          },
+          "observations": [
+            "The Langflow password is reused by nightfall for SSH.",
+            "nightfall home contains .mcp/config.json with custom MCP server access.",
+            "The MCP service supports JWT alg=none.",
+            "A forged admin JWT registers and invokes a malicious tool, yielding mcp pod RCE."
+          ],
+          "hypotheses": [
+            {
+              "statement": "Credential reuse enables the SSH pivot.",
+              "origin": "explicit"
+            },
+            {
+              "statement": "The advertised none algorithm permits admin impersonation.",
+              "origin": "explicit"
+            }
+          ],
+          "selected_action": {
+            "intent": "Reuse the password over SSH, then abuse unsigned JWT to register an MCP shell tool.",
+            "capability_ref": null
+          },
+          "evidence": [
+            {
+              "summary": "SSH as nightfall succeeds.",
+              "origin": "explicit",
+              "category": "lateral-movement"
+            },
+            {
+              "summary": "MCP tool registration yields pod-level code execution.",
+              "origin": "explicit",
+              "category": "lateral-movement"
+            }
+          ],
+          "negative_evidence": [],
+          "transfer_conditions": [
+            "A leaked config points to a service advertising insecure JWT algorithms."
+          ],
+          "case_specific_details": [],
+          "origin": "explicit",
+          "citations": [
+            {
+              "segment_indexes": [
+                3
+              ]
+            }
+          ]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "fireflow-step-4",
+          "ordinal": 4,
+          "state_before": {
+            "access": "mcp pod uid 1000",
+            "environment": [
+              "Linux HTB target"
+            ],
+            "privileges": []
+          },
+          "state_after": {
+            "access": "root on host filesystem",
+            "environment": [
+              "Linux HTB target"
+            ],
+            "privileges": []
+          },
+          "observations": [
+            "The pod service account has get on nodes/proxy.",
+            "Kubelet /pods reveals a privileged node-exporter pod mounting host /, /proc and /sys.",
+            "Direct websocket exec to kubelet :10250 uses output=1&error=1 and v4.channel.k8s.io.",
+            "The host root is mounted at /host/root."
+          ],
+          "hypotheses": [
+            {
+              "statement": "nodes/proxy permits direct kubelet exec without pods/exec when a privileged pod exists.",
+              "origin": "explicit"
+            }
+          ],
+          "selected_action": {
+            "intent": "Use the kubelet websocket against the privileged node-exporter pod and read the host root flag.",
+            "capability_ref": null
+          },
+          "evidence": [
+            {
+              "summary": "The privileged pod provides command execution against the host filesystem.",
+              "origin": "explicit",
+              "category": "privilege-escalation"
+            }
+          ],
+          "negative_evidence": [],
+          "transfer_conditions": [
+            "SA has nodes/proxy and a privileged host-root pod exists."
+          ],
+          "case_specific_details": [
+            "Use node IP :10250, not API service IP; strip the first channel byte from frames."
+          ],
+          "origin": "explicit",
+          "citations": [
+            {
+              "segment_indexes": [
+                4
+              ]
+            }
+          ]
+        }
+      ],
+      "citations": [
+        {
+          "segment_indexes": [
+            1
+          ]
+        }
+      ]
+    }
+  ],
+  "execution_examples": [
+    {
+      "local_id": "fireflow-ex-1",
+      "parent_local_id": "fireflow-step-4",
+      "command_template": "python3 kube_exec.py --node {{node}} --namespace {{namespace}} --pod {{pod}} --container {{container}} \"cat /host/root/root/root.txt\"",
+      "placeholders": [
+        {
+          "name": "node",
+          "kind": "target",
+          "binding_policy": "authorized_scope",
+          "role": "authorized node IP"
+        },
+        {
+          "name": "namespace",
+          "kind": "value",
+          "binding_policy": "host_supplied",
+          "role": "pod namespace"
+        },
+        {
+          "name": "pod",
+          "kind": "value",
+          "binding_policy": "host_supplied",
+          "role": "privileged pod"
+        },
+        {
+          "name": "container",
+          "kind": "value",
+          "binding_policy": "host_supplied",
+          "role": "container"
+        }
+      ],
+      "capability_hint": "websocket exec to kubelet 10250",
+      "purpose": "Read host root through privileged pod mount",
+      "observed_role": "mcp pod user",
+      "prerequisites": [
+        {
+          "statement": "SA has nodes/proxy and privileged host-root pod exists.",
+          "citations": [
+            {
+              "segment_indexes": [
+                6
+              ]
+            }
+          ]
+        }
+      ],
+      "platform_constraints": [
+        {
+          "dimension": "execution_environment",
+          "relation": "required",
+          "value": "Kubernetes pod with service-account token",
+          "citations": [
+            {
+              "segment_indexes": [
+                6
+              ]
+            }
+          ]
+        },
+        {
+          "dimension": "os_family",
+          "relation": "compatible",
+          "value": "linux",
+          "citations": [
+            {
+              "segment_indexes": [
+                6
+              ]
+            }
+          ]
+        }
+      ],
+      "citations": [
+        {
+          "segment_indexes": [
+            6
+          ]
+        }
+      ]
+    }
+  ],
+  "ignored_segment_indexes": [
+    0,
+    7
+  ]
+}

@@ -1,0 +1,288 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-devarea",
+      "origin": "explicit",
+      "title": "Apache CXF SSRF to Hoverfly RCE and world-writable bash privesc (DevArea)",
+      "starting_access": "unauthenticated access to FTP and HTTP services",
+      "source_quality": "complete",
+      "difficulty": "medium",
+      "outcome": "root flag via SUID rootbash from world-writable /usr/bin/bash",
+      "transferable_properties": [
+        "download JARs from anonymous FTP",
+        "CXF XOP Include SSRF file read",
+        "Hoverfly middleware RCE",
+        "world-writable system binary + systemd timer"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": [
+              "FTP, HTTP, Jetty 8080, Hoverfly 8888"
+            ],
+            "privileges": []
+          },
+          "observations": [
+            "ports 21/22/80/8080/8500/8888 open",
+            "FTP anonymous allowed",
+            "CXF SOAP and Hoverfly"
+          ],
+          "hypotheses": [
+            {
+              "statement": "the FTP JAR and SOAP service hide the real attack surface",
+              "origin": "inferred"
+            }
+          ],
+          "selected_action": {
+            "intent": "enumerate FTP, decompile the JAR, and map the SOAP service"
+          },
+          "evidence": [
+            {
+              "summary": "downloaded employee-service.jar via anonymous FTP and decompiled to find Apache CXF 3.2.14",
+              "origin": "explicit",
+              "category": "recon"
+            }
+          ],
+          "state_after": {
+            "access": "unauthenticated",
+            "environment": [
+              "Apache CXF 3.2.14 SOAP"
+            ],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [
+            {
+              "segment_indexes": [
+                0,
+                1
+              ]
+            }
+          ]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": [
+              "Apache CXF 3.2.14 SOAP"
+            ],
+            "privileges": []
+          },
+          "observations": [
+            "CXF 3.2.14 vulnerable to CVE-2022-46364 XOP SSRF",
+            "file:// URIs resolved server-side"
+          ],
+          "hypotheses": [
+            {
+              "statement": "XOP Include SSRF can read arbitrary files including service credentials",
+              "origin": "inferred"
+            }
+          ],
+          "selected_action": {
+            "intent": "use the XOP SSRF to read hoverfly.service"
+          },
+          "evidence": [
+            {
+              "summary": "read hoverfly.service via CVE-2022-46364 and extracted admin credentials and dev_ryan service user",
+              "origin": "explicit",
+              "category": "exploitation"
+            }
+          ],
+          "state_after": {
+            "access": "unauthenticated",
+            "environment": [],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [
+            {
+              "segment_indexes": [
+                2
+              ]
+            }
+          ]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": [
+              "Hoverfly"
+            ],
+            "privileges": []
+          },
+          "observations": [
+            "Hoverfly middleware RCE CVE-2025-54123",
+            "authenticated via admin JWT"
+          ],
+          "hypotheses": [
+            {
+              "statement": "middleware script injection yields a shell as dev_ryan",
+              "origin": "inferred"
+            }
+          ],
+          "selected_action": {
+            "intent": "inject a bash reverse shell as Hoverfly middleware and trigger via proxy"
+          },
+          "evidence": [
+            {
+              "summary": "PUT middleware with a reverse shell and triggered it via the proxy to get a shell as dev_ryan",
+              "origin": "explicit",
+              "category": "exploitation"
+            }
+          ],
+          "state_after": {
+            "access": "shell as dev_ryan",
+            "environment": [],
+            "privileges": [
+              "dev_ryan"
+            ]
+          },
+          "origin": "explicit",
+          "citations": [
+            {
+              "segment_indexes": [
+                2
+              ]
+            }
+          ]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-4",
+          "ordinal": 4,
+          "state_before": {
+            "access": "shell as dev_ryan",
+            "environment": [],
+            "privileges": [
+              "dev_ryan"
+            ]
+          },
+          "observations": [
+            "sudo -l allows NOPASSWD syswatch.sh",
+            "/usr/bin/bash is 777",
+            "syswatch-monitor.timer runs as root"
+          ],
+          "hypotheses": [
+            {
+              "statement": "overwriting world-writable bash lets a root timer execute our payload",
+              "origin": "inferred"
+            }
+          ],
+          "selected_action": {
+            "intent": "get a non-bash shell, kill bash, and overwrite /usr/bin/bash with a SUID payload"
+          },
+          "evidence": [
+            {
+              "summary": "spawned a python/sh shell, killed bash, wrote a SUID payload to /usr/bin/bash, and waited for the root timer to create rootbash",
+              "origin": "explicit",
+              "category": "privilege_escalation"
+            }
+          ],
+          "state_after": {
+            "access": "root shell",
+            "environment": [],
+            "privileges": [
+              "root"
+            ]
+          },
+          "origin": "explicit",
+          "citations": [
+            {
+              "segment_indexes": [
+                3,
+                4
+              ]
+            }
+          ]
+        }
+      ],
+      "citations": [
+        {
+          "segment_indexes": [
+            0,
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      ]
+    }
+  ],
+  "execution_examples": [
+    {
+      "local_id": "ex-devarea-1",
+      "parent_local_id": "step-2",
+      "command_template": "curl -s -X POST 'http://devarea.htb:8080/employeeservice' -H 'Content-Type: multipart/related; boundary={{boundary}}' --data-binary @{{payload}}",
+      "placeholders": [
+        {
+          "name": "boundary",
+          "kind": "value",
+          "binding_policy": "host_supplied",
+          "role": "MIME boundary string"
+        },
+        {
+          "name": "payload",
+          "kind": "path",
+          "binding_policy": "host_supplied",
+          "role": "multipart XOP SOAP payload file"
+        }
+      ],
+      "capability_hint": "SSRF arbitrary file read via CXF XOP Include",
+      "purpose": "read arbitrary server files through the SOAP service",
+      "observed_role": "attacker host",
+      "prerequisites": [
+        {
+          "statement": "SOAP endpoint is reachable and CXF parses multipart XOP Include",
+          "citations": [
+            {
+              "segment_indexes": [
+                2
+              ]
+            }
+          ]
+        }
+      ],
+      "platform_constraints": [
+        {
+          "dimension": "os_family",
+          "relation": "required",
+          "value": "linux",
+          "citations": [
+            {
+              "segment_indexes": [
+                2
+              ]
+            }
+          ]
+        }
+      ],
+      "citations": [
+        {
+          "segment_indexes": [
+            2
+          ]
+        }
+      ]
+    }
+  ],
+  "ignored_segment_indexes": [
+    5,
+    6,
+    7
+  ]
+}

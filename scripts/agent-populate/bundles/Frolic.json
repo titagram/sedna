@@ -1,0 +1,92 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-frolic",
+      "origin": "explicit",
+      "title": "Encoding chain to playSMS RCE and ret2libc SUID root (Frolic)",
+      "starting_access": "unauthenticated access to nginx and Node-RED on an Ubuntu 16.04 host",
+      "source_quality": "complete",
+      "difficulty": "hard",
+      "outcome": "root via ret2libc against a SUID binary",
+      "transferable_properties": [
+        "check client-side JavaScript for hardcoded credentials before brute forcing",
+        "chained encoding puzzles need a decoder toolkit",
+        "playSMS CSV upload RCE via CVE-2017-9101 reads the command from the User-Agent header",
+        "ret2libc is the go-to when NX is enabled but PIE is disabled",
+        "always gather libc values from the victim, not locally"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["nginx 1.10.3", "Node-RED", "SMB"],
+            "privileges": []
+          },
+          "observations": ["ports 22/139/445/1880/9999 open", "/admin has credentials in JS source", "login leads to an Ook encoded page"],
+          "hypotheses": [{"statement": "decoding the Ook chain reveals a hidden path with playSMS credentials", "origin": "inferred"}],
+          "selected_action": {"intent": "login to /admin, decode the Ook chain, and find the playSMS credentials"},
+          "evidence": [{"summary": "decoded the Ook->Base64->ZIP->Hex->Base64->Brainfuck chain and logged into playSMS as admin", "origin": "explicit", "category": "recon"}],
+          "state_after": {
+            "access": "playSMS admin",
+            "environment": ["playSMS"],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [2]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "playSMS admin",
+            "environment": ["playSMS"],
+            "privileges": []
+          },
+          "observations": ["playSMS CSV import is vulnerable to CVE-2017-9101", "the command executes via the HTTP User-Agent header", "CSRF token comes from the upload response"],
+          "hypotheses": [{"statement": "a malicious CSV with a User-Agent reverse shell yields a shell", "origin": "inferred"}],
+          "selected_action": {"intent": "upload a malicious CSV twice to capture the token and execute a reverse shell"},
+          "evidence": [{"summary": "got a reverse shell as www-data via the playSMS CSV upload RCE", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "shell as www-data",
+            "environment": [],
+            "privileges": ["www-data"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "shell as www-data",
+            "environment": [],
+            "privileges": ["www-data"]
+          },
+          "observations": ["a non-standard SUID binary /home/ayush/.binary/rop exists", "NX enabled, PIE disabled, no canary"],
+          "hypotheses": [{"statement": "ret2libc against the SUID binary yields a root shell", "origin": "inferred"}],
+          "selected_action": {"intent": "gather libc offsets on the victim and build a ret2libc payload"},
+          "evidence": [{"summary": "built a ret2libc exploit with system/exit//bin/sh from the victim libc and spawned a root shell", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "root shell",
+            "environment": [],
+            "privileges": ["root"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0, 1, 2, 3, 4]}]
+    }
+  ],
+  "execution_examples": [],
+  "ignored_segment_indexes": [5, 6, 7]
+}

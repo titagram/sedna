@@ -1,0 +1,105 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-beep",
+      "origin": "explicit",
+      "title": "Elastix LFI to pre-auth RCE and nmap GTFOBins privesc (Beep)",
+      "starting_access": "unauthenticated access to an Elastix VoIP PBX on CentOS",
+      "source_quality": "complete",
+      "difficulty": "medium",
+      "outcome": "root via sudoable nmap interactive mode",
+      "transferable_properties": [
+        "run searchsploit immediately after identifying a web application",
+        "LFI can leak config files with plaintext credentials, /etc/amportal.conf on Elastix",
+        "the same password is often reused across services",
+        "old servers may only support SSLv3/TLS1.0 requiring OpenSSL config changes",
+        "nmap --interactive with !sh is instant root when nmap is sudoable (GTFOBins)"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["Elastix VoIP PBX", "Apache 2.2.3", "mail and webmin ports"],
+            "privileges": []
+          },
+          "observations": ["many open ports including 443 HTTPS and 10000 Webmin", "Elastix VoIP PBX identified"],
+          "hypotheses": [{"statement": "Elastix has known LFI and pre-auth RCE vulnerabilities", "origin": "inferred"}],
+          "selected_action": {"intent": "search exploit-db for Elastix vulnerabilities and use LFI to read configs"},
+          "evidence": [{"summary": "found LFI via graph.php and read /etc/amportal.conf with plaintext credentials", "origin": "explicit", "category": "recon"}],
+          "state_after": {
+            "access": "Elastix web panel credentials",
+            "environment": ["amportal.conf leaked"],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [1, 2]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "Elastix web panel credentials",
+            "environment": ["amportal.conf leaked"],
+            "privileges": []
+          },
+          "observations": ["CVE-2012-4869 is a FreePBX/Elastix pre-auth RCE via callme_page.php", "SSL legacy issues with the old server"],
+          "hypotheses": [{"statement": "the pre-auth RCE gives a shell as the asterisk user", "origin": "inferred"}],
+          "selected_action": {"intent": "trigger CVE-2012-4869 with a reverse shell payload"},
+          "evidence": [{"summary": "got a reverse shell as asterisk via CVE-2012-4869 using curl with forced TLS 1.0", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "shell as asterisk",
+            "environment": [],
+            "privileges": ["asterisk"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [2, 3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "shell as asterisk",
+            "environment": [],
+            "privileges": ["asterisk"]
+          },
+          "observations": ["sudo -l allows asterisk to run /usr/bin/nmap as root NOPASSWD"],
+          "hypotheses": [{"statement": "nmap interactive mode can spawn a root shell via GTFOBins", "origin": "inferred"}],
+          "selected_action": {"intent": "run sudo nmap --interactive and spawn a shell with !sh"},
+          "evidence": [{"summary": "used sudo nmap --interactive then !sh to get a root shell", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "root shell",
+            "environment": [],
+            "privileges": ["root"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0, 1, 2, 3, 4]}]
+    }
+  ],
+  "execution_examples": [
+    {
+      "local_id": "ex-beep-1",
+      "parent_local_id": "step-3",
+      "command_template": "sudo nmap --interactive",
+      "placeholders": [],
+      "capability_hint": "spawn a root shell from an interactive sudoable nmap via GTFOBins",
+      "purpose": "privilege escalation to root via nmap interactive mode",
+      "observed_role": "attacker shell as asterisk",
+      "prerequisites": [{"statement": "asterisk can sudo nmap without a password", "citations": [{"segment_indexes": [4]}]}],
+      "platform_constraints": [{"dimension": "os_family", "relation": "required", "value": "linux", "citations": [{"segment_indexes": [4]}]}],
+      "citations": [{"segment_indexes": [4]}]
+    }
+  ],
+  "ignored_segment_indexes": [5, 6]
+}

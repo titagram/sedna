@@ -1,0 +1,92 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-interpreter",
+      "origin": "explicit",
+      "title": "Mirth Connect RCE to notif.py eval root (Interpreter)",
+      "starting_access": "unauthenticated access to Mirth Connect on a Debian 12 host",
+      "source_quality": "complete",
+      "difficulty": "medium",
+      "outcome": "root via a Python eval injection in a root service",
+      "transferable_properties": [
+        "identify the exact application version early to find CVEs",
+        "CVE-2023-43208 is an unauthenticated RCE on Mirth Connect < 4.4.1",
+        "Mirth Connect 4.4.0 stores PBKDF2-HMAC-SHA256 hashes",
+        "a root process with an injectable eval or f-string is an immediate root",
+        "use pathlib.Path.write_text when commas are filtered in injection"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["Mirth Connect 4.4.0", "Jetty"],
+            "privileges": []
+          },
+          "observations": ["ports 22/80/443 open", "Mirth Connect Administrator detected", "version 4.4.0 vulnerable to CVE-2023-43208"],
+          "hypotheses": [{"statement": "CVE-2023-43208 gives unauthenticated RCE", "origin": "inferred"}],
+          "selected_action": {"intent": "run the CVE-2023-43208 exploit to execute a reverse shell"},
+          "evidence": [{"summary": "got a reverse shell as mirth via CVE-2023-43208 unauthenticated RCE", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "shell as mirth",
+            "environment": [],
+            "privileges": ["mirth"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [0]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "shell as mirth",
+            "environment": [],
+            "privileges": ["mirth"]
+          },
+          "observations": ["mirth.properties contains database credentials", "the Mirth DB has PERSON and PERSON_PASSWORD tables"],
+          "hypotheses": [{"statement": "dumping the DB hash and cracking it yields the sedric system password", "origin": "inferred"}],
+          "selected_action": {"intent": "query the Mirth database for sedric's password hash and crack it"},
+          "evidence": [{"summary": "extracted sedric's PBKDF2 hash from the DB, cracked it with hashcat mode 10900, and logged in over SSH as sedric", "origin": "explicit", "category": "lateral_movement"}],
+          "state_after": {
+            "access": "shell as sedric",
+            "environment": [],
+            "privileges": ["sedric"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [0]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "shell as sedric",
+            "environment": [],
+            "privileges": ["sedric"]
+          },
+          "observations": ["notif.py runs as root on 127.0.0.1:54321", "it evaluates an f-string built from patient XML fields"],
+          "hypotheses": [{"statement": "injecting a Python expression into the f-string executes as root", "origin": "inferred"}],
+          "selected_action": {"intent": "inject an os.popen id command into the /addPatient eval to confirm root RCE"},
+          "evidence": [{"summary": "confirmed root RCE via the f-string eval, then injected an SSH key into /root/.ssh/authorized_keys using pathlib", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "root via SSH key",
+            "environment": [],
+            "privileges": ["root"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [0]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0]}]
+    }
+  ],
+  "execution_examples": [],
+  "ignored_segment_indexes": []
+}

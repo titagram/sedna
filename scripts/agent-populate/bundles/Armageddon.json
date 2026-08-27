@@ -1,0 +1,93 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-armageddon",
+      "origin": "explicit",
+      "title": "Drupalgeddon2 RCE to snap install privesc (Armageddon)",
+      "starting_access": "unauthenticated web access to Drupal 7 on port 80",
+      "source_quality": "complete",
+      "difficulty": "medium",
+      "outcome": "root via malicious snap install hook",
+      "transferable_properties": [
+        "check CHANGELOG.txt on Drupal sites for the exact version",
+        "read settings.php for database credentials when you have file read",
+        "database credentials often reused as system passwords",
+        "adapt to blocked outbound with file read and DB queries instead of reverse shells",
+        "sudo snap install with wildcard is a direct privesc via root hooks",
+        "on CentOS/RHEL the sudoers group is wheel"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["Apache httpd 2.4.6", "Drupal 7", "SSH"],
+            "privileges": []
+          },
+          "observations": ["ports 22 and 80 open", "Drupal 7 detected", "robots.txt exposes structure", "CHANGELOG.txt confirms 7.56"],
+          "hypotheses": [{"statement": "Drupal 7.56 is vulnerable to Drupalgeddon2 RCE", "origin": "inferred"}],
+          "selected_action": {"intent": "confirm the Drupal version and map the CMS"},
+          "evidence": [{"summary": "confirmed Drupal 7.56 via CHANGELOG.txt, vulnerable to CVE-2018-7600", "origin": "explicit", "category": "recon"}],
+          "state_after": {
+            "access": "unauthenticated",
+            "environment": ["Drupal 7.56"],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [0, 1]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["Drupal 7.56"],
+            "privileges": []
+          },
+          "observations": ["CVE-2018-7600 is unauthenticated RCE", "reverse shell blocked by firewall"],
+          "hypotheses": [{"statement": "RCE lets us read files and query the DB to extract credentials", "origin": "inferred"}],
+          "selected_action": {"intent": "run the Drupalgeddon2 exploit and read settings.php + query MySQL"},
+          "evidence": [{"summary": "got RCE as apache, read DB credentials from settings.php, extracted and cracked the Drupal hash, then logged in over SSH as brucetherealadmin", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "shell as brucetherealadmin",
+            "environment": [],
+            "privileges": ["brucetherealadmin"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [1, 2]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "shell as brucetherealadmin",
+            "environment": [],
+            "privileges": ["brucetherealadmin"]
+          },
+          "observations": ["sudo -l allows snap install as root NOPASSWD"],
+          "hypotheses": [{"statement": "a malicious snap with an install hook runs as root", "origin": "inferred"}],
+          "selected_action": {"intent": "build a malicious snap that adds a sudoer user and install it"},
+          "evidence": [{"summary": "packaged a snap with a root install hook that created the pwned sudoer, installed with sudo snap install --dangerous --devmode, then SSHed as pwned and sudo su to root", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "root shell",
+            "environment": [],
+            "privileges": ["root"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [3]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0, 1, 2, 3]}]
+    }
+  ],
+  "execution_examples": [],
+  "ignored_segment_indexes": [4, 5]
+}

@@ -1,0 +1,113 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-variatype",
+      "origin": "explicit",
+      "title": "fonttools file write to cron injection and sudo URL traversal (VariaType)",
+      "starting_access": "unauthenticated access to nginx and a Flask font service on Debian 12",
+      "source_quality": "complete",
+      "difficulty": "hard",
+      "outcome": "root via %2F path traversal in a sudoable install script",
+      "transferable_properties": [
+        "always enumerate subdomains early",
+        "check exposed .git directories, deleted commits contain credentials",
+        "fonttools varLib CVE-2025-66034 arbitrary file write via unsanitised designspace",
+        "bash command injection via filenames inside archives bypasses outer regex checks",
+        "for sudo privesc involving URLs test %2F-encoded slashes to bypass basename()"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["nginx reverse proxy", "Flask font app", "portal subdomain"],
+            "privileges": []
+          },
+          "observations": ["ports 22/80 open", "subdomain fuzzing finds portal.variatype.htb", "portal has an exposed .git directory"],
+          "hypotheses": [{"statement": "the exposed git repo reveals credentials in deleted commit history", "origin": "inferred"}],
+          "selected_action": {"intent": "dump the git repo and recover deleted credentials"},
+          "evidence": [{"summary": "recovered gitbot credentials from a deleted commit in the exposed .git and logged into the portal", "origin": "explicit", "category": "recon"}],
+          "state_after": {
+            "access": "portal login as gitbot",
+            "environment": ["portal dashboard"],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [1, 2]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "portal login as gitbot",
+            "environment": ["font generator"],
+            "privileges": []
+          },
+          "observations": ["font generator uses fontTools.varLib on .designspace files", "CVE-2025-66034 allows path traversal and XML injection"],
+          "hypotheses": [{"statement": "a malicious designspace can write a PHP webshell to the portal webroot", "origin": "inferred"}],
+          "selected_action": {"intent": "build two-master fonts with a CDATA XML injection and path traversal to write shell.php"},
+          "evidence": [{"summary": "wrote shell.php to the PHP-FPM webroot via CVE-2025-66034 and triggered a reverse shell as www-data", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "shell as www-data",
+            "environment": [],
+            "privileges": ["www-data"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "shell as www-data",
+            "environment": [],
+            "privileges": ["www-data"]
+          },
+          "observations": ["steve's cron script processes uploaded .zip files", "inner zip filenames are not validated and interpolated into a bash command"],
+          "hypotheses": [{"statement": "a malicious zip with a $() command injection filename yields a shell as steve", "origin": "inferred"}],
+          "selected_action": {"intent": "place a malicious zip with an injection filename in the upload dir and wait for the cron"},
+          "evidence": [{"summary": "steve's cron processed the malicious zip and the filename injection gave a reverse shell as steve", "origin": "explicit", "category": "lateral_movement"}],
+          "state_after": {
+            "access": "shell as steve",
+            "environment": [],
+            "privileges": ["steve"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-4",
+          "ordinal": 4,
+          "state_before": {
+            "access": "shell as steve",
+            "environment": [],
+            "privileges": ["steve"]
+          },
+          "observations": ["sudo allows steve to run install_validator.py as root", "CVE-2025-47273 %2F bypasses basename() to escape validators dir"],
+          "hypotheses": [{"statement": "a %2F-encoded URL lets us write an SSH key to /root/.ssh/authorized_keys", "origin": "inferred"}],
+          "selected_action": {"intent": "run install_validator.py with a %2F-encoded URL pointing to our authorized_keys and SSH as root"},
+          "evidence": [{"summary": "used the %2F path traversal to install our SSH key and logged in as root", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "root shell",
+            "environment": [],
+            "privileges": ["root"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0, 1, 2, 3, 4]}]
+    }
+  ],
+  "execution_examples": [],
+  "ignored_segment_indexes": [5, 6, 7]
+}

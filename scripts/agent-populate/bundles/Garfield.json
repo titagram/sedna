@@ -1,0 +1,136 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-garfield",
+      "origin": "explicit",
+      "title": "scriptPath abuse to RODC golden ticket and Kerb-Key-List (Garfield)",
+      "starting_access": "no credentials on a Windows Server 2019 Active Directory domain controller",
+      "source_quality": "complete",
+      "difficulty": "hard",
+      "outcome": "Administrator via RODC golden ticket and Kerb-Key-List",
+      "transferable_properties": [
+        "fix clock skew before any Kerberos attack",
+        "a krbtgt_XXXX account indicates a Read-Only Domain Controller",
+        "msDS-RevealedUsers on an RODC lists cached credentials, a treasure map",
+        "scriptPath executes on interactive logon, replace an existing script",
+        "Set-ADAccountPassword -Reset uses User-Force-Change-Password without the old password",
+        "RODC rejects RC4 tickets, use AES for RBCD",
+        "clear the entire msDS-NeverRevealGroup list or Kerb-Key-List fails"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "j.arbuckle credentials",
+            "environment": ["Windows Server 2019 DC", "RODC present"],
+            "privileges": ["j.arbuckle"]
+          },
+          "observations": ["clock skew +8h", "BloodHound shows j.arbuckle has scriptPath WRITE on l.wilson", "RODC01 has Administrator in msDS-RevealedUsers"],
+          "hypotheses": [{"statement": "abusing scriptPath gives a shell as l.wilson, who can change l.wilson_adm's password", "origin": "inferred"}],
+          "selected_action": {"intent": "upload a malicious printerDetect.bat to SYSVOL and set it as l.wilson's scriptPath"},
+          "evidence": [{"summary": "replaced printerDetect.bat in SYSVOL, set it as l.wilson's scriptPath, and got a shell as garfield/l.wilson", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "shell as l.wilson",
+            "environment": [],
+            "privileges": ["l.wilson"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [1, 2, 3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "shell as l.wilson",
+            "environment": [],
+            "privileges": ["l.wilson"]
+          },
+          "observations": ["l.wilson has User-Force-Change-Password over l.wilson_adm"],
+          "hypotheses": [{"statement": "resetting l.wilson_adm's password gives WinRM access", "origin": "inferred"}],
+          "selected_action": {"intent": "reset l.wilson_adm's password with Set-ADAccountPassword -Reset and log in via WinRM"},
+          "evidence": [{"summary": "reset l.wilson_adm's password and connected over WinRM, obtaining the user flag", "origin": "explicit", "category": "lateral_movement"}],
+          "state_after": {
+            "access": "shell as l.wilson_adm",
+            "environment": [],
+            "privileges": ["l.wilson_adm", "Tier 1"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "shell as l.wilson_adm",
+            "environment": [],
+            "privileges": ["l.wilson_adm", "Tier 1"]
+          },
+          "observations": ["l.wilson_adm can AddSelf to RODC Administrators", "WriteAccountRestrictions enables RBCD on RODC01", "need chisel SOCKS to reach RODC on 192.168.100.2"],
+          "hypotheses": [{"statement": "joining RODC Administrators and RBCD lets us get SYSTEM on the RODC", "origin": "inferred"}],
+          "selected_action": {"intent": "add l.wilson_adm to RODC Administrators, create ATTACKER$, configure RBCD, and get a SYSTEM shell on RODC via psexec"},
+          "evidence": [{"summary": "tunneled to the RODC with chisel, configured RBCD, and obtained a SYSTEM shell on RODC01", "origin": "explicit", "category": "lateral_movement"}],
+          "state_after": {
+            "access": "SYSTEM on RODC01",
+            "environment": [],
+            "privileges": ["SYSTEM"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-4",
+          "ordinal": 4,
+          "state_before": {
+            "access": "SYSTEM on RODC01",
+            "environment": [],
+            "privileges": ["SYSTEM"]
+          },
+          "observations": ["mimikatz dumps krbtgt_8245 and RODC01$ keys", "need to clear msDS-NeverRevealGroup and add Administrator to RevealOnDemandGroup"],
+          "hypotheses": [{"statement": "a RODC golden ticket plus Kerb-Key-List yields the Administrator hash", "origin": "inferred"}],
+          "selected_action": {"intent": "dump keys with mimikatz, modify the RODC PRP, forge a golden ticket, and run asktgs /keyList"},
+          "evidence": [{"summary": "forged a RODC golden ticket with Rubeus and obtained the Administrator NTLM hash via Kerb-Key-List", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "Administrator NT hash",
+            "environment": [],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-5",
+          "ordinal": 5,
+          "state_before": {
+            "access": "Administrator NT hash",
+            "environment": [],
+            "privileges": []
+          },
+          "observations": ["the Administrator hash can be used over WinRM"],
+          "hypotheses": [{"statement": "pass-the-hash gives a shell as Administrator on DC01", "origin": "inferred"}],
+          "selected_action": {"intent": "connect with evil-winrm using the Administrator NT hash"},
+          "evidence": [{"summary": "connected as Administrator and obtained the root flag", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "Administrator shell",
+            "environment": [],
+            "privileges": ["Administrator"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0, 1, 2, 3, 4]}]
+    }
+  ],
+  "execution_examples": [],
+  "ignored_segment_indexes": [5, 6, 7]
+}

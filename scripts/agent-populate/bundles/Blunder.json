@@ -1,0 +1,147 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-blunder",
+      "origin": "explicit",
+      "title": "Bludit bruteforce bypass to auth RCE and sudo UID-1 root (Blunder)",
+      "starting_access": "unauthenticated web access to a Bludit CMS on an Ubuntu host",
+      "source_quality": "complete",
+      "difficulty": "medium",
+      "outcome": "root via sudo (ALL, !root) CVE-2019-14287 bypass",
+      "transferable_properties": [
+        "always enumerate txt/php files, todo.txt reveals usernames",
+        "use CeWL to build a targeted wordlist instead of generic rockyou",
+        "check ALL application directories, credentials are often reused across versions",
+        "SHA1 without salt cracks instantly",
+        "(ALL, !root) in sudoers is not safe on sudo < 1.8.28, use sudo -u#-1"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["Apache 2.4.41", "Bludit CMS"],
+            "privileges": []
+          },
+          "observations": ["only port 80 open", "/todo.txt reveals username fergus", "install.php confirms Bludit", "admin panel shows version 3.9.2"],
+          "hypotheses": [{"statement": "Bludit 3.9.2 is vulnerable to bruteforce bypass and RCE", "origin": "inferred"}],
+          "selected_action": {"intent": "enumerate the CMS and build a targeted wordlist with CeWL"},
+          "evidence": [{"summary": "found the fergus username and confirmed Bludit 3.9.2, vulnerable to CVE-2019-17240", "origin": "explicit", "category": "recon"}],
+          "state_after": {
+            "access": "unauthenticated",
+            "environment": ["Bludit 3.9.2"],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [1, 2]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["Bludit 3.9.2"],
+            "privileges": []
+          },
+          "observations": ["CVE-2019-17240 bypasses bruteforce lockout via X-Forwarded-For", "CeWL wordlist ready"],
+          "hypotheses": [{"statement": "spoofing X-Forwarded-For lets us bruteforce the fergus password", "origin": "inferred"}],
+          "selected_action": {"intent": "run the bruteforce bypass with the CeWL wordlist"},
+          "evidence": [{"summary": "obtained fergus:RolandDeschain via the X-Forwarded-For bruteforce bypass", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "Bludit admin as fergus",
+            "environment": [],
+            "privileges": ["fergus"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "Bludit admin as fergus",
+            "environment": [],
+            "privileges": ["fergus"]
+          },
+          "observations": ["CVE-2019-16113 is an authenticated RCE via image upload directory traversal"],
+          "hypotheses": [{"statement": "uploading a malicious .htaccess + jpg via the traversal gives a shell as www-data", "origin": "inferred"}],
+          "selected_action": {"intent": "run the 48568.py exploit to get a reverse shell"},
+          "evidence": [{"summary": "got a reverse shell as www-data via the CVE-2019-16113 authenticated RCE", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "shell as www-data",
+            "environment": [],
+            "privileges": ["www-data"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-4",
+          "ordinal": 4,
+          "state_before": {
+            "access": "shell as www-data",
+            "environment": [],
+            "privileges": ["www-data"]
+          },
+          "observations": ["a second Bludit install contains Hugo's SHA1 password hash"],
+          "hypotheses": [{"statement": "cracking the SHA1 hash gives the hugo system password", "origin": "inferred"}],
+          "selected_action": {"intent": "read users.php from the newer Bludit install and crack the hash"},
+          "evidence": [{"summary": "cracked hugo's SHA1 hash and su'd to hugo, obtaining the user flag", "origin": "explicit", "category": "lateral_movement"}],
+          "state_after": {
+            "access": "shell as hugo",
+            "environment": [],
+            "privileges": ["hugo"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-5",
+          "ordinal": 5,
+          "state_before": {
+            "access": "shell as hugo",
+            "environment": [],
+            "privileges": ["hugo"]
+          },
+          "observations": ["sudo -l shows (ALL, !root) /bin/bash", "sudo version vulnerable to CVE-2019-14287 UID wraparound"],
+          "hypotheses": [{"statement": "sudo -u#-1 bypasses the !root restriction and yields a root shell", "origin": "inferred"}],
+          "selected_action": {"intent": "run sudo -u#-1 /bin/bash to escalate to root"},
+          "evidence": [{"summary": "used sudo -u#-1 /bin/bash to get a root shell and the root flag", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "root shell",
+            "environment": [],
+            "privileges": ["root"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0, 1, 2, 3, 4]}]
+    }
+  ],
+  "execution_examples": [
+    {
+      "local_id": "ex-blunder-1",
+      "parent_local_id": "step-5",
+      "command_template": "sudo -u#-1 /bin/bash",
+      "placeholders": [],
+      "capability_hint": "privilege escalation via sudo UID -1 wraparound (CVE-2019-14287)",
+      "purpose": "bypass the sudo (ALL, !root) restriction to obtain a root shell",
+      "observed_role": "attacker shell as hugo",
+      "prerequisites": [{"statement": "sudo version is below 1.8.28 and hugo can sudo /bin/bash", "citations": [{"segment_indexes": [4]}]}],
+      "platform_constraints": [{"dimension": "os_family", "relation": "required", "value": "linux", "citations": [{"segment_indexes": [4]}]}],
+      "citations": [{"segment_indexes": [4]}]
+    }
+  ],
+  "ignored_segment_indexes": [5, 6, 7]
+}

@@ -1,0 +1,316 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-reactor",
+      "origin": "explicit",
+      "title": "Next.js React Flight RCE and Node inspector privesc (Reactor)",
+      "starting_access": "unauthenticated web access to Next.js dashboard on port 3000",
+      "source_quality": "complete",
+      "difficulty": "easy",
+      "outcome": "root flag via exposed Node.js inspector running as root",
+      "transferable_properties": [
+        "inspect Next.js build manifest for hidden routes",
+        "Next.js 15.0.3 vulnerable to CVE-2025-55182 React Flight RCE",
+        "application SQLite databases often contain reusable credentials",
+        "weak MD5 password hashes are trivially cracked",
+        "exposed Node.js inspector (127.0.0.1:9229) running as root gives arbitrary JS execution"
+      ],
+      "non_transferable_properties": [
+        "specific reactor.db schema and engineer credentials are machine-local"
+      ],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated network access",
+            "environment": [
+              "SSH port 22",
+              "Next.js port 3000"
+            ],
+            "privileges": []
+          },
+          "observations": [
+            "nmap reveals only SSH (22) and a Next.js web app (3000)",
+            "dashboard is static with no API endpoints or auth form",
+            "build manifest shows only /_app and /_error pages",
+            "dashboard discloses staff names (Elena Rodriguez, Marcus Kim, James Thompson)"
+          ],
+          "hypotheses": [
+            {
+              "statement": "the Next.js version may be vulnerable to a known RCE",
+              "origin": "inferred"
+            }
+          ],
+          "selected_action": {
+            "intent": "fingerprint the Next.js version and research known vulnerabilities"
+          },
+          "evidence": [
+            {
+              "summary": "identified Next.js 15.0.3 via Wappalyzer and confirmed the app is a static ReactorWatch dashboard",
+              "origin": "explicit",
+              "category": "recon"
+            }
+          ],
+          "state_after": {
+            "access": "unauthenticated network access",
+            "environment": [
+              "Next.js 15.0.3"
+            ],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [
+            {
+              "segment_indexes": [3]
+            }
+          ]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "unauthenticated network access",
+            "environment": [
+              "Next.js 15.0.3"
+            ],
+            "privileges": []
+          },
+          "observations": [
+            "Next.js 15.0.3 is vulnerable to CVE-2025-55182 (React Server Components Flight RCE, CVSS 10.0)",
+            "the exploit abuses crafted multipart payloads to trigger arbitrary JS execution"
+          ],
+          "hypotheses": [
+            {
+              "statement": "CVE-2025-55182 gives remote code execution as the node user",
+              "origin": "inferred"
+            }
+          ],
+          "selected_action": {
+            "intent": "run the React2Shell exploit to execute commands and obtain a reverse shell"
+          },
+          "evidence": [
+            {
+              "summary": "confirmed code execution as node via whoami, then obtained a reverse shell as node@reactor",
+              "origin": "explicit",
+              "category": "exploitation"
+            }
+          ],
+          "state_after": {
+            "access": "shell as node",
+            "environment": [
+              "/opt/reactor-app"
+            ],
+            "privileges": [
+              "node"
+            ]
+          },
+          "origin": "explicit",
+          "citations": [
+            {
+              "segment_indexes": [5]
+            }
+          ]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "shell as node",
+            "environment": [
+              "/opt/reactor-app"
+            ],
+            "privileges": [
+              "node"
+            ]
+          },
+          "observations": [
+            "the application directory contains reactor.db (SQLite)",
+            "the users table holds admin and engineer records with MD5 password hashes",
+            "the engineer MD5 hash cracks to a weak password via rockyou"
+          ],
+          "hypotheses": [
+            {
+              "statement": "the cracked engineer password is reused for the SSH system account",
+              "origin": "inferred"
+            }
+          ],
+          "selected_action": {
+            "intent": "dump the users table, crack the engineer MD5 hash, and try it over SSH"
+          },
+          "evidence": [
+            {
+              "summary": "extracted engineer MD5 hash from reactor.db, cracked it with john, and logged in over SSH as engineer",
+              "origin": "explicit",
+              "category": "lateral_movement"
+            }
+          ],
+          "state_after": {
+            "access": "shell as engineer",
+            "environment": [],
+            "privileges": [
+              "engineer"
+            ]
+          },
+          "origin": "explicit",
+          "citations": [
+            {
+              "segment_indexes": [6, 7, 8]
+            }
+          ]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-4",
+          "ordinal": 4,
+          "state_before": {
+            "access": "shell as engineer",
+            "environment": [],
+            "privileges": [
+              "engineer"
+            ]
+          },
+          "observations": [
+            "ss -tlnp reveals 127.0.0.1:9229",
+            "the Node.js inspector is running as root on /opt/uptime-monitor/worker.js"
+          ],
+          "hypotheses": [
+            {
+              "statement": "the Node inspector allows arbitrary JS execution inside the root process",
+              "origin": "inferred"
+            }
+          ],
+          "selected_action": {
+            "intent": "connect to the Node inspector and evaluate JS to run commands as root"
+          },
+          "evidence": [
+            {
+              "summary": "connected to the inspector and confirmed uid=0(root), then read the root flag",
+              "origin": "explicit",
+              "category": "privilege_escalation"
+            }
+          ],
+          "state_after": {
+            "access": "root shell",
+            "environment": [],
+            "privileges": [
+              "root"
+            ]
+          },
+          "origin": "explicit",
+          "citations": [
+            {
+              "segment_indexes": [9, 10]
+            }
+          ]
+        }
+      ],
+      "citations": [
+        {
+          "segment_indexes": [0]
+        }
+      ]
+    }
+  ],
+  "execution_examples": [
+    {
+      "local_id": "ex-reactor-1",
+      "parent_local_id": "step-2",
+      "command_template": "python3 exploit.py exec -t http://{{target}}:3000 -c '{{command}}'",
+      "placeholders": [
+        {
+          "name": "target",
+          "kind": "target",
+          "binding_policy": "authorized_scope",
+          "role": "HTB target host"
+        },
+        {
+          "name": "command",
+          "kind": "value",
+          "binding_policy": "host_supplied",
+          "role": "command to execute via RCE"
+        }
+      ],
+      "capability_hint": "Next.js React Flight RCE (CVE-2025-55182) to execute commands as node",
+      "purpose": "initial foothold via unauthenticated Next.js RCE",
+      "observed_role": "attacker with unauthenticated web access",
+      "prerequisites": [
+        {
+          "statement": "Next.js 15.0.3 is vulnerable to CVE-2025-55182",
+          "citations": [
+            {
+              "segment_indexes": [5]
+            }
+          ]
+        }
+      ],
+      "platform_constraints": [
+        {
+          "dimension": "os_family",
+          "relation": "required",
+          "value": "linux",
+          "citations": [
+            {
+              "segment_indexes": [0]
+            }
+          ]
+        }
+      ],
+      "citations": [
+        {
+          "segment_indexes": [5]
+        }
+      ]
+    },
+    {
+      "local_id": "ex-reactor-2",
+      "parent_local_id": "step-4",
+      "command_template": "exec(\"process.mainModule.require('child_process').execSync('{{command}}').toString()\")",
+      "placeholders": [
+        {
+          "name": "command",
+          "kind": "value",
+          "binding_policy": "host_supplied",
+          "role": "command to execute as root via the Node inspector"
+        }
+      ],
+      "capability_hint": "arbitrary JS execution as root through an exposed Node.js inspector",
+      "purpose": "privilege escalation from engineer to root",
+      "observed_role": "attacker shell as engineer",
+      "prerequisites": [
+        {
+          "statement": "a Node.js inspector is listening on 127.0.0.1:9229 running as root",
+          "citations": [
+            {
+              "segment_indexes": [9]
+            }
+          ]
+        }
+      ],
+      "platform_constraints": [
+        {
+          "dimension": "os_family",
+          "relation": "required",
+          "value": "linux",
+          "citations": [
+            {
+              "segment_indexes": [0]
+            }
+          ]
+        }
+      ],
+      "citations": [
+        {
+          "segment_indexes": [10]
+        }
+      ]
+    }
+  ],
+  "ignored_segment_indexes": [1, 2, 4, 11, 12, 13]
+}

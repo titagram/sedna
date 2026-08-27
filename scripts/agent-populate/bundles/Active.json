@@ -1,0 +1,114 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-active",
+      "origin": "explicit",
+      "title": "SMB null session to GPP creds and Kerberoasting (Active)",
+      "starting_access": "no credentials on a Windows Server 2008 R2 Active Directory domain controller",
+      "source_quality": "complete",
+      "difficulty": "medium",
+      "outcome": "domain Administrator via GPP credentials and Kerberoasting",
+      "transferable_properties": [
+        "SMB null session shares are the first vector on AD machines with no credentials",
+        "the Replication share (SYSVOL copy) can contain GPOs with GPP credentials in Groups.xml",
+        "GPP Passwords (MS14-025) are cracked instantly with gpp-decrypt",
+        "a service account name containing TGS hints at Kerberoasting",
+        "use wmiexec.py on Windows 2008 when psexec has encoding issues",
+        "enumerate SPNs with GetUserSPNs.py as soon as you have any credentials"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["Windows Server 2008 R2", "Active Directory domain controller", "SMB"],
+            "privileges": []
+          },
+          "observations": ["AD/DNS/Kerberos/LDAP/SMB ports open", "SMB signing enabled and required", "anonymous null session login succeeds"],
+          "hypotheses": [{"statement": "anonymous SMB enumeration reveals share contents including GPP credentials", "origin": "inferred"}],
+          "selected_action": {"intent": "list SMB shares with a null session and inspect non-standard ones"},
+          "evidence": [{"summary": "found the Replication share and retrieved Groups.xml containing a GPP cpassword for SVC_TGS", "origin": "explicit", "category": "recon"}],
+          "state_after": {
+            "access": "unauthenticated SMB read",
+            "environment": ["Replication share", "Groups.xml"],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [1, 2]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "unauthenticated SMB read",
+            "environment": ["Groups.xml"],
+            "privileges": []
+          },
+          "observations": ["GPP cpassword encrypted, decryptable with gpp-decrypt", "SVC_TGS is a service account"],
+          "hypotheses": [{"statement": "decrypting the GPP password yields service credentials usable for Kerberoasting", "origin": "inferred"}],
+          "selected_action": {"intent": "decrypt the GPP password with gpp-decrypt"},
+          "evidence": [{"summary": "gpp-decrypt revealed the plaintext SVC_TGS password", "origin": "explicit", "category": "credential_extraction"}],
+          "state_after": {
+            "access": "SVC_TGS service credentials",
+            "environment": [],
+            "privileges": ["SVC_TGS"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [2, 3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "SVC_TGS service credentials",
+            "environment": [],
+            "privileges": ["SVC_TGS"]
+          },
+          "observations": ["SVC_TGS can request service tickets", "an SPN under the Administrator account exists"],
+          "hypotheses": [{"statement": "Kerberoasting the Administrator SPN yields a crackable TGS-REP hash", "origin": "inferred"}],
+          "selected_action": {"intent": "run GetUserSPNs.py to request the Administrator SPN ticket and crack the hash"},
+          "evidence": [{"summary": "obtained a TGS-REP hash for Administrator and cracked it with hashcat", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "domain Administrator credentials",
+            "environment": [],
+            "privileges": ["Administrator"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-4",
+          "ordinal": 4,
+          "state_before": {
+            "access": "domain Administrator credentials",
+            "environment": [],
+            "privileges": ["Administrator"]
+          },
+          "observations": ["Kerberoasted credentials already belong to the domain Administrator"],
+          "hypotheses": [{"statement": "the Administrator credentials give SYSTEM via wmiexec", "origin": "inferred"}],
+          "selected_action": {"intent": "get a shell with wmiexec.py as Administrator"},
+          "evidence": [{"summary": "obtained NT AUTHORITY/SYSTEM via wmiexec.py with the Administrator credentials", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "NT AUTHORITY/SYSTEM",
+            "environment": [],
+            "privileges": ["SYSTEM"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0, 1, 2, 3, 4]}]
+    }
+  ],
+  "execution_examples": [],
+  "ignored_segment_indexes": [5, 6]
+}

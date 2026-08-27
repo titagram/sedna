@@ -1,0 +1,105 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-bashed",
+      "origin": "explicit",
+      "title": "phpbash webshell to cron SUID privesc (Bashed)",
+      "starting_access": "unauthenticated web access to Apache port 80",
+      "source_quality": "complete",
+      "difficulty": "easy",
+      "outcome": "root via overwriting a cron-executed Python script",
+      "transferable_properties": [
+        "check /dev directories for developer tools left on production",
+        "site titles and meta tags reveal framework versions",
+        "sudo -u user with tee to write files when redirects are filtered",
+        "cron jobs running root scripts in user-writable dirs are a privesc vector",
+        "use -p -c with SUID bash copies to run commands without a TTY"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["Apache 2.4.18", "port 80"],
+            "privileges": []
+          },
+          "observations": ["single port 80 open", "site titled Arrexel's Development Site"],
+          "hypotheses": [{"statement": "the dev site may expose a developer web shell tool", "origin": "inferred"}],
+          "selected_action": {"intent": "gobuster the site and inspect /dev"},
+          "evidence": [{"summary": "found /dev containing phpbash.php and phpbash.min.php", "origin": "explicit", "category": "recon"}],
+          "state_after": {
+            "access": "unauthenticated",
+            "environment": ["phpbash on /dev"],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [1, 2]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["phpbash on /dev"],
+            "privileges": []
+          },
+          "observations": ["phpbash.php is an interactive web shell"],
+          "hypotheses": [{"statement": "the phpbash webshell gives immediate command execution", "origin": "inferred"}],
+          "selected_action": {"intent": "open the phpbash webshell"},
+          "evidence": [{"summary": "gained an interactive web shell as www-data with no exploit", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "webshell as www-data",
+            "environment": [],
+            "privileges": ["www-data"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "webshell as www-data",
+            "environment": [],
+            "privileges": ["www-data"]
+          },
+          "observations": ["sudo -l allows www-data to run anything as scriptmanager", "/scripts contains test.py", "root runs .py files in /scripts via cron"],
+          "hypotheses": [{"statement": "overwriting test.py with a malicious payload yields root", "origin": "inferred"}],
+          "selected_action": {"intent": "write a SUID-creation payload to /scripts/test.py and wait for cron"},
+          "evidence": [{"summary": "used tee with sudo -u scriptmanager to overwrite test.py, then /tmp/rootbash2 appeared with SUID after cron", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "root via SUID rootbash",
+            "environment": [],
+            "privileges": ["root"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0, 1, 2, 3, 4]}]
+    }
+  ],
+  "execution_examples": [
+    {
+      "local_id": "ex-bashed-1",
+      "parent_local_id": "step-3",
+      "command_template": "printf \"import os; os.system('cp /bin/bash /tmp/rootbash; chmod 4755 /tmp/rootbash')\" | sudo -u scriptmanager tee /scripts/test.py",
+      "placeholders": [],
+      "capability_hint": "overwrite a cron-executed root script via sudo tee",
+      "purpose": "privilege escalation by injecting a SUID-creation payload into a root cron script",
+      "observed_role": "attacker webshell as www-data",
+      "prerequisites": [{"statement": "www-data can sudo as scriptmanager and root runs the script via cron", "citations": [{"segment_indexes": [4]}]}],
+      "platform_constraints": [{"dimension": "os_family", "relation": "required", "value": "linux", "citations": [{"segment_indexes": [4]}]}],
+      "citations": [{"segment_indexes": [4]}]
+    }
+  ],
+  "ignored_segment_indexes": [5, 6]
+}

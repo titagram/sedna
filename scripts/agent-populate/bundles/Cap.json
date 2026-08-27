@@ -1,0 +1,105 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-cap",
+      "origin": "explicit",
+      "title": "PCAP IDOR to FTP credential leak and cap_setuid privesc (Cap)",
+      "starting_access": "unauthenticated web access to Gunicorn on port 80",
+      "source_quality": "complete",
+      "difficulty": "medium",
+      "outcome": "root via cap_setuid on Python",
+      "transferable_properties": [
+        "auto-incremented IDs in URLs are a red flag for IDOR",
+        "FTP transmits credentials in cleartext, capture and analyze PCAPs",
+        "credential reuse between services is common",
+        "getcap -r / is essential during privesc enumeration",
+        "cap_setuid on an interpreter is an immediate root escalation via setuid(0)"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["FTP vsftpd", "SSH", "HTTP Gunicorn"],
+            "privileges": []
+          },
+          "observations": ["ports 21/22/80 open", "HTTP exposes diagnostic endpoints", "/data/<id> downloads PCAPs"],
+          "hypotheses": [{"statement": "the PCAP download endpoint is vulnerable to IDOR", "origin": "inferred"}],
+          "selected_action": {"intent": "enumerate the web app and test adjacent /data IDs"},
+          "evidence": [{"summary": "found /data endpoint with auto-incremented IDs; /data/0 leaked another user's PCAP", "origin": "explicit", "category": "recon"}],
+          "state_after": {
+            "access": "unauthenticated",
+            "environment": ["PCAP download"],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [1, 2]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["PCAP download"],
+            "privileges": []
+          },
+          "observations": ["downloaded PCAP contains FTP traffic"],
+          "hypotheses": [{"statement": "the PCAP reveals plaintext FTP credentials that are reused for SSH", "origin": "inferred"}],
+          "selected_action": {"intent": "analyze the PCAP in Wireshark and try the FTP credentials on SSH"},
+          "evidence": [{"summary": "found USER nathan and PASS in FTP traffic, then logged in over SSH as nathan", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "shell as nathan",
+            "environment": [],
+            "privileges": ["nathan"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "shell as nathan",
+            "environment": [],
+            "privileges": ["nathan"]
+          },
+          "observations": ["/usr/bin/python3.8 has cap_setuid capability"],
+          "hypotheses": [{"statement": "cap_setuid on Python lets us setuid to root", "origin": "inferred"}],
+          "selected_action": {"intent": "use python3.8 setuid(0) to spawn a root shell"},
+          "evidence": [{"summary": "ran python3.8 -c 'import os; os.setuid(0); os.system(/bin/bash)' and got a root shell", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "root shell",
+            "environment": [],
+            "privileges": ["root"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0, 1, 2, 3, 4]}]
+    }
+  ],
+  "execution_examples": [
+    {
+      "local_id": "ex-cap-1",
+      "parent_local_id": "step-3",
+      "command_template": "/usr/bin/python3.8 -c \"import os; os.setuid(0); os.system('/bin/bash')\"",
+      "placeholders": [],
+      "capability_hint": "escalate to root using cap_setuid on an interpreter",
+      "purpose": "privilege escalation via the cap_setuid Linux capability on python3.8",
+      "observed_role": "attacker shell as nathan",
+      "prerequisites": [{"statement": "python3.8 has the cap_setuid capability set", "citations": [{"segment_indexes": [4]}]}],
+      "platform_constraints": [{"dimension": "os_family", "relation": "required", "value": "linux", "citations": [{"segment_indexes": [4]}]}],
+      "citations": [{"segment_indexes": [4]}]
+    }
+  ],
+  "ignored_segment_indexes": [5, 6]
+}

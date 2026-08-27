@@ -1,0 +1,132 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-facts",
+      "origin": "explicit",
+      "title": "Camaleon CMS 2.9.0 compromise (Facts)",
+      "starting_access": "unauthenticated web access to facts.htb",
+      "source_quality": "complete",
+      "difficulty": "medium",
+      "outcome": "root shell via sudoable facter RCE",
+      "transferable_properties": [
+        "open registration gives foothold",
+        "S3 on non-standard port"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated web",
+            "environment": [
+              "nginx 1.26.3"
+            ],
+            "privileges": []
+          },
+          "observations": [
+            "ports 22 and 80 open"
+          ],
+          "hypotheses": [
+            {
+              "statement": "web is the foothold",
+              "origin": "inferred"
+            }
+          ],
+          "selected_action": {
+            "intent": "enumerate the web app"
+          },
+          "evidence": [
+            {
+              "summary": "blog runs Camaleon CMS 2.9.0",
+              "origin": "explicit",
+              "category": "recon"
+            }
+          ],
+          "state_after": {
+            "access": "unauthenticated web",
+            "environment": [
+              "Camaleon CMS"
+            ],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [
+            {
+              "segment_indexes": [
+                0
+              ]
+            }
+          ]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "unauthenticated web",
+            "environment": [
+              "Camaleon CMS"
+            ],
+            "privileges": []
+          },
+          "observations": [
+            "open /admin/register"
+          ],
+          "hypotheses": [
+            {
+              "statement": "escalate CMS user to admin",
+              "origin": "inferred"
+            }
+          ],
+          "selected_action": {
+            "intent": "register and escalate with CVE-2025-2304"
+          },
+          "evidence": [
+            {
+              "summary": "escalated aaa to admin",
+              "origin": "explicit",
+              "category": "exploitation"
+            }
+          ],
+          "state_after": {
+            "access": "admin",
+            "environment": [],
+            "privileges": [
+              "admin"
+            ]
+          },
+          "origin": "explicit",
+          "citations": [
+            {
+              "segment_indexes": [
+                1,
+                2
+              ]
+            }
+          ]
+        }
+      ],
+      "citations": [
+        {
+          "segment_indexes": [
+            0,
+            1,
+            2
+          ]
+        }
+      ]
+    }
+  ],
+  "execution_examples": [],
+  "ignored_segment_indexes": [
+    3,
+    4,
+    5,
+    6
+  ]
+}

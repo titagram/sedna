@@ -1,0 +1,93 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-bastion",
+      "origin": "explicit",
+      "title": "SMB VHD mount to SAM extraction and mRemoteNG creds (Bastion)",
+      "starting_access": "no credentials on a standalone Windows Server 2016",
+      "source_quality": "complete",
+      "difficulty": "medium",
+      "outcome": "Administrator via NTLM crack and mRemoteNG password dump",
+      "transferable_properties": [
+        "non-standard SMB shares like Backups deserve attention",
+        "mount VHD files directly over SMB with guestmount instead of downloading",
+        "SAM + SYSTEM hives from a mounted disk allow offline NTLM extraction",
+        "NTLM hash 31d6cfe0... is an empty/disabled blank account",
+        "mRemoteNG saves RDP credentials encrypted in confCons.xml with a hardcoded key",
+        "enumerate third-party software under Program Files during privesc"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "no credentials",
+            "environment": ["Windows Server 2016", "SMB", "SSH", "WinRM"],
+            "privileges": []
+          },
+          "observations": ["ports 22/135/139/445/5985 open", "SMB guest account enabled", "non-standard Backups share"],
+          "hypotheses": [{"statement": "anonymous SMB access to Backups reveals a VHD we can mount offline", "origin": "inferred"}],
+          "selected_action": {"intent": "enumerate SMB shares and mount the backup VHD over SMB"},
+          "evidence": [{"summary": "found a Backups share with a WindowsImageBackup VHD, mounted it with guestmount, and accessed SAM/SYSTEM", "origin": "explicit", "category": "recon"}],
+          "state_after": {
+            "access": "offline disk read",
+            "environment": ["VHD mounted"],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [1, 2]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "offline disk read",
+            "environment": ["SAM + SYSTEM hives"],
+            "privileges": []
+          },
+          "observations": ["SAM and SYSTEM hives extracted", "L4mpje NTLM hash is crackable"],
+          "hypotheses": [{"statement": "cracking the L4mpje hash yields valid SSH credentials", "origin": "inferred"}],
+          "selected_action": {"intent": "extract NTLM hashes with secretsdump and crack with john"},
+          "evidence": [{"summary": "extracted hashes, cracked L4mpje to bureaulampje, and logged in over SSH", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "shell as L4mpje",
+            "environment": [],
+            "privileges": ["L4mpje"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "shell as L4mpje",
+            "environment": [],
+            "privileges": ["L4mpje"]
+          },
+          "observations": ["mRemoteNG installed under Program Files (x86)", "confCons.xml holds saved RDP connections"],
+          "hypotheses": [{"statement": "decrypting the mRemoteNG stored password yields Administrator credentials", "origin": "inferred"}],
+          "selected_action": {"intent": "read confCons.xml and decrypt the stored Administrator password"},
+          "evidence": [{"summary": "decrypted the mRemoteNG Administrator password with the hardcoded key and logged in over SSH as Administrator", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "shell as Administrator",
+            "environment": [],
+            "privileges": ["Administrator"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0, 1, 2, 3, 4]}]
+    }
+  ],
+  "execution_examples": [],
+  "ignored_segment_indexes": [5, 6]
+}

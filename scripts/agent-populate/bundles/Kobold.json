@@ -1,0 +1,114 @@
+{
+  "artifacts": [
+    {
+      "draft_type": "case",
+      "artifact_type": "case",
+      "knowledge_role": "case_study",
+      "local_id": "case-kobold",
+      "origin": "explicit",
+      "title": "Arcane Docker Management RCE to gshadow docker-group privesc (Kobold)",
+      "starting_access": "unauthenticated access to nginx, HTTPS, and Arcane Docker Management on an Ubuntu host",
+      "source_quality": "complete",
+      "difficulty": "medium",
+      "outcome": "root via docker group host filesystem mount",
+      "transferable_properties": [
+        "always enumerate all ports, non-standard ones hide the vulnerable app",
+        "wildcard SSL certs signal subdomain enumeration is needed",
+        "read OpenAPI specs to reveal dangerous API endpoints",
+        "browser-console exploits bypass CORS for same-origin fetches",
+        "newgrp can grant group membership when /etc/gshadow has no password",
+        "docker group membership equals root via host filesystem mount"
+      ],
+      "non_transferable_properties": [],
+      "steps": [
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-1",
+          "ordinal": 1,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["nginx 1.24.0", "Arcane Docker Management 3552"],
+            "privileges": []
+          },
+          "observations": ["ports 22/80/443/3552 open", "wildcard SSL cert *.kobold.htb", "subdomains mcp and bin found"],
+          "hypotheses": [{"statement": "the Arcane Docker Management app on 3552 has an unauthenticated RCE", "origin": "inferred"}],
+          "selected_action": {"intent": "enumerate subdomains and inspect the Arcane and MCPJam APIs"},
+          "evidence": [{"summary": "found mcp.kobold.htb (MCPJam) and the /api/mcp/connect endpoint vulnerable to command injection", "origin": "explicit", "category": "recon"}],
+          "state_after": {
+            "access": "unauthenticated",
+            "environment": ["Arcane Docker Management", "MCPJam"],
+            "privileges": []
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [1, 2]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-2",
+          "ordinal": 2,
+          "state_before": {
+            "access": "unauthenticated",
+            "environment": ["/api/mcp/connect endpoint"],
+            "privileges": []
+          },
+          "observations": ["CVE-2026-23520 passes command directly to /bin/sh -c", "exploit must run from the browser console at mcp.kobold.htb to bypass CORS"],
+          "hypotheses": [{"statement": "sending a reverse shell command to /api/mcp/connect yields a shell", "origin": "inferred"}],
+          "selected_action": {"intent": "send a reverse shell payload from the browser console and catch it with netcat"},
+          "evidence": [{"summary": "triggered the command injection from the browser console and received a reverse shell as ben", "origin": "explicit", "category": "exploitation"}],
+          "state_after": {
+            "access": "shell as ben",
+            "environment": [],
+            "privileges": ["ben"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [3]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-3",
+          "ordinal": 3,
+          "state_before": {
+            "access": "shell as ben",
+            "environment": [],
+            "privileges": ["ben", "operator"]
+          },
+          "observations": ["ben is not in the docker group in /etc/group", "gshadow has no password for the docker group"],
+          "hypotheses": [{"statement": "newgrp docker can join the group because gshadow enforces no membership check", "origin": "inferred"}],
+          "selected_action": {"intent": "run newgrp docker to obtain the docker group GID"},
+          "evidence": [{"summary": "joined the docker group via newgrp and confirmed docker access", "origin": "explicit", "category": "lateral_movement"}],
+          "state_after": {
+            "access": "shell as ben with docker group",
+            "environment": [],
+            "privileges": ["ben", "docker"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        },
+        {
+          "artifact_type": "case_step",
+          "local_id": "step-4",
+          "ordinal": 4,
+          "state_before": {
+            "access": "shell as ben with docker group",
+            "environment": ["docker daemon access"],
+            "privileges": ["ben", "docker"]
+          },
+          "observations": ["docker socket access lets us mount the host filesystem"],
+          "hypotheses": [{"statement": "mounting / as /hostfs in a privileged container gives a root shell and root flag", "origin": "inferred"}],
+          "selected_action": {"intent": "run a container mounting / and read the root flag"},
+          "evidence": [{"summary": "ran a docker container mounting / as /hostfs and read /hostfs/root/root.txt", "origin": "explicit", "category": "privilege_escalation"}],
+          "state_after": {
+            "access": "root",
+            "environment": [],
+            "privileges": ["root"]
+          },
+          "origin": "explicit",
+          "citations": [{"segment_indexes": [4]}]
+        }
+      ],
+      "citations": [{"segment_indexes": [0, 1, 2, 3, 4]}]
+    }
+  ],
+  "execution_examples": [],
+  "ignored_segment_indexes": [5, 6]
+}
