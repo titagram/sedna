@@ -81,8 +81,12 @@ class EngagementLifecycleService:
         *,
         lane: ExecutionLaneKey,
         reason: str,
+        allow_unsettled_evidence: bool = False,
     ) -> EngagementMutationResult:
-        self._settle(engagement_id, "close")
+        if allow_unsettled_evidence:
+            self._planning.reconcile_attested_proofs(engagement_id, reason=reason)
+        else:
+            self._settle(engagement_id, "close")
         snapshot = self._journal.load_snapshot(engagement_id)
         if self._status(snapshot) == "active":
             snapshot = self._journal.request_close(
@@ -102,8 +106,10 @@ class EngagementLifecycleService:
         verification_kind: Literal["platform", "user"],
         verification_reference: str,
     ) -> EngagementMutationResult:
-        self._settle(engagement_id, "verify")
         snapshot = self._journal.load_snapshot(engagement_id)
+        if self._status(snapshot) not in {"closed_unverified", "closed_verified"}:
+            self._settle(engagement_id, "verify")
+            snapshot = self._journal.load_snapshot(engagement_id)
         if self._status(snapshot) == "closed_verified":
             verification = next(
                 (

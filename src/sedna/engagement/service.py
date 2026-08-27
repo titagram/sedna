@@ -602,7 +602,7 @@ class ProofClosureCapability:
                 origin="proof_settlement",
             ),
             system_correlation=SystemCorrelation(
-                source="planning", operation_id=self._service._uuid_factory()
+                source="proof_settlement", operation_id=self._service._uuid_factory()
             ),
         )
         result = self._service._repository.append_batch(
@@ -631,7 +631,7 @@ class ProofClosureCapability:
             type="closure_cancelled",
             payload=ClosureCancelledPayload(closure_event_id=barrier.event_id, reason=reason),
             system_correlation=SystemCorrelation(
-                source="planning", operation_id=self._service._uuid_factory()
+                source="proof_settlement", operation_id=self._service._uuid_factory()
             ),
         )
         result = self._service._repository.append_batch(

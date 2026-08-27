@@ -110,9 +110,9 @@ def load_private_capture(tmp_path, engagement_id) -> tuple[list[Any], bytes]:
 
     for line in (root / "events.jsonl").read_text(encoding="utf-8").splitlines():
         events.append(JournalEvent.model_validate_json(line))
-    evidence = b""
-    for blob in (root / "evidence").glob("blob-*.bin"):
-        evidence = blob.read_bytes()
+    evidence = b"".join(
+        blob.read_bytes() for blob in sorted((root / "evidence").glob("blob-*.bin"))
+    )
     return events, evidence
 
 

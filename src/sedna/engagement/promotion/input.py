@@ -112,7 +112,13 @@ PROMOTION_PRIVATE_TEXT_MEDIA_TYPES = frozenset(
     {"application/json", "application/yaml", "text/plain"}
 )
 PROMOTION_PRIVATE_TEXT_REPRESENTATIONS = frozenset(
-    {"canonical_host_json", "host_text", "sanitized_host_json", "utf-8"}
+    {
+        "canonical_host_json",
+        "host_text",
+        "private_proof_utf8",
+        "sanitized_host_json",
+        "utf-8",
+    }
 )
 
 

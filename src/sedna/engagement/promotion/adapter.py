@@ -1485,6 +1485,7 @@ class JournalPromotionAdapter:
         *,
         expected_revision: JournalRevision,
         verification_event_id: UUID,
+        verified_revision: JournalRevision | None = None,
     ) -> PromotionResult:
         """Publish an exact verified snapshot or coalesce with its durable attempt."""
 
@@ -1494,21 +1495,28 @@ class JournalPromotionAdapter:
             return completed
         prior_publication = getattr(snapshot.state.promotion, "latest_successful_publication", None)
         active = getattr(snapshot.state.promotion, "active_attempt", None)
+        fixed_verified_revision = verified_revision or expected_revision
         resumable = (
             active is not None
             and active.verification_event_id == verification_event_id
-            and active.verified_revision == expected_revision
+            and active.verified_revision == fixed_verified_revision
         )
         if snapshot.revision != expected_revision and not resumable:
             raise ValueError("promotion expected revision is stale")
+        projection_events = tuple(
+            event for event in snapshot.events if event.sequence <= fixed_verified_revision.sequence
+        )
+        projection_snapshot = snapshot.model_copy(
+            update={"events": projection_events, "revision": fixed_verified_revision}
+        )
         projection = self._inputs.project(
-            snapshot,
+            projection_snapshot,
             verification_event_id=verification_event_id,
             evidence_reader=self._evidence_reader,
         )
         claim = self._capability.claim(
             engagement_id,
-            self._claim_request(expected_revision, verification_event_id),
+            self._claim_request(fixed_verified_revision, verification_event_id),
             expected_revision=snapshot.revision if resumable else expected_revision,
         )
         if claim.disposition == "retry_exhausted":
@@ -1530,7 +1538,7 @@ class JournalPromotionAdapter:
             raise ValueError("created promotion claim has no ownership")
         return self._run_owned(
             engagement_id,
-            expected_revision,
+            fixed_verified_revision,
             verification_event_id,
             projection,
             attempt,
@@ -2027,8 +2035,9 @@ class PromotionRecoveryCoordinator:
         try:
             return self._adapter.promote_verified(
                 engagement_id,
-                expected_revision=verified_revision,
+                expected_revision=snapshot.revision,
                 verification_event_id=verification.event_id,
+                verified_revision=verified_revision,
             )
         except Exception:
             return PromotionResult(

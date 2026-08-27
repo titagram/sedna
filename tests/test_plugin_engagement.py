@@ -201,14 +201,120 @@ def test_manage_schema_exposes_verified_lifecycle_and_report_actions(
     parameters = tool["schema"]["parameters"]
 
     actions = set(parameters["properties"]["action"]["enum"])
-    assert {"close", "verify", "reject", "reopen", "report"} <= actions
+    assert {"close", "verify", "reject", "reopen", "report", "record_proof"} <= actions
     assert {"regenerate_report", "repair_report"}.isdisjoint(actions)
     assert {
         "verification_kind",
         "verification_reference",
         "flag_event_id",
+        "proof_requirement_id",
+        "proof_file",
+        "attestation_reference",
+        "allow_unsettled_evidence",
     } <= parameters["properties"].keys()
     assert "rejected_value_sha256" not in parameters["properties"]
+
+
+def test_record_proof_from_private_file_is_idempotent_and_unblocks_close(tmp_path: Path) -> None:
+    from sedna.engagement.events import EvidenceAttachedPayload, EventType, JournalEventDraft
+    from sedna.engagement.models import ExecutionLaneKey, HostKind
+    from sedna.engagement.service import EngagementJournalService
+    from sedna.planning.situation import SituationReducer
+
+    root = tmp_path / "knowledge"
+    context = HookContext(configured_root=root)
+    register(context)
+    lane = {"session_id": "session-a", "task_id": "root-a"}
+    payload = create_payload("Orion")
+    payload["required_proofs"] = (
+        {"proof_id": "user-flag", "kind": "flag", "description": "user flag"},
+    )
+    created = call_tool(context, "sedna_manage_engagement", payload, **lane)
+    engagement_id = created["engagement"]["engagement_id"]
+    with EngagementJournalService.open(root) as journal:
+        snapshot = journal.load_snapshot(UUID(engagement_id))
+        legacy = journal.write_evidence(
+            snapshot.engagement_id,
+            b"legacy operational output",
+            media_type="text/plain",
+            representation="host_text",
+        )
+        journal.append_hook_events(
+            snapshot.engagement_id,
+            (
+                JournalEventDraft(
+                    lane=ExecutionLaneKey.from_host(host_kind=HostKind.HADES, **lane),
+                    actor="host_agent",
+                    type=EventType.EVIDENCE_ATTACHED,
+                    payload=EvidenceAttachedPayload(evidence=legacy),
+                ),
+            ),
+            expected_revision=snapshot.revision,
+        )
+    proof_file = tmp_path / "user-proof.txt"
+    proof_file.write_text("proof-value\n")
+    proof_symlink = tmp_path / "proof-link.txt"
+    proof_symlink.symlink_to(proof_file)
+    record_payload = {
+        "action": "record_proof",
+        "engagement_id": engagement_id,
+        "proof_requirement_id": "user-flag",
+        "proof_file": str(proof_file),
+        "attestation_reference": "authorized-lab-observation",
+    }
+
+    rejected_symlink = call_tool(
+        context,
+        "sedna_manage_engagement",
+        {**record_payload, "proof_file": str(proof_symlink)},
+        **lane,
+    )
+    recorded = call_tool(context, "sedna_manage_engagement", record_payload, **lane)
+    repeated = call_tool(context, "sedna_manage_engagement", record_payload, **lane)
+
+    assert rejected_symlink == {
+        "ok": False,
+        "error": {"code": "invalid_transition", "retryable": False},
+    }
+    assert recorded["ok"] is True
+    assert recorded["proof"]["existing"] is False
+    assert repeated["ok"] is True
+    assert repeated["proof"]["existing"] is True
+    assert repeated["proof"]["proof_event_id"] == recorded["proof"]["proof_event_id"]
+    with EngagementJournalService.open(root) as journal:
+        snapshot = journal.load_snapshot(UUID(engagement_id))
+        progress = SituationReducer.rebuild(snapshot).objective_progress.requirements[0]
+        assert progress.status == "supported"
+        assert sum(event.type == "objective_proof_observed" for event in snapshot.events) == 1
+        assert sum(event.type == "interpretation_succeeded" for event in snapshot.events) == 1
+
+    blocked = call_tool(
+        context,
+        "sedna_manage_engagement",
+        {"action": "close", "engagement_id": engagement_id, "reason": "proof complete"},
+        **lane,
+    )
+    closed = call_tool(
+        context,
+        "sedna_manage_engagement",
+        {
+            "action": "close",
+            "engagement_id": engagement_id,
+            "reason": "proof complete",
+            "allow_unsettled_evidence": True,
+        },
+        **lane,
+    )
+    assert blocked == {
+        "ok": False,
+        "error": {"code": "invalid_transition", "retryable": False},
+    }
+    assert closed["ok"] is True, closed
+    assert closed["engagement"]["status"] == "closed_unverified"
+    with EngagementJournalService.open(root) as journal:
+        snapshot = journal.load_snapshot(UUID(engagement_id))
+        closure = next(event for event in snapshot.events if event.type == "closure_requested")
+        assert "retained_uninterpreted_ranges=1" in closure.payload.reason
 
 
 def test_owned_sedna_runtime_protocol_has_exact_typed_m6c_surfaces() -> None:

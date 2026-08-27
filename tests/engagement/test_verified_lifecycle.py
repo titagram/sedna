@@ -182,7 +182,7 @@ def test_repeated_exact_verification_recovers_without_a_second_commit(monkeypatc
 
     assert result.existing_event_ids == (event_id,)
     assert recovery.engagement_ids == [snapshot.engagement_id]
-    assert planning.reasons == ["verify"]
+    assert planning.reasons == []
 
 
 @pytest.mark.parametrize("action", ("reopen", "reject"))

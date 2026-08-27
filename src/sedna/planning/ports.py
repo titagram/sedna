@@ -38,6 +38,10 @@ class PlanningOperations(Protocol):
         self, engagement_id: UUID, *, reason: SettlementReason
     ) -> SettlementResult: ...
 
+    def reconcile_attested_proofs(
+        self, engagement_id: UUID, *, reason: str
+    ) -> SituationProjection: ...
+
     def plan_next(self, lane: ExecutionLaneKey, *, max_proposals: int = 5) -> PlanningResult: ...
 
 
@@ -176,6 +180,6 @@ class TerminalSettlementPort(Protocol):
         situation: SituationProjection,
         requirement_ids: tuple[ProofRequirementId, ...],
         authoritative_revision: JournalRevision,
-        reason: SettlementReason,
+        reason: str,
         all_required_proofs_satisfied: bool,
     ) -> TerminalReconciliationResult: ...

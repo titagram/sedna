@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -24,7 +26,13 @@ from sedna.engagement.events import (
     ControlToolInvokedPayload,
     EvidenceAttachedPayload,
     EvidenceCaptureFailedPayload,
+    EvidenceSliceEventRef,
+    EventType,
+    InterpretationSucceededEventPayload,
     JournalEventDraft,
+    ObjectiveProofObservedEventPayload,
+    PlanningCallMetadataEventRecord,
+    PrivateValueEventRecord,
     SessionCheckpointedPayload,
     SessionFinalizedPayload,
     SessionStartedPayload,
@@ -64,6 +72,7 @@ from sedna.engagement.service import (
     EngagementJournalService,
     EngagementSettlementOutcome,
     EngagementSettlementPortFactory,
+    PlanningEventCommitItem,
     SettlementReason,
 )
 from sedna.engagement.sources import (
@@ -105,6 +114,7 @@ class _ManageEngagementInput(BaseModel):
         "change_objective",
         "unbind",
         "resolve_call",
+        "record_proof",
         "verify",
         "reject",
         "report",
@@ -124,6 +134,12 @@ class _ManageEngagementInput(BaseModel):
     call_id: Annotated[str | None, Field(pattern=r"^call-[0-9a-f]{64}$")] = None
     resolution: Literal["timed_out", "abandoned"] | None = None
     flag_event_id: UUID | None = None
+    proof_requirement_id: Annotated[
+        str | None, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")
+    ] = None
+    proof_file: Annotated[str | None, Field(min_length=1, max_length=4096)] = None
+    attestation_reference: Annotated[str | None, Field(min_length=1, max_length=256)] = None
+    allow_unsettled_evidence: bool = False
     verification_kind: Literal["platform", "user"] | None = None
     verification_reference: Annotated[str | None, Field(min_length=1, max_length=2048)] = None
     after_engagement_id: UUID | None = None
@@ -142,6 +158,12 @@ class _ManageEngagementInput(BaseModel):
             raise ValueError("verify requires verification_kind and verification_reference")
         if self.action == "reject" and not (self.flag_event_id and self.reason):
             raise ValueError("reject requires flag_event_id and reason")
+        if self.action == "record_proof" and not (
+            self.proof_requirement_id and self.proof_file and self.attestation_reference
+        ):
+            raise ValueError(
+                "record_proof requires proof_requirement_id, proof_file, and attestation_reference"
+            )
         if self.action == "inspect" and (
             self.after_call_id is not None and self.after_engagement_id is not None
         ):
@@ -325,6 +347,7 @@ class HadesEngagementAdapter:
                                 "change_objective",
                                 "unbind",
                                 "resolve_call",
+                                "record_proof",
                                 "verify",
                                 "reject",
                                 "report",
@@ -344,6 +367,17 @@ class HadesEngagementAdapter:
                         "call_id": {"type": "string", "pattern": "^call-[0-9a-f]{64}$"},
                         "resolution": {"type": "string", "enum": ["timed_out", "abandoned"]},
                         "flag_event_id": {"type": "string", "format": "uuid"},
+                        "proof_requirement_id": {
+                            "type": "string",
+                            "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+                        },
+                        "proof_file": {"type": "string", "minLength": 1, "maxLength": 4096},
+                        "attestation_reference": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 256,
+                        },
+                        "allow_unsettled_evidence": {"type": "boolean", "default": False},
                         "verification_kind": {
                             "type": "string",
                             "enum": ["platform", "user"],
@@ -504,6 +538,194 @@ class HadesEngagementAdapter:
         resolved = service.resolve_lane_binding(lane)
         return resolved.engagement_id, False
 
+    def _record_explicit_proof(
+        self,
+        service: EngagementJournalService,
+        engagement_id: UUID,
+        lane: Any,
+        payload: _ManageEngagementInput,
+    ) -> dict[str, Any]:
+        """Record one user-attested proof without exposing its value in tool arguments."""
+        from sedna.planning.situation import SituationReducer
+
+        proof_id = payload.proof_requirement_id
+        proof_file = payload.proof_file
+        attestation = payload.attestation_reference
+        if not (proof_id and proof_file and attestation):
+            raise ValueError("explicit_proof_fields_required")
+
+        candidate_path = Path(proof_file).expanduser()
+        if not candidate_path.is_absolute():
+            raise ValueError("proof_file_must_be_absolute")
+        descriptor = os.open(
+            candidate_path,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= 4096:
+                raise ValueError("proof_file_must_be_a_small_regular_file")
+            candidate = os.read(descriptor, 4097).strip()
+        finally:
+            os.close(descriptor)
+        if not candidate or len(candidate) > 4096:
+            raise ValueError("proof_value_size_invalid")
+        candidate.decode("utf-8", errors="strict")
+        if b"\x00" in candidate:
+            raise ValueError("proof_value_contains_nul")
+        candidate_digest = sha256(candidate).hexdigest()
+
+        snapshot = service.load_snapshot(engagement_id)
+        status = getattr(snapshot.state.status, "value", snapshot.state.status)
+        if status != "active":
+            raise ValueError("record_proof_requires_active_engagement")
+        if proof_id not in {item.proof_id for item in snapshot.manifest.required_proofs}:
+            raise ValueError("proof_requirement_not_in_manifest")
+        situation = SituationReducer.rebuild(snapshot)
+        progress = next(
+            item
+            for item in situation.objective_progress.requirements
+            if item.proof_requirement_id == proof_id
+        )
+        if progress.status != "pending":
+            existing = next(
+                (
+                    item
+                    for item in progress.value_references
+                    if item.assessment == "supported" and item.value_sha256 == candidate_digest
+                ),
+                None,
+            )
+            if existing is None:
+                raise ValueError("proof_requirement_already_assessed")
+            return self._result(
+                {
+                    "ok": True,
+                    "engagement": self._summary(service, engagement_id).model_dump(mode="json"),
+                    "proof": {
+                        "proof_requirement_id": proof_id,
+                        "proof_event_id": str(existing.proof_event_id),
+                        "value_sha256": candidate_digest,
+                        "existing": True,
+                    },
+                }
+            )
+
+        operation_seed = json.dumps(
+            {
+                "engagement_id": str(engagement_id),
+                "proof_requirement_id": proof_id,
+                "value_sha256": candidate_digest,
+                "attestation_reference": attestation,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        input_digest = sha256(operation_seed).hexdigest()
+        operation_id = uuid5(NAMESPACE_URL, f"sedna:explicit-proof:{input_digest}")
+        attachment_event_id = uuid5(operation_id, "attachment")
+        proof_event_id = uuid5(operation_id, "proof")
+        interpretation_event_id = uuid5(operation_id, "interpretation")
+
+        evidence = service.write_evidence(
+            engagement_id,
+            candidate,
+            media_type="text/plain",
+            representation="private_proof_utf8",
+        )
+        attached = service.append_hook_events(
+            engagement_id,
+            (
+                JournalEventDraft(
+                    event_id=attachment_event_id,
+                    idempotency_key=f"explicit-proof-attachment:{operation_id}",
+                    lane=lane,
+                    actor="host_agent",
+                    type=EventType.EVIDENCE_ATTACHED,
+                    payload=EvidenceAttachedPayload(evidence=evidence),
+                ),
+            ),
+            expected_revision=snapshot.revision,
+        )
+        evidence_slice = EvidenceSliceEventRef(
+            evidence_id=evidence.evidence_id,
+            start=0,
+            end=evidence.size,
+            sha256=evidence.sha256,
+            media_type=evidence.media_type,
+        )
+        proof_payload = ObjectiveProofObservedEventPayload(
+            proof_requirement_id=proof_id,
+            assessment_generation=progress.assessment_generation,
+            assessment="supported",
+            candidate_value=PrivateValueEventRecord(
+                evidence_slice=evidence_slice,
+                value_sha256=evidence.sha256,
+            ),
+            confidence=1.0,
+            evidence_ids=(evidence.evidence_id,),
+            source_event_ids=(attachment_event_id,),
+            interpretation_input_digest=input_digest,
+        )
+        output_digest = sha256(proof_payload.model_dump_json().encode("utf-8")).hexdigest()
+        committed = service._issue_planning_event_commit_capability().commit_planning_events(
+            engagement_id,
+            (
+                PlanningEventCommitItem(
+                    event_id=proof_event_id,
+                    idempotency_key=f"explicit-proof-observed:{operation_id}",
+                    payload=proof_payload,
+                ),
+                PlanningEventCommitItem(
+                    event_id=interpretation_event_id,
+                    idempotency_key=f"explicit-proof-interpretation:{operation_id}",
+                    payload=InterpretationSucceededEventPayload(
+                        interpretation_id=operation_id,
+                        attachment_event_id=attachment_event_id,
+                        terminal_tool_event_id=None,
+                        evidence_id=evidence.evidence_id,
+                        covered_slices=(evidence_slice,),
+                        emitted_event_ids=(proof_event_id,),
+                        call_metadata=PlanningCallMetadataEventRecord(
+                            purpose="observe",
+                            provider="user-attestation",
+                            model="explicit-proof",
+                            agent_id=attestation,
+                            prompt_id="explicit-proof",
+                            prompt_version="1",
+                            response_schema_version="1",
+                            input_digest=input_digest,
+                            input_tokens=0,
+                            output_tokens=0,
+                            elapsed_ms=0,
+                        ),
+                        call_input_digest=input_digest,
+                        call_output_digest=output_digest,
+                    ),
+                ),
+            ),
+            operation_id=operation_id,
+            expected_revision=attached.snapshot.revision,
+        )
+        service.commit_projection(
+            engagement_id,
+            "state",
+            SituationReducer.rebuild(committed.snapshot),
+            expected_revision=committed.snapshot.revision,
+        )
+        return self._result(
+            {
+                "ok": True,
+                "engagement": self._summary(service, engagement_id).model_dump(mode="json"),
+                "proof": {
+                    "proof_requirement_id": proof_id,
+                    "proof_event_id": str(proof_event_id),
+                    "value_sha256": candidate_digest,
+                    "existing": False,
+                },
+            }
+        )
+
     # -- control tool handlers --------------------------------------------
 
     def _handle_manage(self, **kwargs: Any) -> dict[str, Any]:
@@ -622,6 +844,16 @@ class HadesEngagementAdapter:
                             ),
                         }
                     )
+                if payload.action == "record_proof":
+                    engagement_id, explicit = self._lane_engagement_id(
+                        service, payload.engagement_id, lane
+                    )
+                    if engagement_id is None:
+                        return self._error(
+                            "engagement_conflict" if explicit else "engagement_not_found",
+                            retryable=False,
+                        )
+                    return self._record_explicit_proof(service, engagement_id, lane, payload)
                 return self._error("invalid_transition", retryable=False)
         except Exception as exc:
             return _mapped_error(exc)
@@ -835,6 +1067,8 @@ class HadesEngagementAdapter:
                             ),
                         }
                     )
+                if payload.action == "record_proof":
+                    return self._record_explicit_proof(journal, engagement_id, lane, payload)
                 if payload.action == "verify":
                     if (
                         runtime.engagements is None
@@ -880,7 +1114,10 @@ class HadesEngagementAdapter:
                     if runtime.engagements is None:
                         return self._error("knowledge_runtime_unavailable", retryable=True)
                     result = runtime.engagements.close(
-                        engagement_id, lane=lane, reason=payload.reason or "manual close"
+                        engagement_id,
+                        lane=lane,
+                        reason=payload.reason or "manual close",
+                        allow_unsettled_evidence=payload.allow_unsettled_evidence,
                     )
                     return self._result(
                         {

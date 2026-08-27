@@ -74,6 +74,46 @@ def test_recovery_coordinator_closes_adapter_failure_without_losing_verified_sta
     assert result.journal_revision == revision
 
 
+def test_recovery_retry_uses_current_cas_and_preserves_verified_revision() -> None:
+    verified_revision = JournalRevision(sequence=7, event_hash="a" * 64)
+    current_revision = JournalRevision(sequence=9, event_hash="c" * 64)
+    event = SimpleNamespace(
+        type="engagement_verified",
+        event_id=UUID("00000000-0000-4000-8000-000000000007"),
+        sequence=verified_revision.sequence,
+        event_hash=verified_revision.event_hash,
+    )
+    snapshot = SimpleNamespace(
+        revision=current_revision,
+        events=(event,),
+        state=SimpleNamespace(promotion=SimpleNamespace(active_attempt=None)),
+    )
+    calls = []
+
+    class Adapter:
+        def promote_verified(self, engagement_id, **kwargs):
+            calls.append((engagement_id, kwargs))
+            return SimpleNamespace(disposition="promoted")
+
+    engagement_id = UUID("00000000-0000-4000-8000-000000000008")
+    result = PromotionRecoveryCoordinator(
+        journal=SimpleNamespace(load_snapshot=lambda _engagement_id: snapshot),
+        adapter=Adapter(),  # type: ignore[arg-type]
+    ).resume_for_engagement(engagement_id)
+
+    assert result.disposition == "promoted"
+    assert calls == [
+        (
+            engagement_id,
+            {
+                "expected_revision": current_revision,
+                "verification_event_id": event.event_id,
+                "verified_revision": verified_revision,
+            },
+        )
+    ]
+
+
 def test_recovery_coordinator_finishes_durable_revocation_intent_instead_of_promoting() -> None:
     engagement_id = UUID("00000000-0000-4000-8000-000000000008")
     verification_id = UUID("00000000-0000-4000-8000-000000000007")

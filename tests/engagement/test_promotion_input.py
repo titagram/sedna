@@ -73,6 +73,7 @@ def _build_verified_journal(
     fixed_uuid_factory,
     *,
     host_adapted_command: HostAdaptedCommandRecord | None = None,
+    private_representation: str = "utf-8",
 ):
     manager = EngagementJournalService.open(
         tmp_path / "knowledge", clock=fixed_clock, uuid_factory=fixed_uuid_factory
@@ -93,7 +94,7 @@ def _build_verified_journal(
             opened.snapshot.engagement_id,
             value,
             media_type="text/plain",
-            representation="utf-8",
+            representation=private_representation,
         )
         for value in (CREDENTIAL, USER_FLAG, ROOT_FLAG)
     )
@@ -371,11 +372,17 @@ def test_projector_rejects_unclassified_event_before_private_evidence_access(
     assert calls == []
 
 
+@pytest.mark.parametrize("private_representation", ("utf-8", "private_proof_utf8"))
 def test_projector_builds_only_symbolized_input_from_exact_verified_journal(
-    tmp_path, authorized_scope, lane, fixed_clock, fixed_uuid_factory
+    tmp_path, authorized_scope, lane, fixed_clock, fixed_uuid_factory, private_representation
 ) -> None:
-    manager, service, snapshot, verification_event_id, references, event_ids = (
-        _build_verified_journal(tmp_path, authorized_scope, lane, fixed_clock, fixed_uuid_factory)
+    manager, service, snapshot, verification_event_id, references, event_ids = _build_verified_journal(
+        tmp_path,
+        authorized_scope,
+        lane,
+        fixed_clock,
+        fixed_uuid_factory,
+        private_representation=private_representation,
     )
     calls: list[tuple[UUID, str, int, int]] = []
 

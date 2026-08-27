@@ -2291,6 +2291,35 @@ class PlanningService:
                 possible_terminal_evidence=False,
             )
 
+    def reconcile_attested_proofs(
+        self,
+        engagement_id: UUID,
+        *,
+        reason: str,
+    ) -> SituationProjection:
+        """Close on supported proofs while retaining non-terminal legacy evidence."""
+        snapshot = self._journal.load_snapshot(engagement_id)
+        situation = SituationReducer.rebuild(snapshot)
+        requirement_ids = tuple(
+            sorted(requirement.proof_id for requirement in snapshot.manifest.required_proofs)
+        )
+        if not self._proofs_satisfied(situation, requirement_ids):
+            raise ValueError("attested_close_requires_supported_proofs")
+        if self._pending_possible_terminal_evidence(snapshot):
+            raise ValueError("attested_close_forbids_possible_terminal_evidence")
+        if snapshot.state.in_flight_call_ids:
+            raise ValueError("attested_close_forbids_in_flight_calls")
+        _, pending_total, _, _ = self._pending_inventory(engagement_id, snapshot)
+        closure_reason = (
+            f"attested proof closure; retained_uninterpreted_ranges={pending_total}; {reason}"
+        )[:2048]
+        return self._reconcile_terminal(
+            engagement_id=engagement_id,
+            situation=situation,
+            requirement_ids=requirement_ids,
+            reason=closure_reason,
+        )
+
     def _settle_pending_evidence(
         self,
         engagement_id: UUID,
@@ -3143,13 +3172,31 @@ class PlanningService:
             getattr(event.payload, "possible_terminal_evidence", False) for event in snapshot.events
         )
 
+    @staticmethod
+    def _pending_possible_terminal_evidence(snapshot: Any) -> bool:
+        """Return true only for captured terminal evidence that remains uninterpreted."""
+        interpreted_terminal_ids = {
+            event.payload.terminal_tool_event_id
+            for event in snapshot.events
+            if isinstance(event.payload, InterpretationSucceededEventPayload)
+            and event.payload.terminal_tool_event_id is not None
+        }
+        return any(
+            isinstance(event.payload, ToolCallCompletedPayload)
+            and event.payload.possible_terminal_evidence
+            and event.payload.evidence_attachment_event_id is not None
+            and event.payload.evidence_id is not None
+            and event.event_id not in interpreted_terminal_ids
+            for event in snapshot.events
+        )
+
     def _reconcile_terminal(
         self,
         *,
         engagement_id: UUID,
         situation: SituationProjection,
         requirement_ids: tuple[str, ...],
-        reason: SettlementReason,
+        reason: str,
     ) -> SituationProjection:
         """Run the optional lifecycle seam after all journal locks are released."""
         if self._terminal_settlement_port is None or not requirement_ids:
