@@ -5,6 +5,8 @@ from __future__ import annotations
 from hashlib import sha256
 from uuid import UUID, uuid4
 
+import pytest
+
 import sedna.planning.retrieval as retrieval_module
 from sedna.engagement import JournalRevision, ScopeReference
 from sedna.knowledge.retrieval.models import (
@@ -25,6 +27,7 @@ from sedna.planning.models import (
     UnresolvedInformation,
 )
 from sedna.planning.retrieval import (
+    HindsightCandidateContext,
     PlannerKnowledgeContext,
     assemble_planner_knowledge,
     build_retrieval_queries,
@@ -87,6 +90,30 @@ def test_build_retrieval_queries_emits_one_authorized_query_per_active_target() 
     assert all(query.max_candidates == 32 and query.lane_limit == 5 for query in queries)
 
 
+def test_build_retrieval_queries_never_exempts_private_access_subject() -> None:
+    scope = ScopeReference(
+        reference_id="scope-" + "3" * 32,
+        kind="hostname",
+        value="box.example.test",
+    )
+    private_subject = "".join(("pass", "word=", "synthetic-value"))
+    situation = _situation(with_evidence=True).model_copy(
+        update={
+            "access_states": (
+                AccessState(
+                    event_ids=(UUID("00000000-0000-4000-8000-000000000001"),),
+                    subject=private_subject,
+                    state="credential available",
+                ),
+            )
+        }
+    )
+
+    (query,) = build_retrieval_queries(situation, (scope,))
+
+    assert query.situation.access == ()
+
+
 def test_build_retrieval_queries_drops_invalid_scope_targets() -> None:
     scopes = (
         ScopeReference(reference_id="scope-" + "1" * 32, kind="exact_target", value="999.1.1.1"),
@@ -112,6 +139,47 @@ def test_build_retrieval_queries_uses_only_evidence_backed_state() -> None:
         ("observed", "os_family", "linux")
     ]
     assert query.synonyms == ()
+
+
+def test_build_retrieval_queries_expands_code_intelligence_primitives() -> None:
+    event_id = UUID("00000000-0000-0000-0000-000000000010")
+    situation = _situation().model_copy(
+        update={
+            "facts": (
+                ObservedFact(
+                    event_ids=(event_id,),
+                    text="attacker-controlled transcription is persisted server-side",
+                ),
+                ObservedFact(
+                    event_ids=(event_id,),
+                    text="client-side encryption key permits forged payloads",
+                ),
+            ),
+            "hypotheses": (
+                SituationHypothesis(
+                    event_ids=(event_id,),
+                    text="an administrator renders the stored transcription",
+                    confidence=0.65,
+                ),
+            ),
+        }
+    )
+    scope = ScopeReference(
+        reference_id="scope-" + "7" * 32,
+        kind="exact_target",
+        value="10.10.10.10",
+    )
+
+    (query,) = build_retrieval_queries(situation, (scope,))
+
+    assert {
+        "persistent attacker-controlled input",
+        "stored xss",
+        "blind xss",
+        "privileged renderer",
+        "client-side integrity bypass",
+        "forged encrypted payload",
+    } <= set(query.synonyms)
 
 
 def test_build_retrieval_queries_never_forwards_private_values_or_flags() -> None:
@@ -203,6 +271,7 @@ def test_planner_knowledge_context_is_frozen_bounded_and_digest_bound() -> None:
     context = PlannerKnowledgeContext(
         canonical_revision=_sha("canonical"),
         situation_digest=_sha("state"),
+        material_event_revision=0,
         source_registry_digest=_sha("registry"),
         context_digest=_sha("empty-context"),
     )
@@ -243,6 +312,123 @@ def test_assemble_planner_knowledge_revision_binds_empty_context() -> None:
     assert context.source_registry_digest == _sha("registry")
     assert context.references == ()
     assert context.context_digest
+
+
+@pytest.mark.parametrize(
+    ("overrides",),
+    (
+        ({"memory_id": "token-secret-reference"},),
+        ({"tags": ("candidate", "pass" + "word=" + "synthetic-value")},),
+    ),
+)
+def test_hindsight_candidate_rejects_private_material_in_all_forwarded_fields(
+    overrides: dict[str, object],
+) -> None:
+    values: dict[str, object] = {
+        "memory_id": "episode-xss-1",
+        "query": "persistent input privileged renderer",
+        "summary": "Test a harmless marker.",
+        "relevance": 0.82,
+        "tags": ("candidate", "stored-xss"),
+    }
+    values.update(overrides)
+
+    with pytest.raises(ValueError, match="private-value-shaped material"):
+        HindsightCandidateContext.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    "private_value",
+    (
+        ".".join(("eyJ" + "A" * 20, "eyJ" + "B" * 20, "C" * 32)),
+        " ".join(("Bearer", "opaque" + "A" * 24)),
+        "".join(("AK", "IA", "A" * 16)),
+        "".join(("gh", "p_", "A" * 36)),
+        "".join(("Cookie", ": session=", "A" * 32)),
+        " ".join(("-----BEGIN", "PRIVATE", "KEY-----")),
+        " ".join(("-----BEGIN", "ENCRYPTED", "PRIVATE", "KEY-----")),
+        " ".join(("-----BEGIN", "DSA", "PRIVATE", "KEY-----")),
+    ),
+)
+def test_hindsight_candidate_rejects_structured_secret_shapes(private_value: str) -> None:
+    with pytest.raises(ValueError, match="private-value-shaped material"):
+        HindsightCandidateContext(
+            memory_id="episode-xss-1",
+            query="persistent input privileged renderer",
+            summary=private_value,
+            relevance=0.82,
+            tags=("candidate",),
+        )
+
+
+def test_assemble_planner_knowledge_never_forwards_hindsight_free_text() -> None:
+    memory_id = "episode-opaque-1"
+    query = "violet comet reference string"
+    summary = "cobalt sparrow value with no recognizable classification"
+    candidate = HindsightCandidateContext(
+        memory_id=memory_id,
+        query=query,
+        summary=summary,
+        relevance=0.73,
+        tags=("candidate", "opaque-label"),
+    )
+
+    context = assemble_planner_knowledge(
+        _situation(),
+        (),
+        retrieval=object(),
+        source_registry=_empty_registry(),
+        canonical_revision=lambda: _sha("canonical"),
+        hindsight_candidates=(candidate,),
+    )
+
+    serialized = context.model_dump_json()
+    assert memory_id not in serialized
+    assert query not in serialized
+    assert summary not in serialized
+    assert "opaque-label" not in serialized
+    assert (
+        context.hindsight_candidates[0].memory_id_digest == sha256(memory_id.encode()).hexdigest()
+    )
+    assert context.hindsight_candidates[0].query_digest == sha256(query.encode()).hexdigest()
+
+
+def test_assemble_planner_knowledge_includes_unverified_hindsight_candidates_in_digest() -> None:
+    candidate = HindsightCandidateContext(
+        memory_id="episode-xss-1",
+        query="persistent input privileged renderer",
+        summary="A prior episode suggests testing a harmless blind-XSS marker.",
+        relevance=0.82,
+        tags=("candidate", "stored-xss"),
+    )
+    baseline = assemble_planner_knowledge(
+        _situation(),
+        (),
+        retrieval=object(),
+        source_registry=_empty_registry(),
+        canonical_revision=lambda: _sha("canonical"),
+    )
+    enriched = assemble_planner_knowledge(
+        _situation(),
+        (),
+        retrieval=object(),
+        source_registry=_empty_registry(),
+        canonical_revision=lambda: _sha("canonical"),
+        hindsight_candidates=(candidate,),
+    )
+
+    assert enriched.hindsight_candidates != (candidate,)
+    assert enriched.context_digest != baseline.context_digest
+    assert (
+        enriched.hindsight_candidates[0].memory_id_digest
+        == sha256(candidate.memory_id.encode()).hexdigest()
+    )
+    assert (
+        enriched.hindsight_candidates[0].query_digest
+        == sha256(candidate.query.encode()).hexdigest()
+    )
+    assert enriched.hindsight_candidates[0].verification == "unverified_candidate"
+    assert enriched.hindsight_candidates[0].provenance == "hindsight"
 
 
 def test_retrieval_unavailable_remains_typed_and_never_becomes_research_advice() -> None:

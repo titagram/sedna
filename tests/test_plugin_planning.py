@@ -68,7 +68,7 @@ def test_registration_declares_rootless_plan_tool_without_opening_runtime(
 
     tool = next(item for item in context.tools if item["name"] == "sedna_plan_next")
     properties = tool["schema"]["parameters"]["properties"]
-    assert set(properties) == {"max_proposals"}
+    assert set(properties) == {"max_proposals", "hindsight_candidates"}
     assert properties["max_proposals"]["default"] == 5
     assert properties["max_proposals"]["minimum"] == 3
     assert properties["max_proposals"]["maximum"] == 8
@@ -85,7 +85,16 @@ def test_plan_tool_resolves_current_root_and_preserves_exact_lane(
     closed: list[Path] = []
 
     class _Planning:
-        def plan_next(self, lane: object, *, max_proposals: int) -> object:
+        def plan_next(
+            self,
+            lane: object,
+            *,
+            max_proposals: int,
+            writeup_authorization=None,
+            hindsight_candidates=(),
+        ) -> object:
+            assert writeup_authorization is None
+            assert hindsight_candidates == ()
             calls.append((current_root, lane, max_proposals))
             return SimpleNamespace(
                 model_dump=lambda **_kwargs: {
@@ -137,8 +146,15 @@ def test_plan_tool_preserves_authoritative_llm_unavailable_gap(
     context = _RegistrationContext(tmp_path / "knowledge")
 
     class _Planning:
-        def plan_next(self, lane: object, *, max_proposals: int) -> PlanningResult:
-            del lane, max_proposals
+        def plan_next(
+            self,
+            lane: object,
+            *,
+            max_proposals: int,
+            writeup_authorization=None,
+            hindsight_candidates=(),
+        ) -> PlanningResult:
+            del lane, max_proposals, writeup_authorization, hindsight_candidates
             return PlanningResult.model_validate(
                 {
                     "status": "gap",

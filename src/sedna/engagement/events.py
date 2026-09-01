@@ -1302,10 +1302,16 @@ class PlanRequestedEventPayload(_PlanningEventPayload):
     canonical_revision: Sha256Hex
     source_registry_digest: Sha256Hex
     max_proposals: Annotated[int, Field(ge=3, le=8)]
+    hindsight_candidate_ids: Annotated[tuple[StableRef, ...], Field(max_length=16)] = ()
+    hindsight_query_digests: Annotated[tuple[Sha256Hex, ...], Field(max_length=16)] = ()
     request_digest: Sha256Hex
 
     @model_validator(mode="after")
     def validate_request_digest(self) -> PlanRequestedEventPayload:
+        if len(self.hindsight_candidate_ids) != len(self.hindsight_query_digests):
+            raise ValueError("hindsight telemetry ids and query digests must align")
+        if self.hindsight_candidate_ids != tuple(sorted(set(self.hindsight_candidate_ids))):
+            raise ValueError("hindsight candidate ids must be sorted and unique")
         canonical = self.model_dump(
             mode="json", exclude={"kind", "request_digest"}, warnings="error"
         )
@@ -1318,7 +1324,23 @@ class PlanRequestedEventPayload(_PlanningEventPayload):
                 sort_keys=True,
             ).encode("utf-8")
         ).hexdigest()
-        if self.request_digest != expected:
+        accepted_digests = {expected}
+        if not self.hindsight_candidate_ids and not self.hindsight_query_digests:
+            legacy = dict(canonical)
+            legacy.pop("hindsight_candidate_ids")
+            legacy.pop("hindsight_query_digests")
+            accepted_digests.add(
+                sha256(
+                    json.dumps(
+                        legacy,
+                        allow_nan=False,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest()
+            )
+        if self.request_digest not in accepted_digests:
             raise ValueError("request_digest does not match canonical request")
         return self
 
@@ -1483,6 +1505,101 @@ class StrategyReactivatedEventPayload(_PlanningEventPayload):
         return self
 
 
+class WriteupAuthorizationScope(BaseModel):
+    """Narrow target-and-technique scope for one class of writeup source."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    source_class: Literal["machine_writeup", "challenge_writeup"]
+    target_terms: Annotated[
+        tuple[Annotated[str, Field(min_length=1, max_length=128)], ...],
+        Field(min_length=1, max_length=8),
+    ]
+    technique_terms: Annotated[
+        tuple[Annotated[str, Field(min_length=1, max_length=128)], ...],
+        Field(min_length=1, max_length=8),
+    ]
+
+    @model_validator(mode="after")
+    def validate_specific_terms(self) -> WriteupAuthorizationScope:
+        generic = {
+            "attack",
+            "box",
+            "challenge",
+            "ctf",
+            "exploit",
+            "guide",
+            "guides",
+            "hackthebox",
+            "host",
+            "htb",
+            "lab",
+            "machine",
+            "method",
+            "platform",
+            "procedure",
+            "solution",
+            "solutions",
+            "system",
+            "target",
+            "technique",
+            "tutorial",
+            "tutorials",
+            "vulnerability",
+            "walkthrough",
+            "walkthroughs",
+            "walk-through",
+            "walk-throughs",
+            "walk through",
+            "walk throughs",
+            "writeup",
+            "writeups",
+            "write-up",
+            "write-ups",
+            "write up",
+            "write ups",
+        }
+        for values in (self.target_terms, self.technique_terms):
+            normalized = tuple(" ".join(value.lower().split()) for value in values)
+            if values != normalized or values != tuple(sorted(set(values))):
+                raise ValueError(
+                    "writeup authorization terms must be normalized, sorted, and unique"
+                )
+            if not any(value not in generic for value in values):
+                raise ValueError("writeup authorization scope requires specific terms")
+            if any(value in generic for value in values):
+                raise ValueError("writeup authorization scope terms cannot be generic")
+        if set(self.target_terms) & set(self.technique_terms):
+            raise ValueError("writeup authorization target and technique terms must be disjoint")
+        return self
+
+
+class WriteupAuthorizationGrant(BaseModel):
+    """Explicit user grant required before consulting any writeup source."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    authorized_by: Annotated[str, Field(min_length=1, max_length=256)]
+    authorized_at: Annotated[
+        str,
+        Field(pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$"),
+    ]
+    authorization_reference: Annotated[str, Field(min_length=1, max_length=512)]
+    scope: Annotated[
+        tuple[WriteupAuthorizationScope, ...],
+        Field(min_length=1, max_length=16),
+    ]
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> WriteupAuthorizationGrant:
+        keys = tuple(
+            (item.source_class, item.target_terms, item.technique_terms) for item in self.scope
+        )
+        if keys != tuple(sorted(set(keys))):
+            raise ValueError("writeup authorization scope must be sorted and unique")
+        return self
+
+
 class ResearchQueryProposedEventPayload(_PlanningEventPayload):
     kind: Literal["research_query_proposed"] = "research_query_proposed"
     query_id: UUID
@@ -1496,11 +1613,15 @@ class ResearchQueryProposedEventPayload(_PlanningEventPayload):
     ]
     related_event_ids: Annotated[tuple[UUID, ...], Field(max_length=32)] = ()
     candidate_source_ids: Annotated[tuple[StableRef, ...], Field(max_length=16)] = ()
+    writeup_authorization: WriteupAuthorizationGrant | None = None
 
     @model_validator(mode="after")
     def validate_query_digest(self) -> ResearchQueryProposedEventPayload:
         if self.query_digest != sha256(self.normalized_query.encode("utf-8")).hexdigest():
             raise ValueError("query_digest does not match normalized_query")
+        explicitly_authorized = "explicit_writeup_authorization" in self.reason_codes
+        if explicitly_authorized != (self.writeup_authorization is not None):
+            raise ValueError("writeup authorization metadata does not match policy decision")
         return self
 
 

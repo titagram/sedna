@@ -240,3 +240,23 @@ unplanned actions remain allowed and are assessed on the next planning pass.
 
 The LLM-facing operating contract with complete JSON examples is in the
 [Sedna engagement tools guide](docs/llm/sedna-engagement-tools.md).
+
+## Exportable Hermes skill
+
+[`skills/sedna-cyber-workflow/SKILL.md`](skills/sedna-cyber-workflow/SKILL.md) is the
+official, exportable **Hermes skill** for operating Sedna as a closed-loop cyber workflow. The
+whole `skills/sedna-cyber-workflow/` directory is the distributable unit: it includes the skill
+manifest/instructions, references, templates, verification scripts, and skill tests.
+
+Install it into a Hermes profile by copying the directory without modifying its internal layout:
+
+```bash
+cp -R skills/sedna-cyber-workflow \
+  "${HERMES_HOME:-$HOME/.hermes}/skills/security/sedna-cyber-workflow"
+```
+
+The exported skill preserves the writeup authorization gate: searching, opening, downloading,
+consulting, or ingesting a machine/challenge writeup is **default deny** until the user supplies
+explicit prior authorization. Generic technical references are not writeups, but their provenance
+must still be journaled. Never place engagement secrets, credentials, private proof blobs, or raw
+flag values in the exported skill.

@@ -6,8 +6,8 @@
   },
   "expected_strategy_ids": [
     "strategy-ftp-enumeration",
-    "strategy-ssh-credential-reuse",
-    "strategy-http-reference-discovery"
+    "strategy-http-reference-discovery",
+    "strategy-ssh-credential-reuse"
   ],
   "reactivated_strategy_id": "strategy-ssh-credential-reuse",
   "events": [

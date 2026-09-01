@@ -51,6 +51,7 @@ from sedna.engagement.events import (
 )
 from sedna.engagement.models import PromotionSagaInProgressError
 from sedna.engagement.service import PlanningEventCommitItem
+from sedna.planning.belief import validate_outcome_score_transition
 from sedna.planning.commands import validate_command_suggestion
 from sedna.planning.frontier import FrontierReducer
 from sedna.planning.journal_events import (
@@ -74,6 +75,7 @@ from sedna.planning.llm import (
     PlannerRequest,
     PlanningLlmError,
 )
+from sedna.planning.loop import has_newer_material_reference, validate_semantic_retry
 from sedna.planning.models import (
     EVIDENCE_SLICE_BYTES,
     MAX_PLANNING_EVENT_BATCH,
@@ -100,6 +102,7 @@ from sedna.planning.models import (
     ObservationEventConversion,
     ObservationExtractedSource,
     OutcomeAssessedSource,
+    OutcomeCategory,
     PendingEvidenceRange,
     PlannerCriticVerdict,
     PlannerDraft,
@@ -134,6 +137,8 @@ from sedna.planning.models import (
     StrategyReconciliationEventConversion,
     StrategyReconciliationItem,
     StrategyStatus,
+    WriteupAuthorizationGrant,
+    WriteupAuthorizationScope,
 )
 from sedna.planning.ports import TerminalSettlementPort
 from sedna.planning.prompts import (
@@ -150,8 +155,14 @@ from sedna.planning.prompts import (
     PLANNER_REPAIR_PROMPT_ID,
     PLANNER_REPAIR_PROMPT_VERSION,
 )
-from sedna.planning.retrieval import PlannerKnowledgeContext, assemble_planner_knowledge
+from sedna.planning.retrieval import (
+    HindsightCandidateContext,
+    PlannerKnowledgeContext,
+    assemble_planner_knowledge,
+    digest_hindsight_candidates,
+)
 from sedna.planning.situation import SituationReducer
+from sedna.planning.utility import rank_utilities, utility_input_for_proposal
 
 
 class _EvidenceReadError(Exception):
@@ -180,6 +191,7 @@ class PlanningService:
         source_registry: Any | None = None,
         research_aliases: tuple[str, ...] = (),
         known_flag_values: tuple[str, ...] = (),
+        writeup_authorization_verifier: Callable[[WriteupAuthorizationGrant], bool] | None = None,
     ) -> None:
         self._journal = journal
         self._llm = llm
@@ -191,12 +203,25 @@ class PlanningService:
         self._source_registry = source_registry
         self._research_aliases = research_aliases
         self._known_flag_values = known_flag_values
+        self._writeup_authorization_verifier = writeup_authorization_verifier
         self._frontier_cache: dict[str, FrontierProjection] = {}
 
-    def plan_next(self, lane: ExecutionLaneKey, *, max_proposals: int = 5) -> PlanningResult:
+    def plan_next(
+        self,
+        lane: ExecutionLaneKey,
+        *,
+        max_proposals: int = 5,
+        writeup_authorization: WriteupAuthorizationGrant | None = None,
+        hindsight_candidates: tuple[HindsightCandidateContext, ...] = (),
+    ) -> PlanningResult:
         """Plan outside repository locks with one bounded optimistic restart."""
         if not 3 <= max_proposals <= 8:
             raise ValueError("max_proposals must be between 3 and 8")
+        if writeup_authorization is not None and (
+            self._writeup_authorization_verifier is None
+            or not self._writeup_authorization_verifier(writeup_authorization)
+        ):
+            raise ValueError("writeup_authorization_untrusted")
         resolution = self._journal.resolve_lane_binding(lane)
         if resolution.mode != "exact" or resolution.engagement_id is None:
             raise ValueError("engagement_binding_required")
@@ -205,7 +230,12 @@ class PlanningService:
             raise PromotionSagaInProgressError()
         for attempt in range(2):
             try:
-                return self._plan_next_once(lane, max_proposals=max_proposals)
+                return self._plan_next_once(
+                    lane,
+                    max_proposals=max_proposals,
+                    writeup_authorization=writeup_authorization,
+                    hindsight_candidates=hindsight_candidates,
+                )
             except RevisionConflictError:
                 if attempt == 0:
                     continue
@@ -351,7 +381,14 @@ class PlanningService:
                 raise
             raise _PlanningLlmUnavailableError from exc
 
-    def _plan_next_once(self, lane: ExecutionLaneKey, *, max_proposals: int) -> PlanningResult:
+    def _plan_next_once(
+        self,
+        lane: ExecutionLaneKey,
+        *,
+        max_proposals: int,
+        writeup_authorization: WriteupAuthorizationGrant | None,
+        hindsight_candidates: tuple[HindsightCandidateContext, ...],
+    ) -> PlanningResult:
         """Settle evidence, then refuse planning across lifecycle terminal barriers."""
         resolution = self._journal.resolve_lane_binding(lane)
         if resolution.mode != "exact" or resolution.engagement_id is None:
@@ -424,6 +461,7 @@ class PlanningService:
                 retrieval=self._retrieval,
                 source_registry=self._source_registry,
                 canonical_revision=self._canonical_revision,
+                hindsight_candidates=hindsight_candidates,
             )
             canonical_revision = knowledge_context.canonical_revision
             source_registry_digest = knowledge_context.source_registry_digest
@@ -431,14 +469,24 @@ class PlanningService:
             knowledge_values = {
                 "canonical_revision": canonical_revision,
                 "situation_digest": situation.state_digest,
+                "material_event_revision": situation.material_event_revision,
                 "source_registry_digest": source_registry_digest,
             }
+            hindsight_references = digest_hindsight_candidates(hindsight_candidates)
             knowledge_context = PlannerKnowledgeContext(
                 **knowledge_values,
+                hindsight_candidates=hindsight_references,
                 context_digest=sha256(
-                    json.dumps(knowledge_values, sort_keys=True, separators=(",", ":")).encode(
-                        "utf-8"
-                    )
+                    json.dumps(
+                        {
+                            **knowledge_values,
+                            "hindsight_candidates": [
+                                item.model_dump(mode="json") for item in hindsight_references
+                            ],
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
                 ).hexdigest(),
             )
         valid_event_ids = {event.event_id for event in snapshot.events}
@@ -456,6 +504,9 @@ class PlanningService:
         valid_knowledge_ids.update(
             example.example_id for example in knowledge_context.execution_examples
         )
+        valid_knowledge_ids.update(
+            candidate.memory_id_digest for candidate in knowledge_context.hindsight_candidates
+        )
         cache_key = sha256(
             json.dumps(
                 {
@@ -464,6 +515,7 @@ class PlanningService:
                     "resulting_ledger_digest": replay.ledger_sha256,
                     "canonical_revision": canonical_revision,
                     "source_registry_digest": source_registry_digest,
+                    "knowledge_context_digest": knowledge_context.context_digest,
                     "max_proposals": max_proposals,
                     "observation_prompt_version": OBSERVATION_PROMPT_VERSION,
                     "planner_prompt_version": PLANNER_PROMPT_VERSION,
@@ -474,6 +526,11 @@ class PlanningService:
                     "frontier_schema_version": "1",
                     "research_policy_version": "1",
                     "command_policy_version": "1",
+                    "writeup_authorization": (
+                        None
+                        if writeup_authorization is None
+                        else writeup_authorization.model_dump(mode="json")
+                    ),
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -550,7 +607,12 @@ class PlanningService:
                 )
                 for index, item in enumerate(planned.proposals, start=1)
             )
-            self._validate_score_changes(planned, provisional_proposals, prior_frontier)
+            self._validate_score_changes(
+                planned,
+                provisional_proposals,
+                prior_frontier,
+                events_by_id={event.event_id: event for event in snapshot.events},
+            )
             provisional_request_id = uuid5(provisional_frontier_id, "request")
             provisional_ledger, _ = self._reconcile_frontier(
                 replay.ledger,
@@ -768,7 +830,21 @@ class PlanningService:
             )
             for index, item in enumerate(planned.proposals, start=1)
         )
-        self._validate_score_changes(planned, proposals, prior_frontier)
+        self._validate_expected_utility_selection(planned)
+        self._validate_semantic_loops(
+            planned,
+            proposals,
+            prior_frontier,
+            replay.ledger,
+            event_order={event.event_id: index for index, event in enumerate(snapshot.events)},
+            event_types={event.event_id: str(event.type) for event in snapshot.events},
+        )
+        self._validate_score_changes(
+            planned,
+            proposals,
+            prior_frontier,
+            events_by_id={event.event_id: event for event in snapshot.events},
+        )
         request_id = uuid5(frontier_id, "request")
         planner_metadata = self._planning_call_metadata("plan", cache_key, plan_completion)
         critic_metadata = self._planning_call_metadata("critic", cache_key, critic_completion)
@@ -827,6 +903,12 @@ class PlanningService:
             "canonical_revision": canonical_revision,
             "source_registry_digest": source_registry_digest,
             "max_proposals": max_proposals,
+            "hindsight_candidate_ids": tuple(
+                candidate.memory_id_digest for candidate in knowledge_context.hindsight_candidates
+            ),
+            "hindsight_query_digests": tuple(
+                candidate.query_digest for candidate in knowledge_context.hindsight_candidates
+            ),
         }
         request_digest = sha256(
             json.dumps(
@@ -1054,6 +1136,8 @@ class PlanningService:
                 canonical_revision=canonical_revision,
                 source_registry_digest=source_registry_digest,
                 max_proposals=max_proposals,
+                hindsight_candidate_ids=request_fields["hindsight_candidate_ids"],
+                hindsight_query_digests=request_fields["hindsight_query_digests"],
             ),
             planner_draft=planned,
             planner_proposals=tuple(proposal_audits),
@@ -1087,6 +1171,7 @@ class PlanningService:
                         key=str,
                     )
                 ),
+                writeup_authorization=writeup_authorization,
             )
             for ordinal, query in enumerate(planned.research_queries, start=1)
         )
@@ -1170,6 +1255,7 @@ class PlanningService:
                     "resulting_ledger_digest": resulting_ledger_digest,
                     "canonical_revision": canonical_revision,
                     "source_registry_digest": source_registry_digest,
+                    "knowledge_context_digest": knowledge_context.context_digest,
                     "max_proposals": max_proposals,
                     "observation_prompt_version": OBSERVATION_PROMPT_VERSION,
                     "planner_prompt_version": PLANNER_PROMPT_VERSION,
@@ -1180,6 +1266,11 @@ class PlanningService:
                     "frontier_schema_version": "1",
                     "research_policy_version": "1",
                     "command_policy_version": "1",
+                    "writeup_authorization": (
+                        None
+                        if writeup_authorization is None
+                        else writeup_authorization.model_dump(mode="json")
+                    ),
                 }
             )
         )
@@ -1200,19 +1291,134 @@ class PlanningService:
         *,
         protected_aliases: tuple[str, ...] = (),
         known_flag_values: tuple[str, ...] = (),
+        writeup_authorization: WriteupAuthorizationGrant | None = None,
     ) -> tuple[Literal["allowed", "rejected"], tuple[str, ...], str]:
         normalized = " ".join(query.lower().split())
-        unsafe_terms = ("walkthrough", "writeup", "solution", "flag", "user.txt", "root.txt")
+
+        def contains_term(term: str) -> bool:
+            return (
+                re.search(
+                    rf"(?<![a-z0-9_]){re.escape(term)}(?![a-z0-9_])",
+                    normalized,
+                )
+                is not None
+            )
+
+        strong_writeup_terms = (
+            "walk-through",
+            "walk-throughs",
+            "walk through",
+            "walk throughs",
+            "walkthrough",
+            "walkthroughs",
+            "writeup",
+            "writeups",
+            "write-up",
+            "write-ups",
+            "write up",
+            "write ups",
+        )
+        ambiguous_reference_terms = (
+            "guide",
+            "guides",
+            "tutorial",
+            "tutorials",
+            "solution",
+            "solutions",
+        )
+        writeup_context_terms = ("box", "challenge", "ctf", "hackthebox", "htb", "machine")
+        writeup_terms = (*strong_writeup_terms, *ambiguous_reference_terms)
+        unsafe_terms = (*writeup_terms, "flag", "user.txt", "root.txt")
         aliases = tuple(
             " ".join(alias.lower().split()) for alias in protected_aliases if alias.strip()
         )
         flags = tuple(value.lower() for value in known_flag_values if value)
         if any(value in normalized for value in flags):
             return "rejected", ("known_flag_value",), normalized
-        if any(alias in normalized for alias in aliases) and any(
-            term in normalized for term in unsafe_terms
-        ):
-            return "rejected", ("current_machine_solution",), normalized
+        targets_current_solution = any(contains_term(alias) for alias in aliases) and any(
+            contains_term(term) for term in unsafe_terms
+        )
+        authorized_target_terms = (
+            tuple(term for scope in writeup_authorization.scope for term in scope.target_terms)
+            if writeup_authorization is not None
+            else ()
+        )
+        has_writeup_context = writeup_authorization is not None or any(
+            contains_term(term)
+            for term in (*writeup_context_terms, *aliases, *authorized_target_terms)
+        )
+        writeup_query = has_writeup_context and any(contains_term(term) for term in writeup_terms)
+        if targets_current_solution or writeup_query:
+            if writeup_authorization is None:
+                reason = (
+                    "current_machine_solution"
+                    if targets_current_solution
+                    else "writeup_authorization_required"
+                )
+                return "rejected", (reason,), normalized
+            requested_source_classes = tuple(
+                sorted(
+                    {
+                        source_class
+                        for source_class, marker in (
+                            ("machine_writeup", "machine"),
+                            ("machine_writeup", "box"),
+                            ("challenge_writeup", "challenge"),
+                            ("challenge_writeup", "ctf"),
+                        )
+                        if contains_term(marker)
+                    }
+                )
+            )
+
+            def remove_term(text: str, term: str) -> str:
+                return re.sub(
+                    rf"(?<![a-z0-9_]){re.escape(term)}(?![a-z0-9_])",
+                    " ",
+                    text,
+                )
+
+            def scope_covers_exact_query(scope: WriteupAuthorizationScope) -> bool:
+                if requested_source_classes and (
+                    len(requested_source_classes) != 1
+                    or scope.source_class != requested_source_classes[0]
+                ):
+                    return False
+                if not any(contains_term(term) for term in scope.target_terms) or not any(
+                    contains_term(term) for term in scope.technique_terms
+                ):
+                    return False
+                source_markers = (
+                    ("machine", "box")
+                    if scope.source_class == "machine_writeup"
+                    else ("challenge", "ctf")
+                )
+                allowed_terms = {
+                    *scope.target_terms,
+                    *scope.technique_terms,
+                    *writeup_terms,
+                    *source_markers,
+                    "a",
+                    "an",
+                    "for",
+                    "hackthebox",
+                    "htb",
+                    "of",
+                    "on",
+                    "the",
+                    "to",
+                }
+                residual = normalized
+                for term in sorted(allowed_terms, key=lambda value: (-len(value), value)):
+                    residual = remove_term(residual, term)
+                return re.search(r"[a-z0-9_]", residual) is None
+
+            matching_scopes = tuple(
+                scope for scope in writeup_authorization.scope if scope_covers_exact_query(scope)
+            )
+            if not matching_scopes or len({scope.source_class for scope in matching_scopes}) != 1:
+                return "rejected", ("writeup_authorization_scope_mismatch",), normalized
+            return "allowed", ("explicit_writeup_authorization",), normalized
         return "allowed", ("generic_technical_research",), normalized
 
     def _research_query_payload(
@@ -1222,20 +1428,25 @@ class PlanningService:
         query_id: UUID,
         authoritative_aliases: tuple[str, ...],
         related_event_ids: tuple[UUID, ...],
+        writeup_authorization: WriteupAuthorizationGrant | None = None,
     ) -> ResearchQueryProposedEventPayload:
         decision, reason_codes, normalized = self.evaluate_research_query(
             query,
             protected_aliases=tuple(sorted({*self._research_aliases, *authoritative_aliases})),
             known_flag_values=self._known_flag_values,
+            writeup_authorization=writeup_authorization,
         )
         return ResearchQueryProposedEventPayload(
             query_id=query_id,
             normalized_query=normalized,
             query_digest=sha256(normalized.encode("utf-8")).hexdigest(),
             policy_decision=decision,
-            policy_version="1",
+            policy_version="3",
             reason_codes=reason_codes,
             related_event_ids=related_event_ids,
+            writeup_authorization=(
+                writeup_authorization if "explicit_writeup_authorization" in reason_codes else None
+            ),
         )
 
     @staticmethod
@@ -1301,7 +1512,7 @@ class PlanningService:
             rationale=proposal.rationale,
             score=proposal.score,
             confidence=proposal.confidence / 100,
-            prerequisites=draft.prerequisites,
+            prerequisites=tuple(item.statement for item in draft.prerequisites),
             expected_information_gain=draft.expected_information_gain,
             expected_evidence=draft.expected_evidence,
             stop_conditions=draft.stop_conditions,
@@ -1324,6 +1535,7 @@ class PlanningService:
         execution_examples: tuple[Any, ...],
     ) -> None:
         command_keys: set[tuple[str, str, str | None]] = set()
+        scope_by_id = {item.reference_id: item for item in scope_references}
         for proposal in draft.proposals:
             if not set(proposal.event_refs) <= valid_event_ids:
                 raise ValueError("planner_invented_event_reference")
@@ -1331,6 +1543,20 @@ class PlanningService:
                 raise ValueError("planner_out_of_scope_reference")
             if not set(proposal.knowledge_refs) <= valid_knowledge_ids:
                 raise ValueError("planner_invented_knowledge_reference")
+            for proof in proposal.prerequisite_proofs:
+                prerequisite = proposal.prerequisites[proof.prerequisite_index]
+                if proof.proof_kind == "event_observed":
+                    event = events_by_id.get(UUID(proof.reference_id))
+                    if event is None or event.type != prerequisite.event_type:
+                        raise ValueError("prerequisite_event_type_mismatch")
+                else:
+                    scope = scope_by_id.get(proof.reference_id)
+                    if (
+                        scope is None
+                        or scope.kind != prerequisite.scope_kind
+                        or scope.value != prerequisite.scope_value
+                    ):
+                        raise ValueError("prerequisite_scope_constraint_mismatch")
             if proposal.score == 0:
                 cited_payloads = tuple(
                     events_by_id[event_id].payload for event_id in proposal.event_refs
@@ -1367,10 +1593,51 @@ class PlanningService:
                 command_keys.add(key)
 
     @staticmethod
+    def _validate_expected_utility_selection(draft: PlannerDraft) -> None:
+        if not draft.proposals:
+            return
+        candidates = tuple(
+            (proposal.variant_runtime_key, utility_input_for_proposal(proposal))
+            for proposal in draft.proposals
+        )
+        expected_order = rank_utilities(candidates)
+        actual_order = tuple(proposal.variant_runtime_key for proposal in draft.proposals)
+        if expected_order != actual_order:
+            raise ValueError("frontier_not_expected_utility_ordered")
+
+    @staticmethod
+    def _validate_semantic_loops(
+        draft: PlannerDraft,
+        proposals: tuple[FrontierProposal, ...],
+        prior_frontier: FrontierProjection | None,
+        ledger: StrategyLedger,
+        *,
+        event_order: dict[UUID, int],
+        event_types: dict[UUID, str],
+    ) -> None:
+        del prior_frontier
+        state_by_variant = {item.variant_id: item for item in ledger.variants}
+        for item, proposal in zip(draft.proposals, proposals, strict=True):
+            state = state_by_variant.get(proposal.variant_id)
+            if state is None or not state.recent_attempts:
+                continue
+            validate_semantic_retry(
+                latest_outcome=state.recent_attempts[-1].outcome,
+                has_new_material_evidence=has_newer_material_reference(
+                    item.event_refs,
+                    state.recent_attempts[-1].outcome_event_id,
+                    event_order,
+                    event_types,
+                ),
+            )
+
+    @staticmethod
     def _validate_score_changes(
         draft: PlannerDraft,
         proposals: tuple[FrontierProposal, ...],
         prior_frontier: FrontierProjection | None,
+        *,
+        events_by_id: dict[UUID, Any],
     ) -> None:
         prior_scores = (
             {}
@@ -1388,6 +1655,17 @@ class PlanningService:
                 }:
                     raise ValueError("new_proposal_score_must_be_positive")
                 continue
+            cited_outcomes = tuple(
+                OutcomeCategory(payload.category)
+                for event_id in item.event_refs
+                if (event := events_by_id.get(event_id)) is not None
+                and isinstance((payload := event.payload), OutcomeAssessedEventPayload)
+            )
+            validate_outcome_score_transition(
+                previous_score=prior_score,
+                new_score=item.score,
+                outcomes=cited_outcomes,
+            )
             if item.score != prior_score:
                 if item.previous_score != prior_score:
                     raise ValueError("planner_previous_score_mismatch")

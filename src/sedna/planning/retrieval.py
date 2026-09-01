@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import Callable
 from hashlib import sha256
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -28,11 +28,58 @@ from sedna.knowledge.schema.execution import ExecutionExample
 from sedna.planning.models import SituationProjection
 
 MAX_PLANNER_KNOWLEDGE_BYTES = 512 * 1024
-_PRIVATE_TERM = re.compile(
-    r"(?:\b(?:password|passwd|secret|token|api[_ -]?key|credential)\b|"
-    r"(?:htb|thm|flag)\s*\{)",
+_PRIVATE_VALUE = re.compile(
+    r"(?:"
+    r"\b(?:password|passwd|secret|token|api[_ -]?key|credential)\b|"
+    r"(?:htb|thm|flag)\s*\{|"
+    r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{16,}\b|"
+    r"\bbearer\s+[A-Za-z0-9._~+/=-]{16,}|"
+    r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|"
+    r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b|"
+    r"\b(?:cookie|set-cookie)\s*:\s*[^\s;,=]+=[^;\s]{8,}|"
+    r"-----BEGIN(?:\s+[A-Z0-9]+)*\s+PRIVATE\s+KEY-----"
+    r")",
     re.IGNORECASE,
 )
+
+
+class HindsightCandidateContext(BaseModel):
+    """Explicit, bounded, unverified memory candidate supplied by the host agent."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    memory_id: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")]
+    query: Annotated[str, Field(min_length=1, max_length=2048)]
+    summary: Annotated[str, Field(min_length=1, max_length=4096)]
+    relevance: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+    tags: tuple[Annotated[str, Field(min_length=1, max_length=128)], ...] = Field(
+        default=(), max_length=32
+    )
+    provenance: Literal["hindsight"] = "hindsight"
+    verification: Literal["unverified_candidate"] = "unverified_candidate"
+
+    @model_validator(mode="after")
+    def _safe_deterministic_candidate(self) -> HindsightCandidateContext:
+        forwarded_text = (self.memory_id, self.query, self.summary, *self.tags)
+        if any(_PRIVATE_VALUE.search(value) for value in forwarded_text):
+            raise ValueError("hindsight candidate contains private-value-shaped material")
+        if self.tags != tuple(sorted(set(self.tags))):
+            raise ValueError("hindsight candidate tags must be sorted and unique")
+        return self
+
+
+class HindsightCandidateReference(BaseModel):
+    """Digest-only planner reference for an unverified Hindsight candidate."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    memory_id_digest: Sha256Hex
+    query_digest: Sha256Hex
+    summary_digest: Sha256Hex
+    tags_digest: Sha256Hex
+    relevance: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+    provenance: Literal["hindsight"] = "hindsight"
+    verification: Literal["unverified_candidate"] = "unverified_candidate"
 
 
 class CandidateResearchSource(BaseModel):
@@ -53,6 +100,7 @@ class PlannerKnowledgeContext(BaseModel):
 
     canonical_revision: Sha256Hex
     situation_digest: Sha256Hex
+    material_event_revision: Annotated[int, Field(ge=0)]
     source_registry_digest: Sha256Hex
     references: tuple[RetrievalHit, ...] = Field(default=(), max_length=64)
     case_steps: tuple[RetrievalHit, ...] = Field(default=(), max_length=64)
@@ -67,6 +115,7 @@ class PlannerKnowledgeContext(BaseModel):
     candidate_research_sources: tuple[CandidateResearchSource, ...] = Field(
         default=(), max_length=16
     )
+    hindsight_candidates: tuple[HindsightCandidateReference, ...] = Field(default=(), max_length=16)
     retrieval_unavailable: bool = False
     context_digest: Sha256Hex
 
@@ -77,6 +126,26 @@ class PlannerKnowledgeContext(BaseModel):
         return self
 
 
+def digest_hindsight_candidates(
+    hindsight_candidates: tuple[HindsightCandidateContext, ...],
+) -> tuple[HindsightCandidateReference, ...]:
+    memory_ids = tuple(item.memory_id for item in hindsight_candidates)
+    if memory_ids != tuple(sorted(set(memory_ids))):
+        raise ValueError("hindsight candidate ids must be sorted and unique")
+    return tuple(
+        HindsightCandidateReference(
+            memory_id_digest=sha256(item.memory_id.encode("utf-8")).hexdigest(),
+            query_digest=sha256(item.query.encode("utf-8")).hexdigest(),
+            summary_digest=sha256(item.summary.encode("utf-8")).hexdigest(),
+            tags_digest=sha256(
+                json.dumps(item.tags, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+            relevance=item.relevance,
+        )
+        for item in hindsight_candidates
+    )
+
+
 def assemble_planner_knowledge(
     situation: SituationProjection,
     scope_references: tuple[ScopeReference, ...],
@@ -84,8 +153,10 @@ def assemble_planner_knowledge(
     retrieval: Any,
     source_registry: Any,
     canonical_revision: Callable[[], str],
+    hindsight_candidates: tuple[HindsightCandidateContext, ...] = (),
 ) -> PlannerKnowledgeContext:
     """Retrieve all lanes, drill into qualifying hits, and revision-bind the result."""
+    hindsight_references = digest_hindsight_candidates(hindsight_candidates)
     revision = _strict_revision(canonical_revision())
     results = tuple(
         retrieval.retrieve(query) for query in build_retrieval_queries(situation, scope_references)
@@ -142,6 +213,7 @@ def assemble_planner_knowledge(
     values = {
         "canonical_revision": revision,
         "situation_digest": situation.state_digest,
+        "material_event_revision": situation.material_event_revision,
         "source_registry_digest": source_page.registry_sha256,
         "references": references,
         "case_steps": case_steps,
@@ -152,6 +224,7 @@ def assemble_planner_knowledge(
         "execution_examples": tuple(examples),
         "execution_example_gaps": _bounded_example_gaps(tuple(example_gaps)),
         "candidate_research_sources": candidates,
+        "hindsight_candidates": hindsight_references,
         "retrieval_unavailable": retrieval_unavailable,
     }
     serializable = {
@@ -212,7 +285,7 @@ def _planner_topic_tokens(situation: SituationProjection) -> tuple[str, ...]:
                 item.value.casefold()
                 for item in situation.facets
                 if item.key.casefold() in {"os_family", "cpu_architecture", "service", "protocol"}
-                and not _PRIVATE_TERM.search(item.value)
+                and not _PRIVATE_VALUE.search(item.value)
             }
         )
     )
@@ -286,7 +359,7 @@ def build_retrieval_queries(
             confidence=1.0,
         )
         for item in situation.facets
-        if not _PRIVATE_TERM.search(item.value)
+        if not _PRIVATE_VALUE.search(item.value)
     )[:32]
     services = tuple(
         sorted(
@@ -312,9 +385,14 @@ def build_retrieval_queries(
     outcomes = tuple(
         (item.outcome.value, item.summary)
         for item in situation.attempts
-        if not _PRIVATE_TERM.search(item.summary)
+        if not _PRIVATE_VALUE.search(item.summary)
     )[:64]
     unresolved = _safe_texts((item.question for item in situation.unresolved_information), limit=64)
+    synonyms = _code_intelligence_expansions(
+        terms=terms,
+        hypotheses=hypotheses,
+        facets=facets,
+    )
     queries: list[RetrievalQuery] = []
     seen: set[str] = set()
     for reference in sorted(scope_references, key=lambda item: item.reference_id):
@@ -339,12 +417,45 @@ def build_retrieval_queries(
                     unresolved_questions=unresolved,
                 ),
                 terms=terms,
+                synonyms=synonyms,
                 facets=facets,
                 max_candidates=max_candidates,
                 lane_limit=lane_limit,
             )
         )
     return tuple(queries)
+
+
+def _code_intelligence_expansions(
+    *,
+    terms: tuple[str, ...],
+    hypotheses: tuple[str, ...],
+    facets: tuple[SituationFacet, ...],
+) -> tuple[str, ...]:
+    """Map concrete observations to transferable source/sink and trust-boundary terms."""
+
+    corpus = " ".join(
+        (*terms, *hypotheses, *(f"{item.key} {item.value}" for item in facets))
+    ).casefold()
+    expansions: set[str] = set()
+    controlled = any(token in corpus for token in ("attacker-controlled", "user-controlled"))
+    persistent = any(token in corpus for token in ("persist", "stored", "saved server-side"))
+    rendered = any(token in corpus for token in ("render", "display", "viewer"))
+    privileged = any(token in corpus for token in ("administrator", "admin", "privileged"))
+    client_crypto = "client-side" in corpus and any(
+        token in corpus for token in ("encryption", "cryptographic", " key")
+    )
+    forgeable = any(token in corpus for token in ("forged", "forgeable", "permits forg"))
+
+    if controlled and persistent:
+        expansions.update(("persistent attacker-controlled input", "stored xss"))
+    if persistent and rendered and privileged:
+        expansions.update(("blind xss", "privileged renderer", "administrative rendering"))
+    if client_crypto and forgeable:
+        expansions.update(("client-side integrity bypass", "forged encrypted payload"))
+    if any(token in corpus for token in ("symbol mapping", "html symbol", "output encoding")):
+        expansions.update(("html injection", "output encoding bypass", "stored xss"))
+    return tuple(sorted(expansions))[:32]
 
 
 def _safe_texts(
@@ -355,10 +466,11 @@ def _safe_texts(
     seen: set[str] = set()
     for value in values:
         normalized = " ".join(value.split()).casefold()
-        safe_symbolic = allowed_exact_suffix is not None and normalized.endswith(
-            allowed_exact_suffix
-        )
-        if _PRIVATE_TERM.search(value) and not safe_symbolic:
+        safe_symbolic = False
+        if allowed_exact_suffix is not None and normalized.endswith(allowed_exact_suffix):
+            subject = normalized[: -len(allowed_exact_suffix)].strip()
+            safe_symbolic = bool(subject) and _PRIVATE_VALUE.search(subject) is None
+        if _PRIVATE_VALUE.search(value) and not safe_symbolic:
             continue
         if not normalized or normalized in seen:
             continue
