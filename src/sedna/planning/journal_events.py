@@ -232,6 +232,8 @@ def _payload_from_planning(
             "canonical_revision": source.canonical_revision,
             "source_registry_digest": source.source_registry_digest,
             "max_proposals": source.max_proposals,
+            "hindsight_candidate_ids": source.hindsight_candidate_ids,
+            "hindsight_query_digests": source.hindsight_query_digests,
         }
         return PlanRequestedEventPayload(
             **fields,
@@ -247,6 +249,8 @@ def _payload_from_planning(
                     "canonical_revision": source.canonical_revision,
                     "source_registry_digest": source.source_registry_digest,
                     "max_proposals": source.max_proposals,
+                    "hindsight_candidate_ids": list(source.hindsight_candidate_ids),
+                    "hindsight_query_digests": list(source.hindsight_query_digests),
                 }
             ),
         )

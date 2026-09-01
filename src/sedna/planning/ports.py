@@ -28,7 +28,9 @@ from sedna.planning.models import (
     ProofRequirementId,
     SettlementResult,
     SituationProjection,
+    WriteupAuthorizationGrant,
 )
+from sedna.planning.retrieval import HindsightCandidateContext
 
 KnowledgeRootResolver = Callable[[], Path]
 
@@ -42,7 +44,14 @@ class PlanningOperations(Protocol):
         self, engagement_id: UUID, *, reason: str
     ) -> SituationProjection: ...
 
-    def plan_next(self, lane: ExecutionLaneKey, *, max_proposals: int = 5) -> PlanningResult: ...
+    def plan_next(
+        self,
+        lane: ExecutionLaneKey,
+        *,
+        max_proposals: int = 5,
+        writeup_authorization: WriteupAuthorizationGrant | None = None,
+        hindsight_candidates: tuple[HindsightCandidateContext, ...] = (),
+    ) -> PlanningResult: ...
 
 
 class OwnedPlanningRuntime(Protocol):

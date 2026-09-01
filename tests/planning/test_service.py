@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from hashlib import sha256
 from types import SimpleNamespace
+from typing import Literal
 from uuid import UUID
 
 import pytest
@@ -43,16 +45,29 @@ from sedna.planning.models import (
     PlannerCriticVerdict,
     PlannerDraft,
     PlannerFinding,
+    PrerequisiteProof,
+    ProposalPrerequisite,
     RetryPredicate,
     RetryPredicateKind,
     SettlementResultAdapter,
     SituationProjection,
     StrategyStatus,
+    WriteupAuthorizationGrant,
+    WriteupAuthorizationScope,
 )
 from sedna.planning.ports import TerminalReconciliationResult
+from sedna.planning.retrieval import HindsightCandidateContext
 from sedna.planning.service import PlanningService
 
 FIXED_TIME = datetime(2026, 8, 11, 12, 30, tzinfo=UTC)
+
+
+def writeup_scope(target: str, technique: str) -> WriteupAuthorizationScope:
+    return WriteupAuthorizationScope(
+        source_class="machine_writeup",
+        target_terms=(target,),
+        technique_terms=(technique,),
+    )
 
 
 def test_task9_public_service_and_reducer_are_exported() -> None:
@@ -1812,7 +1827,21 @@ class GroundedCommandPlannerLlm(AcceptedPlannerLlm):
                     confidence=84,
                     rationale="The observed service merits a bounded probe.",
                     strategic_intent="Collect discriminating service evidence.",
-                    prerequisites=("The target remains in scope.",),
+                    prerequisites=(
+                        ProposalPrerequisite(
+                            kind="scope_authorized",
+                            statement="The target remains in scope.",
+                            scope_kind=scope.kind,
+                            scope_value=scope.value,
+                        ),
+                    ),
+                    prerequisite_proofs=(
+                        PrerequisiteProof(
+                            prerequisite_index=0,
+                            proof_kind="scope_authorized",
+                            reference_id=scope.reference_id,
+                        ),
+                    ),
                     expected_information_gain="Resolve the service implementation.",
                     expected_evidence=("A service banner is captured.",),
                     stop_conditions=("Stop after one bounded request.",),
@@ -1855,7 +1884,7 @@ class GroundedCommandPlannerLlm(AcceptedPlannerLlm):
             ),
             research_queries=(
                 "OpenSSH 9.2 protocol CVE details",
-                "HTB-Orion root.txt walkthrough",
+                "HTB-Orion machine root.txt walkthrough",
             ),
         )
         return SimpleNamespace(
@@ -1865,6 +1894,447 @@ class GroundedCommandPlannerLlm(AcceptedPlannerLlm):
             agent_id="test-agent",
             usage=SimpleNamespace(input_tokens=7, output_tokens=3),
         )
+
+
+def test_planner_draft_rejects_prerequisite_event_of_wrong_type() -> None:
+    event_id = UUID("00000000-0000-4000-8000-000000000501")
+    event = SimpleNamespace(
+        event_id=event_id,
+        type="decision_recorded",
+        payload=SimpleNamespace(kind="decision_recorded"),
+    )
+    proposal = FrontierProposalDraft(
+        family_runtime_key="family-event-proof",
+        variant_runtime_key="variant-event-proof",
+        title="Use observed event",
+        score=80,
+        confidence=70,
+        rationale="A typed event should ground this step.",
+        prerequisites=(
+            ProposalPrerequisite(
+                kind="event_observed",
+                statement="An observation was extracted.",
+                event_type="observation_extracted",
+            ),
+        ),
+        prerequisite_proofs=(
+            PrerequisiteProof(
+                prerequisite_index=0,
+                proof_kind="event_observed",
+                reference_id=str(event_id),
+            ),
+        ),
+        event_refs=(event_id,),
+    )
+
+    with pytest.raises(ValueError, match="prerequisite_event_type_mismatch"):
+        PlanningService._validate_planner_draft(
+            PlannerDraft(proposals=(proposal,)),
+            valid_event_ids={event_id},
+            events_by_id={event_id: event},
+            valid_scope_ids=set(),
+            valid_knowledge_ids=set(),
+            scope_references=(),
+            secret_references=(),
+            execution_examples=(),
+        )
+
+
+def test_planner_draft_rejects_prerequisite_scope_target_mismatch() -> None:
+    scope = SimpleNamespace(
+        reference_id="scope-" + "5" * 32,
+        kind="exact_target",
+        value="10.10.10.11",
+    )
+    proposal = FrontierProposalDraft(
+        family_runtime_key="family-scope-proof",
+        variant_runtime_key="variant-scope-proof",
+        title="Use authorized scope",
+        score=80,
+        confidence=70,
+        rationale="A typed scope should ground this step.",
+        prerequisites=(
+            ProposalPrerequisite(
+                kind="scope_authorized",
+                statement="The intended target is authorized.",
+                scope_kind="exact_target",
+                scope_value="10.10.10.10",
+            ),
+        ),
+        prerequisite_proofs=(
+            PrerequisiteProof(
+                prerequisite_index=0,
+                proof_kind="scope_authorized",
+                reference_id=scope.reference_id,
+            ),
+        ),
+        scope_reference_ids=(scope.reference_id,),
+    )
+
+    with pytest.raises(ValueError, match="prerequisite_scope_constraint_mismatch"):
+        PlanningService._validate_planner_draft(
+            PlannerDraft(proposals=(proposal,)),
+            valid_event_ids=set(),
+            events_by_id={},
+            valid_scope_ids={scope.reference_id},
+            valid_knowledge_ids=set(),
+            scope_references=(scope,),
+            secret_references=(),
+            execution_examples=(),
+        )
+
+
+def test_research_policy_requires_explicit_user_authorization_for_any_writeup() -> None:
+    grant = WriteupAuthorizationGrant(
+        authorized_by="user",
+        authorized_at="2026-08-31T12:00:00Z",
+        authorization_reference="trusted-user-message:42",
+        scope=(writeup_scope("wordpress", "stored xss"),),
+    )
+    denied = PlanningService.evaluate_research_query(
+        "WordPress machine stored XSS writeup",
+    )
+    allowed = PlanningService.evaluate_research_query(
+        "WordPress machine stored XSS writeup",
+        writeup_authorization=grant,
+    )
+
+    assert denied[:2] == ("rejected", ("writeup_authorization_required",))
+    assert allowed[:2] == ("allowed", ("explicit_writeup_authorization",))
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "Orion machine guide",
+        "Nebula challenge guides",
+        "Helios HTB tutorial",
+        "Aster CTF tutorials",
+        "Lyra machine walk-through",
+        "Vega challenge walk-throughs",
+        "Cygnus CTF walk through",
+        "Draco HTB walk throughs",
+        "Phoenix machine write up",
+        "Hydra challenge write ups",
+    ),
+)
+def test_research_policy_requires_authorization_for_writeup_guide_synonyms(query: str) -> None:
+    decision = PlanningService.evaluate_research_query(query)
+
+    assert decision[:2] == ("rejected", ("writeup_authorization_required",))
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "Kubernetes tutorial",
+        "OAuth solution guide",
+        "Python guides",
+        "Kubernetes walkthrough",
+        "Rust writeup conventions",
+        "Kubernetes walk through conventions",
+        "Rust write up conventions",
+    ),
+)
+def test_research_policy_allows_ambiguous_generic_technical_references(query: str) -> None:
+    decision = PlanningService.evaluate_research_query(query)
+
+    assert decision[:2] == ("allowed", ("generic_technical_research",))
+    assert decision[2] == query.lower()
+
+
+def test_research_policy_infers_unique_grant_source_class_without_query_marker() -> None:
+    grant = WriteupAuthorizationGrant(
+        authorized_by="user",
+        authorized_at="2026-08-31T12:00:00Z",
+        authorization_reference="trusted-user-message:43",
+        scope=(writeup_scope("orion", "stored xss"),),
+    )
+
+    decision = PlanningService.evaluate_research_query(
+        "Orion stored XSS walkthrough",
+        writeup_authorization=grant,
+    )
+
+    assert decision[:2] == ("allowed", ("explicit_writeup_authorization",))
+
+
+def test_research_policy_rejects_ambiguous_grant_source_class_without_query_marker() -> None:
+    grant = WriteupAuthorizationGrant(
+        authorized_by="user",
+        authorized_at="2026-08-31T12:00:00Z",
+        authorization_reference="trusted-user-message:44",
+        scope=(
+            WriteupAuthorizationScope(
+                source_class="challenge_writeup",
+                target_terms=("orion",),
+                technique_terms=("stored xss",),
+            ),
+            writeup_scope("orion", "stored xss"),
+        ),
+    )
+
+    decision = PlanningService.evaluate_research_query(
+        "Orion stored XSS walkthrough",
+        writeup_authorization=grant,
+    )
+
+    assert decision[:2] == ("rejected", ("writeup_authorization_scope_mismatch",))
+
+
+@pytest.mark.parametrize(
+    ("marker", "grant_source", "expected_decision"),
+    (
+        ("box", "machine_writeup", "allowed"),
+        ("box", "challenge_writeup", "rejected"),
+        ("ctf", "challenge_writeup", "allowed"),
+        ("ctf", "machine_writeup", "rejected"),
+    ),
+)
+def test_research_policy_enforces_box_and_ctf_source_classes(
+    marker: str,
+    grant_source: Literal["machine_writeup", "challenge_writeup"],
+    expected_decision: str,
+) -> None:
+    grant = WriteupAuthorizationGrant(
+        authorized_by="user",
+        authorized_at="2026-08-31T12:00:00Z",
+        authorization_reference="trusted-user-message:45",
+        scope=(
+            WriteupAuthorizationScope(
+                source_class=grant_source,
+                target_terms=("orion",),
+                technique_terms=("stored xss",),
+            ),
+        ),
+    )
+
+    decision = PlanningService.evaluate_research_query(
+        f"Orion {marker} stored XSS walkthrough",
+        writeup_authorization=grant,
+    )
+
+    assert decision[0] == expected_decision
+    expected_reason = (
+        "explicit_writeup_authorization"
+        if expected_decision == "allowed"
+        else "writeup_authorization_scope_mismatch"
+    )
+    assert decision[1] == (expected_reason,)
+
+
+def test_research_policy_rejects_writeup_outside_authorized_scope() -> None:
+    grant = WriteupAuthorizationGrant(
+        authorized_by="user",
+        authorized_at="2026-08-31T12:00:00Z",
+        authorization_reference="trusted-user-message:42",
+        scope=(writeup_scope("wordpress", "stored xss"),),
+    )
+
+    decision = PlanningService.evaluate_research_query(
+        "ADCS ESC4 walkthrough",
+        writeup_authorization=grant,
+    )
+
+    assert decision[:2] == ("rejected", ("writeup_authorization_scope_mismatch",))
+
+
+def test_research_policy_rejects_plural_writeup_markers_without_authorization() -> None:
+    decision = PlanningService.evaluate_research_query("Orion machine walkthroughs")
+
+    assert decision[:2] == ("rejected", ("writeup_authorization_required",))
+
+
+def test_research_policy_requires_exact_term_boundaries_in_scope() -> None:
+    grant = WriteupAuthorizationGrant(
+        authorized_by="user",
+        authorized_at="2026-08-31T12:00:00Z",
+        authorization_reference="trusted-user-message:42",
+        scope=(writeup_scope("orion", "root.txt"),),
+    )
+
+    decision = PlanningService.evaluate_research_query(
+        "OrionX machine root.txt walkthrough",
+        writeup_authorization=grant,
+    )
+
+    assert decision[:2] == ("rejected", ("writeup_authorization_scope_mismatch",))
+
+
+def test_research_policy_rejects_query_superset_outside_authorized_scope() -> None:
+    grant = WriteupAuthorizationGrant(
+        authorized_by="user",
+        authorized_at="2026-08-31T12:00:00Z",
+        authorization_reference="trusted-user-message:42",
+        scope=(writeup_scope("orion", "stored xss"),),
+    )
+
+    decision = PlanningService.evaluate_research_query(
+        "Orion Helios machine stored XSS SQL injection writeup",
+        writeup_authorization=grant,
+    )
+
+    assert decision[:2] == ("rejected", ("writeup_authorization_scope_mismatch",))
+
+
+def test_research_policy_enforces_writeup_source_class() -> None:
+    grant = WriteupAuthorizationGrant(
+        authorized_by="user",
+        authorized_at="2026-08-31T12:00:00Z",
+        authorization_reference="trusted-user-message:42",
+        scope=(writeup_scope("orion", "root.txt"),),
+    )
+
+    decision = PlanningService.evaluate_research_query(
+        "Orion challenge root.txt writeup",
+        writeup_authorization=grant,
+    )
+
+    assert decision[:2] == ("rejected", ("writeup_authorization_scope_mismatch",))
+
+
+def test_writeup_authorization_scope_rejects_overlapping_target_and_technique_terms() -> None:
+    with pytest.raises(ValueError, match="target and technique terms must be disjoint"):
+        WriteupAuthorizationScope(
+            source_class="machine_writeup",
+            target_terms=("orion",),
+            technique_terms=("orion",),
+        )
+
+
+def test_writeup_authorization_scope_rejects_generic_terms_mixed_with_specific_terms() -> None:
+    with pytest.raises(ValueError, match="scope terms cannot be generic"):
+        WriteupAuthorizationScope(
+            source_class="machine_writeup",
+            target_terms=("machine", "orion"),
+            technique_terms=("stored xss", "writeup"),
+        )
+
+
+@pytest.mark.parametrize(
+    "generic_term",
+    (
+        "attack",
+        "box",
+        "challenge",
+        "exploit",
+        "host",
+        "guides",
+        "solutions",
+        "technique",
+        "tutorials",
+        "vulnerability",
+        "walk through",
+        "walk-through",
+        "write up",
+        "write-up",
+    ),
+)
+@pytest.mark.parametrize("field", ("target_terms", "technique_terms"))
+def test_writeup_authorization_scope_rejects_domain_generic_terms(
+    generic_term: str,
+    field: str,
+) -> None:
+    values = {
+        "source_class": "machine_writeup",
+        "target_terms": ("orion",),
+        "technique_terms": ("stored xss",),
+    }
+    values[field] = tuple(sorted((generic_term, *values[field])))
+
+    with pytest.raises(ValueError, match="scope terms cannot be generic"):
+        WriteupAuthorizationScope.model_validate(values)
+
+
+def test_research_policy_rejects_generic_only_authorization_scope() -> None:
+    with pytest.raises(ValueError, match="writeup authorization scope requires specific terms"):
+        WriteupAuthorizationScope(
+            source_class="machine_writeup",
+            target_terms=("htb",),
+            technique_terms=("writeup",),
+        )
+
+
+def test_plan_next_journals_explicit_writeup_authorization_metadata(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    grant = WriteupAuthorizationGrant(
+        authorized_by="user",
+        authorized_at="2026-08-31T12:00:00Z",
+        authorization_reference="telegram-message:writeup-approved",
+        scope=(writeup_scope("orion", "root.txt"),),
+    )
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        result = PlanningService(
+            journal=journal,
+            llm=GroundedCommandPlannerLlm(),
+            clock=lambda: FIXED_TIME,
+            research_aliases=("HTB-Orion", "Orion"),
+            writeup_authorization_verifier=lambda candidate: candidate == grant,
+        ).plan_next(current_lane, max_proposals=3, writeup_authorization=grant)
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+
+    assert result.status == "success"
+    research = [
+        event.payload for event in snapshot.events if event.type == "research_query_proposed"
+    ]
+    writeup = next(item for item in research if "walkthrough" in item.normalized_query)
+    assert writeup.policy_decision == "allowed"
+    assert writeup.reason_codes == ("explicit_writeup_authorization",)
+    assert writeup.writeup_authorization == grant
+
+
+def test_plan_next_rejects_untrusted_writeup_authorization(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    grant = WriteupAuthorizationGrant(
+        authorized_by="user",
+        authorized_at="2026-08-31T12:00:00Z",
+        authorization_reference="payload-self-assertion",
+        scope=(writeup_scope("orion", "root.txt"),),
+    )
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        service = PlanningService(
+            journal=journal,
+            llm=GroundedCommandPlannerLlm(),
+            clock=lambda: FIXED_TIME,
+        )
+
+        with pytest.raises(ValueError, match="writeup_authorization_untrusted"):
+            service.plan_next(current_lane, max_proposals=3, writeup_authorization=grant)
+
+
+def test_plan_next_journals_privacy_safe_hindsight_telemetry(tmp_path) -> None:
+    current_manifest = manifest()
+    current_lane = lane()
+    query = "persistent input reaches a privileged renderer"
+    candidate = HindsightCandidateContext(
+        memory_id="episode-xss-1",
+        query=query,
+        summary="Prior strategy: validate a harmless stored marker before escalation.",
+        relevance=0.87,
+        tags=("candidate", "stored-xss"),
+    )
+    with journal_service(tmp_path) as journal:
+        journal.create_from_manifest(current_manifest, lane=current_lane)
+        result = PlanningService(
+            journal=journal,
+            llm=GroundedCommandPlannerLlm(),
+            clock=lambda: FIXED_TIME,
+        ).plan_next(
+            current_lane,
+            max_proposals=3,
+            hindsight_candidates=(candidate,),
+        )
+        snapshot = journal.load_snapshot(current_manifest.engagement_id)
+
+    assert result.status == "success"
+    request = next(event.payload for event in snapshot.events if event.type == "plan_requested")
+    assert request.hindsight_candidate_ids == (sha256(candidate.memory_id.encode()).hexdigest(),)
+    assert request.hindsight_query_digests == (sha256(query.encode()).hexdigest(),)
+    assert query not in request.model_dump_json()
 
 
 def test_plan_next_persists_grounded_proposal_and_exact_command_record(tmp_path) -> None:

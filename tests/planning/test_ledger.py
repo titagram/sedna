@@ -560,6 +560,9 @@ def test_reducer_replays_complete_reconciliation_and_bounds_attempt_summaries(
         "event_hash": evicted[-1].event_hash,
     }
     assert variant_state.historical_attempt_digest == digest
+    assert (
+        variant_state.recent_attempts[-1].outcome_event_id == settled.snapshot.events[-1].event_id
+    )
 
     monkeypatch.setattr(ledger_module, "MAX_HOT_ATTEMPTS", 2)
     compacted = StrategyLedgerReducer.rebuild(settled.snapshot)

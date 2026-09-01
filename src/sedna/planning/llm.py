@@ -136,6 +136,12 @@ class PlannerRequest(_PlanningRequest):
 
     @model_validator(mode="after")
     def _recent_event_context_is_bounded(self) -> PlannerRequest:
+        if (
+            self.knowledge_context.situation_digest != self.situation.state_digest
+            or self.knowledge_context.material_event_revision
+            != self.situation.material_event_revision
+        ):
+            raise ValueError("stale_planner_knowledge_context")
         if sum(len(item.encode("utf-8")) for item in self.recent_event_context) > (
             MAX_RECENT_EVENT_TEXT_BYTES
         ):

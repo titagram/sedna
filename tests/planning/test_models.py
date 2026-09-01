@@ -58,11 +58,13 @@ from sedna.planning.models import (
     PlanningGap,
     PlanningResult,
     PlanRequestAudit,
+    PrerequisiteProof,
     PrivateValueDraft,
     ProofCandidateAdmission,
     ProofIndexRecord,
     ProofProgress,
     ProofValueReference,
+    ProposalPrerequisite,
     ResearchPolicyDecision,
     ResearchSourceObservationDraft,
     RetryPredicate,
@@ -583,15 +585,16 @@ def test_frontier_requires_stable_score_order_and_complete_proposal_identity() -
         is None
     )
 
-    with pytest.raises(ValidationError, match="frontier_proposals_not_score_ordered"):
-        FrontierProjection(
-            frontier_id=uuid4(),
-            engagement_id=engagement_id,
-            state_digest=_sha("state"),
-            input_ledger_digest=_sha("input-ledger"),
-            resulting_ledger_digest=_sha("result-ledger"),
-            proposals=(second, first),
-        )
+    utility_ordered = FrontierProjection(
+        frontier_id=uuid4(),
+        engagement_id=engagement_id,
+        state_digest=_sha("state"),
+        input_ledger_digest=_sha("input-ledger"),
+        resulting_ledger_digest=_sha("result-ledger"),
+        proposals=(second, first),
+        constrained_rationale="Expected utility, not raw score, determines frontier order.",
+    )
+    assert utility_ordered.proposals == (second, first)
 
 
 def test_planner_draft_rejects_semantically_duplicate_proposals() -> None:
@@ -606,6 +609,81 @@ def test_planner_draft_rejects_semantically_duplicate_proposals() -> None:
 
     with pytest.raises(ValidationError, match="planner_proposals_not_unique"):
         PlannerDraft(proposals=(proposal, proposal.model_copy(update={"score": 70})))
+
+
+def test_planner_draft_rejects_duplicate_variant_runtime_key_across_families() -> None:
+    proposal = FrontierProposalDraft(
+        family_runtime_key="family-ssh",
+        variant_runtime_key="variant-password",
+        title="Try SSH authentication",
+        score=80,
+        confidence=70,
+        rationale="Test the currently supported authentication path.",
+    )
+    other_family = proposal.model_copy(
+        update={
+            "family_runtime_key": "family-web",
+            "title": "Try web authentication",
+        }
+    )
+
+    with pytest.raises(ValidationError, match="planner_variant_runtime_keys_not_unique"):
+        PlannerDraft(proposals=(proposal, other_family))
+
+
+def test_proposal_rejects_unlinked_prerequisite_proof_reference() -> None:
+    with pytest.raises(ValidationError, match="prerequisite_proof_reference_not_grounded"):
+        FrontierProposalDraft(
+            family_runtime_key="family-web",
+            variant_runtime_key="variant-scope",
+            title="Probe scoped target",
+            score=80,
+            confidence=70,
+            rationale="A bounded probe can discriminate the implementation.",
+            prerequisites=(
+                ProposalPrerequisite(
+                    kind="scope_authorized",
+                    statement="The target remains in scope.",
+                    scope_kind="exact_target",
+                    scope_value="10.10.10.10",
+                ),
+            ),
+            prerequisite_proofs=(
+                PrerequisiteProof(
+                    prerequisite_index=0,
+                    proof_kind="scope_authorized",
+                    reference_id="scope-missing",
+                ),
+            ),
+        )
+
+
+def test_proposal_rejects_semantically_mismatched_prerequisite_proof() -> None:
+    scope_id = "scope-authorized-target"
+    with pytest.raises(ValidationError, match="prerequisite_proof_kind_mismatch"):
+        FrontierProposalDraft(
+            family_runtime_key="family-web",
+            variant_runtime_key="variant-observation",
+            title="Use observed service",
+            score=80,
+            confidence=70,
+            rationale="The service observation enables a bounded test.",
+            prerequisites=(
+                ProposalPrerequisite(
+                    kind="event_observed",
+                    statement="The service was observed.",
+                    event_type="observation_extracted",
+                ),
+            ),
+            prerequisite_proofs=(
+                PrerequisiteProof(
+                    prerequisite_index=0,
+                    proof_kind="scope_authorized",
+                    reference_id=scope_id,
+                ),
+            ),
+            scope_reference_ids=(scope_id,),
+        )
 
 
 def test_zero_score_requires_terminal_status_and_typed_retry_predicate() -> None:

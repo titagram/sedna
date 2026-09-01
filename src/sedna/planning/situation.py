@@ -27,6 +27,7 @@ from sedna.engagement.events import (
     SecretReferenceEventRecord,
     TextFactEventRecord,
 )
+from sedna.planning.belief import project_hypothesis_beliefs
 from sedna.planning.models import (
     AccessState,
     AttemptSummary,
@@ -682,11 +683,13 @@ class SituationReducer:
         objective_progress = ObjectiveProgress(
             requirements=tuple(proof_by_id[key] for key in sorted(proof_by_id))
         )
+        hypothesis_beliefs = project_hypothesis_beliefs(tuple(hypotheses), validated.events)
         material_state = {
             "objective_progress": objective_progress.model_dump(mode="json"),
             "facts": [fact.model_dump(mode="json") for fact in facts],
             "facets": [facet.model_dump(mode="json") for facet in facets],
             "hypotheses": [item.model_dump(mode="json") for item in hypotheses],
+            "hypothesis_beliefs": [item.model_dump(mode="json") for item in hypothesis_beliefs],
             "unresolved_information": [
                 item.model_dump(mode="json") for item in unresolved_information
             ],
@@ -706,6 +709,7 @@ class SituationReducer:
             facts=tuple(facts),
             facets=tuple(facets),
             hypotheses=tuple(hypotheses),
+            hypothesis_beliefs=hypothesis_beliefs,
             unresolved_information=tuple(unresolved_information),
             research_sources=tuple(research_sources),
             access_states=tuple(access_states),

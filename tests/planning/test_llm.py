@@ -231,6 +231,31 @@ def test_adapter_closes_host_and_response_failures() -> None:
         assert error.value.reason_code == code
 
 
+def test_planner_request_rejects_stale_knowledge_context() -> None:
+    from sedna.planning.llm import PlannerRequest
+    from sedna.planning.models import StrategyLedger
+    from sedna.planning.retrieval import PlannerKnowledgeContext
+
+    situation = _situation()
+    stale = PlannerKnowledgeContext(
+        canonical_revision="a" * 64,
+        situation_digest=situation.state_digest,
+        material_event_revision=situation.material_event_revision - 1,
+        source_registry_digest="b" * 64,
+        context_digest="c" * 64,
+    )
+
+    with pytest.raises(ValidationError, match="stale_planner_knowledge_context"):
+        PlannerRequest(
+            situation=situation,
+            ledger=StrategyLedger(),
+            knowledge_context=stale,
+            scope_references=(),
+            recent_event_ids=(),
+            max_proposals=5,
+        )
+
+
 def test_planner_request_requires_current_situation_and_ledger() -> None:
     from sedna.planning.llm import PlannerRequest
     from sedna.planning.models import StrategyLedger
@@ -240,6 +265,7 @@ def test_planner_request_requires_current_situation_and_ledger() -> None:
     context = PlannerKnowledgeContext(
         canonical_revision="a" * 64,
         situation_digest=situation.state_digest,
+        material_event_revision=situation.material_event_revision,
         source_registry_digest="b" * 64,
         context_digest="c" * 64,
     )
@@ -369,6 +395,7 @@ def test_adapter_plan_requires_exact_request_and_response_contract() -> None:
         knowledge_context=PlannerKnowledgeContext(
             canonical_revision="a" * 64,
             situation_digest=situation.state_digest,
+            material_event_revision=situation.material_event_revision,
             source_registry_digest="b" * 64,
             context_digest="c" * 64,
         ),

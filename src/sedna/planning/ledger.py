@@ -786,6 +786,7 @@ class StrategyLedgerReducer:
                     if variant is not None:
                         attempt = AttemptState(
                             attempt_event_id=_attempt_id(payload),
+                            outcome_event_id=event.event_id,
                             outcome=payload.category,
                             summary=payload.summary,
                         )

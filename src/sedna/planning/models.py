@@ -28,6 +28,8 @@ from sedna.engagement.events import (
     PrivateValueEventRecord,
     StrategyReconciliationEventOperation,
     StrategyResultSnapshot,
+    WriteupAuthorizationGrant,  # noqa: F401 - intentional public planning re-export
+    WriteupAuthorizationScope,  # noqa: F401 - intentional public planning re-export
 )
 from sedna.planning.commands import CommandSuggestionDraft
 
@@ -208,6 +210,21 @@ class ObjectiveProgress(BaseModel):
         return self
 
 
+class HypothesisBelief(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    hypothesis_event_id: UUID
+    prior: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+    posterior: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+    update_event_ids: Annotated[tuple[UUID, ...], Field(max_length=256)] = ()
+
+    @model_validator(mode="after")
+    def _updates_are_sorted_unique(self) -> Self:
+        if self.update_event_ids != tuple(sorted(set(self.update_event_ids), key=str)):
+            raise ValueError("belief update event ids must be sorted and unique")
+        return self
+
+
 class SituationProjection(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
@@ -219,6 +236,7 @@ class SituationProjection(BaseModel):
     facts: Annotated[tuple[ObservedFact, ...], Field(max_length=64)] = ()
     facets: Annotated[tuple[ObservedFacet, ...], Field(max_length=64)] = ()
     hypotheses: Annotated[tuple[SituationHypothesis, ...], Field(max_length=64)] = ()
+    hypothesis_beliefs: Annotated[tuple[HypothesisBelief, ...], Field(max_length=64)] = ()
     unresolved_information: Annotated[tuple[UnresolvedInformation, ...], Field(max_length=64)] = ()
     research_sources: Annotated[tuple[ResearchSourceAssessment, ...], Field(max_length=64)] = ()
     access_states: Annotated[tuple[AccessState, ...], Field(max_length=64)] = ()
@@ -243,6 +261,39 @@ class RetryPredicate(BaseModel):
     value: Annotated[str, Field(min_length=1, max_length=512)]
 
 
+class ProposalPrerequisite(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    kind: Literal["scope_authorized", "event_observed"]
+    statement: ShortText
+    event_type: Annotated[str, Field(min_length=1, max_length=128)] | None = None
+    scope_kind: Literal["exact_target", "cidr", "hostname", "url_origin", "generic_id"] | None = (
+        None
+    )
+    scope_value: Annotated[str, Field(min_length=1, max_length=2048)] | None = None
+
+    @model_validator(mode="after")
+    def _validate_reference_constraint(self) -> Self:
+        if self.kind == "event_observed":
+            if (
+                self.event_type is None
+                or self.scope_kind is not None
+                or self.scope_value is not None
+            ):
+                raise ValueError("event_prerequisite_requires_event_type_only")
+        elif self.event_type is not None or self.scope_kind is None or self.scope_value is None:
+            raise ValueError("scope_prerequisite_requires_scope_kind_and_value")
+        return self
+
+
+class PrerequisiteProof(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    prerequisite_index: Annotated[int, Field(ge=0, le=15)]
+    proof_kind: Literal["scope_authorized", "event_observed"]
+    reference_id: Annotated[str, Field(min_length=1, max_length=128)]
+
+
 class FrontierProposalDraft(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
@@ -259,7 +310,8 @@ class FrontierProposalDraft(BaseModel):
     confidence: Annotated[int, Field(ge=0, le=100)]
     rationale: ShortText
     strategic_intent: ShortText | None = None
-    prerequisites: Annotated[tuple[ShortText, ...], Field(max_length=16)] = ()
+    prerequisites: Annotated[tuple[ProposalPrerequisite, ...], Field(max_length=16)] = ()
+    prerequisite_proofs: Annotated[tuple[PrerequisiteProof, ...], Field(max_length=16)] = ()
     expected_information_gain: ShortText = "Reduce current uncertainty."
     expected_evidence: Annotated[tuple[ShortText, ...], Field(max_length=16)] = ()
     stop_conditions: Annotated[tuple[ShortText, ...], Field(max_length=16)] = ()
@@ -270,9 +322,27 @@ class FrontierProposalDraft(BaseModel):
 
     @model_validator(mode="after")
     def _references_and_commands_are_unique(self) -> Self:
-        for values in (self.event_refs, self.knowledge_refs, self.scope_reference_ids):
+        for values in (
+            self.event_refs,
+            self.knowledge_refs,
+            self.scope_reference_ids,
+        ):
             if len(values) != len(set(values)):
                 raise ValueError("planner_proposal_references_not_unique")
+        proof_indexes = tuple(item.prerequisite_index for item in self.prerequisite_proofs)
+        if proof_indexes != tuple(range(len(self.prerequisites))):
+            raise ValueError("prerequisite_proof_count_mismatch")
+        event_ref_strings = {str(value) for value in self.event_refs}
+        for proof in self.prerequisite_proofs:
+            prerequisite = self.prerequisites[proof.prerequisite_index]
+            if proof.proof_kind != prerequisite.kind:
+                raise ValueError("prerequisite_proof_kind_mismatch")
+            if proof.proof_kind == "scope_authorized":
+                grounded = proof.reference_id in self.scope_reference_ids
+            else:
+                grounded = proof.reference_id in event_ref_strings
+            if not grounded:
+                raise ValueError("prerequisite_proof_reference_not_grounded")
         command_keys = tuple(
             (command.command_template, command.origin, command.source_example_id)
             for command in self.commands
@@ -312,6 +382,9 @@ class PlannerDraft(BaseModel):
         )
         if len(identities) != len(set(identities)):
             raise ValueError("planner_proposals_not_unique")
+        variant_runtime_keys = tuple(proposal.variant_runtime_key for proposal in self.proposals)
+        if len(variant_runtime_keys) != len(set(variant_runtime_keys)):
+            raise ValueError("planner_variant_runtime_keys_not_unique")
         normalized_queries = tuple(
             " ".join(query.lower().split()) for query in self.research_queries
         )
@@ -345,13 +418,10 @@ class FrontierProjection(BaseModel):
     stale: bool = False
 
     @model_validator(mode="after")
-    def _proposals_are_viable_and_score_ordered(self) -> Self:
+    def _proposals_are_viable(self) -> Self:
         proposal_ids = tuple(proposal.proposal_id for proposal in self.proposals)
         if len(proposal_ids) != len(set(proposal_ids)):
             raise ValueError("frontier_proposal_ids_not_unique")
-        scores = tuple(proposal.score for proposal in self.proposals)
-        if scores != tuple(sorted(scores, reverse=True)):
-            raise ValueError("frontier_proposals_not_score_ordered")
         if len(self.proposals) < 3 and self.constrained_rationale is None:
             raise ValueError("frontier_requires_constrained_rationale")
         if len(self.proposals) >= 3 and self.constrained_rationale is not None:
@@ -537,6 +607,8 @@ class PlanRequestedSource(_PlanningEventSource):
     canonical_revision: Sha256Hex
     source_registry_digest: Sha256Hex
     max_proposals: Annotated[int, Field(ge=3, le=8)]
+    hindsight_candidate_ids: Annotated[tuple[str, ...], Field(max_length=16)] = ()
+    hindsight_query_digests: Annotated[tuple[Sha256Hex, ...], Field(max_length=16)] = ()
 
 
 class FrontierProposedSource(_PlanningEventSource):
@@ -898,6 +970,8 @@ class PlanRequestAudit(BaseModel):
     canonical_revision: Sha256Hex | None = None
     source_registry_digest: Sha256Hex | None = None
     max_proposals: Annotated[int, Field(ge=3, le=8)] | None = None
+    hindsight_candidate_ids: Annotated[tuple[str, ...], Field(max_length=16)] = ()
+    hindsight_query_digests: Annotated[tuple[Sha256Hex, ...], Field(max_length=16)] = ()
 
 
 class PlannerProposalAudit(BaseModel):
@@ -1110,6 +1184,7 @@ class AttemptState(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
     attempt_event_id: UUID
+    outcome_event_id: UUID | None = Field(default=None, exclude=True)
     outcome: OutcomeCategory
     summary: ShortText
 

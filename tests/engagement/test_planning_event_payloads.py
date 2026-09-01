@@ -118,7 +118,9 @@ REMAINING_CASES = (
             "canonical_revision": DIGEST,
             "source_registry_digest": DIGEST,
             "max_proposals": 3,
-            "request_digest": "66cac7c832d506ebc56618e4b12c24c54cec7003d76fbad9ac6f24c8d6bf919e",
+            "hindsight_candidate_ids": [],
+            "hindsight_query_digests": [],
+            "request_digest": "5d556b44a95954fdd70690ebe5fe9eb7f1050caf6c57600aee4fd1a194f0810b",
         },
     ),
     (
@@ -320,6 +322,18 @@ def test_plan_request_digest_covers_every_field_except_kind_and_itself() -> None
         {"kind": kind, **body, "request_digest": expected}
     )
     assert payload.request_digest == expected
+
+
+def test_plan_request_accepts_legacy_digest_without_hindsight_fields() -> None:
+    kind, body = REMAINING_CASES[3]
+    legacy = dict(body)
+    legacy.pop("hindsight_candidate_ids")
+    legacy.pop("hindsight_query_digests")
+    legacy["request_digest"] = "66cac7c832d506ebc56618e4b12c24c54cec7003d76fbad9ac6f24c8d6bf919e"
+
+    payload = TypeAdapter(EventPayload).validate_python({"kind": kind, **legacy})
+
+    assert payload.request_digest == legacy["request_digest"]
     with pytest.raises(ValidationError, match="request_digest"):
         TypeAdapter(EventPayload).validate_python({"kind": kind, **body, "request_digest": DIGEST})
 

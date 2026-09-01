@@ -31,6 +31,7 @@ from sedna.planning import (
     PlanningRuntimeFactory,
     PlanningSettlementPortFactory,
 )
+from sedna.planning.retrieval import HindsightCandidateContext
 from sedna.runners import ToolRunner, nmap_service_scan, nmap_tcp_discovery
 
 _MAX_PATH_LENGTH = 4096
@@ -108,11 +109,26 @@ class _FacetInput(_ToolInput):
     confidence: float = Field(ge=0.0, le=1.0)
 
 
+class _PrimitiveInput(_ToolInput):
+    kind: BoundedFacetKey
+    source: BoundedTerm | None = None
+    transforms: tuple[BoundedTerm, ...] = Field(default=(), max_length=16)
+    sink: BoundedTerm | None = None
+    persistence: BoundedTerm | None = None
+    trust_boundary: BoundedTerm | None = None
+    preconditions: tuple[BoundedTerm, ...] = Field(default=(), max_length=16)
+    candidate_classes: tuple[BoundedTerm, ...] = Field(default=(), max_length=16)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
 class _RetrieveInput(_RuntimeInput):
     target: BoundedTarget
     authorization: _AuthorizationInput
     observed_terms: tuple[BoundedTerm, ...] = Field(default=(), max_length=_MAX_SITUATION_ITEMS)
     observed_facts: tuple[_FacetInput, ...] = Field(default=(), max_length=_MAX_SITUATION_ITEMS)
+    observed_primitives: tuple[_PrimitiveInput, ...] = Field(
+        default=(), max_length=_MAX_SITUATION_ITEMS
+    )
     observed_access: tuple[BoundedTerm, ...] = Field(default=(), max_length=_MAX_SITUATION_ITEMS)
     observed_services: tuple[BoundedTerm, ...] = Field(default=(), max_length=_MAX_SITUATION_ITEMS)
     observed_hypotheses: tuple[BoundedTerm, ...] = Field(
@@ -141,6 +157,7 @@ class _MaintenanceInput(_RuntimeInput):
 
 class _PlanNextInput(_ToolInput):
     max_proposals: int = Field(default=5, ge=3, le=8)
+    hindsight_candidates: tuple[HindsightCandidateContext, ...] = Field(default=(), max_length=16)
 
 
 class _ToolErrorResult(BaseModel):
@@ -368,6 +385,7 @@ def _plan_next_handler(
             result = runtime.planning.plan_next(
                 lane,
                 max_proposals=request.max_proposals,
+                hindsight_candidates=request.hindsight_candidates,
             )
         return _serialize_planning_result(result)
     except _ToolBoundaryError as error:
@@ -487,6 +505,51 @@ def _build_query(request: _RetrieveInput) -> RetrievalQuery:
         SituationFacet.model_validate(facet.model_dump(mode="json"))
         for facet in request.observed_facts
     )
+    primitive_facets = tuple(
+        SituationFacet(
+            namespace="code_intel",
+            key=primitive.kind,
+            value="; ".join(
+                part
+                for part in (
+                    f"kind={primitive.kind}",
+                    f"source={primitive.source}" if primitive.source else "",
+                    f"transforms={','.join(primitive.transforms)}" if primitive.transforms else "",
+                    f"sink={primitive.sink}" if primitive.sink else "",
+                    f"persistence={primitive.persistence}" if primitive.persistence else "",
+                    f"trust_boundary={primitive.trust_boundary}"
+                    if primitive.trust_boundary
+                    else "",
+                )
+                if part
+            ),
+            confidence=primitive.confidence,
+        )
+        for primitive in request.observed_primitives
+    )
+    primitive_terms = tuple(
+        dict.fromkeys(
+            term
+            for primitive in request.observed_primitives
+            for term in (
+                primitive.kind,
+                primitive.source,
+                *primitive.transforms,
+                primitive.sink,
+                primitive.persistence,
+                primitive.trust_boundary,
+                *primitive.preconditions,
+            )
+            if term is not None
+        )
+    )[:_MAX_QUERY_TERMS]
+    primitive_classes = tuple(
+        dict.fromkeys(
+            candidate
+            for primitive in request.observed_primitives
+            for candidate in primitive.candidate_classes
+        )
+    )[:_MAX_QUERY_TERMS]
     query_facets = tuple(
         SituationFacet.model_validate(facet.model_dump(mode="json"))
         for facet in request.query_facets
@@ -495,16 +558,20 @@ def _build_query(request: _RetrieveInput) -> RetrievalQuery:
         situation=CurrentSituation(
             target=target,
             authorization=authorization,
-            terms=request.observed_terms,
-            facts=facts,
+            terms=tuple(dict.fromkeys((*request.observed_terms, *primitive_terms)))[
+                :_MAX_SITUATION_ITEMS
+            ],
+            facts=(*facts, *primitive_facets)[:_MAX_SITUATION_ITEMS],
             access=request.observed_access,
             services=request.observed_services,
             hypotheses=request.observed_hypotheses,
             tried_outcomes=request.tried_outcomes,
             unresolved_questions=request.unresolved_questions,
         ),
-        terms=request.query_terms,
-        synonyms=request.query_synonyms,
+        terms=tuple(dict.fromkeys((*request.query_terms, *primitive_terms)))[:_MAX_QUERY_TERMS],
+        synonyms=tuple(dict.fromkeys((*request.query_synonyms, *primitive_classes)))[
+            :_MAX_QUERY_TERMS
+        ],
         facets=query_facets,
         max_candidates=request.max_candidates,
         lane_limit=request.lane_limit,

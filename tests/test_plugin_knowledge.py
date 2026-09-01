@@ -103,6 +103,35 @@ def _authorized_query(
     }
 
 
+def test_build_query_projects_typed_code_intelligence_primitives() -> None:
+    payload = _authorized_query(query_terms=["web attack surface"])
+    payload["observed_primitives"] = [
+        {
+            "kind": "stored_rendering_path",
+            "source": "attacker-controlled transcription",
+            "transforms": ["symbol mapping", "server-side persistence"],
+            "sink": "administrator HTML renderer",
+            "persistence": "database record",
+            "trust_boundary": "unprivileged user to administrator",
+            "preconditions": ["administrator reviews transcription"],
+            "candidate_classes": ["stored xss", "blind xss"],
+            "confidence": 0.86,
+        }
+    ]
+
+    request = plugin_module._RetrieveInput.model_validate_json(json.dumps(payload))
+    query = plugin_module._build_query(request)
+
+    assert "stored_rendering_path" in query.terms
+    assert "attacker-controlled transcription" in query.terms
+    assert "stored xss" in query.synonyms
+    assert "blind xss" in query.synonyms
+    assert query.situation.facts[-1].namespace == "code_intel"
+    assert query.situation.facts[-1].key == "stored_rendering_path"
+    assert "sink=administrator html renderer" in query.situation.facts[-1].value
+    assert query.situation.facts[-1].confidence == 0.86
+
+
 def _serialized(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 

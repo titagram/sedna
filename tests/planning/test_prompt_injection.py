@@ -63,12 +63,12 @@ def test_planning_prompts_have_independent_ids_and_versions() -> None:
         "sedna-frontier-critic",
         "sedna-frontier-repair",
     )
-    assert {
+    assert (
         OBSERVATION_PROMPT_VERSION,
         PLANNER_PROMPT_VERSION,
         PLANNER_CRITIC_PROMPT_VERSION,
         PLANNER_REPAIR_PROMPT_VERSION,
-    } == {"1"}
+    ) == ("1", "2", "1", "1")
 
 
 def test_hostile_evidence_is_serialized_only_in_json_input() -> None:

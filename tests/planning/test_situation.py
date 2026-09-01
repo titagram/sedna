@@ -568,6 +568,10 @@ def test_hypothesis_preserves_support_and_contradiction_grounding(tmp_path) -> N
         (hypothesis.text, hypothesis.confidence, hypothesis.event_ids)
         for hypothesis in situation.hypotheses
     ) == (("SSH may accept recovered credentials", 0.75, (event_id,)),)
+    assert tuple(
+        (belief.hypothesis_event_id, belief.prior, belief.posterior)
+        for belief in situation.hypothesis_beliefs
+    ) == ((event_id, 0.75, 0.75),)
     assert situation.material_event_revision == result.snapshot.revision.sequence
 
 

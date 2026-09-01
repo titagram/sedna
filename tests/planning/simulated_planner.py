@@ -55,6 +55,7 @@ from sedna.planning.models import (
     StrategyStatus,
 )
 from sedna.planning.retrieval import _example_applies
+from sedna.planning.utility import rank_utilities, utility_input_for_proposal
 from tests.engagement.simulated_hades import SimulatedHades
 
 
@@ -276,8 +277,15 @@ class _ScriptedPlanningHost:
                         commands=(command,) if command is not None else (),
                     )
                 )
+            proposal_by_key = {item.variant_runtime_key: item for item in proposals}
+            ranked_keys = rank_utilities(
+                tuple(
+                    (item.variant_runtime_key, utility_input_for_proposal(item))
+                    for item in proposals
+                )
+            )
             parsed = PlannerDraft(
-                proposals=tuple(proposals),
+                proposals=tuple(proposal_by_key[key] for key in ranked_keys),
                 research_queries=tuple(
                     self._scenario.get(
                         "planning_research_queries",
