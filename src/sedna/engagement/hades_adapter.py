@@ -24,10 +24,10 @@ from sedna.engagement.events import (
     CONTROL_TOOL_POLICY_VERSION,
     ClosureCancelledPayload,
     ControlToolInvokedPayload,
+    EventType,
     EvidenceAttachedPayload,
     EvidenceCaptureFailedPayload,
     EvidenceSliceEventRef,
-    EventType,
     InterpretationSucceededEventPayload,
     JournalEventDraft,
     ObjectiveProofObservedEventPayload,
@@ -134,9 +134,7 @@ class _ManageEngagementInput(BaseModel):
     call_id: Annotated[str | None, Field(pattern=r"^call-[0-9a-f]{64}$")] = None
     resolution: Literal["timed_out", "abandoned"] | None = None
     flag_event_id: UUID | None = None
-    proof_requirement_id: Annotated[
-        str | None, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")
-    ] = None
+    proof_requirement_id: Annotated[str | None, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")] = None
     proof_file: Annotated[str | None, Field(min_length=1, max_length=4096)] = None
     attestation_reference: Annotated[str | None, Field(min_length=1, max_length=256)] = None
     allow_unsettled_evidence: bool = False
@@ -325,6 +323,7 @@ class HadesEngagementAdapter:
     def register(self) -> None:
         self._context.register_tool(
             name="sedna_manage_engagement",
+            toolset="plugin_sedna",
             description=(
                 "Create, resume, inspect, list, close, reopen, abandon, or resolve "
                 "calls for the active engagement."
@@ -395,6 +394,7 @@ class HadesEngagementAdapter:
         )
         self._context.register_tool(
             name="sedna_record_decision",
+            toolset="plugin_sedna",
             description="Record one strategy decision bound to the calling lane.",
             schema={
                 "parameters": {
@@ -413,6 +413,7 @@ class HadesEngagementAdapter:
         )
         self._context.register_tool(
             name="sedna_add_source",
+            toolset="plugin_sedna",
             description="Suggest a shared external source in the sources registry.",
             schema={
                 "parameters": {
