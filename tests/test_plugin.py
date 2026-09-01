@@ -25,8 +25,8 @@ class FakeContext:
         self.tools: list[dict] = []
         self.hooks: dict = {}
 
-    def register_tool(self, **kwargs) -> None:
-        self.tools.append(kwargs)
+    def register_tool(self, *, toolset: str, **kwargs) -> None:
+        self.tools.append({"toolset": toolset, **kwargs})
 
     def register_hook(self, name, callback) -> None:
         self.hooks[name] = callback
@@ -49,7 +49,7 @@ def test_plugin_registers_all_implemented_tools_and_hooks():
         "sedna_record_decision",
         "sedna_add_source",
     ]
-    assert all(tool["toolset"] == "plugin_sedna" for tool in context.tools[:6])
+    assert all(tool["toolset"] == "plugin_sedna" for tool in context.tools)
     assert set(context.hooks) == EXPECTED_ENGAGEMENT_HOOKS
 
 
