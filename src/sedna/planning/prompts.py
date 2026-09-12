@@ -3,7 +3,7 @@
 from typing import Final
 
 OBSERVATION_PROMPT_ID: Final = "sedna-observation-extractor"
-OBSERVATION_PROMPT_VERSION: Final = "1"
+OBSERVATION_PROMPT_VERSION: Final = "2"
 PLANNER_PROMPT_ID: Final = "sedna-frontier-planner"
 PLANNER_PROMPT_VERSION: Final = "2"
 PLANNER_CRITIC_PROMPT_ID: Final = "sedna-frontier-critic"

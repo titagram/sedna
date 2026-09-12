@@ -121,6 +121,9 @@ class ObservationRequest(_PlanningRequest):
     """Bounded evidence supplied to the observation role."""
 
     evidence_slices: Annotated[tuple[ObservationEvidenceSlice, ...], Field(max_length=64)]
+    # Advisory host-derived eligibility, never authorization from model output.
+    # The service still validates terminal provenance and the active decision.
+    terminal_claims_allowed: bool = False
 
 
 class PlannerRequest(_PlanningRequest):

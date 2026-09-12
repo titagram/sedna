@@ -6,6 +6,7 @@ import json
 from collections.abc import Callable, Iterable
 from hashlib import sha256
 from typing import cast
+from uuid import UUID
 
 from pydantic import BaseModel, TypeAdapter
 
@@ -473,6 +474,30 @@ _EVENT_REF_FIELDS = frozenset(
     }
 )
 _EVIDENCE_REF_FIELDS = frozenset({"evidence_id", "evidence_ids"})
+
+
+def _referenced_event_ids(value: object) -> set[UUID]:
+    """Collect UUIDs the model places in event-reference fields.
+
+    Event-reference fields are the closed vocabulary the converters use for
+    journal provenance. This walks one conversion's sources and payloads the
+    same way the reference validator does, so scoping an index and validating
+    it can never disagree about what counts as a reference.
+    """
+    referenced: set[UUID] = set()
+    for name, item in _walk(value):
+        if name not in _EVENT_REF_FIELDS:
+            continue
+        values = item if isinstance(item, tuple | list) else (item,)
+        for candidate in values:
+            if isinstance(candidate, UUID):
+                referenced.add(candidate)
+            elif isinstance(candidate, str):
+                try:
+                    referenced.add(UUID(candidate))
+                except ValueError:
+                    continue
+    return referenced
 
 
 def _validate_references(payload: EventPayload, conversion: _ConversionEnvelope) -> None:

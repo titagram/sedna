@@ -55,6 +55,7 @@ from sedna.planning.belief import validate_outcome_score_transition
 from sedna.planning.commands import validate_command_suggestion
 from sedna.planning.frontier import FrontierReducer
 from sedna.planning.journal_events import (
+    _referenced_event_ids,
     payloads_from_observation_batch,
     payloads_from_planning_attempt,
     payloads_from_reconciliation,
@@ -331,12 +332,9 @@ class PlanningService:
             local_event_bindings=(
                 LocalEventIdBinding(local_id="planning-gap", event_id=gap_event_id),
             ),
-            valid_event_ids=tuple(
-                sorted(
-                    (*(event.event_id for event in snapshot.events), gap_event_id),
-                    key=str,
-                )
-            ),
+            # llm_unavailable gap carries no payload-level event references
+            # beyond its own bindings, so a batch-scoped index suffices.
+            valid_event_ids=(gap_event_id,),
             valid_evidence_ids=tuple(
                 sorted(
                     {
@@ -629,6 +627,7 @@ class PlanningService:
                 ),
                 event_offset=2 + len(provisional_proposals),
                 prior_frontier=prior_frontier,
+                authoritative_event_ids=valid_event_ids,
             )
             provisional_result = PlanningResult(
                 status="success",
@@ -757,10 +756,11 @@ class PlanningService:
                 )
                 conversion = PlanningAttemptEventConversion(
                     local_event_bindings=bindings,
+                    # critic_rejected payloads reference only their own locally
+                    # generated event IDs; the batch-scoped index stays bounded.
                     valid_event_ids=tuple(
                         sorted(
                             {
-                                *(event.event_id for event in snapshot.events),
                                 *critic_event_ids,
                                 rejected_event_id,
                                 gap_event_id,
@@ -864,6 +864,7 @@ class PlanningService:
             ),
             event_offset=planning_event_count,
             prior_frontier=prior_frontier,
+            authoritative_event_ids=valid_event_ids,
         )
         resulting_ledger_digest = ledger_digest(resulting_ledger)
         frontier = FrontierProjection(
@@ -1093,14 +1094,21 @@ class PlanningService:
         authoritative_planner_metadata = PlanningCallMetadata.model_validate(
             planner_metadata.model_dump(mode="json")
         )
+        # Batch-scoped index: every authoritative event actually referenced by
+        # this attempt, plus locally generated bindings. References to IDs that
+        # are not in the journal remain excluded and fail validation downstream.
+        authoritative_event_ids = {event.event_id for event in snapshot.events}
+        referenced_by_attempt = {
+            event_ref,
+            *(ref for draft in planned.proposals for ref in draft.event_refs),
+            *(ref for verdict_ in critic_verdicts for ref in verdict_.cited_event_ids),
+        }
         planning_conversion = PlanningAttemptEventConversion(
             local_event_bindings=planning_bindings,
             valid_event_ids=tuple(
                 sorted(
-                    {
-                        *(event.event_id for event in snapshot.events),
-                        *(item.event_id for item in planning_bindings),
-                    },
+                    (referenced_by_attempt & authoritative_event_ids)
+                    | {binding.event_id for binding in planning_bindings},
                     key=str,
                 )
             ),
@@ -1689,6 +1697,7 @@ class PlanningService:
         call_metadata: PlanningCallMetadata,
         event_offset: int,
         prior_frontier: FrontierProjection | None,
+        authoritative_event_ids: set[UUID],
     ) -> tuple[StrategyLedger, tuple[StrategyReconciledEventPayload, ...]]:
         """Allocate a complete no-loss ledger snapshot for the accepted frontier."""
         family_by_key = {item.runtime_key: item for item in ledger.families}
@@ -1874,7 +1883,25 @@ class PlanningService:
                 for source in sources
             ),
         )
-        valid_events = tuple(sorted({event_ref, *(item.event_id for item in bindings)}, key=str))
+        # Batch-scoped index: references must exist in the authoritative journal;
+        # a model-cited unknown ID fails closed here instead of becoming valid.
+        referenced_event_ids = {
+            event_ref,
+            *(
+                ref
+                for draft in draft_by_variant_id.values()
+                for ref in getattr(draft, "event_refs", ())
+            ),
+        }
+        unknown_references = referenced_event_ids - authoritative_event_ids
+        if unknown_references:
+            raise ValueError("reconciliation_reference_not_in_journal")
+        valid_events = tuple(
+            sorted(
+                referenced_event_ids | {binding.event_id for binding in bindings},
+                key=str,
+            )
+        )
         payloads = payloads_from_reconciliation(
             StrategyReconciliationEventConversion(
                 local_event_bindings=bindings,
@@ -1971,14 +1998,19 @@ class PlanningService:
                 key=str,
             )
         )
+        # Batch-scoped index built from what the sources actually reference:
+        # source archive events, triggering events, and evidence_event_ids
+        # inside restored snapshots — never the whole journal.
+        referenced = _referenced_event_ids(sources)
+        authoritative = {event.event_id for event in snapshot.events}
+        unknown = referenced - authoritative - {binding.event_id for binding in bindings}
+        if unknown:
+            raise ValueError("reactivation_reference_not_in_journal")
         conversion = StrategyReconciliationEventConversion(
             local_event_bindings=bindings,
             valid_event_ids=tuple(
                 sorted(
-                    {
-                        *(event.event_id for event in snapshot.events),
-                        *(binding.event_id for binding in bindings),
-                    },
+                    (referenced & authoritative) | {binding.event_id for binding in bindings},
                     key=str,
                 )
             ),
@@ -2216,6 +2248,15 @@ class PlanningService:
         existing_event_ids = tuple(event.event_id for event in snapshot.events)
         if set(allocated_event_ids) & set(existing_event_ids):
             raise ValueError("research_event_id_already_exists")
+        # Batch-scoped authoritative index: only journal events actually
+        # referenced by this research conversion, plus its own bindings.
+        # Locally allocated bindings are valid by construction and are excluded
+        # from the unknown-reference check.
+        referenced = _referenced_event_ids(conversion) - set(allocated_event_ids)
+        valid_authoritative = referenced & set(existing_event_ids)
+        missing_references = referenced - valid_authoritative
+        if missing_references:
+            raise ValueError("research_reference_not_in_snapshot")
         evidence_ids = tuple(
             sorted(
                 {
@@ -2230,7 +2271,7 @@ class PlanningService:
             {
                 **conversion.model_dump(mode="python", warnings="error"),
                 "valid_event_ids": tuple(
-                    sorted((*existing_event_ids, *allocated_event_ids), key=str)
+                    sorted({*valid_authoritative, *allocated_event_ids}, key=str)
                 ),
                 "valid_evidence_ids": evidence_ids,
                 "valid_source_ids": source_ids,
@@ -2416,7 +2457,16 @@ class PlanningService:
                 LocalEventIdBinding(local_id="consulted", event_id=consulted_event_id),
             ),
             valid_event_ids=tuple(
-                sorted((*events_by_id, consulted_event_id, assessed_event_id), key=str)
+                sorted(
+                    {
+                        *related_event_ids,
+                        *tool_event_ids,
+                        *(event.event_id for event in attachment_events),
+                        consulted_event_id,
+                        assessed_event_id,
+                    },
+                    key=str,
+                )
             ),
             valid_evidence_ids=evidence_ids,
             valid_source_ids=(source_id,),
@@ -2877,12 +2927,33 @@ class PlanningService:
                 None,
             )
             terminal_event_id = None if terminal is None else terminal.event_id
+            active_decision = next(
+                (item for item in snapshot.state.active_decisions if item.lane == attachment.lane),
+                None,
+            )
+            terminal_claims_allowed = False
+            if terminal is not None and attachment.lane is not None and active_decision is not None:
+                try:
+                    UUID(active_decision.decision_id.removeprefix("decision-"))
+                    terminal_claims_allowed = True
+                except ValueError:
+                    pass
+            request = ObservationRequest(
+                evidence_slices=request.evidence_slices,
+                terminal_claims_allowed=terminal_claims_allowed,
+            )
+            claim_instructions = (
+                "Terminal claims may be proposed only when grounded in this completed tool result."
+                if terminal_claims_allowed
+                else "outcomes and objective_proofs must both be empty. "
+                "Extract grounded observations only; do not treat command arguments as results."
+            )
             completion = self._llm.complete(
                 ObservationBatchDraft,
                 instructions=(
                     f"{OBSERVATION_PROMPT}\n"
                     "Return the authoritative subject exactly. "
-                    f"terminal_tool_event_id={terminal_event_id}."
+                    f"terminal_tool_event_id={terminal_event_id}. {claim_instructions}"
                 ),
                 payload=request,
                 purpose="sedna.planning.observe",
@@ -2948,10 +3019,6 @@ class PlanningService:
                 terminal_payload, ToolCallCompletedPayload
             ):
                 raise RuntimeError("terminal event payload is not a tool completion")
-            active_decision = next(
-                (item for item in snapshot.state.active_decisions if item.lane == attachment.lane),
-                None,
-            )
             decision_id = None
             if structured_terminal_claim:
                 if terminal_payload is None:
@@ -3167,6 +3234,21 @@ class PlanningService:
                 )
             )
             sources = (*emitted_sources, interpretation_source)
+            # The conversion index is batch-scoped, not the entire journal.
+            # Intersect references with authoritative history: unknown IDs must
+            # still fail conversion, never become valid because the LLM cited them.
+            referenced_event_ids = {
+                descriptor.attachment_event_id,
+                *(event_id for draft in structured_drafts for event_id in draft.event_ids),
+            }
+            if terminal_event_id is not None:
+                referenced_event_ids.add(terminal_event_id)
+            authoritative_event_ids = {event.event_id for event in snapshot.events}
+            conversion_event_ids = (
+                (referenced_event_ids & authoritative_event_ids)
+                | set(emitted_event_ids)
+                | {success_event_id}
+            )
             conversion = ObservationEventConversion(
                 batch=completion.parsed.model_copy(
                     update={
@@ -3185,16 +3267,7 @@ class PlanningService:
                     ),
                 ),
                 local_event_bindings=bindings,
-                valid_event_ids=tuple(
-                    sorted(
-                        (
-                            *(event.event_id for event in snapshot.events),
-                            *emitted_event_ids,
-                            success_event_id,
-                        ),
-                        key=str,
-                    )
-                ),
+                valid_event_ids=tuple(sorted(conversion_event_ids, key=str)),
                 valid_evidence_ids=(descriptor.reference.evidence_id,),
                 valid_proof_indexes=tuple(
                     sorted(
