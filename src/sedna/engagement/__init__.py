@@ -62,6 +62,7 @@ from sedna.engagement.events import (
     UnmatchedToolCompletionPayload,
     UnplannedActionPayload,
     UserNotePayload,
+    JournalCorrectionRecordedPayload,
 )
 from sedna.engagement.models import (
     CORRELATION_POLICY_VERSION,
@@ -389,6 +390,7 @@ __all__ = [
     "UnmatchedToolCompletionPayload",
     "UnplannedActionPayload",
     "UserNotePayload",
+    "JournalCorrectionRecordedPayload",
     "bounded_safe_argument_summary",
     "normalize_host_payload",
     "render_session_logbook",

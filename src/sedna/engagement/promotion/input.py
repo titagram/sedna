@@ -86,6 +86,7 @@ PROMOTION_IGNORED_EVENT_TYPES = frozenset(
         EventType.RECOVERY_WARNING,
         EventType.UNCERTAIN_CORRELATION,
         EventType.USER_NOTE,
+        EventType.JOURNAL_CORRECTION_RECORDED,
         EventType.INTERPRETATION_SUCCEEDED,
         EventType.INTERPRETATION_FAILED,
         EventType.PLAN_REQUESTED,

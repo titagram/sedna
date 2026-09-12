@@ -8,6 +8,38 @@ import pytest
 from pydantic import ValidationError
 
 
+def test_journal_correction_requires_target_and_reason_code() -> None:
+    from sedna.engagement import EventType, JournalCorrectionRecordedPayload
+
+    payload = JournalCorrectionRecordedPayload(
+        correction_id=UUID("00000000-0000-0000-0000-000000000001"),
+        target_event_id=UUID("00000000-0000-0000-0000-000000000002"),
+        target_claim_ref="outcome:credential-variant-a",
+        correction_kind="retraction",
+        reason_code="evidence_reassessment",
+    )
+
+    assert payload.kind == EventType.JOURNAL_CORRECTION_RECORDED.value
+    assert payload.reason_code == "evidence_reassessment"
+
+    from sedna.engagement import JournalEventDraft
+
+    draft = JournalEventDraft(
+        actor="operator",
+        type=EventType.JOURNAL_CORRECTION_RECORDED,
+        payload=payload,
+    )
+    assert draft.type is EventType.JOURNAL_CORRECTION_RECORDED
+
+    with pytest.raises(ValidationError, match="reason_code"):
+        JournalCorrectionRecordedPayload(
+            correction_id=UUID("00000000-0000-0000-0000-000000000001"),
+            target_event_id=UUID("00000000-0000-0000-0000-000000000002"),
+            correction_kind="retraction",
+            reason_code="freeform secret-like rationale",
+        )
+
+
 def test_outcome_assessed_preserves_attachment_attempt_context() -> None:
     from sedna.engagement import EventType, OutcomeAssessedEventPayload
 

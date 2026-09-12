@@ -47,8 +47,404 @@ class PlannerState(BaseModel):
     strategy: str = "planner"
 
 
+def test_append_journal_correction_is_append_only_and_targets_existing_event(
+    tmp_path, fixed_clock, fixed_uuid_factory, authorized_scope, lane
+) -> None:
+    from sedna.engagement import JournalCorrectionRecordedPayload
+
+    with engagement_service(tmp_path, fixed_clock, fixed_uuid_factory) as service:
+        created = create_orion(service, authorized_scope, lane)
+        before = service.load_snapshot(created.engagement_id)
+        target = before.events[0]
+
+        result = service.append_journal_correction(
+            created.engagement_id,
+            actor="operator:alice",
+            payload=JournalCorrectionRecordedPayload(
+                correction_id=UUID("00000000-0000-0000-0000-000000000009"),
+                target_event_id=target.event_id,
+                correction_kind="clarification",
+                reason_code="scope_change",
+            ),
+            expected_revision=before.revision,
+        )
+        after = service.load_snapshot(created.engagement_id)
+
+    assert result.snapshot.revision.sequence == before.revision.sequence + 1
+    assert after.events[:-1] == before.events
+    assert after.events[-1].type is EventType.JOURNAL_CORRECTION_RECORDED
+    assert after.events[-1].actor == "operator:alice"
+
+
+def test_append_journal_correction_rejects_unknown_target(
+    tmp_path, fixed_clock, fixed_uuid_factory, authorized_scope, lane
+) -> None:
+    from sedna.engagement import JournalCorrectionRecordedPayload
+
+    with engagement_service(tmp_path, fixed_clock, fixed_uuid_factory) as service:
+        created = create_orion(service, authorized_scope, lane)
+        snapshot = service.load_snapshot(created.engagement_id)
+        with pytest.raises(ValueError, match="correction_target_not_in_journal"):
+            service.append_journal_correction(
+                created.engagement_id,
+                actor="operator:alice",
+                payload=JournalCorrectionRecordedPayload(
+                    correction_id=UUID("00000000-0000-0000-0000-000000000009"),
+                    target_event_id=UUID("00000000-0000-0000-0000-000000000010"),
+                    correction_kind="retraction",
+                    reason_code="evidence_reassessment",
+                ),
+                expected_revision=snapshot.revision,
+            )
+
+
+def test_generic_append_rejects_unvalidated_correction(
+    tmp_path, fixed_clock, fixed_uuid_factory, authorized_scope, lane
+) -> None:
+    from sedna.engagement import JournalCorrectionRecordedPayload
+
+    with engagement_service(tmp_path, fixed_clock, fixed_uuid_factory) as service:
+        created = create_orion(service, authorized_scope, lane)
+        snapshot = service.load_snapshot(created.engagement_id)
+        draft = JournalEventDraft(
+            actor="operator:alice",
+            type=EventType.JOURNAL_CORRECTION_RECORDED,
+            payload=JournalCorrectionRecordedPayload(
+                correction_id=UUID("00000000-0000-0000-0000-000000000009"),
+                target_event_id=UUID("00000000-0000-0000-0000-000000000010"),
+                correction_kind="retraction",
+                reason_code="evidence_reassessment",
+            ),
+        )
+
+        with pytest.raises(ValueError, match="correction_target_not_in_journal"):
+            service.append_events(
+                created.engagement_id,
+                (draft,),
+                expected_revision=snapshot.revision,
+            )
+
+
+def test_generic_append_requires_watermark_for_correction(
+    tmp_path, fixed_clock, fixed_uuid_factory, authorized_scope, lane
+) -> None:
+    from sedna.engagement import JournalCorrectionRecordedPayload
+
+    with engagement_service(tmp_path, fixed_clock, fixed_uuid_factory) as service:
+        created = create_orion(service, authorized_scope, lane)
+        snapshot = service.load_snapshot(created.engagement_id)
+        draft = JournalEventDraft(
+            actor="operator:alice",
+            type=EventType.JOURNAL_CORRECTION_RECORDED,
+            payload=JournalCorrectionRecordedPayload(
+                correction_id=UUID("00000000-0000-0000-0000-000000000009"),
+                target_event_id=snapshot.events[0].event_id,
+                correction_kind="retraction",
+                reason_code="evidence_reassessment",
+            ),
+        )
+
+        with pytest.raises(ValueError, match="correction_expected_revision_required"):
+            service.append_events(created.engagement_id, (draft,))
+
+
+def test_duplicate_correction_target_is_rejected(
+    tmp_path, fixed_clock, fixed_uuid_factory, authorized_scope, lane
+) -> None:
+    from sedna.engagement import JournalCorrectionRecordedPayload
+
+    with engagement_service(tmp_path, fixed_clock, fixed_uuid_factory) as service:
+        created = create_orion(service, authorized_scope, lane)
+        initial = service.load_snapshot(created.engagement_id)
+        target = initial.events[0].event_id
+        service.append_journal_correction(
+            created.engagement_id,
+            actor="operator:alice",
+            payload=JournalCorrectionRecordedPayload(
+                correction_id=UUID("00000000-0000-0000-0000-000000000009"),
+                target_event_id=target,
+                target_claim_ref="outcome:credential-variant-a",
+                correction_kind="retraction",
+                reason_code="evidence_reassessment",
+            ),
+            expected_revision=initial.revision,
+        )
+        current = service.load_snapshot(created.engagement_id)
+        # Same claim on the same target: rejected.
+        with pytest.raises(ValueError, match="correction_target_already_corrected"):
+            service.append_journal_correction(
+                created.engagement_id,
+                actor="operator:alice",
+                payload=JournalCorrectionRecordedPayload(
+                    correction_id=UUID("00000000-0000-0000-0000-000000000010"),
+                    target_event_id=target,
+                    target_claim_ref="outcome:credential-variant-a",
+                    correction_kind="clarification",
+                    reason_code="operator_review",
+                ),
+                expected_revision=current.revision,
+            )
+        # A second child of the same event would branch the chain: rejected.
+        with pytest.raises(ValueError, match="correction_target_already_corrected"):
+            service.append_journal_correction(
+                created.engagement_id,
+                actor="operator:alice",
+                payload=JournalCorrectionRecordedPayload(
+                    correction_id=UUID("00000000-0000-0000-0000-000000000011"),
+                    target_event_id=target,
+                    target_claim_ref="outcome:credential-variant-b",
+                    correction_kind="clarification",
+                    reason_code="operator_review",
+                ),
+                expected_revision=current.revision,
+            )
+        # Correcting the correction keeps a linear, append-only chain.
+        correction_event_id = current.events[-1].event_id
+        service.append_journal_correction(
+            created.engagement_id,
+            actor="operator:bob",
+            payload=JournalCorrectionRecordedPayload(
+                correction_id=UUID("00000000-0000-0000-0000-000000000012"),
+                target_event_id=correction_event_id,
+                target_claim_ref="outcome:credential-variant-a",
+                correction_kind="clarification",
+                reason_code="operator_review",
+            ),
+            expected_revision=current.revision,
+        )
+        after = service.load_snapshot(created.engagement_id)
+        corrections = tuple(
+            event.payload
+            for event in after.events
+            if isinstance(event.payload, JournalCorrectionRecordedPayload)
+        )
+        assert len(corrections) == 2
+        assert corrections[-1].target_event_id == correction_event_id
+        assert corrections[-1].target_claim_ref == corrections[0].target_claim_ref
+        # Relabelling the root claim while correcting a correction is rejected.
+        latest = service.load_snapshot(created.engagement_id)
+        with pytest.raises(ValueError, match="correction_root_claim_changed"):
+            service.append_journal_correction(
+                created.engagement_id,
+                actor="operator:alice",
+                payload=JournalCorrectionRecordedPayload(
+                    correction_id=UUID("00000000-0000-0000-0000-000000000013"),
+                    target_event_id=after.events[-1].event_id,
+                    target_claim_ref="some-other-claim",
+                    correction_kind="clarification",
+                    reason_code="operator_review",
+                ),
+                expected_revision=latest.revision,
+            )
+
+
+def test_whole_event_correction_is_unique_per_target(
+    tmp_path, fixed_clock, fixed_uuid_factory, authorized_scope, lane
+) -> None:
+    from sedna.engagement import JournalCorrectionRecordedPayload
+
+    with engagement_service(tmp_path, fixed_clock, fixed_uuid_factory) as service:
+        created = create_orion(service, authorized_scope, lane)
+        initial = service.load_snapshot(created.engagement_id)
+        target = initial.events[0].event_id
+        service.append_journal_correction(
+            created.engagement_id,
+            actor="operator:alice",
+            payload=JournalCorrectionRecordedPayload(
+                correction_id=UUID("00000000-0000-0000-0000-000000000009"),
+                target_event_id=target,
+                correction_kind="supersession",
+                reason_code="operator_review",
+            ),
+            expected_revision=initial.revision,
+        )
+        current = service.load_snapshot(created.engagement_id)
+        with pytest.raises(ValueError, match="correction_target_already_corrected"):
+            service.append_journal_correction(
+                created.engagement_id,
+                actor="operator:bob",
+                payload=JournalCorrectionRecordedPayload(
+                    correction_id=UUID("00000000-0000-0000-0000-000000000010"),
+                    target_event_id=target,
+                    correction_kind="supersession",
+                    reason_code="operator_review",
+                ),
+                expected_revision=current.revision,
+            )
+
+
+def test_batch_with_duplicate_correction_targets_is_rejected(
+    tmp_path, fixed_clock, fixed_uuid_factory, authorized_scope, lane
+) -> None:
+
+    with engagement_service(tmp_path, fixed_clock, fixed_uuid_factory) as service:
+        created = create_orion(service, authorized_scope, lane)
+        snapshot = service.load_snapshot(created.engagement_id)
+        target = snapshot.events[0].event_id
+        drafts = (
+            _correction_draft(target, "00000000-0000-0000-0000-000000000109"),
+            _correction_draft(target, "00000000-0000-0000-0000-000000000110"),
+        )
+        with pytest.raises(ValueError, match="correction_target_already_corrected"):
+            service.append_events(
+                created.engagement_id, drafts, expected_revision=snapshot.revision
+            )
+
+
+def _correction_draft(
+    target, correction_id: str, claim_ref: str | None = "outcome:credential-variant-a"
+):
+    from sedna.engagement import JournalCorrectionRecordedPayload
+
+    return JournalEventDraft(
+        actor="operator:alice",
+        type=EventType.JOURNAL_CORRECTION_RECORDED,
+        payload=JournalCorrectionRecordedPayload(
+            correction_id=UUID(correction_id),
+            target_event_id=target,
+            target_claim_ref=claim_ref,
+            correction_kind="clarification",
+            reason_code="operator_review",
+        ),
+    )
+
+
 def fixture_planner_state(revision: JournalRevision) -> PlannerState:
     return PlannerState(revision=revision, strategy="enumerate")
+
+
+def test_correction_duplicate_id_is_rejected_by_facade_and_generic_append(
+    tmp_path, fixed_clock, fixed_uuid_factory, authorized_scope, lane
+) -> None:
+    from sedna.engagement import JournalCorrectionRecordedPayload
+
+    with engagement_service(tmp_path, fixed_clock, fixed_uuid_factory) as service:
+        created = create_orion(service, authorized_scope, lane)
+        initial = service.load_snapshot(created.engagement_id)
+        payload = JournalCorrectionRecordedPayload(
+            correction_id=UUID("00000000-0000-0000-0000-000000000009"),
+            target_event_id=initial.events[0].event_id,
+            correction_kind="retraction",
+            reason_code="evidence_reassessment",
+        )
+        service.append_journal_correction(
+            created.engagement_id,
+            actor="operator:alice",
+            payload=payload,
+            expected_revision=initial.revision,
+        )
+        current = service.load_snapshot(created.engagement_id)
+        with pytest.raises(ValueError, match="correction_id_already_recorded"):
+            service.append_journal_correction(
+                created.engagement_id,
+                actor="operator:alice",
+                payload=payload,
+                expected_revision=current.revision,
+            )
+        with pytest.raises(ValueError, match="correction_id_already_recorded"):
+            service.append_events(
+                created.engagement_id,
+                (
+                    JournalEventDraft(
+                        actor="operator:alice",
+                        type=EventType.JOURNAL_CORRECTION_RECORDED,
+                        payload=payload,
+                    ),
+                ),
+                expected_revision=current.revision,
+            )
+
+
+def test_stale_correction_writer_cannot_commit_after_revision_changes(
+    tmp_path, fixed_clock, fixed_uuid_factory, authorized_scope, lane
+) -> None:
+    from sedna.engagement import JournalCorrectionRecordedPayload
+
+    with engagement_service(tmp_path, fixed_clock, fixed_uuid_factory) as service:
+        created = create_orion(service, authorized_scope, lane)
+        initial = service.load_snapshot(created.engagement_id)
+        target = initial.events[0].event_id
+        service.append_journal_correction(
+            created.engagement_id,
+            actor="operator:alice",
+            payload=JournalCorrectionRecordedPayload(
+                correction_id=UUID("00000000-0000-0000-0000-000000000009"),
+                target_event_id=target,
+                target_claim_ref="outcome:credential-variant-a",
+                correction_kind="clarification",
+                reason_code="operator_review",
+            ),
+            expected_revision=initial.revision,
+        )
+        # A distinct target keeps this correction otherwise valid, so it must
+        # reach the optimistic-concurrency check and lose on the stale
+        # watermark rather than on the lineage rule.
+        other_target = initial.events[1].event_id
+        with pytest.raises(RevisionConflictError):
+            service.append_journal_correction(
+                created.engagement_id,
+                actor="operator:bob",
+                payload=JournalCorrectionRecordedPayload(
+                    correction_id=UUID("00000000-0000-0000-0000-000000000010"),
+                    target_event_id=other_target,
+                    target_claim_ref="outcome:credential-variant-b",
+                    correction_kind="clarification",
+                    reason_code="operator_review",
+                ),
+                expected_revision=initial.revision,
+            )
+
+
+def test_same_batch_duplicate_correction_id_is_rejected(
+    tmp_path, fixed_clock, fixed_uuid_factory, authorized_scope, lane
+) -> None:
+    from sedna.engagement import JournalCorrectionRecordedPayload
+
+    with engagement_service(tmp_path, fixed_clock, fixed_uuid_factory) as service:
+        created = create_orion(service, authorized_scope, lane)
+        snapshot = service.load_snapshot(created.engagement_id)
+        shared = "00000000-0000-0000-0000-000000000109"
+        drafts = tuple(
+            JournalEventDraft(
+                actor="operator:alice",
+                type=EventType.JOURNAL_CORRECTION_RECORDED,
+                payload=JournalCorrectionRecordedPayload(
+                    correction_id=UUID(shared),
+                    target_event_id=event_id,
+                    correction_kind="clarification",
+                    reason_code="operator_review",
+                ),
+            )
+            for event_id in (snapshot.events[0].event_id, snapshot.events[1].event_id)
+        )
+        with pytest.raises(ValueError, match="correction_id_already_recorded"):
+            service.append_events(
+                created.engagement_id, drafts, expected_revision=snapshot.revision
+            )
+
+
+def test_correction_event_type_is_classified_everywhere() -> None:
+    from sedna.engagement.events import EventType
+    from sedna.engagement.promotion.input import (
+        PROMOTION_IGNORED_EVENT_TYPES,
+        PROMOTION_PROJECTED_EVENT_TYPES,
+    )
+    from sedna.engagement.reducer import EVENT_LIFECYCLE_EFFECTS
+    from sedna.engagement.reporting.projector import (
+        REPORT_IGNORED_EVENT_TYPES,
+        REPORT_PROJECTED_EVENT_TYPES,
+    )
+    from sedna.engagement.service import EVENT_APPEND_OWNER_BY_TYPE
+    from sedna.planning.ledger import LEDGER_NO_OP_EVENT_TYPES
+    from sedna.planning.situation import SITUATION_NO_OP_EVENT_TYPES
+
+    target = EventType.JOURNAL_CORRECTION_RECORDED
+    assert target in EVENT_LIFECYCLE_EFFECTS
+    assert target in PROMOTION_IGNORED_EVENT_TYPES | PROMOTION_PROJECTED_EVENT_TYPES
+    assert target in REPORT_IGNORED_EVENT_TYPES | REPORT_PROJECTED_EVENT_TYPES
+    assert target in LEDGER_NO_OP_EVENT_TYPES
+    assert target in SITUATION_NO_OP_EVENT_TYPES
+    assert EVENT_APPEND_OWNER_BY_TYPE[target.value] == "caller_facade"
 
 
 @contextmanager
@@ -194,6 +590,7 @@ def test_event_append_owner_map_is_complete_and_authoritative() -> None:
         "source_suggested": "source_registry",
         "recovery_warning": "recovery_repository",
         "user_note": "caller_facade",
+        "journal_correction_recorded": "caller_facade",
         "observation_extracted": "planning_capability",
         "hypothesis_formed": "planning_capability",
         "missing_information_identified": "planning_capability",

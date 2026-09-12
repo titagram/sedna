@@ -613,6 +613,23 @@ StableRef: TypeAlias = Annotated[
 Confidence: TypeAlias = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
 
 
+class JournalCorrectionRecordedPayload(_Payload):
+    """Append-only correction of a prior journal claim/event."""
+
+    kind: Literal["journal_correction_recorded"] = "journal_correction_recorded"
+    correction_id: UUID
+    target_event_id: UUID
+    target_claim_ref: StableRef | None = None
+    correction_kind: Literal["retraction", "clarification", "supersession"]
+    reason_code: Literal[
+        "evidence_reassessment",
+        "provenance_error",
+        "scope_change",
+        "operator_review",
+        "duplicate_claim",
+    ]
+
+
 class _EventRecord(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
@@ -1946,6 +1963,7 @@ EventPayload: TypeAlias = Annotated[
     | RecoveryWarningPayload
     | UncertainCorrelationPayload
     | UserNotePayload
+    | JournalCorrectionRecordedPayload
     | ObservationExtractedEventPayload
     | HypothesisFormedEventPayload
     | MissingInformationIdentifiedEventPayload
@@ -2017,6 +2035,7 @@ class EventType(StrEnum):
     RECOVERY_WARNING = "recovery_warning"
     UNCERTAIN_CORRELATION = "uncertain_correlation"
     USER_NOTE = "user_note"
+    JOURNAL_CORRECTION_RECORDED = "journal_correction_recorded"
     OBSERVATION_EXTRACTED = "observation_extracted"
     HYPOTHESIS_FORMED = "hypothesis_formed"
     MISSING_INFORMATION_IDENTIFIED = "missing_information_identified"

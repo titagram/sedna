@@ -87,6 +87,7 @@ LEDGER_NO_OP_EVENT_TYPES = frozenset(
         EventType.RECOVERY_WARNING,
         EventType.UNCERTAIN_CORRELATION,
         EventType.USER_NOTE,
+        EventType.JOURNAL_CORRECTION_RECORDED,
         EventType.OBSERVATION_EXTRACTED,
         EventType.HYPOTHESIS_FORMED,
         EventType.MISSING_INFORMATION_IDENTIFIED,

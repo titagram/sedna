@@ -25,7 +25,9 @@ from sedna.engagement.events import (
     EngagementSnapshot,
     EngagementVerifiedPayload,
     EventPayload,
+    EventType,
     FlagRejectedPayload,
+    JournalCorrectionRecordedPayload,
     JournalEvent,
     JournalEventDraft,
     LaneBoundPayload,
@@ -108,6 +110,7 @@ EVENT_APPEND_OWNER_BY_TYPE: dict[str, str] = {
     "source_suggested": "source_registry",
     "recovery_warning": "recovery_repository",
     "user_note": "caller_facade",
+    "journal_correction_recorded": "caller_facade",
     "observation_extracted": "planning_capability",
     "hypothesis_formed": "planning_capability",
     "missing_information_identified": "planning_capability",
@@ -1179,6 +1182,32 @@ class EngagementJournalService:
             complete=complete,
         )
 
+    def append_journal_correction(
+        self,
+        engagement_id: UUID,
+        *,
+        actor: str,
+        payload: JournalCorrectionRecordedPayload,
+        expected_revision: JournalRevision,
+    ) -> EngagementMutationResult:
+        """Append an operator correction without changing the target event.
+
+        Validation (target membership, correction-id uniqueness, one
+        correction per target claim) lives in append_events so the generic
+        facade cannot bypass it.
+        """
+        draft = JournalEventDraft(
+            actor=actor,
+            type=EventType.JOURNAL_CORRECTION_RECORDED,
+            payload=payload,
+            idempotency_key=f"journal-correction:{payload.correction_id}",
+        )
+        return self.append_events(
+            engagement_id,
+            (draft,),
+            expected_revision=expected_revision,
+        )
+
     def append_events(
         self,
         engagement_id: UUID,
@@ -1189,6 +1218,48 @@ class EngagementJournalService:
         validated = tuple(
             JournalEventDraft.model_validate(item.model_dump(mode="python")) for item in drafts
         )
+        correction_payloads = tuple(
+            draft.payload
+            for draft in validated
+            if isinstance(draft.payload, JournalCorrectionRecordedPayload)
+        )
+        if correction_payloads:
+            if expected_revision is None:
+                raise ValueError("correction_expected_revision_required")
+            snapshot = self._repository.load_snapshot(engagement_id)
+            event_ids = {event.event_id for event in snapshot.events}
+            corrections_by_event: dict[UUID, JournalCorrectionRecordedPayload] = {
+                event.event_id: event.payload
+                for event in snapshot.events
+                if isinstance(event.payload, JournalCorrectionRecordedPayload)
+            }
+            correction_ids = {payload.correction_id for payload in corrections_by_event.values()}
+            # Lineage model. A claim may be corrected once, and every journal
+            # event may have at most ONE correction child. A second correction
+            # of the same root claim must therefore target the previous
+            # correction event: the chain stays linear (no branching) and the
+            # original events are never rewritten (append-only).
+            corrected_targets: set[UUID] = {
+                payload.target_event_id for payload in corrections_by_event.values()
+            }
+
+            for payload in correction_payloads:
+                target = payload.target_event_id
+                if target not in event_ids:
+                    raise ValueError("correction_target_not_in_journal")
+                if payload.correction_id in correction_ids:
+                    raise ValueError("correction_id_already_recorded")
+                if target in corrected_targets:
+                    # The target already carries a correction child: correct
+                    # that child instead of branching from the same event.
+                    raise ValueError("correction_target_already_corrected")
+                prior = corrections_by_event.get(target)
+                if prior is not None and payload.target_claim_ref != prior.target_claim_ref:
+                    # Correcting a correction must not relabel the root claim,
+                    # or a chain could be hijacked onto another claim.
+                    raise ValueError("correction_root_claim_changed")
+                correction_ids.add(payload.correction_id)
+                corrected_targets.add(target)
         for draft in validated:
             owner = EVENT_APPEND_OWNER_BY_TYPE.get(draft.type)
             if owner != "caller_facade":

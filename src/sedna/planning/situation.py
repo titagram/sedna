@@ -95,6 +95,7 @@ SITUATION_NO_OP_EVENT_TYPES = frozenset(
         EventType.RECOVERY_WARNING,
         EventType.UNCERTAIN_CORRELATION,
         EventType.USER_NOTE,
+        EventType.JOURNAL_CORRECTION_RECORDED,
         EventType.PLAN_REQUESTED,
         EventType.FRONTIER_PROPOSED,
         EventType.FRONTIER_CRITICIZED,
