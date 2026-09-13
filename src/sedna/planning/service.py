@@ -22,6 +22,7 @@ from sedna.engagement import (
     StrategyArchiveRecordDraft,
 )
 from sedna.engagement.events import (
+    AccessStateDeltaEventRecord,
     ArchivedStrategyEventRecord,
     AttemptAggregateEventRecord,
     CommandBindingEventRecord,
@@ -30,6 +31,7 @@ from sedna.engagement.events import (
     EvidenceAttachedPayload,
     EvidenceSliceEventRef,
     ExecutionVariantEventRecord,
+    ExtractedObservationEventRecord,
     FacetObservationEventRecord,
     FrontierCriticizedEventPayload,
     FrontierProposalEventRecord,
@@ -42,6 +44,7 @@ from sedna.engagement.events import (
     PrivateValueEventRecord,
     ResearchQueryProposedEventPayload,
     RetryPredicateEventRecord,
+    SecretReferenceEventRecord,
     StrategyArchivedEventPayload,
     StrategyFamilyEventRecord,
     StrategyReconciledEventPayload,
@@ -49,7 +52,7 @@ from sedna.engagement.events import (
     TextFactEventRecord,
     ToolCallCompletedPayload,
 )
-from sedna.engagement.models import PromotionSagaInProgressError
+from sedna.engagement.models import PromotionSagaInProgressError, scope_references
 from sedna.engagement.service import PlanningEventCommitItem
 from sedna.planning.belief import validate_outcome_score_transition
 from sedna.planning.commands import validate_command_suggestion
@@ -2967,7 +2970,24 @@ class PlanningService:
                 evidence_id=descriptor.reference.evidence_id,
             )
             if completion.parsed.subject != subject:
-                raise ValueError("observation_subject_mismatch")
+                # Models faithfully echo the terminal_tool_event_id named in the
+                # instructions even when they raise no terminal claim, so the
+                # authoritative subject (None) differs from the echo. Accept ONLY
+                # that exact case: the same attachment/evidence, no structured
+                # claim, and the echo naming THIS attachment's own terminal event.
+                # Every other mismatch still fails closed.
+                echoed = completion.parsed.subject
+                echo_is_own_terminal_only = (
+                    subject.terminal_tool_event_id is None
+                    and terminal_event_id is not None
+                    and echoed.terminal_tool_event_id == terminal_event_id
+                )
+                subject_matches_except_terminal = (
+                    echoed.attachment_event_id == subject.attachment_event_id
+                    and echoed.evidence_id == subject.evidence_id
+                )
+                if not (subject_matches_except_terminal and echo_is_own_terminal_only):
+                    raise ValueError("observation_subject_mismatch")
             protected_values = tuple(value for value in self._known_flag_values if value)
             public_observation_values = (
                 *(draft.text for draft in completion.parsed.observations),
@@ -3049,6 +3069,14 @@ class PlanningService:
             emitted_event_ids: list[UUID] = []
             local_bindings: list[LocalEventIdBinding] = []
             valid_snapshot_event_ids = {event.event_id for event in snapshot.events}
+            # Scope references the model may legitimately cite for an access
+            # observation: only the engagement's own authorized manifest scope.
+            valid_scope_reference_ids = tuple(
+                sorted(
+                    reference.reference_id
+                    for reference in scope_references(snapshot.manifest.initial_scope)
+                )
+            )
             for draft in grounded_drafts:
                 if not set(draft.event_ids).issubset(valid_snapshot_event_ids):
                     raise ValueError("observation_event_reference_not_in_snapshot")
@@ -3064,22 +3092,73 @@ class PlanningService:
             if len(facet_keys) != len(set(facet_keys)):
                 raise ValueError("duplicate_facet_observation")
             for index, draft in enumerate(completion.parsed.observations):
-                if draft.kind != "text":
-                    raise ValueError("unsupported_generic_observation_kind")
                 event_id = uuid5(success_event_id, f"observation:{index}")
                 local_id = f"observation-{index}"
                 emitted_event_ids.append(event_id)
                 local_bindings.append(LocalEventIdBinding(local_id=local_id, event_id=event_id))
+                if draft.kind == "text":
+                    record: ExtractedObservationEventRecord = TextFactEventRecord(
+                        subject="evidence observation",
+                        value=draft.text,
+                    )
+                elif draft.kind == "secret":
+                    # Never persist the model's text for a credential-shaped
+                    # observation: it may contain the literal secret. Only a
+                    # fixed redacted label plus the evidence slice digest are
+                    # recorded, so no credential can reach the journal.
+                    record = SecretReferenceEventRecord(
+                        secret_ref_id=f"evidence-secret:{success_event_id}:{index}",
+                        secret_kind="other",
+                        label="redacted evidence secret",
+                        value=PrivateValueEventRecord(
+                            evidence_slice=event_ref,
+                            value_sha256=event_ref.sha256,
+                        ),
+                    )
+                elif draft.kind == "facet":
+                    # A facet observation is a dimension of the observed surface.
+                    # The generic path cannot prove a typed dimension, so it is
+                    # recorded as a custom facet carrying the model's wording.
+                    record = FacetObservationEventRecord(
+                        dimension="custom",
+                        key=draft.text[:512],
+                        value=draft.text[:2048],
+                        relation="observed",
+                    )
+                elif draft.kind == "access":
+                    # An access observation is about this engagement's own
+                    # authorized scope. Bind it only when the manifest supplies
+                    # exactly one scope reference; otherwise fail closed rather
+                    # than guess which target the model meant.
+                    if len(valid_scope_reference_ids) != 1:
+                        raise ValueError("unsupported_generic_observation_kind")
+                    record = AccessStateDeltaEventRecord(
+                        scope_reference_id=valid_scope_reference_ids[0],
+                        access_kind="custom",
+                        transition="unknown",
+                        privilege_label=draft.text[:512],
+                    )
+                else:
+                    # `incompatibility` needs authoritative scope and prior-event
+                    # grounding this generic path cannot prove: fail closed.
+                    raise ValueError("unsupported_generic_observation_kind")
                 emitted_sources.append(
                     ObservationExtractedSource(
                         local_id=local_id,
-                        summary=draft.text,
-                        observation=TextFactEventRecord(
-                            subject="evidence observation",
-                            value=draft.text,
+                        # A secret observation keeps a redacted summary so the
+                        # model's raw (possibly credential-bearing) text is never
+                        # journaled; other kinds keep the grounded wording.
+                        summary=(
+                            "redacted evidence secret"
+                            if draft.kind == "secret"
+                            else draft.text
                         ),
+                        observation=record,
                         confidence=1.0,
                         evidence_slices=(event_ref,),
+                        scope_reference_ids=(
+                            (valid_scope_reference_ids[0],) if draft.kind == "access" else ()
+                        ),
                     )
                 )
             synthesized_facet_observations: list[ObservationDraft] = []
@@ -3268,6 +3347,9 @@ class PlanningService:
                 ),
                 local_event_bindings=bindings,
                 valid_event_ids=tuple(sorted(conversion_event_ids, key=str)),
+                # Scope references the batch may legitimately cite: the
+                # engagement's own authoritative authorized scope only.
+                valid_scope_reference_ids=valid_scope_reference_ids,
                 valid_evidence_ids=(descriptor.reference.evidence_id,),
                 valid_proof_indexes=tuple(
                     sorted(

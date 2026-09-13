@@ -29,6 +29,7 @@ from sedna.engagement.events import (
 )
 from sedna.planning.belief import project_hypothesis_beliefs
 from sedna.planning.models import (
+    MAX_SITUATION_ITEMS,
     AccessState,
     AttemptSummary,
     EvidenceInterpretationState,
@@ -687,8 +688,8 @@ class SituationReducer:
         hypothesis_beliefs = project_hypothesis_beliefs(tuple(hypotheses), validated.events)
         material_state = {
             "objective_progress": objective_progress.model_dump(mode="json"),
-            "facts": [fact.model_dump(mode="json") for fact in facts],
-            "facets": [facet.model_dump(mode="json") for facet in facets],
+            "facts": [fact.model_dump(mode="json") for fact in facts[-MAX_SITUATION_ITEMS:]],
+            "facets": [facet.model_dump(mode="json") for facet in facets[-MAX_SITUATION_ITEMS:]],
             "hypotheses": [item.model_dump(mode="json") for item in hypotheses],
             "hypothesis_beliefs": [item.model_dump(mode="json") for item in hypothesis_beliefs],
             "unresolved_information": [
@@ -707,8 +708,11 @@ class SituationReducer:
             material_event_revision=material_event_revision,
             state_digest=sha256(_canonical_bytes(material_state)).hexdigest(),
             objective_progress=objective_progress,
-            facts=tuple(facts),
-            facets=tuple(facets),
+            # Retention is bounded by the projection schema; the journal remains
+            # the complete record. Keep the MOST RECENT items so the planner still
+            # sees current knowledge instead of failing on tuple overflow.
+            facts=tuple(facts[-MAX_SITUATION_ITEMS:]),
+            facets=tuple(facets[-MAX_SITUATION_ITEMS:]),
             hypotheses=tuple(hypotheses),
             hypothesis_beliefs=hypothesis_beliefs,
             unresolved_information=tuple(unresolved_information),

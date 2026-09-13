@@ -626,18 +626,35 @@ def _source_is_represented_by_authoritative_model(
     if isinstance(conversion, ObservationEventConversion):
         batch = conversion.batch
         if isinstance(source, ObservationExtractedSource):
-            return any(
-                draft.text == source.summary
-                and draft.kind
-                == {
-                    "text_fact": "text",
-                    "facet": "facet",
-                    "access_state_delta": "access",
-                    "secret_reference": "secret",
-                    "incompatibility": "incompatibility",
-                }[source.observation.record_kind]
-                for draft in batch.observations
-            )
+            redacted_label = source.summary
+            for draft in batch.observations:
+                if (
+                    draft.kind
+                    != {
+                        "text_fact": "text",
+                        "facet": "facet",
+                        "access_state_delta": "access",
+                        "secret_reference": "secret",
+                        "incompatibility": "incompatibility",
+                    }[source.observation.record_kind]
+                ):
+                    continue
+                if source.observation.record_kind == "secret_reference":
+                    # A secret observation deliberately replaces the model's text
+                    # with a redacted summary, so text cannot be compared. Bind it
+                    # by EXACT evidence: this conversion is scoped to a single
+                    # attached evidence, so the record's evidence must be that very
+                    # evidence. An unrelated secret draft (grounded in any other
+                    # evidence) cannot represent this source.
+                    secret_evidence_id = source.observation.value.evidence_slice.evidence_id
+                    if (
+                        len(conversion.valid_evidence_ids) == 1
+                        and secret_evidence_id == conversion.valid_evidence_ids[0]
+                    ):
+                        return True
+                elif draft.text == redacted_label:
+                    return True
+            return False
         if isinstance(source, HypothesisFormedSource):
             return any(
                 draft.text == source.statement

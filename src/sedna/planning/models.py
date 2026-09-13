@@ -49,6 +49,10 @@ MAX_PLANNING_RESULT_BYTES = MAX_HOST_RESULT_BYTES - 16 * 1024
 EVIDENCE_SLICE_BYTES = 32 * 1024
 MAX_EVIDENCE_SLICES_PER_SETTLEMENT = 64
 MAX_SITUATION_INTERPRETATIONS = 100_000
+# Bounded retention for the projected situation tuples (facts/facets). The
+# journal keeps every observation; the projection retains the most recent so a
+# long engagement cannot overflow the schema and stall the planner.
+MAX_SITUATION_ITEMS = 64
 MAX_EVIDENCE_BYTES_PER_SETTLEMENT = 2 * 1024 * 1024
 
 
