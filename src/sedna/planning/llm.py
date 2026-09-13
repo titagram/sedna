@@ -17,6 +17,7 @@ from sedna.planning.models import (
     MAX_PLANNER_REQUEST_BYTES,
     MAX_RECENT_EVENT_TEXT_BYTES,
     EvidenceId,
+    FacetObservationDraft,
     MediaType,
     ObservationBatchDraft,
     PlannerCriticVerdict,
@@ -173,6 +174,53 @@ _CALL_CONTRACTS: Mapping[str, tuple[type[_PlanningRequest], type[BaseModel]]] = 
 }
 
 
+# The observer can report a field whose value IS the empty string (for example
+# `lint.output`). Such a facet is omitted rather than rewritten, matching
+# OBSERVATION_PROMPT version 3: the fact stays in the text observation, and no
+# invented value can be confused with a genuine source value.
+def _normalise_observation_facets(response_data: object, model_type: type[BaseModel]) -> object:
+    """Omit facets whose value is genuinely empty — after structural validation.
+
+    The observer legitimately emits ``{"key": "lint.output", "value": ""}``:
+    for that field the value literally is the empty string. The shared
+    ``FacetObservationDraft`` schema requires ``min_length=1``, so validating
+    such a response raised and the adapter collapsed it into a generic
+    ``invalid_structured_response`` — stalling settlement on whichever batch
+    first contained one.
+
+    The empty facet is OMITTED rather than rewritten to a marker string: a
+    marker would be indistinguishable from a genuine source value of that same
+    string, which would make the observed fact ambiguous. Omitting it matches
+    ``OBSERVATION_PROMPT`` (version 3), which instructs the observer to keep
+    "the field was present and empty" in the text observation instead.
+
+    Crucially this is NOT a bypass: before an empty facet is dropped, its whole
+    structure is validated against the real schema with only the ``value`` field
+    relaxed, so an empty-valued facet with a missing key, malformed event
+    references or forbidden extra fields still fails closed. Only a
+    structurally valid facet whose value is exactly the empty string is
+    affected; every other facet is passed through untouched.
+    """
+    if model_type is not ObservationBatchDraft or not isinstance(response_data, dict):
+        return response_data
+    facets = response_data.get("facets")
+    if not isinstance(facets, list):
+        return response_data
+    retained: list[object] = []
+    for facet in facets:
+        if isinstance(facet, dict) and facet.get("value") == "":
+            # Prove everything except the empty value is well-formed.
+            candidate = {key: value for key, value in facet.items() if key != "value"}
+            FacetObservationDraft.model_validate(
+                {**candidate, "value": " "},
+            )
+            continue
+        retained.append(facet)
+    if len(retained) == len(facets):
+        return response_data
+    return {**response_data, "facets": retained}
+
+
 class PlanningLlmAdapter:
     """Validate planning completions without provider/model routing overrides."""
 
@@ -246,9 +294,15 @@ class PlanningLlmAdapter:
                 else parsed_response
             )
             response_json = json.dumps(response_data, allow_nan=False)
-            if len(response_json.encode("utf-8")) > MAX_PLANNER_RESPONSE_BYTES:
+            # Normalise before the single authoritative size check, so the limit
+            # is enforced on exactly the object that is validated.
+            normalised_json = json.dumps(
+                _normalise_observation_facets(json.loads(response_json), model_type),
+                allow_nan=False,
+            )
+            if len(normalised_json.encode("utf-8")) > MAX_PLANNER_RESPONSE_BYTES:
                 raise PlanningLlmError("planner_output_too_large")
-            parsed = model_type.model_validate(json.loads(response_json))
+            parsed = model_type.model_validate(json.loads(normalised_json))
             usage = StructuredUsage.model_validate(host_result.usage)
             attribution = _HostAttribution(
                 provider=host_result.provider,

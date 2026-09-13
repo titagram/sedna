@@ -203,11 +203,7 @@ def test_secret_representation_requires_the_referenced_evidence_slice():
     other_id = "evidence-sha256-" + "b" * 64
     conversion = ObservationEventConversion(
         batch=ObservationBatchDraft(
-            observations=(
-                ObservationDraft(
-                    kind="secret", text="x", event_ids=(UUID(int=1),)
-                ),
-            )
+            observations=(ObservationDraft(kind="secret", text="x", event_ids=(UUID(int=1),)),)
         ),
         call_metadata=_call_metadata(),
         interpretation_audits=(),
@@ -296,6 +292,120 @@ def test_facet_representation_requires_exact_text_match():
     )
 
     assert not _source_is_represented_by_authoritative_model(source, conversion)
+
+
+def test_empty_facet_observation_settles_end_to_end(tmp_path):
+    """The empty-facet case must survive real settlement, not just parsing.
+
+    Proves the whole path: adapter normalisation -> service validation ->
+    grounding/representation checks -> committed journal events.
+    """
+    from types import SimpleNamespace
+
+    from sedna.engagement import EventType
+
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        _single_attachment_journal(journal, current_manifest, current_lane)
+
+        class _RawHost:
+            """Returns a raw dict, exactly like the real codex host."""
+
+            def complete_structured(self, **kwargs):  # noqa: ANN003
+                import json as _json
+
+                payload = _json.loads(kwargs["input"][0]["text"])
+                slice_ = payload["evidence_slices"][0]
+                return SimpleNamespace(
+                    parsed={
+                        "subject": {
+                            "attachment_event_id": slice_["event_id"],
+                            "evidence_id": slice_["evidence_id"],
+                            "terminal_tool_event_id": None,
+                        },
+                        "observations": [
+                            {
+                                "kind": "text",
+                                "text": "lint status ok with empty output",
+                                "event_ids": [slice_["event_id"]],
+                            }
+                        ],
+                        "facets": [
+                            {
+                                "key": "lint.output",
+                                "value": "",
+                                "event_ids": [slice_["event_id"]],
+                            },
+                            {
+                                "key": "exit_code",
+                                "value": "0",
+                                "event_ids": [slice_["event_id"]],
+                            },
+                        ],
+                    },
+                    provider="test-provider",
+                    model="test-model",
+                    agent_id="test-agent",
+                    usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+                )
+
+        class _EmptyFacetLlm(EmptyObservationLlm):
+            """Routes through the real adapter so normalisation is exercised."""
+
+            def __init__(self) -> None:
+                super().__init__(
+                    InterpretationSubject(
+                        attachment_event_id=UUID(int=0),
+                        evidence_id="evidence-sha256-" + "0" * 64,
+                    )
+                )
+                from sedna.planning.llm import PlanningLlmAdapter
+
+                self._adapter = PlanningLlmAdapter(_RawHost())
+
+            def complete(self, model_type, **kwargs):  # noqa: ANN003
+                return self._adapter.complete(
+                    model_type,
+                    instructions=kwargs["instructions"],
+                    payload=kwargs["payload"],
+                    purpose=kwargs["purpose"],
+                )
+
+        result = PlanningService(
+            journal=journal,
+            llm=_EmptyFacetLlm(),
+            clock=lambda: FIXED_TIME,
+        ).settle_pending_evidence(current_manifest.engagement_id, reason="plan")
+
+        raw = _journal_raw(journal, current_manifest.engagement_id)
+
+    assert result.status == "settled", result
+    # The text fact and the non-empty facet are recorded; the empty facet is not.
+    assert "lint status ok with empty output" in raw
+    assert "exit_code" in raw
+    assert "lint.output" not in raw
+    _ = EventType  # imported for symmetry with the other safety tests
+
+
+def test_missing_subject_fails_closed_without_crashing(tmp_path):
+    """A None subject is a contract violation, not an echo.
+
+    Regression: the echo-acceptance branch dereferenced ``echoed`` before
+    checking for None, so a response with ``subject: null`` crashed settlement
+    with AttributeError instead of a clean, fail-closed rejection.
+    """
+    current_manifest = manifest()
+    current_lane = lane()
+    with journal_service(tmp_path) as journal:
+        _single_attachment_journal(journal, current_manifest, current_lane)
+        llm = EmptyObservationLlm(None)
+        result = PlanningService(
+            journal=journal, llm=llm, clock=lambda: FIXED_TIME
+        ).settle_pending_evidence(current_manifest.engagement_id, reason="plan")
+
+    assert result.status == "failed", result
+    assert result.failure_code == "invalid_extractor_output"
 
 
 def test_incompatibility_observation_fails_closed(tmp_path):

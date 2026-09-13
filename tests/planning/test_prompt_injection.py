@@ -68,7 +68,7 @@ def test_planning_prompts_have_independent_ids_and_versions() -> None:
         PLANNER_PROMPT_VERSION,
         PLANNER_CRITIC_PROMPT_VERSION,
         PLANNER_REPAIR_PROMPT_VERSION,
-    ) == ("2", "2", "1", "1")
+    ) == ("3", "2", "1", "1")
 
 
 def test_hostile_evidence_is_serialized_only_in_json_input() -> None:

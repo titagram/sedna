@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from hashlib import sha256
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -87,6 +88,262 @@ def _observation_request() -> object:
             ),
         )
     )
+
+
+def test_empty_facet_value_is_omitted_not_rejected() -> None:
+    """A tool-result facet whose value IS the empty string must not fail settle.
+
+    Regression: the observer legitimately reports
+    ``{"key": "lint.output", "value": ""}`` because for that field the value
+    literally is empty. ``FacetObservationDraft.value`` requires min_length=1,
+    so ``model_validate`` raised and the adapter reported the generic
+    ``invalid_structured_response``, stalling settlement non-deterministically
+    on whichever batch first contained such a facet.
+
+    The empty facet is omitted (matching the version-3 observation prompt, which
+    keeps the fact in the text observation); the observed text is untouched.
+    """
+    from sedna.planning.llm import PlanningLlmAdapter
+    from sedna.planning.models import ObservationBatchDraft
+
+    result = SimpleNamespace(
+        parsed={
+            "subject": {
+                "attachment_event_id": "00000000-0000-0000-0000-000000000001",
+                "evidence_id": "evidence-sha256-" + "a" * 64,
+                "terminal_tool_event_id": None,
+            },
+            "observations": [
+                {
+                    "kind": "text",
+                    "text": "lint status ok with empty output",
+                    "event_ids": ["00000000-0000-0000-0000-000000000001"],
+                }
+            ],
+            "facets": [
+                {
+                    "key": "lint.output",
+                    "value": "",
+                    "event_ids": ["00000000-0000-0000-0000-000000000001"],
+                }
+            ],
+        },
+        provider="host-provider",
+        model="host-model",
+        agent_id="default",
+        usage=_Usage(),
+    )
+    adapter = PlanningLlmAdapter(_RecordingHost(result))
+
+    completed = adapter.complete(
+        ObservationBatchDraft,
+        instructions="observe",
+        payload=_observation_request(),
+        purpose="sedna.planning.observe",
+    )
+
+    assert completed.parsed.facets == ()
+    # The fact itself is still captured by the text observation.
+    assert completed.parsed.observations[0].text == "lint status ok with empty output"
+
+
+def test_empty_facet_omission_leaves_other_facets_intact() -> None:
+    """Only the empty-valued facet is dropped; the rest survive unchanged."""
+    from sedna.planning.llm import PlanningLlmAdapter
+    from sedna.planning.models import ObservationBatchDraft
+
+    result = SimpleNamespace(
+        parsed={
+            "subject": {
+                "attachment_event_id": "00000000-0000-0000-0000-000000000001",
+                "evidence_id": "evidence-sha256-" + "a" * 64,
+                "terminal_tool_event_id": None,
+            },
+            "observations": [],
+            "facets": [
+                {
+                    "key": "exit_code",
+                    "value": "0",
+                    "event_ids": ["00000000-0000-0000-0000-000000000001"],
+                },
+                {
+                    "key": "lint.output",
+                    "value": "",
+                    "event_ids": ["00000000-0000-0000-0000-000000000001"],
+                },
+                {
+                    "key": "target",
+                    "value": "10.0.0.1",
+                    "event_ids": ["00000000-0000-0000-0000-000000000001"],
+                },
+            ],
+        },
+        provider="host-provider",
+        model="host-model",
+        agent_id="default",
+        usage=_Usage(),
+    )
+    adapter = PlanningLlmAdapter(_RecordingHost(result))
+
+    completed = adapter.complete(
+        ObservationBatchDraft,
+        instructions="observe",
+        payload=_observation_request(),
+        purpose="sedna.planning.observe",
+    )
+
+    assert [(f.key, f.value) for f in completed.parsed.facets] == [
+        ("exit_code", "0"),
+        ("target", "10.0.0.1"),
+    ]
+
+
+def test_non_empty_facet_value_is_untouched() -> None:
+    """A whitespace/zero value is NOT empty and must never be dropped."""
+    from sedna.planning.llm import PlanningLlmAdapter
+    from sedna.planning.models import ObservationBatchDraft
+
+    result = SimpleNamespace(
+        parsed={
+            "subject": {
+                "attachment_event_id": "00000000-0000-0000-0000-000000000001",
+                "evidence_id": "evidence-sha256-" + "a" * 64,
+                "terminal_tool_event_id": None,
+            },
+            "observations": [],
+            "facets": [
+                {
+                    "key": "output",
+                    "value": " ",
+                    "event_ids": ["00000000-0000-0000-0000-000000000001"],
+                },
+                {
+                    "key": "flag",
+                    "value": "false",
+                    "event_ids": ["00000000-0000-0000-0000-000000000001"],
+                },
+            ],
+        },
+        provider="host-provider",
+        model="host-model",
+        agent_id="default",
+        usage=_Usage(),
+    )
+    adapter = PlanningLlmAdapter(_RecordingHost(result))
+
+    completed = adapter.complete(
+        ObservationBatchDraft,
+        instructions="observe",
+        payload=_observation_request(),
+        purpose="sedna.planning.observe",
+    )
+
+    assert [(f.key, f.value) for f in completed.parsed.facets] == [
+        ("output", " "),
+        ("flag", "false"),
+    ]
+
+
+def test_empty_facet_with_invalid_event_ids_still_fails_closed() -> None:
+    """An empty value must NOT be a bypass for a malformed facet.
+
+    Regression guard for a fail-open: omitting an empty-valued facet before any
+    validation would let a facet with malformed event references skip the
+    contract entirely. Every non-value field must still validate.
+    """
+    from sedna.planning.llm import PlanningLlmAdapter, PlanningLlmError
+    from sedna.planning.models import ObservationBatchDraft
+
+    for malformed in (
+        # event_ids missing entirely
+        {"key": "lint.output", "value": ""},
+        # event_ids empty
+        {"key": "lint.output", "value": "", "event_ids": []},
+        # event_ids not valid UUIDs
+        {"key": "lint.output", "value": "", "event_ids": ["not-a-uuid"]},
+        # key missing
+        {"value": "", "event_ids": ["00000000-0000-0000-0000-000000000001"]},
+        # key empty
+        {"key": "", "value": "", "event_ids": ["00000000-0000-0000-0000-000000000001"]},
+        # forbidden extra field
+        {
+            "key": "lint.output",
+            "value": "",
+            "event_ids": ["00000000-0000-0000-0000-000000000001"],
+            "injected": True,
+        },
+    ):
+        result = SimpleNamespace(
+            parsed={
+                "subject": {
+                    "attachment_event_id": "00000000-0000-0000-0000-000000000001",
+                    "evidence_id": "evidence-sha256-" + "a" * 64,
+                    "terminal_tool_event_id": None,
+                },
+                "observations": [],
+                "facets": [malformed],
+            },
+            provider="host-provider",
+            model="host-model",
+            agent_id="default",
+            usage=_Usage(),
+        )
+        with pytest.raises(PlanningLlmError) as caught:
+            PlanningLlmAdapter(_RecordingHost(result)).complete(
+                ObservationBatchDraft,
+                instructions="observe",
+                payload=_observation_request(),
+                purpose="sedna.planning.observe",
+            )
+        # Assert the exact code, not merely "some planning error": a malformed
+        # facet must be reported as a rejected host response.
+        assert caught.value.reason_code == "invalid_structured_response"
+
+
+def test_planner_response_is_not_normalised() -> None:
+    """Normalisation must apply only to the observation contract."""
+    from sedna.planning.llm import (
+        PlannerKnowledgeContext,
+        PlannerRequest,
+        PlanningLlmAdapter,
+        PlanningLlmError,
+    )
+    from sedna.planning.models import PlannerDraft, StrategyLedger
+
+    situation = _situation()
+    request = PlannerRequest(
+        situation=situation,
+        ledger=StrategyLedger(),
+        knowledge_context=PlannerKnowledgeContext(
+            canonical_revision="a" * 64,
+            situation_digest=situation.state_digest,
+            material_event_revision=situation.material_event_revision,
+            source_registry_digest="b" * 64,
+            context_digest="c" * 64,
+        ),
+        scope_references=(),
+        recent_event_ids=(),
+        max_proposals=5,
+    )
+    # A payload with an unknown/invalid planner shape must still be rejected,
+    # proving normalisation is scoped to ObservationBatchDraft only.
+    host = _RecordingHost(
+        SimpleNamespace(
+            parsed={"facets": [{"key": "k", "value": "", "event_ids": []}]},
+            provider="host-provider",
+            model="host-model",
+            agent_id="default",
+            usage=_Usage(),
+        )
+    )
+
+    with pytest.raises(PlanningLlmError):
+        PlanningLlmAdapter(host).complete(
+            PlannerDraft,
+            instructions="plan",
+            payload=request,
+            purpose="sedna.planning.plan",
+        )
 
 
 def test_adapter_rejects_malformed_host_attribution() -> None:

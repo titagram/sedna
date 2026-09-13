@@ -2975,14 +2975,16 @@ class PlanningService:
                 # authoritative subject (None) differs from the echo. Accept ONLY
                 # that exact case: the same attachment/evidence, no structured
                 # claim, and the echo naming THIS attachment's own terminal event.
-                # Every other mismatch still fails closed.
+                # A missing subject is a genuine contract violation, not an echo,
+                # and must fail closed rather than be dereferenced.
                 echoed = completion.parsed.subject
                 echo_is_own_terminal_only = (
-                    subject.terminal_tool_event_id is None
+                    echoed is not None
+                    and subject.terminal_tool_event_id is None
                     and terminal_event_id is not None
                     and echoed.terminal_tool_event_id == terminal_event_id
                 )
-                subject_matches_except_terminal = (
+                subject_matches_except_terminal = echoed is not None and (
                     echoed.attachment_event_id == subject.attachment_event_id
                     and echoed.evidence_id == subject.evidence_id
                 )
@@ -3149,9 +3151,7 @@ class PlanningService:
                         # model's raw (possibly credential-bearing) text is never
                         # journaled; other kinds keep the grounded wording.
                         summary=(
-                            "redacted evidence secret"
-                            if draft.kind == "secret"
-                            else draft.text
+                            "redacted evidence secret" if draft.kind == "secret" else draft.text
                         ),
                         observation=record,
                         confidence=1.0,
