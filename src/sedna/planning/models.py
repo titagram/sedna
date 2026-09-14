@@ -248,6 +248,13 @@ class SituationProjection(BaseModel):
         tuple[EvidenceInterpretationState, ...], Field(max_length=MAX_SITUATION_INTERPRETATIONS)
     ] = ()
     secret_references: Annotated[tuple[SecretReference, ...], Field(max_length=64)] = ()
+    available_credentials: Annotated[tuple[AvailableCredential, ...], Field(max_length=64)] = ()
+    """Credential labels a command binding may cite.
+
+    Populated from ``secret_references`` by the situation reducer. It exists so the
+    planner is told which labels are valid: a credential_ref binding must name one
+    of these, and previously the planner was given no way to discover them.
+    """
     attempts: Annotated[tuple[AttemptSummary, ...], Field(max_length=64)] = ()
     incompatibilities: Annotated[tuple[Incompatibility, ...], Field(max_length=64)] = ()
 
@@ -1467,6 +1474,19 @@ class SecretReference(_DerivedSituationRecord):
         ):
             raise ValueError("secret_reference_range_must_be_positive")
         return self
+
+
+class AvailableCredential(_DerivedSituationRecord):
+    """A credential the planner may cite in a command binding.
+
+    Only the label and kind are exposed, never the value. A binding's
+    reference_id must equal a label from ``CurrentSituation.secret_references``,
+    and without this view the planner had no way to learn which labels exist, so
+    it could not write a valid credential binding at all.
+    """
+
+    label: ShortText
+    secret_kind: Annotated[str, Field(min_length=1, max_length=128)] = "other"
 
 
 class AttemptSummary(_DerivedSituationRecord):

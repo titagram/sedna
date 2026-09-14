@@ -180,6 +180,28 @@ class _JournalAppendError(Exception):
     pass
 
 
+# Violations that are NOT wording problems: planning must write nothing at all
+# when grounding is unsupported, so they keep raising. Routing them into repair
+# would let an unsupported proposal be reworded into acceptance.
+_UNREPAIRABLE_PLANNER_VIOLATIONS = (
+    "zero_score_terminal_not_grounded",
+    "terminal_strategy_requires_cited_event",
+    "changed_score_requires_cited_event",
+    "changed_score_requires_explanation",
+    # Reference-integrity violations: a fabricated citation must fail closed with
+    # nothing journaled, never be reworded into acceptance by the repair pass.
+    "planner_invented_event_reference",
+    "planner_invented_knowledge_reference",
+    "planner_out_of_scope_reference",
+)
+
+
+def _is_unrepairable_planner_violation(exc: BaseException) -> bool:
+    """True when the violation must abort planning rather than be repaired."""
+    text = str(exc)
+    return any(code in text for code in _UNREPAIRABLE_PLANNER_VIOLATIONS)
+
+
 class _PlanningLlmUnavailableError(RuntimeError):
     """Internal boundary marker for planner-host failures only."""
 
@@ -329,6 +351,128 @@ class PlanningService:
             local_id="planning-gap",
             request_id=request_id,
             code="llm_unavailable",
+            summary=gap.summary,
+            retryable=True,
+            situation_digest=situation.state_digest,
+            ledger_digest=replay.ledger_sha256,
+        )
+        conversion = PlanningAttemptEventConversion(
+            local_event_bindings=(
+                LocalEventIdBinding(local_id="planning-gap", event_id=gap_event_id),
+            ),
+            # llm_unavailable gap carries no payload-level event references
+            # beyond its own bindings, so a batch-scoped index suffices.
+            valid_event_ids=(gap_event_id,),
+            # The conversion index is bounded by the contract (512 items). This
+            # path only needs to authorise the references the gap payload may
+            # carry, so it is capped rather than built from the whole journal:
+            # a settled engagement accumulates well over 512 evidence slices and
+            # an unbounded tuple made the error path itself fail with
+            # "Tuple should have at most 512 items after validation, not 579".
+            valid_evidence_ids=tuple(
+                sorted(
+                    {
+                        event.payload.evidence.evidence_id
+                        for event in snapshot.events
+                        if isinstance(event.payload, EvidenceAttachedPayload)
+                    }
+                )
+            )[:MAX_CONVERSION_INDEX_ITEMS],
+            valid_family_ids=reconciliation.input_family_ids,
+            valid_variant_ids=reconciliation.input_variant_ids,
+            sources=(source,),
+            reconciliation=reconciliation,
+            call_metadata=metadata,
+            planning_gaps=(gap,),
+        )
+        payload = payloads_from_planning_attempt(conversion)[0]
+        committed = self._commit_planning_events(
+            engagement_id,
+            (
+                PlanningEventCommitItem(
+                    event_id=gap_event_id,
+                    idempotency_key=f"planning:{request_id}:llm-unavailable",
+                    payload=payload,
+                ),
+            ),
+            operation_id=request_id,
+            expected_revision=snapshot.revision,
+        )
+        return PlanningResult(
+            status="gap",
+            engagement_id=engagement_id,
+            current_authoritative_journal_revision=committed.snapshot.revision,
+            gap=gap,
+        )
+
+    def _publish_invalid_draft_gap(self, lane: ExecutionLaneKey, reason: str) -> PlanningResult:
+        """Record a retryable gap when a draft stays structurally invalid.
+
+        A structural violation that survives repair is an exhausted attempt, not a
+        fatal error: the attempt must be auditable instead of vanishing into an
+        uncaught exception (which is what used to happen).
+        """
+        resolution = self._journal.resolve_lane_binding(lane)
+        if resolution.mode != "exact" or resolution.engagement_id is None:
+            raise ValueError("engagement_binding_required") from None
+        engagement_id = resolution.engagement_id
+        snapshot = self._journal.load_snapshot(engagement_id)
+        situation = SituationReducer.rebuild(snapshot)
+        replay = StrategyLedgerReducer.rebuild_state(snapshot)
+        input_digest = sha256(
+            json.dumps(
+                {
+                    "lane_key": lane.stable_key,
+                    "revision": snapshot.revision.model_dump(mode="json"),
+                    "situation_digest": situation.state_digest,
+                    "reason": reason,
+                    "ledger_digest": replay.ledger_sha256,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        request_id = uuid5(NAMESPACE_URL, f"sedna:invalid-draft:{input_digest}")
+        gap_event_id = uuid5(request_id, "planning-gap")
+        gap = PlanningGap(
+            request_id=request_id,
+            code="invalid_planner_output",
+            summary=("The planner draft stayed structurally invalid: " + reason)[:2048],
+            retryable=True,
+            situation_digest=situation.state_digest,
+            ledger_digest=replay.ledger_sha256,
+        )
+        metadata = PlanningCallMetadata(
+            purpose="plan",
+            provider="unavailable",
+            model="unavailable",
+            agent_id="planning-service",
+            prompt_id=PLANNER_PROMPT_ID,
+            prompt_version=PLANNER_PROMPT_VERSION,
+            response_schema_version="1",
+            input_digest=input_digest,
+            input_tokens=0,
+            output_tokens=0,
+            elapsed_ms=0,
+        )
+        reconciliation = StrategyReconciliation(
+            input_family_ids=tuple(
+                sorted((item.family_id for item in replay.ledger.families), key=str)
+            ),
+            input_variant_ids=tuple(
+                sorted((item.variant_id for item in replay.ledger.variants), key=str)
+            ),
+            retained_family_ids=tuple(
+                sorted((item.family_id for item in replay.ledger.families), key=str)
+            ),
+            retained_variant_ids=tuple(
+                sorted((item.variant_id for item in replay.ledger.variants), key=str)
+            ),
+        )
+        source = PlanningGapRecordedSource(
+            local_id="planning-gap",
+            request_id=request_id,
+            code="invalid_planner_output",
             summary=gap.summary,
             retryable=True,
             situation_digest=situation.state_digest,
@@ -573,16 +717,33 @@ class PlanningService:
         planned = plan_completion.parsed
         if len(planned.proposals) > max_proposals:
             raise ValueError("planner_exceeded_max_proposals")
-        self._validate_planner_draft(
-            planned,
-            valid_event_ids=valid_event_ids,
-            events_by_id={event.event_id: event for event in snapshot.events},
-            valid_scope_ids=valid_scope_ids,
-            valid_knowledge_ids=valid_knowledge_ids,
-            scope_references=snapshot.state.scope_references,
-            secret_references=situation.secret_references,
-            execution_examples=knowledge_context.execution_examples,
-        )
+        planner_draft_invalid: PlannerCriticVerdict | None = None
+        try:
+            self._validate_planner_draft(
+                planned,
+                valid_event_ids=valid_event_ids,
+                events_by_id={event.event_id: event for event in snapshot.events},
+                valid_scope_ids=valid_scope_ids,
+                valid_knowledge_ids=valid_knowledge_ids,
+                scope_references=snapshot.state.scope_references,
+                secret_references=situation.secret_references,
+                execution_examples=knowledge_context.execution_examples,
+            )
+        except ValueError as exc:
+            if _is_unrepairable_planner_violation(exc):
+                raise
+            planner_draft_invalid = PlannerCriticVerdict(
+                accepted=False,
+                findings=(
+                    PlannerFinding(
+                        code="planner_draft_invalid",
+                        summary=(
+                            f"The draft violates a structural contract and must be repaired: {exc}"
+                        ),
+                        material=True,
+                    ),
+                ),
+            )
         critic_completion = self._complete_planning(
             PlannerCriticVerdict,
             instructions=PLANNER_CRITIC_PROMPT,
@@ -590,6 +751,8 @@ class PlanningService:
             purpose="sedna.planning.critic",
         )
         verdict = critic_completion.parsed
+        if planner_draft_invalid is not None:
+            verdict = planner_draft_invalid
         initial_verdict = verdict
         repaired_once = False
         repair_completion = None
@@ -676,25 +839,37 @@ class PlanningService:
                 initial_verdict = verdict
         if not verdict.accepted:
             repaired_once = True
-            repair_completion = self._complete_planning(
-                PlannerDraft,
-                instructions=PLANNER_REPAIR_PROMPT,
-                payload=PlannerRepairRequest(draft=planned, critic=verdict),
-                purpose="sedna.planning.repair",
-            )
+            try:
+                repair_completion = self._complete_planning(
+                    PlannerDraft,
+                    instructions=PLANNER_REPAIR_PROMPT,
+                    payload=PlannerRepairRequest(draft=planned, critic=verdict),
+                    purpose="sedna.planning.repair",
+                )
+            except PlanningLlmError as exc:
+                # A failed repair call is an exhausted attempt, not a fatal error:
+                # recording it keeps the attempt auditable instead of losing it.
+                return self._publish_invalid_draft_gap(lane, f"repair_failed: {exc}")
             repaired = repair_completion.parsed
             if len(repaired.proposals) > max_proposals:
                 raise ValueError("planner_exceeded_max_proposals")
-            self._validate_planner_draft(
-                repaired,
-                valid_event_ids=valid_event_ids,
-                events_by_id={event.event_id: event for event in snapshot.events},
-                valid_scope_ids=valid_scope_ids,
-                valid_knowledge_ids=valid_knowledge_ids,
-                scope_references=snapshot.state.scope_references,
-                secret_references=situation.secret_references,
-                execution_examples=knowledge_context.execution_examples,
-            )
+            try:
+                self._validate_planner_draft(
+                    repaired,
+                    valid_event_ids=valid_event_ids,
+                    events_by_id={event.event_id: event for event in snapshot.events},
+                    valid_scope_ids=valid_scope_ids,
+                    valid_knowledge_ids=valid_knowledge_ids,
+                    scope_references=snapshot.state.scope_references,
+                    secret_references=situation.secret_references,
+                    execution_examples=knowledge_context.execution_examples,
+                )
+            except ValueError as exc:
+                if _is_unrepairable_planner_violation(exc):
+                    raise
+                # Repair did not resolve the structural violation: record the
+                # reasoned outcome rather than deleting the attempt.
+                return self._publish_invalid_draft_gap(lane, str(exc))
             critic_completion = self._complete_planning(
                 PlannerCriticVerdict,
                 instructions=PLANNER_CRITIC_PROMPT,

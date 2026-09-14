@@ -32,6 +32,7 @@ from sedna.planning.models import (
     MAX_SITUATION_ITEMS,
     AccessState,
     AttemptSummary,
+    AvailableCredential,
     EvidenceInterpretationState,
     Incompatibility,
     InterpretationSubject,
@@ -699,6 +700,13 @@ class SituationReducer:
             "access_states": [item.model_dump(mode="json") for item in access_states],
             "interpretations": [item.model_dump(mode="json") for item in interpretations],
             "secret_references": [item.model_dump(mode="json") for item in secret_references],
+            "available_credentials": [
+                {
+                    "label": item.label,
+                    "secret_kind": getattr(item, "secret_kind", "other"),
+                }
+                for item in secret_references
+            ],
             "attempts": [item.model_dump(mode="json") for item in attempts],
             "incompatibilities": [item.model_dump(mode="json") for item in incompatibilities],
         }
@@ -720,6 +728,14 @@ class SituationReducer:
             access_states=tuple(access_states),
             interpretations=tuple(interpretations),
             secret_references=tuple(secret_references),
+            available_credentials=tuple(
+                AvailableCredential(
+                    event_ids=item.event_ids,
+                    label=item.label,
+                    secret_kind=getattr(item, "secret_kind", "other"),
+                )
+                for item in secret_references
+            ),
             attempts=tuple(attempts),
             incompatibilities=tuple(incompatibilities),
         )
