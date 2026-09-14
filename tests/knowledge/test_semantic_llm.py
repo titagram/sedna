@@ -447,6 +447,7 @@ def test_resolve_schema_refs_inlines_and_drops_defs() -> None:
 def test_dedup_citation_indexes_removes_duplicates() -> None:
     """Duplicated segment indexes across citations must be deduplicated."""
     from sedna.knowledge.semantic.llm import _dedup_citation_indexes
+
     response = {
         "artifacts": [
             {
@@ -465,7 +466,9 @@ def test_dedup_citation_indexes_removes_duplicates() -> None:
     }
     _dedup_citation_indexes(response)
     assert response["artifacts"][0]["citations"][0]["segment_indexes"] == [3, 1]
-    assert response["artifacts"][0]["applicability"]["typed_context"]["os_family"]["citations"][0]["segment_indexes"] == [2, 0]
+    assert response["artifacts"][0]["applicability"]["typed_context"]["os_family"]["citations"][0][
+        "segment_indexes"
+    ] == [2, 0]
     assert response["artifacts"][0]["steps"][0]["citations"][0]["segment_indexes"] == [5]
     assert response["execution_examples"][0]["citations"][0]["segment_indexes"] == [7, 8]
 
@@ -473,21 +476,35 @@ def test_dedup_citation_indexes_removes_duplicates() -> None:
 def test_drop_incomplete_optional_assertions_preserves_complete_core() -> None:
     """Incomplete optional assertions are dropped; complete ones and the core are kept."""
     from sedna.knowledge.semantic.llm import _drop_incomplete_optional_assertions
+
     response = {
         "artifacts": [
             {
                 "applicability": {
                     "typed_context": {
                         # missing confidence -> drop
-                        "os_family": {"value": "linux", "relation": "required",
-                                      "origin": "explicit", "citations": [{"segment_indexes": [0]}]},
+                        "os_family": {
+                            "value": "linux",
+                            "relation": "required",
+                            "origin": "explicit",
+                            "citations": [{"segment_indexes": [0]}],
+                        },
                         # empty citations -> drop
-                        "os_version": {"value": "5", "relation": "required",
-                                       "origin": "explicit", "confidence": 0.9, "citations": []},
+                        "os_version": {
+                            "value": "5",
+                            "relation": "required",
+                            "origin": "explicit",
+                            "confidence": 0.9,
+                            "citations": [],
+                        },
                         # complete -> keep
-                        "cpu_architecture": {"value": "x86_64", "relation": "required",
-                                             "origin": "explicit", "confidence": 0.9,
-                                             "citations": [{"segment_indexes": [1]}]},
+                        "cpu_architecture": {
+                            "value": "x86_64",
+                            "relation": "required",
+                            "origin": "explicit",
+                            "confidence": 0.9,
+                            "citations": [{"segment_indexes": [1]}],
+                        },
                     }
                 }
             }
@@ -509,13 +526,18 @@ def test_chunk_and_merge_preserves_global_indexes() -> None:
         _merge_draft_bundles,
         _offset_citation_indexes,
     )
+
     segments = [
         SafeSourceSegment(index=i, start_line=2 * i + 1, end_line=2 * i + 2, text=f"seg {i}")
         for i in range(7)
     ]
     source = SafePreparedSourcePayload(
-        source_id="s", title="t", document_type="machine_walkthrough",
-        knowledge_role="case_study", quality="complete", segments=tuple(segments),
+        source_id="s",
+        title="t",
+        document_type="machine_walkthrough",
+        knowledge_role="case_study",
+        quality="complete",
+        segments=tuple(segments),
     )
     chunks = _chunk_segments(source)
     assert chunks == [
@@ -523,12 +545,16 @@ def test_chunk_and_merge_preserves_global_indexes() -> None:
         segments[5:7],
     ]
 
-    part0 = {"artifacts": [{"local_id": "r1", "citations": [{"segment_indexes": [0, 2]}]}],
-             "execution_examples": [{"parent_local_id": "r1"}],
-             "ignored_segment_indexes": [3]}
-    part1 = {"artifacts": [{"local_id": "r1", "citations": [{"segment_indexes": [1]}]}],
-             "execution_examples": [{"parent_local_id": "r1"}],
-             "ignored_segment_indexes": [0]}
+    part0 = {
+        "artifacts": [{"local_id": "r1", "citations": [{"segment_indexes": [0, 2]}]}],
+        "execution_examples": [{"parent_local_id": "r1"}],
+        "ignored_segment_indexes": [3],
+    }
+    part1 = {
+        "artifacts": [{"local_id": "r1", "citations": [{"segment_indexes": [1]}]}],
+        "execution_examples": [{"parent_local_id": "r1"}],
+        "ignored_segment_indexes": [0],
+    }
     _offset_citation_indexes(part0, 0)
     _offset_citation_indexes(part1, 5)
     merged = _merge_draft_bundles([part0, part1])
