@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from sedna.engagement.models import ScopeReference, Sha256Hex
 from sedna.knowledge.retrieval.models import (
+    _MAX_QUERY_TEXT,
     AuthorizationScope,
     AuthorizationState,
     CurrentSituation,
@@ -349,18 +350,51 @@ def build_retrieval_queries(
     max_candidates: int = 32,
     lane_limit: int = 5,
 ) -> tuple[RetrievalQuery, ...]:
-    """Build one conservative query for each valid, explicitly scoped target."""
-    terms = _safe_texts((item.text for item in situation.facts), limit=32)
-    facets = tuple(
-        SituationFacet(
-            namespace="observed",
-            key=item.key,
-            value=item.value,
-            confidence=1.0,
-        )
-        for item in situation.facets
-        if not _PRIVATE_VALUE.search(item.value)
-    )[:32]
+    """Build one conservative query for each valid, explicitly scoped target.
+
+    Per-field and per-count bounds are not sufficient on their own: 32 terms of
+    512 characters, or 32 facets of 2048, overflow the ``CurrentSituation``
+    cumulative text bound (``_MAX_QUERY_TEXT``), and the model then raises
+    "current situation text exceeds the cumulative bound" — which aborted
+    ``plan_next`` on every settled journal long enough to accumulate that much
+    evidence. Everything assembled below therefore shares ONE explicit budget.
+    """
+    # The contract counts terms + access + services + hypotheses + outcomes +
+    # unresolved + facets + authorization against ONE limit. Reserve the
+    # authorization share first, then split what remains so the running total
+    # always fits (a per-field share alone overflowed it by 32 characters on a
+    # real settled journal).
+    authorization_reserve = min(_MAX_QUERY_TEXT // 4, 2048)
+    text_budget = _MAX_QUERY_TEXT - authorization_reserve
+    terms_budget = text_budget // 2
+    remaining_budget = text_budget - terms_budget
+    access_budget = remaining_budget // 4
+    services_budget = remaining_budget // 8
+    hypotheses_budget = remaining_budget // 4
+    outcomes_budget = remaining_budget // 8
+    unresolved_budget = remaining_budget // 8
+    facts_budget = remaining_budget - (
+        access_budget + services_budget + hypotheses_budget + outcomes_budget + unresolved_budget
+    )
+
+    terms = _fit_within_budget(
+        _safe_texts((item.text for item in situation.facts), limit=32),
+        limit=32,
+        budget=terms_budget,
+    )
+    facets = _fit_facets_within_budget(
+        tuple(
+            SituationFacet(
+                namespace="observed",
+                key=item.key,
+                value=item.value,
+                confidence=1.0,
+            )
+            for item in situation.facets
+            if not _PRIVATE_VALUE.search(item.value)
+        )[:32],
+        budget=facts_budget,
+    )
     services = tuple(
         sorted(
             {
@@ -371,23 +405,39 @@ def build_retrieval_queries(
             }
         )
     )
-    access = _safe_texts(
-        (
-            f"{item.subject}: credential available"
-            if " ".join(item.state.split()).casefold() == "credential available"
-            else f"{item.subject}: {item.state}"
-            for item in situation.access_states
+    access = _fit_within_budget(
+        _safe_texts(
+            (
+                f"{item.subject}: credential available"
+                if " ".join(item.state.split()).casefold() == "credential available"
+                else f"{item.subject}: {item.state}"
+                for item in situation.access_states
+            ),
+            limit=64,
+            allowed_exact_suffix=": credential available",
         ),
         limit=64,
-        allowed_exact_suffix=": credential available",
+        budget=access_budget,
     )
-    hypotheses = _safe_texts((item.text for item in situation.hypotheses), limit=64)
-    outcomes = tuple(
-        (item.outcome.value, item.summary)
-        for item in situation.attempts
-        if not _PRIVATE_VALUE.search(item.summary)
-    )[:64]
-    unresolved = _safe_texts((item.question for item in situation.unresolved_information), limit=64)
+    hypotheses = _fit_within_budget(
+        _safe_texts((item.text for item in situation.hypotheses), limit=64),
+        limit=64,
+        budget=hypotheses_budget,
+    )
+    outcomes = _fit_within_budget(
+        tuple(
+            _clip_text(item.summary, MAX_TERM_CHARS)
+            for item in situation.attempts
+            if not _PRIVATE_VALUE.search(item.summary)
+        ),
+        limit=64,
+        budget=outcomes_budget,
+    )
+    unresolved = _fit_within_budget(
+        _safe_texts((item.question for item in situation.unresolved_information), limit=64),
+        limit=64,
+        budget=unresolved_budget,
+    )
     synonyms = _code_intelligence_expansions(
         terms=terms,
         hypotheses=hypotheses,
@@ -458,10 +508,224 @@ def _code_intelligence_expansions(
     return tuple(sorted(expansions))[:32]
 
 
-def _safe_texts(
-    values: Any, *, limit: int, allowed_exact_suffix: str | None = None
+# The Term contract in knowledge.retrieval.models bounds each term to 512
+# characters. Terms produced here must satisfy it, so clip to the same bound.
+MAX_TERM_CHARS = 512
+
+
+def _fit_within_budget(
+    values: tuple[str, ...],
+    *,
+    limit: int,
+    budget: int,
 ) -> tuple[str, ...]:
-    """Return deterministic bounded text after removing private-value-shaped records."""
+    """Clip a term tuple until its TOTAL text fits the budget.
+
+    A per-field share is not enough: with a 512-character per-term bound, 32
+    terms reach 16_384 characters and overflow the 8_192 cumulative contract
+    (measured on a real settled journal: terms totalled 8_224, 32 over the
+    limit). This enforces the running total, shortening the last terms as needed
+    and dropping any that no longer carry text.
+    """
+    selected: list[str] = []
+    used = 0
+    for value in values:
+        remaining = budget - used
+        if remaining <= 0:
+            break
+        text = value if len(value) <= remaining else value[:remaining]
+        if len(value) > remaining:
+            boundary = text.rfind(" ")
+            if boundary > remaining // 2:
+                text = text[:boundary]
+        text = text.rstrip()
+        if not text:
+            break
+        selected.append(text)
+        used += len(text)
+        if len(selected) == limit:
+            break
+    return tuple(selected)
+
+
+def _clip_text(value: str, limit: int) -> str:
+    """Clip text to a limit on a word boundary, preserving determinism."""
+    normalized = " ".join(value.split()).casefold()
+    if len(normalized) <= limit:
+        return normalized
+    clipped = normalized[:limit]
+    boundary = clipped.rfind(" ")
+    if boundary > limit // 2:
+        clipped = clipped[:boundary]
+    return clipped.rstrip()
+
+
+def _fit_within_budget(
+    values: tuple[str, ...],
+    *,
+    limit: int,
+    budget: int,
+) -> tuple[str, ...]:
+    """Clip a term tuple until its TOTAL text fits the budget.
+
+    A per-field share is not enough: with a 512-character per-term bound, 32
+    terms reach 16_384 characters and overflow the 8_192 cumulative contract
+    (measured on a real settled journal: terms totalled 8_224, 32 over the
+    limit). This enforces the running total, shortening the last terms as needed
+    and dropping any that no longer carry text.
+    """
+    selected: list[str] = []
+    used = 0
+    for value in values:
+        remaining = budget - used
+        if remaining <= 0:
+            break
+        text = value if len(value) <= remaining else value[:remaining]
+        if len(value) > remaining:
+            boundary = text.rfind(" ")
+            if boundary > remaining // 2:
+                text = text[:boundary]
+        text = text.rstrip()
+        if not text:
+            break
+        selected.append(text)
+        used += len(text)
+        if len(selected) == limit:
+            break
+    return tuple(selected)
+
+
+def _fit_facets_within_budget(
+    facets: tuple[SituationFacet, ...],
+    *,
+    budget: int,
+) -> tuple[SituationFacet, ...]:
+    """Clip facets until their combined namespace+key+value text fits the budget.
+
+    Clipping can collapse two distinct observations onto the same truncated text,
+    and ``RetrievalQuery`` rejects duplicate facets ("query facets must be
+    unique"), so the result is de-duplicated on whole-facet identity after
+    clipping.
+    """
+    selected: list[SituationFacet] = []
+    seen: set[tuple[str, str, str]] = set()
+    used = 0
+    for facet in facets:
+        remaining = budget - used
+        if remaining <= len(facet.namespace) + len(facet.key):
+            break
+        value = facet.value
+        value_limit = remaining - len(facet.namespace) - len(facet.key)
+        if len(value) > value_limit:
+            clipped = value[:value_limit]
+            boundary = clipped.rfind(" ")
+            if boundary > value_limit // 2:
+                clipped = clipped[:boundary]
+            value = clipped.rstrip()
+            if not value:
+                break
+        identity = (facet.namespace, facet.key, value)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        used += len(facet.namespace) + len(facet.key) + len(value)
+        selected.append(
+            SituationFacet(
+                namespace=facet.namespace,
+                key=facet.key,
+                value=value,
+                confidence=facet.confidence,
+            )
+        )
+    return tuple(selected)
+
+
+def _clip_text(value: str, limit: int) -> str:
+    """Clip text to a limit on a word boundary, preserving determinism."""
+    normalized = " ".join(value.split()).casefold()
+    if len(normalized) <= limit:
+        return normalized
+    clipped = normalized[:limit]
+    boundary = clipped.rfind(" ")
+    if boundary > limit // 2:
+        clipped = clipped[:boundary]
+    return clipped.rstrip()
+
+
+class _QueryTextBudget:
+    """Shared cumulative text budget for one CurrentSituation assembly.
+
+    The contract counts every term, facet and question against a single limit
+    (``_MAX_QUERY_TEXT``). Splitting that limit explicitly means no field can
+    silently saturate the whole allowance and break construction.
+    """
+
+    def __init__(self, total: int) -> None:
+        self._total = total
+
+    def share(self, parts: int) -> int:
+        """Return this field's allowance, leaving room for the other fields."""
+        return max(1, self._total // max(1, parts))
+
+
+def _bounded_facets(
+    facets: Any,
+    *,
+    limit: int,
+    budget: int,
+) -> tuple[SituationFacet, ...]:
+    """Return facets bounded both in count and in combined text size."""
+    selected: list[SituationFacet] = []
+    used = 0
+    for facet in facets:
+        namespace = " ".join(str(facet.namespace).split()).casefold()
+        key = " ".join(str(facet.key).split()).casefold()
+        value = " ".join(str(facet.value).split()).casefold()
+        if not namespace or not key or not value:
+            continue
+        remaining = budget - used
+        if remaining <= len(namespace) + len(key):
+            break
+        # The value takes whatever remains after the naming fields.
+        value_limit = min(len(value), max(1, remaining - len(namespace) - len(key)))
+        if value_limit < len(value):
+            clipped = value[:value_limit]
+            boundary = clipped.rfind(" ")
+            if boundary > value_limit // 2:
+                clipped = clipped[:boundary]
+            value = clipped.rstrip()
+            if not value:
+                continue
+        used += len(namespace) + len(key) + len(value)
+        selected.append(
+            SituationFacet(
+                namespace=namespace,
+                key=key,
+                value=value,
+                confidence=facet.confidence,
+            )
+        )
+        if len(selected) == limit:
+            break
+    return tuple(selected)
+
+
+def _safe_texts(
+    values: Any,
+    *,
+    limit: int,
+    allowed_exact_suffix: str | None = None,
+    max_text_length: int = MAX_TERM_CHARS,
+) -> tuple[str, ...]:
+    """Return deterministic bounded text after removing private-value-shaped records.
+
+    Both the NUMBER of returned terms and the LENGTH of each one are bounded.
+    Bounding only the count was a real defect: a long observation (for example a
+    527-character evidence-slice description) produced a term longer than the
+    ``Term`` contract (max_length=512), and ``CurrentSituation`` then raised
+    ``ValidationError: terms.N Value should have at most 512 items``, aborting
+    ``plan_next`` before it could propose anything.
+    """
     selected: list[str] = []
     seen: set[str] = set()
     for value in values:
@@ -474,6 +738,15 @@ def _safe_texts(
             continue
         if not normalized or normalized in seen:
             continue
+        if len(normalized) > max_text_length:
+            # Truncate on a word boundary so the term stays readable and stable.
+            clipped = normalized[:max_text_length]
+            boundary = clipped.rfind(" ")
+            if boundary > max_text_length // 2:
+                clipped = clipped[:boundary]
+            normalized = clipped.rstrip()
+            if not normalized or normalized in seen:
+                continue
         selected.append(normalized)
         seen.add(normalized)
         if len(selected) == limit:

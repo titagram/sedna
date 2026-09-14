@@ -44,6 +44,8 @@ from sedna.engagement.events import (
     RecoveryWarningPayload,
     RevocationLifecycleIntent,
     SystemCorrelation,
+    canonical_event_hash,
+    canonical_event_json_bytes,
 )
 from sedna.engagement.models import (
     MAX_CREATE_INTENT_BYTES,
@@ -190,16 +192,14 @@ def _create_flags(*, append: bool = False) -> int:
 
 
 def _canonical_json(value: Any) -> bytes:
-    try:
-        return json.dumps(
-            value,
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    except (TypeError, ValueError, UnicodeError) as exc:
-        raise ValueError("value cannot be canonically serialized") from exc
+    """Canonical JSON bytes.
+
+    Delegates to ``events.canonical_event_json_bytes`` so that the repository,
+    the reducer and the event module share ONE serialization. Divergence here
+    was a real defect: event hashes written by creation could not be reproduced
+    by validation for non-ASCII payloads.
+    """
+    return canonical_event_json_bytes(value)
 
 
 def _model_bytes(model: BaseModel) -> bytes:
@@ -5075,9 +5075,7 @@ class EngagementJournalRepository:
                 previous_hash=previous_hash,
                 event_hash="0" * 64,
             )
-            digest = sha256(
-                _canonical_json(event.model_dump(mode="json", exclude={"event_hash"}))
-            ).hexdigest()
+            digest = canonical_event_hash(event)
             event = event.model_copy(update={"event_hash": digest})
             event = JournalEvent.model_validate(event.model_dump(mode="python"))
             created.append(event)

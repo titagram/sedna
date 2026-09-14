@@ -2179,6 +2179,39 @@ def _validate_envelope(
         raise ValueError("host events require an exact execution lane")
 
 
+def canonical_event_json_bytes(value: object) -> bytes:
+    """The ONE canonical serialization for event envelopes and their hashes.
+
+    Every producer and verifier of an event digest must use this function. Three
+    divergent serializations previously existed in this codebase; the reducer's
+    used ``json.dumps`` defaults (``ensure_ascii=True``) while the repository's
+    used ``ensure_ascii=False``. For any non-ASCII content the creation and
+    validation digests therefore differed, and every append to such an
+    engagement was refused with
+    ``EngagementReplayError("event hash does not match its canonical envelope")``.
+    """
+    try:
+        return json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ValueError("value cannot be canonically serialized") from exc
+
+
+def canonical_event_envelope(event: JournalEvent) -> object:
+    """The envelope material an event hash is computed over (hash excluded)."""
+    return event.model_dump(mode="json", warnings="error", exclude={"event_hash"})
+
+
+def canonical_event_hash(event: JournalEvent) -> str:
+    """Compute an event's canonical digest exactly as creation does."""
+    return sha256(canonical_event_json_bytes(canonical_event_envelope(event))).hexdigest()
+
+
 def _canonical_event_line_bytes(event: JournalEvent) -> bytes:
     try:
         return json.dumps(

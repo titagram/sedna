@@ -168,6 +168,9 @@ from sedna.planning.retrieval import (
 from sedna.planning.situation import SituationReducer
 from sedna.planning.utility import rank_utilities, utility_input_for_proposal
 
+# The conversion index is bounded by the contract (512 items).
+MAX_CONVERSION_INDEX_ITEMS = 512
+
 
 class _EvidenceReadError(Exception):
     pass
@@ -338,6 +341,12 @@ class PlanningService:
             # llm_unavailable gap carries no payload-level event references
             # beyond its own bindings, so a batch-scoped index suffices.
             valid_event_ids=(gap_event_id,),
+            # The conversion index is bounded by the contract (512 items). This
+            # path only needs to authorise the references the gap payload may
+            # carry, so it is capped rather than built from the whole journal:
+            # a settled engagement accumulates well over 512 evidence slices and
+            # an unbounded tuple made the error path itself fail with
+            # "Tuple should have at most 512 items after validation, not 579".
             valid_evidence_ids=tuple(
                 sorted(
                     {
@@ -346,7 +355,7 @@ class PlanningService:
                         if isinstance(event.payload, EvidenceAttachedPayload)
                     }
                 )
-            ),
+            )[:MAX_CONVERSION_INDEX_ITEMS],
             valid_family_ids=reconciliation.input_family_ids,
             valid_variant_ids=reconciliation.input_variant_ids,
             sources=(source,),

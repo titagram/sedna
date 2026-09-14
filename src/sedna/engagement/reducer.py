@@ -38,6 +38,7 @@ from sedna.engagement.events import (
     ToolCallCompletedPayload,
     ToolCallStartedPayload,
     ToolCallTerminatedPayload,
+    canonical_event_hash,
 )
 from sedna.engagement.models import (
     ActiveDecision,
@@ -282,9 +283,16 @@ _ATOMIC_RESTART_ERROR = "closure_cancelled must be immediately followed by tool_
 
 
 def _canonical_event_hash(item: JournalEvent) -> str:
-    payload = item.model_dump(mode="json", exclude={"event_hash"})
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return sha256(encoded).hexdigest()
+    """Hash an event's canonical envelope, byte-identical to creation.
+
+    Delegates to ``events.canonical_event_hash`` so creation and validation can
+    never diverge again. The previous inline ``json.dumps`` used
+    ``ensure_ascii=True`` while creation used ``ensure_ascii=False``, so any
+    event whose canonical form contained a non-ASCII character produced two
+    different digests and every append to that engagement was refused with
+    "event hash does not match its canonical envelope".
+    """
+    return canonical_event_hash(item)
 
 
 def validate_event_chain(engagement_id: UUID, events: Sequence[JournalEvent]) -> None:

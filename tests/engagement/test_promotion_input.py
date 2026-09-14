@@ -376,13 +376,15 @@ def test_projector_rejects_unclassified_event_before_private_evidence_access(
 def test_projector_builds_only_symbolized_input_from_exact_verified_journal(
     tmp_path, authorized_scope, lane, fixed_clock, fixed_uuid_factory, private_representation
 ) -> None:
-    manager, service, snapshot, verification_event_id, references, event_ids = _build_verified_journal(
-        tmp_path,
-        authorized_scope,
-        lane,
-        fixed_clock,
-        fixed_uuid_factory,
-        private_representation=private_representation,
+    manager, service, snapshot, verification_event_id, references, event_ids = (
+        _build_verified_journal(
+            tmp_path,
+            authorized_scope,
+            lane,
+            fixed_clock,
+            fixed_uuid_factory,
+            private_representation=private_representation,
+        )
     )
     calls: list[tuple[UUID, str, int, int]] = []
 
