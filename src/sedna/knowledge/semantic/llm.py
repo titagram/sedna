@@ -264,7 +264,7 @@ def _resolve_schema_refs(schema: Mapping[str, object]) -> dict[str, object]:
         if isinstance(node, dict):
             ref = node.get("$ref")
             if isinstance(ref, str) and ref.startswith("#/$defs/"):
-                name = ref[len("#/$defs/"):]
+                name = ref[len("#/$defs/") :]
                 target = defs.get(name)
                 if isinstance(target, dict):
                     # Drop the $ref key and merge the target's definition inline.
@@ -301,7 +301,9 @@ def _payload_to_segment_text(payload: SafeRequestPayload) -> str:
         return ""
     parts = [f"# {source.title}", f"type={source.document_type} role={source.knowledge_role}"]
     for segment in source.segments:
-        parts.append(f"\n--- segment {segment.index} (lines {segment.start_line}-{segment.end_line}) ---")
+        parts.append(
+            f"\n--- segment {segment.index} (lines {segment.start_line}-{segment.end_line}) ---"
+        )
         parts.append(segment.text)
     return "\n".join(parts)
 
@@ -382,7 +384,8 @@ def _drop_orphan_execution_examples(response_obj: dict) -> None:
     kept = [
         ex
         for ex in examples
-        if isinstance(ex, dict) and isinstance(ex.get("parent_local_id"), str)
+        if isinstance(ex, dict)
+        and isinstance(ex.get("parent_local_id"), str)
         and ex["parent_local_id"] in parent_ids
     ]
     if len(kept) != len(examples):
@@ -441,7 +444,7 @@ def _chunk_segments(source: SafePreparedSourcePayload) -> list[list[SafeSourceSe
     segments = list(source.segments)
     chunks: list[list[SafeSourceSegment]] = []
     for i in range(0, len(segments), _DECOMPOSE_EXTRACT_SEGMENT_THRESHOLD):
-        chunks.append(segments[i:i + _DECOMPOSE_EXTRACT_SEGMENT_THRESHOLD])
+        chunks.append(segments[i : i + _DECOMPOSE_EXTRACT_SEGMENT_THRESHOLD])
     return chunks
 
 
@@ -449,7 +452,9 @@ def _chunk_to_flat_text(source: SafePreparedSourcePayload, chunk: list[SafeSourc
     """Render one chunk as flat segment text keeping GLOBAL segment indexes."""
     parts = [f"# {source.title}", f"type={source.document_type} role={source.knowledge_role}"]
     for segment in chunk:
-        parts.append(f"\n--- segment {segment.index} (lines {segment.start_line}-{segment.end_line}) ---")
+        parts.append(
+            f"\n--- segment {segment.index} (lines {segment.start_line}-{segment.end_line}) ---"
+        )
         parts.append(segment.text)
     return "\n".join(parts)
 
@@ -463,6 +468,7 @@ def _offset_citation_indexes(node: object, offset: int) -> None:
     citation-bearing structures: artifact/step/example citations and the
     context assertions.
     """
+
     def shift_citations(citations: object) -> None:
         if not isinstance(citations, list):
             return
@@ -635,6 +641,7 @@ def _dedup_citation_indexes(response_obj: dict) -> None:
     rather than a semantic change. Runs on artifacts, case steps, execution
     examples, prerequisites, platform constraints, and context assertions.
     """
+
     def normalize_citations(citations: object) -> None:
         if not isinstance(citations, list):
             return
@@ -743,8 +750,14 @@ def _drop_incomplete_optional_assertions(response_obj: dict) -> None:
             return
         # Optional scalar assertions: drop incomplete ones by setting to None.
         for key in (
-            "os_family", "os_version", "cpu_architecture", "execution_environment",
-            "system_role", "identity_context", "initial_access", "network_position",
+            "os_family",
+            "os_version",
+            "cpu_architecture",
+            "execution_environment",
+            "system_role",
+            "identity_context",
+            "initial_access",
+            "network_position",
             "observation_date",
         ):
             if key in typed and not is_complete(typed[key]):
@@ -955,14 +968,15 @@ class HadesLlmAdapter:
                             # field. Derive it deterministically from the code:
                             # unsafe_material is the only material severity.
                             if "severity" not in finding or finding["severity"] is None:
-                                finding["severity"] = "material" if code == "unsafe_material" else "warning"
+                                finding["severity"] = (
+                                    "material" if code == "unsafe_material" else "warning"
+                                )
                     # The critic validator requires accepted == False exactly
                     # when a material finding exists. Local models frequently
                     # set accepted=false without any material finding (or vice
                     # versa). Normalize accepted to match the derived findings.
                     has_material = any(
-                        isinstance(f, dict) and f.get("severity") == "material"
-                        for f in findings
+                        isinstance(f, dict) and f.get("severity") == "material" for f in findings
                     )
                     if response_obj.get("accepted") == has_material:
                         response_obj["accepted"] = not has_material
@@ -1015,9 +1029,7 @@ class HadesLlmAdapter:
         agent_id = ""
         chunk_offset = 0
         for chunk in chunks:
-            sub_payload = payload.model_copy(
-                update={"segments": tuple(chunk)}
-            )
+            sub_payload = payload.model_copy(update={"segments": tuple(chunk)})
             result = self.complete(
                 model_type,
                 instructions=COMPACT_EXTRACTOR_PROMPT,

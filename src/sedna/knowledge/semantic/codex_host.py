@@ -224,21 +224,30 @@ class CodexCliHost:
 
     @staticmethod
     def _extract_parsed(events: list[dict[str, Any]], raw: str) -> object | None:
+        # The answer is the agent message itself. Every other event in the stream
+        # (thread.started, turn.started, turn.completed with usage counters) is
+        # bookkeeping and must never be returned as the model's output.
         for ev in events:
             if ev.get("type") == "item.completed":
                 item = ev.get("item", {})
-                if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
-                    text = item["text"].strip()
-                    try:
-                        return json.loads(text)
-                    except (ValueError, json.JSONDecodeError):
-                        # The CLI emitted an agent_message that isn't clean JSON;
-                        # fall back to the last parseable JSON in raw output.
-                        parsed = _last_json_object(raw)
-                        if parsed is not None:
-                            return parsed
-                        return None
-        # No item.completed: surface an error event if present.
+                if item.get("type") != "agent_message":
+                    continue
+                text = item.get("text")
+                if not isinstance(text, str):
+                    continue
+                stripped = text.strip()
+                try:
+                    return json.loads(stripped)
+                except (ValueError, json.JSONDecodeError):
+                    # The message is not pure JSON. Extract the object FROM THIS
+                    # MESSAGE only; never fall back to a global last-object scan,
+                    # which returned the turn.completed usage event instead of the
+                    # answer and made a correct draft look malformed.
+                    embedded = _first_json_object(stripped)
+                    if embedded is not None:
+                        return embedded
+                    continue
+        # No agent message produced a usable object: surface an error event.
         for ev in events:
             if ev.get("type") in ("error", "turn.failed"):
                 msg = ev.get("message") or ev.get("error")
@@ -257,26 +266,46 @@ class CodexCliHost:
         return CodexUsage(input_tokens=0, output_tokens=0)
 
 
-def _last_json_object(raw: str) -> object | None:
-    """Best-effort extraction of the last JSON object embedded in raw text."""
-    # Walk backwards from the end looking for a balanced brace.
-    for end in range(len(raw), -1, -1):
-        if end == 0:
-            break
-        if raw[end - 1] == "}":
-            depth = 0
-            for i in range(end - 1, -1, -1):
-                ch = raw[i]
-                if ch == "}":
-                    depth += 1
-                elif ch == "{":
-                    depth -= 1
-                    if depth == 0:
-                        candidate = raw[i:end]
-                        try:
-                            return json.loads(candidate)
-                        except (ValueError, json.JSONDecodeError):
-                            break
+def _first_json_object(raw: str) -> object | None:
+    """Extract the first balanced JSON object embedded in a single message.
+
+    Scans FORWARD, deliberately: a backwards scan returns the LAST object, which
+    on a real stream was the turn.completed usage event rather than the model's
+    answer. Only ever applied to one agent message's text, never to the whole
+    stdout+stderr stream.
+    """
+    length = len(raw)
+    index = 0
+    while index < length:
+        if raw[index] != "{":
+            index += 1
+            continue
+        depth = 0
+        in_string = False
+        escaped = False
+        for position in range(index, length):
+            character = raw[position]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    in_string = False
+                continue
+            if character == '"':
+                in_string = True
+            elif character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = raw[index : position + 1]
+                    try:
+                        return json.loads(candidate)
+                    except (ValueError, json.JSONDecodeError):
+                        break
+        index += 1
     return None
 
 

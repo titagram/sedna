@@ -17,8 +17,9 @@ from __future__ import annotations
 import json
 import os
 import urllib.request
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 _DEFAULT_BASE_URL = os.environ.get("SEDNA_OLLAMA_URL", "http://127.0.0.1:11434")
 _DEFAULT_MODEL = os.environ.get("SEDNA_OLLAMA_MODEL", "qwen3.6:latest")
@@ -212,8 +213,12 @@ class OllamaHost:
                 parsed = _last_json_object(content)
 
         usage = OllamaUsage(
-            input_tokens=int(prompt_tok) if prompt_tok is not None else _estimate_tokens(user_content),
-            output_tokens=int(comp_tok) if comp_tok is not None else _estimate_tokens(content or ""),
+            input_tokens=int(prompt_tok)
+            if prompt_tok is not None
+            else _estimate_tokens(user_content),
+            output_tokens=int(comp_tok)
+            if comp_tok is not None
+            else _estimate_tokens(content or ""),
         )
         return OllamaResult(
             parsed=parsed,
