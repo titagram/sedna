@@ -20,8 +20,9 @@ import os
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
 
 _DEFAULT_MODEL = os.environ.get("SEDNA_CODEX_MODEL", "gpt-5.5")
 _DEFAULT_BINARY = os.environ.get("SEDNA_CODEX_BIN", "codex")
@@ -140,9 +141,11 @@ class CodexCliHost:
         for block in inputs:
             if not isinstance(block, Mapping):
                 continue
-            if block.get("type") == "text" and isinstance(block.get("text"), str):
-                text_blocks.append(block["text"])
-            elif isinstance(block.get("text"), str):
+            if (
+                block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+                or isinstance(block.get("text"), str)
+            ):
                 text_blocks.append(block["text"])
         if text_blocks:
             parts.append("\n\n--- INPUT ---\n\n" + "\n\n".join(text_blocks))
@@ -181,12 +184,20 @@ class CodexCliHost:
         ]
         if schema_path:
             cmd += ["--output-schema", schema_path]
-        cmd += [prompt]
+        # The prompt is delivered on stdin, never in argv. A planner prompt on a
+        # real settled engagement measured 208_114 characters, and passing it as
+        # an argument made the OS refuse the spawn with
+        # "[Errno 7] Argument list too long" (E2BIG) — which the planner adapter
+        # then relabelled `transport_failure` and surfaced as `gap
+        # llm_unavailable`, so a frontier could never be proposed. `codex exec`
+        # reads instructions from stdin when the prompt is given as "-".
+        cmd += ["-"]
         try:
             proc = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
+                input=prompt,
                 timeout=self._timeout,
                 cwd=os.path.dirname(binary) if os.path.dirname(binary) else None,
             )
@@ -261,7 +272,7 @@ def _last_json_object(raw: str) -> object | None:
                 elif ch == "{":
                     depth -= 1
                     if depth == 0:
-                        candidate = raw[i : end]
+                        candidate = raw[i:end]
                         try:
                             return json.loads(candidate)
                         except (ValueError, json.JSONDecodeError):

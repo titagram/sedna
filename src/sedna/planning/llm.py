@@ -65,7 +65,12 @@ class HostStructuredLlm(Protocol):
 
 
 class PlanningLlmError(RuntimeError):
-    """Closed response-free planning LLM boundary failure."""
+    """Closed response-free planning LLM boundary failure.
+
+    ``detail`` is diagnostic only: it carries the underlying exception text so a
+    failure is not hidden behind a generic reason code. It never carries response
+    content, so the response-free contract is preserved.
+    """
 
     def __init__(
         self,
@@ -76,9 +81,12 @@ class PlanningLlmError(RuntimeError):
             "planner_input_too_large",
             "planner_output_too_large",
         ],
+        *,
+        detail: str | None = None,
     ) -> None:
         self.reason_code = reason_code
-        super().__init__(reason_code)
+        self.detail = detail
+        super().__init__(reason_code if detail is None else f"{reason_code}: {detail}")
 
 
 class _HostAttribution(BaseModel):
@@ -282,8 +290,16 @@ class PlanningLlmAdapter:
                 timeout=self._timeout,
                 purpose=purpose,
             )
-        except Exception:
-            raise PlanningLlmError("transport_failure") from None
+        except Exception as exc:
+            # Do not relabel every host-side failure as a transport problem: an
+            # OS-level spawn failure (E2BIG, missing binary) is not an
+            # unavailable transport, and `from None` discarded the diagnosis. A
+            # real planner prompt once failed here with "Argument list too long"
+            # and was reported as `gap llm_unavailable`, hiding the true cause.
+            raise PlanningLlmError(
+                "transport_failure",
+                detail=f"{type(exc).__name__}: {exc}",
+            ) from exc
         parsed_response = getattr(host_result, "parsed", None)
         if parsed_response is None:
             raise PlanningLlmError("missing_parsed_response")
@@ -311,8 +327,16 @@ class PlanningLlmAdapter:
             )
         except PlanningLlmError:
             raise
-        except (AttributeError, TypeError, ValidationError, ValueError):
-            raise PlanningLlmError("invalid_structured_response") from None
+        except (AttributeError, TypeError, ValidationError, ValueError) as exc:
+            # Same lesson as the transport path: do not discard the diagnosis.
+            # An unhelpful "invalid_structured_response" once cost an entire
+            # investigation; the real cause was a single field-level validation
+            # error that this detail now preserves.
+            validation_detail = str(exc).replace("\n", " | ")[:600]
+            raise PlanningLlmError(
+                "invalid_structured_response",
+                detail=f"{type(exc).__name__}: {validation_detail}",
+            ) from exc
         return StructuredResult(
             parsed=parsed,
             provider=attribution.provider,
