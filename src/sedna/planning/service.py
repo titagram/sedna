@@ -2780,14 +2780,23 @@ class PlanningService:
                 failure_code = "extractor_unavailable"
             try:
                 situation = self.load_situation(engagement_id)
-            except Exception:
+            except Exception as exc:
+                # Bind and report the cause. A bare `except Exception` here made
+                # EVERY failure look like a journal problem: a schema violation in
+                # the situation reducer was reported as `journal_unavailable`,
+                # which is false and sent diagnosis after a non-existent journal
+                # fault. The underlying text is preserved so the failure is
+                # diagnosable from the result alone.
                 return FailedSettlementResult(
                     engagement_id=engagement_id,
                     reason=reason,
                     authoritative_journal_revision=None,
                     situation=None,
                     failure_code="journal_unavailable",
-                    failure_summary="The engagement journal is unavailable",
+                    failure_summary=(
+                        f"The engagement situation could not be loaded after a "
+                        f"settlement failure ({type(exc).__name__}): {exc}"
+                    )[:2048],
                     all_required_proofs_satisfied=False,
                     possible_terminal_evidence=False,
                 )
