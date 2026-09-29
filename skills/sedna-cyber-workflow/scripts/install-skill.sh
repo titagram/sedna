@@ -29,7 +29,9 @@ esac
 file_list() {
   find "$1" -type f \
     ! -name '*.bak.*' ! -name '*.orig' ! -name '*~' \
-    ! -path '*/__pycache__/*' ! -name '*.pyc' \
+    ! -name '*.pyc' \
+    ! -path '*/__pycache__/*' ! -path '*/.pytest_cache/*' \
+    ! -path '*/.mypy_cache/*' ! -path '*/.ruff_cache/*' ! -path '*/.git/*' \
     | sed "s|^$1/||" | sort
 }
 
