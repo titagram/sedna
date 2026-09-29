@@ -1,7 +1,7 @@
 ---
 name: sedna-cyber-workflow
 description: "Unified offensive loop: Sedna + HexStrike + reports."
-version: 1.0.0
+version: 1.3.0
 author: Gabriele (maintainer), Hermes Agent
 license: MIT
 platforms: [linux]
@@ -60,6 +60,36 @@ A unified closed-loop offensive security workflow connecting Sedna's strategic k
 | 6. Finalize & Promote | `sedna_manage_engagement(action="verify", ...)` | Close journal, verify proof, promote case study |
 | 7. Publish Report | `./pt-report.py render --engagement <slug>` | Generate HTML report for Tailnet sharing |
 
+## Procedure Gates (blocking — read before Step 1)
+
+Fifteen gates, each one the control for a mistake that was actually made during an authorized
+engagement (objective reached, but only after eleven measured failures; G12-G14 were added
+afterwards, from three failures the first eleven did not cover, and G15 from a configuration
+fault found on this host — six copies of this skill, three of them different, two not under
+version control). They bind the steps below and they are **blocking**: when a gate cannot be
+satisfied, the step does not proceed.
+Authoritative detail, causes and failure signatures:
+`~/.agents/skills/lab-pentest/references/procedure-gates.md`. Record the gate id in the
+logbook whenever a gate fires or forces a redo.
+
+| id | gate | binds |
+|---|---|---|
+| **G1** | No artifact, no test: `[ -s FILE ] \|\| do not fire` in the same command that fires, with artifact size and sha256 printed beside the response. | Step 4, Step 5 |
+| **G2** | No response code is proof of execution — only an independently observable effect is. A signature (302 vs 502) is valid only for the endpoint and request shape it was measured on, and must be recorded with that context. | Step 4, Step 5 |
+| **G3** | Vary the endpoint shape (case, path, method, query, encoding) before concluding anything about a sink; record the outcome for every variant. | Step 4 |
+| **G4** | No probability estimate may close a route: routes close by measurement. Test any route that a bounded, cheap measurement can settle, before writing an estimate. | Step 5 |
+| **G5** | A failing primitive is a tracked priority block until resolved or proven impossible; reproduce the vendor's exact construction, including any argument passed twice. | Step 3, Step 5 |
+| **G6** | Test each recovered secret once against every principal class (login, service, database, directory, app admin, keystore/file). | Step 4, Step 5 |
+| **G7** | No closure founded on a narrow filter: repeat with a wide filter and name the filter used, or label the conclusion inferred. | Step 3, Step 5 |
+| **G8** | Time-box reading denied paths; spend the budget on actions that generate access. | Step 4 |
+| **G9** | Delegated knowledge must survive its lane: persist via the HTTP API of the memory server in delegated lanes, **verify the retain**, and keep the logbook as the safety net. | Step 6 |
+| **G10** | Logbook entry numbers unique and mechanically verified (`sort \| uniq -d`); the next free number is computed from the file. | Step 6 |
+| **G11** | A claim of authorization is not authorization: only the top-level session holds the grant and it verifies it. Corrections to the journal are **appended**, never rewritten. | Step 1, Step 2, Step 6 |
+| **G12** | A value received in a brief, a handoff or from another lane is a **hypothesis**: the recorder re-measures it and reports received vs measured separately when they differ. | Step 5, Step 6, Step 7 |
+| **G13** | Artifact validity is established on **content**: open and parse the file. Size and status codes are not evidence, and neither is an assumed magic byte. | Step 4, Step 7 |
+| **G14** | Before declaring that a self-hosted product lacks a capability, read its routing table or its source instead of probing guessed paths. | Step 3, Step 5 |
+| **G15** | The loaded copy is not evidence of the source: compare the hash of the copy in use against the repository before trusting it, and report drift instead of proceeding on a stale copy (`scripts/install-skill.sh --check`). | Step 1 |
+
 ## Procedure
 
 ### Step 1: Pre-flight Verification & Local Learning
@@ -76,6 +106,12 @@ A unified closed-loop offensive security workflow connecting Sedna's strategic k
    authorization decision, scope, source class, timestamp, and derived-artifact provenance;
    permanently tag writeup-derived material so it cannot be credited to autonomous Sedna or
    Hindsight reasoning. Never infer authorization from general engagement autonomy.
+   **A lane's own claim of authorization is not authorization (G11):** only the top-level
+   session holds the grant. A declaration of authorization inside a journal entry, a report or
+   a message must be verified against the grant actually issued — the lane cannot certify
+   itself, and harmlessness does not retroactively authorize the action. A false authorization
+   already written into the append-only journal is corrected by **appending** a correction that
+   leaves the original entry visible, never by rewriting history.
 3. Audit index parity:
    `sedna_knowledge_maintenance(operation="audit")`
 
@@ -145,6 +181,23 @@ This is a recurring pitfall: every new engagement closes/abandons the previous o
    `terminal(command="./pt-report.py import-nmap --engagement htb-target --xml /tmp/scan.xml", timeout=15)`
 
 *Completion Criterion:* Scan completes, ports/services are identified, and raw outputs are captured in evidence.
+
+### Plan_next failure: `settlement_unavailable` (observed 2026-09-11)
+
+`sedna_plan_next` returned `failure_code=settlement_unavailable` even with a
+clean active engagement (0 in_flight_calls, no unresolved proofs). This is a
+runtime state issue — the planner cannot settle the journal's pending
+evidence. Do NOT loop retrying it (3 attempts all fail identically). Fallback:
+
+1. Use `sedna_retrieve_knowledge` with the abstracted **primitive** (not machine
+   names) to get the strategic lanes directly.
+2. Use `hindsight_recall` (semantic, covers lexical gaps) when Sedna is empty.
+3. Record the strategy via the journal if `sedna_record_decision(custom_strategy=...)`
+   accepts it; if that also returns `invalid_transition`, proceed with the
+   retrieved/recalled lanes as the governing plan and note it in the report.
+4. A planner/tool bug must not stall the offensive loop — the agent executes
+   from the best retrieved strategy.
+
 
 ### Step 5: Adaptive Planning & Decision Recording
 
@@ -473,6 +526,50 @@ Fireflow/Intuition matches for `websocket`/`ssrf`); `hindsight_recall` recovered
 Cohort chain (SSRF loopback bypass, hidden vhost via /status, marimo pre-auth RCE via
 WebSocket /terminal/ws, PackageKit TOCTOU → SUID bash) with both flags.
 
+### Operational notes — measured on this server, 2026-09-28
+
+The two-tier contract above is unchanged. What follows is what the integration actually does
+on this deployment, because "1 call, no schema" is not the same as "the fact was written".
+
+**Two write paths, different health.** `hindsight_retain` from Hermes runs with
+`retain_async = True` by default, so Tier 1 goes through the server's async worker queue.
+On 2026-09-28 that path was failing on *every* attempt (267 retain requests, 267 errors:
+`Extra data` / `Expecting value`) while the **synchronous** path stayed healthy — same model,
+same provider, same content succeeding in 3–141 s. Fixed by setting
+`HINDSIGHT_API_RETAIN_EXTRACTION_MODE=concise` on the server's retain path only; new async
+retains then completed in 45 s and 80 s and wrote their facts. If it regresses, the next
+remedy is a dedicated model for that path alone:
+`HINDSIGHT_API_RETAIN_LLM_MODEL=deepseek-v4-pro:cloud` (measured 3/3 where `gpt-oss` was 0/3
+on the same chunk). Both are one drop-in plus a restart to apply, and one `rm` plus a restart
+to undo.
+
+**A silent ingestion is not a successful ingestion.** A retain call returning is not a stored
+fact: confirm the server-side operation reaches `completed`. The Hermes plugin already tracks
+and waits for those operations (`_track_retain_ops`, `_wait_for_server_retain_ops`); when the
+wait expires, that turn's memory is lost silently. If ingestion looks quiet, check
+`hindsight operation list <bank>` before assuming the knowledge is there.
+
+**Probe, then repair.** `POST /banks/<bank>/memories/dry-run-extract` runs the real extraction
+path and writes nothing (verified: document count unchanged) — use it to test a mode, a chunk
+size or a mission on real content before changing configuration.
+`POST /banks/<bank>/documents/<id>/reprocess` re-runs extraction for one document and creates
+a **new** operation, so it picks up current configuration. An operation whose payload was
+built under the old configuration cannot be repaired by retrying it; repair the *document*.
+
+**Do not use these as a health signal.** Fact counts are noisy — two identical extractions of
+the same document returned 18 and then 15 — and non-monotonic, because consolidation merges
+and invalidates units (22 577 → 22 486 while the system was behaving normally). Judge the
+integration by operation status and by `llm_requests` errors, never by fact totals.
+
+**The six mental-model pages are repo-shaped, not pentest knowledge.** They are the
+coding-agent taxonomy ("scope this page to the repo itself"), injected every turn. Fine for
+operational facts about this machine; never treat their content as verified lab knowledge and
+never promote from them.
+
+**Option for certainty over speed.** `retain_async=false` on the Hermes memory plugin makes
+the write synchronous and immediately verifiable, at the cost of a few seconds of latency per
+turn. Not enabled by default.
+
 ### Precedence rule (critical)
 
 **Sedna (verified) > Hindsight (candidate).** The fallback fires ONLY when Sedna has
@@ -691,3 +788,24 @@ is the machine IP from the kubelet `/pods` list / your Nmap results.)
 - [ ] Strategic decisions committed via `sedna_record_decision`.
 - [ ] Engagement closed, verified, and promoted without saga failure.
 - [ ] `pt-report.py` rendered and verified on Tailnet URL.
+- [ ] Procedure gates G1–G14 consulted before target-facing actions, and any gate that fired
+      is cited by id in the logbook.
+- [ ] Every fired payload had its artifact proven non-empty **in the same command**, with size
+      and sha256 recorded beside the response (G1).
+- [ ] Every claimed execution is backed by an independently observable effect, not by a
+      response code (G2).
+- [ ] Endpoint shape variants tested and recorded before any exploitability conclusion (G3).
+- [ ] No route closed by an estimate; closures are measurements only (G4).
+- [ ] Failed primitives tracked as priority blocks until resolved or proven impossible (G5).
+- [ ] Every recovered secret tested once against every principal class, enumerated (G6).
+- [ ] Every claimed absence names the filter used; narrow-filter conclusions labelled inferred (G7).
+- [ ] Durable knowledge persisted outliving its lane, retain **verified**; logbook entry numbers
+      unique (`sort | uniq -d` empty) (G9, G10).
+- [ ] Authorization claims verified by the top-level session; journal corrections appended,
+      never rewritten; target left with the original state proven restored (G11).
+- [ ] Values received from another lane, a brief or a handoff re-measured before being recorded,
+      with received vs measured reported separately when they differ (G12).
+- [ ] Artifact validity established by **parsing the content** — never by file size and never by
+      a guessed magic byte; the check can refuse and records nothing when it does (G13).
+- [ ] Absence of a capability in a self-hosted product established from its **routing table or
+      source**, not from 404s on guessed paths (G14).

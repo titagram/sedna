@@ -7,7 +7,9 @@ echo "=== [1/4] Checking Host HTB/Lab VPN ==="
 TUN_IFACE=""
 if IP_OUTPUT="$(ip -brief addr 2>/dev/null)"; then
     while read -r iface state _rest; do
-        if [[ "${iface}" =~ ^tun[0-9]+$ && "${state}" == "UP" ]]; then
+        # I dispositivi tun riportano operstate "unknown" anche quando il tunnel e'
+        # attivo: pretendere "UP" produce un falso negativo garantito.
+        if [[ "${iface}" =~ ^tun[0-9]+$ && ( "${state}" == "UP" || "${state}" == "UNKNOWN" ) ]]; then
             TUN_IFACE="${iface}"
             break
         fi
@@ -32,7 +34,9 @@ if DOCKER_NAMES="$(docker ps --format '{{.Names}}' 2>/dev/null)"; then
 fi
 if ((HEXSTRIKE_RUNNING == 1)); then
     echo "[+] Container hexstrike-kali is running."
-    HEALTH_MAX_BYTES=4096
+    # Il payload di /health e' cresciuto oltre 4 KB (127 tool censiti, ~4.5 KB):
+    # il cap stretto faceva fallire il check con un falso negativo.
+    HEALTH_MAX_BYTES=262144
     if HEALTH_RESPONSE="$(
         curl -fsS \
             --connect-timeout 2 \
@@ -59,7 +63,9 @@ try:
     payload = json.loads(sys.argv[1], object_pairs_hook=unique_object)
 except (TypeError, ValueError, json.JSONDecodeError):
     raise SystemExit(1)
-raise SystemExit(0 if payload == {"status": "healthy"} else 1)
+# Confronto non piu esatto: il payload aggiunge campi appena la versione cambia.
+# Si richiede la chiave status con valore healthy, mantenendo il rifiuto dei duplicati.
+raise SystemExit(0 if isinstance(payload, dict) and payload.get("status") == "healthy" else 1)
 ' "${HEALTH_RESPONSE}"; then
         echo "[+] HexStrike API is healthy on 127.0.0.1:8888."
     else

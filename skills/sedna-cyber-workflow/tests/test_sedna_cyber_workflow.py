@@ -86,12 +86,13 @@ def test_script_permissions():
         ("tun0 UP 10.10.0.2/24", "other-container", 0, '{"status":"healthy"}', False),
         ("tun0 UP 10.10.0.2/24", "hexstrike-kali", 1, "", False),
         ("tun0 UP 10.10.0.2/24", "hexstrike-kali", 0, '{"status":"unhealthy"}', False),
-        (
+        pytest.param(
             "tun0 UP 10.10.0.2/24",
             "hexstrike-kali",
             0,
             '{"status":"healthy","extra":true}',
-            False,
+            True,
+            id="health-extra-fields-are-tolerated",
         ),
         (
             "tun0 UP 10.10.0.2/24",
@@ -100,12 +101,43 @@ def test_script_permissions():
             '{"status":"unhealthy","status":"healthy"}',
             False,
         ),
-        (
+        pytest.param(
             "tun0 UP 10.10.0.2/24",
             "hexstrike-kali",
             0,
             json.dumps({"status": "healthy", "padding": "x" * 5000}),
+            True,
+            id="health-payload-under-cap",
+        ),
+        # The two cases above were inverted on 2026-09-28: the verifier used to reject any extra
+        # field and any payload over 4 KB, which failed closed on every server upgrade (the health
+        # payload had grown past that cap with 127 tools registered). The verifier now requires the
+        # status key with value healthy and a generous bound. What must still fail closed is
+        # covered by the cases below: a missing status key, a payload over the bound, and a tunnel
+        # that is not up.
+        pytest.param(
+            "tun0 UNKNOWN 10.10.0.2/24",
+            "hexstrike-kali",
+            0,
+            '{"status":"healthy"}',
+            True,
+            id="tun-up-reporting-unknown-operstate",
+        ),
+        pytest.param(
+            "tun0 UP 10.10.0.2/24",
+            "hexstrike-kali",
+            0,
+            json.dumps({"status": "healthy", "padding": "x" * 300000}),
             False,
+            id="health-payload-over-bound",
+        ),
+        pytest.param(
+            "tun0 UP 10.10.0.2/24",
+            "hexstrike-kali",
+            0,
+            '{"ok":true}',
+            False,
+            id="health-status-key-missing",
         ),
         ("tun0 UP 10.10.0.2/24", "hexstrike-kali", 0, '{"status":"healthy"}', True),
     ),
