@@ -1,7 +1,7 @@
 ---
 name: sedna-cyber-workflow
 description: "Unified offensive loop: Sedna + HexStrike + reports."
-version: 1.3.0
+version: 1.3.1
 author: Gabriele (maintainer), Hermes Agent
 license: MIT
 platforms: [linux]
@@ -535,10 +535,12 @@ on this deployment, because "1 call, no schema" is not the same as "the fact was
 `retain_async = True` by default, so Tier 1 goes through the server's async worker queue.
 On 2026-09-28 that path was failing on *every* attempt (267 retain requests, 267 errors:
 `Extra data` / `Expecting value`) while the **synchronous** path stayed healthy — same model,
-same provider, same content succeeding in 3–141 s. Fixed by setting
-`HINDSIGHT_API_RETAIN_EXTRACTION_MODE=concise` on the server's retain path only; new async
-retains then completed in 45 s and 80 s and wrote their facts. If it regresses, the next
-remedy is a dedicated model for that path alone:
+same provider, same content succeeding in 3–141 s. Setting
+`HINDSIGHT_API_RETAIN_EXTRACTION_MODE=concise` on the server's retain path only **largely**
+restored it, but not completely: measured the next day, of the 49 operations created after the
+change **37 completed and 6 failed**, the last failure at 17:25 and none in the thirteen hours
+after it. Treat that path as repaired *and* fragile — re-check it rather than trusting it. If it
+regresses, the next remedy is a dedicated model for that path alone:
 `HINDSIGHT_API_RETAIN_LLM_MODEL=deepseek-v4-pro:cloud` (measured 3/3 where `gpt-oss` was 0/3
 on the same chunk). Both are one drop-in plus a restart to apply, and one `rm` plus a restart
 to undo.
@@ -559,7 +561,17 @@ built under the old configuration cannot be repaired by retrying it; repair the 
 **Do not use these as a health signal.** Fact counts are noisy — two identical extractions of
 the same document returned 18 and then 15 — and non-monotonic, because consolidation merges
 and invalidates units (22 577 → 22 486 while the system was behaving normally). Judge the
-integration by operation status and by `llm_requests` errors, never by fact totals.
+integration by operation status and by the facts actually deposited, never by fact totals and
+never by request-level error counts (see the next paragraph).
+
+**The health signal that lies.** Measured on 2026-09-29: every logged call under
+`retain_extract_facts` failed — 13 of 13, with the same two signatures as the original defect —
+while the `retain` and `batch_retain` operations of that same day **completed** and their two
+documents hold twelve facts each. The path that produces the facts does not register its calls;
+the path that registers them always fails and is tolerated. `llm_requests` therefore overstates
+the damage and under-reports the work, and it is not a health indicator here. **Having an
+indicator is not the same as having the right indicator:** the signals that hold are the
+operation reaching `completed`, the document existing, and its units being there.
 
 **The six mental-model pages are repo-shaped, not pentest knowledge.** They are the
 coding-agent taxonomy ("scope this page to the repo itself"), injected every turn. Fine for
