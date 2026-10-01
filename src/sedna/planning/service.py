@@ -165,7 +165,7 @@ from sedna.planning.retrieval import (
     assemble_planner_knowledge,
     digest_hindsight_candidates,
 )
-from sedna.planning.situation import SituationReducer
+from sedna.planning.situation import SituationReducer, planner_situation_view
 from sedna.planning.utility import rank_utilities, utility_input_for_proposal
 
 # The conversion index is bounded by the contract (512 items).
@@ -702,7 +702,7 @@ class PlanningService:
             PlannerDraft,
             instructions=PLANNER_PROMPT,
             payload=PlannerRequest(
-                situation=situation,
+                situation=planner_situation_view(situation),
                 ledger=replay.ledger,
                 knowledge_context=knowledge_context,
                 scope_references=snapshot.state.scope_references,

@@ -37,6 +37,8 @@ class _MissingParsedHostResult:
 
 
 class _RecordingHost:
+    accepts_schema: bool = False
+
     def __init__(self, result: object) -> None:
         self.result = result
         self.calls: list[dict[str, Any]] = []
@@ -645,6 +647,7 @@ def test_adapter_plan_requires_exact_request_and_response_contract() -> None:
     from sedna.planning.retrieval import PlannerKnowledgeContext
 
     host = _RecordingHost(_HostResult(parsed={"proposals": []}))
+    host.accepts_schema = True
     situation = _situation()
     request = PlannerRequest(
         situation=situation,
@@ -668,6 +671,7 @@ def test_adapter_plan_requires_exact_request_and_response_contract() -> None:
     )
 
     assert result.parsed == PlannerDraft(proposals=())
+    assert host.calls[0]["json_schema"] == PlannerDraft.model_json_schema()
     with pytest.raises(TypeError, match="planning contract"):
         PlanningLlmAdapter(host).complete(
             ObservationBatchDraft,

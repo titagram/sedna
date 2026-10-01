@@ -20,7 +20,12 @@ import subprocess
 
 import pytest
 
-from sedna.knowledge.semantic.codex_host import CodexCliError, CodexCliHost
+from sedna.knowledge.semantic.codex_host import (
+    CodexCliError,
+    CodexCliHost,
+    _codex_strict_schema,
+    _restore_optional_nulls,
+)
 
 
 class _Recorder:
@@ -83,6 +88,42 @@ def test_small_prompt_also_uses_stdin_for_consistency(
     cmd = recorder.calls[0]["cmd"]
     assert "a short prompt" not in cmd
     assert recorder.calls[0].get("input") == "a short prompt"
+
+
+def test_strict_schema_inlines_refs_requires_every_property_and_roundtrips_optionals() -> None:
+    """Codex strict transport is lossless for Pydantic-style optional fields."""
+    schema = {
+        "type": "object",
+        "properties": {"required": {"type": "string"}, "optional": {"$ref": "#/$defs/name"}},
+        "required": ["required"],
+        "$defs": {"name": {"type": "string"}},
+    }
+
+    strict = _codex_strict_schema(schema)
+
+    assert "$defs" not in strict
+    assert "$ref" not in str(strict)
+    assert strict["required"] == ["required", "optional"]
+    assert strict["additionalProperties"] is False
+    assert _restore_optional_nulls({"required": "ok", "optional": None}, schema) == {"required": "ok"}
+
+
+def test_strict_schema_preserves_explicit_nullable_optional_and_rejects_cycles() -> None:
+    """Null remains meaningful when canonical schema already permits it."""
+    nullable = {
+        "type": "object",
+        "properties": {"optional": {"type": ["string", "null"]}},
+        "required": [],
+    }
+    cyclic = {
+        "type": "object",
+        "properties": {"child": {"$ref": "#/$defs/node"}},
+        "$defs": {"node": {"type": "object", "properties": {"child": {"$ref": "#/$defs/node"}}}},
+    }
+
+    assert _restore_optional_nulls({"optional": None}, nullable) == {"optional": None}
+    with pytest.raises(ValueError, match="recursive_schema_not_supported"):
+        _codex_strict_schema(cyclic)
 
 
 def test_codex_error_message_preserves_argument_limit_failure(
