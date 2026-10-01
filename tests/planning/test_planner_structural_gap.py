@@ -87,3 +87,99 @@ def test_service_module_exposes_the_reasoned_gap_path() -> None:
     assert "planner_draft_invalid" in source, (
         "the structural-violation finding is not constructed anywhere"
     )
+
+
+# --------------------------------------------------------------------------- #
+# The same contract, one level up: a completion that ARRIVES but fails its
+# schema.
+#
+# The tests above cover a violation found by _validate_planner_draft, which runs
+# on an already-parsed draft and therefore has a draft to repair. A draft that
+# fails the adapter's own schema validation never becomes an object, so there is
+# nothing to repair -- and before this fix the error escaped `plan_next` as a
+# bare PlanningLlmError with zero events recorded.
+#
+# Worse, the escape was ambiguous in the other direction: the only path that
+# publishes `llm_unavailable` was gated on `reason_code == "transport_failure"`,
+# so a genuinely unavailable host and a reachable model returning garbage were
+# both silent, and the one that DID get published would have claimed "the model
+# is unavailable" while a model was answering.
+# --------------------------------------------------------------------------- #
+
+
+class _RaisingLlm:
+    """A planning LLM boundary that always fails with a chosen reason code."""
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    def complete(self, *_args: object, **_kwargs: object) -> object:
+        raise self._error
+
+
+def _service_with_failing_llm(error: Exception) -> PlanningService:
+    """A PlanningService whose only configured collaborator is a failing LLM.
+
+    `_complete_planning` needs nothing else, so the instance is built without
+    running __init__ -- the alternative is standing up a journal, a repository
+    and a lane just to reach the boundary under test.
+    """
+    service = PlanningService.__new__(PlanningService)
+    service._llm = _RaisingLlm(error)
+    return service
+
+
+def test_a_schema_invalid_completion_is_a_draft_error_not_a_transport_error() -> None:
+    """The model answered; the answer was wrong. That is not an unavailable host."""
+    from sedna.planning.llm import PlanningLlmError
+
+    service = _service_with_failing_llm(
+        PlanningLlmError("invalid_structured_response", detail="extra_forbidden: strategy")
+    )
+
+    with pytest.raises(service_module._PlannerDraftInvalidError) as caught:
+        service._complete_planning(object)
+
+    assert not isinstance(caught.value, service_module._PlanningLlmUnavailableError), (
+        "a schema-invalid draft must not enter the unavailable-host path: the model "
+        "was reachable, so recording 'llm_unavailable' would state a falsehood"
+    )
+    assert "extra_forbidden" in str(caught.value), "the schema diagnosis must survive"
+
+
+def test_a_transport_failure_still_means_the_host_is_unavailable() -> None:
+    """The unavailable-host meaning must stay attached to transport failures only."""
+    from sedna.planning.llm import PlanningLlmError
+
+    service = _service_with_failing_llm(
+        PlanningLlmError("transport_failure", detail="OSError: connection refused")
+    )
+
+    with pytest.raises(service_module._PlanningLlmUnavailableError):
+        service._complete_planning(object)
+
+
+def test_other_non_transport_reasons_are_draft_errors_too() -> None:
+    """Every non-transport reason describes the response, not the transport."""
+    from sedna.planning.llm import PlanningLlmError
+
+    for reason in ("missing_parsed_response", "invalid_structured_response"):
+        service = _service_with_failing_llm(PlanningLlmError(reason))
+        with pytest.raises(service_module._PlannerDraftInvalidError):
+            service._complete_planning(object)
+
+
+def test_plan_next_routes_the_draft_error_to_the_reasoned_gap() -> None:
+    """Guard against regression: the marker must be caught, not left to escape."""
+    source = inspect.getsource(PlanningService.plan_next)
+
+    assert "_PlannerDraftInvalidError" in source, (
+        "_plan_next_once raises _PlannerDraftInvalidError but plan_next does not "
+        "catch it, so a schema-invalid draft still escapes as a bare exception"
+    )
+    assert "_publish_invalid_draft_gap" in source, (
+        "the draft-invalid path must publish a reasoned gap, not vanish"
+    )
+    assert "_publish_llm_unavailable_gap" in source, (
+        "the unavailable-host path must stay wired as well"
+    )
